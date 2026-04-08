@@ -1,0 +1,38 @@
+services:
+  db:
+    image: postgres:15-alpine
+    container_name: inspectre-db
+    restart: always
+    environment:
+      POSTGRES_USER: admin
+      POSTGRES_PASSWORD: password123 # Change this later!
+      POSTGRES_DB: inspectre
+    ports:
+      - "5432:5432"
+    volumes:
+      - ./postgres_data:/var/lib/postgresql/data
+
+  web:
+    build: ./backend
+    container_name: inspectre-web
+    restart: always
+    ports:
+      - "8000:8000"
+    environment:
+      DATABASE_URL: postgresql://admin:password123@db:5432/inspectre
+    depends_on:
+      - db
+
+  probe:
+    build: ./probe
+    container_name: inspectre-probe
+    network_mode: "host"
+    privileged: true
+    restart: always
+    environment:
+      DATABASE_URL: postgresql://admin:password123@localhost:5432/inspectre
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+    depends_on:
+      - db
