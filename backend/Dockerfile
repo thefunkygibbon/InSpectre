@@ -15,4 +15,4 @@ RUN pip install --no-cache-dir fastapi uvicorn sqlalchemy psycopg2-binary
 COPY . .
 
 # Run the API
-CMD ["uvicorn", "main.py:app", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
