@@ -18,6 +18,15 @@
 }
 
 @layer components {
+  /* Noise texture overlay — defined here to avoid SVG escaping issues in JSX */
+  .noise-overlay {
+    position: fixed;
+    inset: 0;
+    pointer-events: none;
+    z-index: 0;
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='4' height='4'%3E%3Crect width='1' height='1' fill='white' opacity='0.015'/%3E%3C/svg%3E");
+  }
+
   .glass {
     @apply bg-gray-900/60 backdrop-blur-xl border border-white/5;
   }

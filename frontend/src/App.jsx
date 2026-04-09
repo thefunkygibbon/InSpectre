@@ -15,11 +15,11 @@ const FILTERS = ['all', 'online', 'offline']
 
 export default function App() {
   const { devices, stats, loading, error, refresh, lastRefresh } = useDevices(10000)
-  const [search, setSearch]         = useState('')
-  const [filter, setFilter]         = useState('all')
-  const [selected, setSelected]     = useState(null)
+  const [search, setSearch]             = useState('')
+  const [filter, setFilter]             = useState('all')
+  const [selected, setSelected]         = useState(null)
   const [showSettings, setShowSettings] = useState(false)
-  const [refreshing, setRefreshing] = useState(false)
+  const [refreshing, setRefreshing]     = useState(false)
 
   const filtered = useMemo(() => {
     let list = devices
@@ -28,11 +28,11 @@ export default function App() {
     if (search.trim()) {
       const q = search.toLowerCase()
       list = list.filter(d =>
-        (d.ip_address      || '').toLowerCase().includes(q) ||
-        (d.mac_address     || '').toLowerCase().includes(q) ||
-        (d.hostname        || '').toLowerCase().includes(q) ||
-        (d.custom_name     || '').toLowerCase().includes(q) ||
-        (d.vendor          || '').toLowerCase().includes(q)
+        (d.ip_address  || '').toLowerCase().includes(q) ||
+        (d.mac_address || '').toLowerCase().includes(q) ||
+        (d.hostname    || '').toLowerCase().includes(q) ||
+        (d.custom_name || '').toLowerCase().includes(q) ||
+        (d.vendor      || '').toLowerCase().includes(q)
       )
     }
     return list
@@ -47,25 +47,22 @@ export default function App() {
   async function handleRename(mac, name) {
     await api.updateDevice(mac, { custom_name: name })
     await refresh()
-    // Update the selected device in place
     setSelected(d => d?.mac_address === mac ? { ...d, custom_name: name } : d)
   }
 
-  const lastRefreshStr = lastRefresh
-    ? lastRefresh.toLocaleTimeString()
-    : null
+  const lastRefreshStr = lastRefresh ? lastRefresh.toLocaleTimeString() : null
 
   return (
     <div className="min-h-screen bg-gray-950 flex flex-col">
-      {/* Top noise texture overlay */}
-      <div className="fixed inset-0 bg-[url(\"data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='4' height='4'%3E%3Crect width='1' height='1' fill='white' opacity='0.015'/%3E%3C/svg%3E\")] pointer-events-none z-0" />
+      {/* Noise texture overlay - class defined in index.css */}
+      <div className="noise-overlay" />
 
       {/* Ambient glow */}
-      <div className="fixed top-0 left-1/2 -translate-x-1/2 w-[600px] h-[300px]
-                      bg-brand-900/20 blur-[120px] rounded-full pointer-events-none z-0" />
+      <div className="fixed top-0 left-1/2 -translate-x-1/2 w-[600px] h-[300px] bg-brand-900/20 blur-[120px] rounded-full pointer-events-none z-0" />
 
       <div className="relative z-10 flex flex-col min-h-screen">
-        {/* ── Navbar ────────────────────────────────── */}
+
+        {/* ── Navbar ─────────────────────────────────────────── */}
         <header className="sticky top-0 z-30 border-b border-white/5 bg-gray-950/80 backdrop-blur-xl">
           <div className="max-w-[1400px] mx-auto px-4 sm:px-6 h-16 flex items-center justify-between gap-4">
             <div className="flex items-center gap-3">
@@ -75,23 +72,14 @@ export default function App() {
                 <span className="hidden sm:inline text-xs text-gray-600 ml-2">Network Security Suite</span>
               </div>
             </div>
-
             <div className="flex items-center gap-2">
               {lastRefreshStr && (
                 <span className="hidden md:block text-xs text-gray-600">Updated {lastRefreshStr}</span>
               )}
-              <button
-                onClick={handleRefresh}
-                className="btn-ghost p-2"
-                aria-label="Refresh"
-              >
+              <button onClick={handleRefresh} className="btn-ghost p-2" aria-label="Refresh">
                 <RefreshCw size={16} className={refreshing ? 'animate-spin' : ''} />
               </button>
-              <button
-                onClick={() => setShowSettings(true)}
-                className="btn-ghost p-2"
-                aria-label="Settings"
-              >
+              <button onClick={() => setShowSettings(true)} className="btn-ghost p-2" aria-label="Settings">
                 <Settings size={16} />
               </button>
             </div>
@@ -102,24 +90,23 @@ export default function App() {
 
           {/* Error banner */}
           {error && (
-            <div className="flex items-center gap-3 px-4 py-3 rounded-xl bg-red-500/10 border border-red-500/20
-                            text-red-400 text-sm animate-slide-up">
+            <div className="flex items-center gap-3 px-4 py-3 rounded-xl bg-red-500/10 border border-red-500/20 text-red-400 text-sm animate-slide-up">
               <AlertCircle size={16} className="shrink-0" />
               {error}
             </div>
           )}
 
-          {/* ── Stat cards ─────────────────────────── */}
+          {/* ── Stat cards ──────────────────────────────────── */}
           <section>
             <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
-              <StatCard label="Total Devices"  value={stats?.total_devices} icon={Monitor}     color="brand" />
-              <StatCard label="Online"         value={stats?.online}        icon={Wifi}         color="emerald" />
-              <StatCard label="Offline"        value={stats?.offline}       icon={WifiOff}      color="red" />
-              <StatCard label="Deep Scanned"   value={stats?.deep_scanned}  icon={ScanSearch}   color="amber" />
+              <StatCard label="Total Devices" value={stats?.total_devices} icon={Monitor}   color="brand"   />
+              <StatCard label="Online"        value={stats?.online}        icon={Wifi}       color="emerald" />
+              <StatCard label="Offline"       value={stats?.offline}       icon={WifiOff}    color="red"     />
+              <StatCard label="Deep Scanned"  value={stats?.deep_scanned}  icon={ScanSearch} color="amber"   />
             </div>
           </section>
 
-          {/* ── Toolbar ────────────────────────────── */}
+          {/* ── Toolbar ─────────────────────────────────────── */}
           <section className="flex flex-col sm:flex-row gap-3 items-stretch sm:items-center">
             <div className="relative flex-1">
               <Search size={15} className="absolute left-3 top-1/2 -translate-y-1/2 text-gray-500 pointer-events-none" />
@@ -136,10 +123,11 @@ export default function App() {
                 <button
                   key={f}
                   onClick={() => setFilter(f)}
-                  className={`px-3 py-1.5 rounded-lg text-xs font-medium capitalize transition-all duration-150
-                    ${ filter === f
-                        ? 'bg-brand-600 text-white'
-                        : 'text-gray-400 hover:text-gray-200 hover:bg-white/5' }`}
+                  className={`px-3 py-1.5 rounded-lg text-xs font-medium capitalize transition-all duration-150 ${
+                    filter === f
+                      ? 'bg-brand-600 text-white'
+                      : 'text-gray-400 hover:text-gray-200 hover:bg-white/5'
+                  }`}
                 >
                   {f}
                 </button>
@@ -147,7 +135,7 @@ export default function App() {
             </div>
           </section>
 
-          {/* ── Device grid ────────────────────────── */}
+          {/* ── Device grid ─────────────────────────────────── */}
           <section>
             {loading ? (
               <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-4">
@@ -183,7 +171,7 @@ export default function App() {
         </footer>
       </div>
 
-      {/* ── Drawers ──────────────────────────────── */}
+      {/* ── Drawers ─────────────────────────────────────────── */}
       {selected && (
         <DeviceDrawer
           device={selected}
@@ -218,8 +206,7 @@ function SkeletonCard() {
 function EmptyState({ search, filter }) {
   return (
     <div className="flex flex-col items-center text-center py-24 gap-4 animate-fade-in">
-      <div className="w-16 h-16 rounded-2xl bg-gray-900 border border-white/5
-                      flex items-center justify-center">
+      <div className="w-16 h-16 rounded-2xl bg-gray-900 border border-white/5 flex items-center justify-center">
         <Monitor size={28} className="text-gray-700" />
       </div>
       <div>
@@ -228,8 +215,8 @@ function EmptyState({ search, filter }) {
         </h3>
         <p className="text-sm text-gray-600 mt-1 max-w-xs">
           {search
-            ? `Try a different search term`
-            : `The probe will discover devices automatically on the next ARP sweep`}
+            ? 'Try a different search term'
+            : 'The probe will discover devices automatically on the next ARP sweep'}
         </p>
       </div>
     </div>
