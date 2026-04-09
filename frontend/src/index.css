@@ -1,0 +1,55 @@
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap');
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    --scrollbar-track: #1a1a2e;
+    --scrollbar-thumb: #2d2d44;
+  }
+  html { @apply antialiased; }
+  body { @apply bg-gray-950 text-gray-100 font-sans; }
+
+  ::-webkit-scrollbar { width: 6px; height: 6px; }
+  ::-webkit-scrollbar-track { background: var(--scrollbar-track); }
+  ::-webkit-scrollbar-thumb { background: var(--scrollbar-thumb); border-radius: 3px; }
+  ::-webkit-scrollbar-thumb:hover { background: #3d3d5c; }
+}
+
+@layer components {
+  .glass {
+    @apply bg-gray-900/60 backdrop-blur-xl border border-white/5;
+  }
+  .glass-hover {
+    @apply hover:bg-gray-800/60 transition-colors duration-150;
+  }
+  .card {
+    @apply glass rounded-2xl;
+  }
+  .btn-primary {
+    @apply bg-brand-600 hover:bg-brand-500 text-white font-medium px-4 py-2 rounded-xl
+           transition-all duration-150 active:scale-95 text-sm;
+  }
+  .btn-ghost {
+    @apply text-gray-400 hover:text-gray-100 hover:bg-white/5 px-3 py-2 rounded-xl
+           transition-all duration-150 text-sm;
+  }
+  .input {
+    @apply bg-gray-800/80 border border-white/10 rounded-xl px-3 py-2 text-sm
+           text-gray-100 placeholder-gray-500 focus:outline-none focus:border-brand-500/50
+           focus:ring-1 focus:ring-brand-500/20 transition-all duration-150 w-full;
+  }
+  .badge-online {
+    @apply inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-xs font-medium
+           bg-emerald-500/15 text-emerald-400 border border-emerald-500/20;
+  }
+  .badge-offline {
+    @apply inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-xs font-medium
+           bg-red-500/15 text-red-400 border border-red-500/20;
+  }
+  .badge-scanning {
+    @apply inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-xs font-medium
+           bg-amber-500/15 text-amber-400 border border-amber-500/20;
+  }
+}
