@@ -32,7 +32,7 @@ services:
     environment:
       DATABASE_URL: postgresql://admin:password123@localhost:5432/inspectre
       IP_RANGE: "192.168.0.0/24"
-      INTERFACE: "eth0"
+      INTERFACE: "eno1"
       SCAN_INTERVAL: "60"
       NMAP_ARGS: "-O --osscan-guess -sV --version-intensity 5 -T4"
       PYTHONUNBUFFERED: "1"
