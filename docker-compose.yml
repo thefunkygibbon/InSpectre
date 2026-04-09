@@ -5,7 +5,7 @@ services:
     restart: always
     environment:
       POSTGRES_USER: admin
-      POSTGRES_PASSWORD: password123 # Change this later!
+      POSTGRES_PASSWORD: password123 # Change this!
       POSTGRES_DB: inspectre
     ports:
       - "5432:5432"
@@ -41,3 +41,12 @@ services:
       - NET_RAW
     depends_on:
       - db
+
+  frontend:
+    build: ./frontend
+    container_name: inspectre-frontend
+    restart: always
+    ports:
+      - "3000:80"
+    depends_on:
+      - web
