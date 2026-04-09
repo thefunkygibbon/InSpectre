@@ -1,38 +1,52 @@
-@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap');
+@import url('https://api.fontshare.com/v2/css?f[]=satoshi@400,500,600,700&f[]=jet-brains-mono@400,500&display=swap');
 @tailwind base;
 @tailwind components;
 @tailwind utilities;
 
+/* ── Design tokens ─────────────────────────────────────────────────────────── */
+:root, [data-theme="light"] {
+  --color-bg:            #f7f6f2;
+  --color-surface:       #ffffff;
+  --color-surface-hover: #f3f0ec;
+  --color-surface-active:#edeae5;
+  --color-surface-offset:#f0ede8;
+  --color-border:        rgba(0,0,0,0.08);
+  --color-text:          #1a1714;
+  --color-text-muted:    #6b6860;
+  --color-brand:         #0d7a82;
+  --color-brand-light:   #1a9ea8;
+  --noise-opacity: 0.025;
+}
+
+[data-theme="dark"] {
+  --color-bg:            #0d0d0f;
+  --color-surface:       #141416;
+  --color-surface-hover: #1c1c1f;
+  --color-surface-active:#222226;
+  --color-surface-offset:#181819;
+  --color-border:        rgba(255,255,255,0.07);
+  --color-text:          #e8e8ea;
+  --color-text-muted:    #6e6e78;
+  --color-brand:         #4fa8b0;
+  --color-brand-light:   #6bbfc7;
+  --noise-opacity: 0.015;
+}
+
+/* Default to dark */
+:root { color-scheme: dark; }
+[data-theme="light"] { color-scheme: light; }
+
 @layer base {
-  :root {
-    --scrollbar-track: #1a1a2e;
-    --scrollbar-thumb: #2d2d44;
+  html { @apply antialiased; }
+  body {
+    font-family: 'Satoshi', system-ui, sans-serif;
+    background-color: var(--color-bg);
+    color: var(--color-text);
+    transition: background-color 0.2s, color 0.2s;
   }
-
-  html        { @apply antialiased; }
-  body        { @apply bg-gray-950 text-gray-100 font-sans transition-colors duration-300; }
-
-  /* Light mode overrides */
-  html:not(.dark) body       { @apply bg-slate-100 text-gray-900; }
-  html:not(.dark) .glass     { background: rgba(255,255,255,0.7) !important; border-color: rgba(0,0,0,0.08) !important; }
-  html:not(.dark) .card      { background: rgba(255,255,255,0.85) !important; border-color: rgba(0,0,0,0.08) !important; }
-  html:not(.dark) .input     { background: rgba(255,255,255,0.9) !important;  border-color: rgba(0,0,0,0.15) !important; color: #111 !important; }
-  html:not(.dark) header     { background: rgba(241,245,249,0.9) !important; }
-  html:not(.dark) .text-gray-100 { color: #111827 !important; }
-  html:not(.dark) .text-gray-200 { color: #1f2937 !important; }
-  html:not(.dark) .text-gray-300 { color: #374151 !important; }
-  html:not(.dark) .text-gray-400 { color: #4b5563 !important; }
-  html:not(.dark) .text-gray-500 { color: #6b7280 !important; }
-  html:not(.dark) .text-gray-600 { color: #9ca3af !important; }
-  html:not(.dark) .bg-gray-950   { background: #f1f5f9 !important; }
-  html:not(.dark) .bg-gray-900   { background: #ffffff !important; }
-  html:not(.dark) .bg-gray-800   { background: #f8fafc !important; }
-  html:not(.dark) .noise-overlay { opacity: 0; }
-
-  ::-webkit-scrollbar        { width: 6px; height: 6px; }
-  ::-webkit-scrollbar-track  { background: var(--scrollbar-track); }
-  ::-webkit-scrollbar-thumb  { background: var(--scrollbar-thumb); border-radius: 3px; }
-  ::-webkit-scrollbar-thumb:hover { background: #3d3d5c; }
+  ::-webkit-scrollbar        { width: 5px; height: 5px; }
+  ::-webkit-scrollbar-track  { background: transparent; }
+  ::-webkit-scrollbar-thumb  { background: var(--color-border); border-radius: 9999px; }
 }
 
 @layer components {
@@ -41,48 +55,73 @@
     inset: 0;
     pointer-events: none;
     z-index: 0;
-    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='4' height='4'%3E%3Crect width='1' height='1' fill='white' opacity='0.015'/%3E%3C/svg%3E");
-  }
-  .glass {
-    @apply bg-gray-900/60 backdrop-blur-xl border border-white/5;
-  }
-  .glass-hover {
-    @apply hover:bg-gray-800/60 transition-colors duration-150;
-  }
-  .card {
-    @apply glass rounded-2xl;
-  }
-  .btn-primary {
-    @apply bg-brand-600 hover:bg-brand-500 text-white font-medium px-4 py-2 rounded-xl
-           transition-all duration-150 active:scale-95 text-sm;
-  }
-  .btn-ghost {
-    @apply text-gray-400 hover:text-gray-100 hover:bg-white/5 px-3 py-2 rounded-xl
-           transition-all duration-150 text-sm;
-  }
-  .input {
-    @apply bg-gray-800/80 border border-white/10 rounded-xl px-3 py-2 text-sm
-           text-gray-100 placeholder-gray-500 focus:outline-none focus:border-brand-500/50
-           focus:ring-1 focus:ring-brand-500/20 transition-all duration-150 w-full;
-  }
-  .badge-online {
-    @apply inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-xs font-medium
-           bg-emerald-500/15 text-emerald-400 border border-emerald-500/20;
-  }
-  .badge-offline {
-    @apply inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-xs font-medium
-           bg-red-500/15 text-red-400 border border-red-500/20;
-  }
-  .badge-scanning {
-    @apply inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-xs font-medium
-           bg-amber-500/15 text-amber-400 border border-amber-500/20;
+    opacity: var(--noise-opacity);
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='200' height='200'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='200' height='200' filter='url(%23n)' opacity='1'/%3E%3C/svg%3E");
   }
 
-  /* List view grid columns: name | ip | mac | vendor | status | last-seen */
-  .list-cols {
-    grid-template-columns: 1fr auto;
+  .glass {
+    background: var(--color-surface);
+    border: 1px solid var(--color-border);
+    backdrop-filter: blur(12px);
   }
-  @media (min-width: 640px)  { .list-cols { grid-template-columns: 1fr 1fr auto auto; } }
-  @media (min-width: 768px)  { .list-cols { grid-template-columns: 1.5fr 1fr 1fr auto auto; } }
-  @media (min-width: 1024px) { .list-cols { grid-template-columns: 1.5fr 1fr 1.2fr 1fr auto auto; } }
+  .card {
+    background: var(--color-surface);
+    border: 1px solid var(--color-border);
+    border-radius: 1rem;
+    backdrop-filter: blur(12px);
+  }
+  .btn-primary {
+    @apply font-medium px-4 py-2 rounded-xl transition-all duration-150 active:scale-95 text-sm;
+    background: var(--color-brand);
+    color: white;
+  }
+  .btn-primary:hover { background: var(--color-brand-light); }
+  .btn-ghost {
+    @apply px-3 py-2 rounded-xl transition-all duration-150 text-sm;
+    color: var(--color-text-muted);
+  }
+  .btn-ghost:hover {
+    color: var(--color-text);
+    background: var(--color-surface-hover);
+  }
+  .input {
+    @apply rounded-xl px-3 py-2 text-sm w-full transition-all duration-150;
+    background: var(--color-surface);
+    border: 1px solid var(--color-border);
+    color: var(--color-text);
+  }
+  .input::placeholder { color: var(--color-text-muted); }
+  .input:focus {
+    outline: none;
+    border-color: var(--color-brand);
+    box-shadow: 0 0 0 3px color-mix(in srgb, var(--color-brand) 15%, transparent);
+  }
+  /* Select inherits .input but needs explicit background for option elements */
+  select.input option {
+    background: var(--color-surface);
+    color: var(--color-text);
+  }
+  .badge-online {
+    @apply inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-xs font-medium;
+    background: rgb(16 185 129 / 0.12);
+    color: #10b981;
+    border: 1px solid rgb(16 185 129 / 0.2);
+  }
+  .badge-offline {
+    @apply inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-xs font-medium;
+    background: rgb(239 68 68 / 0.12);
+    color: #ef4444;
+    border: 1px solid rgb(239 68 68 / 0.2);
+  }
+  .badge-scanning {
+    @apply inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-xs font-medium;
+    background: rgb(245 158 11 / 0.12);
+    color: #f59e0b;
+    border: 1px solid rgb(245 158 11 / 0.2);
+  }
+  @keyframes slide-in {
+    from { transform: translateX(100%); opacity: 0; }
+    to   { transform: translateX(0);    opacity: 1; }
+  }
+  .animate-slide-in { animation: slide-in 0.22s cubic-bezier(0.16,1,0.3,1) both; }
 }
