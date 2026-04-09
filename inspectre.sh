@@ -11,3 +11,4 @@ docker image rm inspectre-probe inspectre-web 2>/dev/null || true
 docker builder prune -af
 docker compose build --no-cache --pull
 docker compose up --force-recreate
+docker compose down --remove-orphans
