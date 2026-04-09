@@ -31,6 +31,10 @@ services:
     restart: always
     environment:
       DATABASE_URL: postgresql://admin:password123@localhost:5432/inspectre
+      IP_RANGE: "192.168.1.0/24"       # Change to your subnet
+      INTERFACE: "eth0"                 # Change to your host interface
+      SCAN_INTERVAL: "60"
+      NMAP_ARGS: "-O --osscan-guess -sV --version-intensity 5 -T4"
     cap_add:
       - NET_ADMIN
       - NET_RAW
