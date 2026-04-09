@@ -1,70 +1,84 @@
+import os
 import time
-import json
 import socket
 import threading
 from datetime import datetime, timezone
 
 import nmap
-from scapy.all import ARP, Ether, srp
-from sqlalchemy import create_engine, Column, String, DateTime, JSON, Boolean, text
-from sqlalchemy.orm import sessionmaker, declarative_base
 import requests
-import os
+from scapy.all import ARP, Ether, sniff, srp
+from sqlalchemy import (
+    Boolean,
+    Column,
+    DateTime,
+    Integer,
+    JSON,
+    String,
+    create_engine,
+    text,
+)
+from sqlalchemy.orm import declarative_base, sessionmaker
 
-# ─── Config ────────────────────────────────────────────────────────────────────
-DATABASE_URL  = os.environ.get("DATABASE_URL", "postgresql://admin:password123@localhost:5432/inspectre")
+DATABASE_URL = os.environ.get("DATABASE_URL", "postgresql://admin:password123@localhost:5432/inspectre")
 SCAN_INTERVAL = int(os.environ.get("SCAN_INTERVAL", 60))
-IP_RANGE      = os.environ.get("IP_RANGE", "192.168.0.0/24")
-INTERFACE     = os.environ.get("INTERFACE", "eth0")
-NMAP_ARGS     = os.environ.get("NMAP_ARGS", "-O --osscan-guess -sV --version-intensity 5 -T4")
+IP_RANGE = os.environ.get("IP_RANGE", "192.168.0.0/24")
+INTERFACE = os.environ.get("INTERFACE", "eth0")
+NMAP_ARGS = os.environ.get(
+    "NMAP_ARGS",
+    "-O --osscan-guess --osscan-limit -sV --version-intensity 5 -T4",
+)
+OFFLINE_MISS_THRESHOLD = int(os.environ.get("OFFLINE_MISS_THRESHOLD", 3))
 
-# ─── DB Model ──────────────────────────────────────────────────────────────────
 Base = declarative_base()
+
 
 class Device(Base):
     __tablename__ = "devices"
-    mac_address  = Column(String, primary_key=True, index=True)
-    ip_address   = Column(String)
-    hostname     = Column(String, nullable=True)
-    vendor       = Column(String, nullable=True)
-    custom_name  = Column(String, nullable=True)
-    is_online    = Column(Boolean, default=True)
-    first_seen   = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
-    last_seen    = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+
+    mac_address = Column(String, primary_key=True, index=True)
+    ip_address = Column(String)
+    hostname = Column(String, nullable=True)
+    vendor = Column(String, nullable=True)
+    custom_name = Column(String, nullable=True)
+    is_online = Column(Boolean, default=True)
+    first_seen = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+    last_seen = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
     scan_results = Column(JSON, nullable=True)
-    deep_scanned = Column(Boolean, default=False)  # True once nmap scan completes
+    deep_scanned = Column(Boolean, default=False)
+    miss_count = Column(Integer, default=0)
+
 
 engine = create_engine(DATABASE_URL, pool_pre_ping=True)
+Session = sessionmaker(bind=engine)
+_scan_lock = threading.Lock()
+_scanning = set()
+
 
 def wait_for_db(retries=10, delay=5):
     for attempt in range(retries):
         try:
             with engine.connect() as conn:
                 conn.execute(text("SELECT 1"))
-            print("[DB] Connected.")
+            print("[DB] Connected.", flush=True)
             return
         except Exception as e:
-            print(f"[DB] Not ready (attempt {attempt+1}/{retries}): {e}")
+            print(f"[DB] Not ready (attempt {attempt + 1}/{retries}): {e}", flush=True)
             time.sleep(delay)
-    raise RuntimeError("Could not connect to database.")
+    raise RuntimeError("Could not connect to database after multiple attempts.")
+
 
 def init_db():
     Base.metadata.create_all(engine)
-    # Safe migration: add deep_scanned if upgrading from earlier schema
     with engine.connect() as conn:
         try:
-            conn.execute(text(
-                "ALTER TABLE devices ADD COLUMN IF NOT EXISTS deep_scanned BOOLEAN DEFAULT FALSE"
-            ))
+            conn.execute(text("ALTER TABLE devices ADD COLUMN IF NOT EXISTS deep_scanned BOOLEAN DEFAULT FALSE"))
+            conn.execute(text("ALTER TABLE devices ADD COLUMN IF NOT EXISTS miss_count INTEGER DEFAULT 0"))
             conn.commit()
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"[DB] Migration warning: {e}", flush=True)
 
-Session = sessionmaker(bind=engine)
 
-# ─── Helpers ───────────────────────────────────────────────────────────────────
 def lookup_vendor(mac: str) -> str:
-    """OUI lookup via macvendors.com — best-effort, returns 'Unknown' on failure."""
     try:
         r = requests.get(f"https://api.macvendors.com/{mac}", timeout=3)
         if r.status_code == 200:
@@ -73,83 +87,80 @@ def lookup_vendor(mac: str) -> str:
         pass
     return "Unknown"
 
-def resolve_hostname(ip: str) -> str | None:
+
+def resolve_hostname(ip: str):
     try:
         return socket.gethostbyaddr(ip)[0]
     except Exception:
         return None
 
-# ─── ARP Scanner ───────────────────────────────────────────────────────────────
+
 def arp_scan(interface: str, ip_range: str) -> list[dict]:
     pkt = Ether(dst="ff:ff:ff:ff:ff:ff") / ARP(pdst=ip_range)
     result = srp(pkt, iface=interface, timeout=3, verbose=0)[0]
     return [{"ip": rcv.psrc, "mac": rcv.hwsrc.lower()} for _, rcv in result]
 
-# ─── Nmap Deep Scanner ─────────────────────────────────────────────────────────
+
 def deep_scan(ip: str, mac: str) -> dict:
-    """
-    Run OS detection + service version scan.
-    Stores structured results in the scan_results JSONB field.
-    """
-    print(f"[nmap] Starting deep scan: {ip} ({mac})")
+    print(f"[nmap] Starting deep scan: {ip} ({mac})", flush=True)
     nm = nmap.PortScanner()
     try:
         nm.scan(hosts=ip, arguments=NMAP_ARGS)
     except nmap.PortScannerError as e:
-        print(f"[nmap] Scan failed for {ip}: {e}")
+        print(f"[nmap] Scan failed for {ip}: {e}", flush=True)
         return {"error": str(e), "scanned_at": datetime.now(timezone.utc).isoformat()}
 
-    result = {
+    host_data = {
         "scanned_at": datetime.now(timezone.utc).isoformat(),
         "os_matches": [],
         "open_ports": [],
-        "hostnames":  [],
+        "hostnames": [],
     }
 
     if ip not in nm.all_hosts():
-        result["error"] = "Host not found in nmap results"
-        return result
+        host_data["error"] = "Host not found in nmap results"
+        return host_data
 
     host = nm[ip]
 
-    # OS candidates (top 3)
     for match in host.get("osmatch", [])[:3]:
-        result["os_matches"].append({
-            "name":     match.get("name", ""),
-            "accuracy": int(match.get("accuracy", 0)),
-            "osclass": [
-                {
-                    "type":     c.get("type", ""),
-                    "vendor":   c.get("vendor", ""),
-                    "osfamily": c.get("osfamily", ""),
-                    "osgen":    c.get("osgen", ""),
-                }
-                for c in match.get("osclass", [])
-            ],
-        })
+        host_data["os_matches"].append(
+            {
+                "name": match.get("name", ""),
+                "accuracy": int(match.get("accuracy", 0)),
+                "osclass": [
+                    {
+                        "type": c.get("type", ""),
+                        "vendor": c.get("vendor", ""),
+                        "osfamily": c.get("osfamily", ""),
+                        "osgen": c.get("osgen", ""),
+                    }
+                    for c in match.get("osclass", [])
+                ],
+            }
+        )
 
-    # Open ports + service banners
     for proto in host.all_protocols():
-        for port, info in host[proto].items():
-            if info.get("state") == "open":
-                result["open_ports"].append({
-                    "port":    port,
-                    "proto":   proto,
-                    "service": info.get("name", ""),
-                    "product": info.get("product", ""),
-                    "version": info.get("version", ""),
-                    "cpe":     info.get("cpe", ""),
-                })
+        for port, port_info in host[proto].items():
+            if port_info.get("state") == "open":
+                host_data["open_ports"].append(
+                    {
+                        "port": port,
+                        "proto": proto,
+                        "service": port_info.get("name", ""),
+                        "product": port_info.get("product", ""),
+                        "version": port_info.get("version", ""),
+                        "cpe": port_info.get("cpe", ""),
+                    }
+                )
 
-    result["hostnames"] = [h["name"] for h in host.get("hostnames", []) if h.get("name")]
+    host_data["hostnames"] = [h["name"] for h in host.get("hostnames", []) if h.get("name")]
+    print(
+        f"[nmap] Done: {ip} — {len(host_data['open_ports'])} ports open, OS: {host_data['os_matches'][0]['name'] if host_data['os_matches'] else 'unknown'}",
+        flush=True,
+    )
+    return host_data
 
-    os_name = result["os_matches"][0]["name"] if result["os_matches"] else "unknown"
-    print(f"[nmap] Done: {ip} — {len(result['open_ports'])} ports open, OS: {os_name}")
-    return result
-
-# ─── Background Thread Pool ────────────────────────────────────────────────────
-_scan_lock = threading.Lock()
-_scanning  = set()  # MACs currently being scanned (prevent duplicates)
 
 def _run_deep_scan_thread(ip: str, mac: str):
     results = deep_scan(ip, mac)
@@ -159,100 +170,133 @@ def _run_deep_scan_thread(ip: str, mac: str):
         if device:
             device.scan_results = results
             device.deep_scanned = True
-            # Backfill hostname from nmap if DNS lookup returned nothing
             if not device.hostname and results.get("hostnames"):
                 device.hostname = results["hostnames"][0]
             session.commit()
-            print(f"[DB] Saved scan results for {ip} ({mac})")
+            print(f"[DB] Saved scan results for {ip} ({mac})", flush=True)
     except Exception as e:
         session.rollback()
-        print(f"[DB] Error saving scan results for {mac}: {e}")
+        print(f"[DB] Error saving scan results for {mac}: {e}", flush=True)
     finally:
         session.close()
         with _scan_lock:
             _scanning.discard(mac)
 
+
 def trigger_deep_scan(ip: str, mac: str):
-    """Non-blocking: launch nmap in a background daemon thread."""
     with _scan_lock:
         if mac in _scanning:
             return
         _scanning.add(mac)
-    t = threading.Thread(target=_run_deep_scan_thread, args=(ip, mac), daemon=True)
-    t.start()
+    threading.Thread(target=_run_deep_scan_thread, args=(ip, mac), daemon=True).start()
 
-# ─── DB Sync ───────────────────────────────────────────────────────────────────
-def sync_device(session, entry: dict) -> tuple:
-    mac, ip = entry["mac"], entry["ip"]
-    now     = datetime.now(timezone.utc)
-    device  = session.get(Device, mac)
-    is_new  = device is None
 
-    if is_new:
-        device = Device(
-            mac_address  = mac,
-            ip_address   = ip,
-            hostname     = resolve_hostname(ip),
-            vendor       = lookup_vendor(mac),
-            is_online    = True,
-            first_seen   = now,
-            last_seen    = now,
-            deep_scanned = False,
-        )
-        session.add(device)
-        print(f"[+] New device: {ip} ({mac}) — vendor: {device.vendor}")
-    else:
-        device.ip_address = ip
-        device.is_online  = True
-        device.last_seen  = now
-        if not device.hostname:
-            device.hostname = resolve_hostname(ip)
+def upsert_seen_device(mac: str, ip: str, source: str):
+    if not mac or mac == "00:00:00:00:00:00":
+        return
 
-    return device, is_new
+    session = Session()
+    try:
+        now = datetime.now(timezone.utc)
+        device = session.get(Device, mac)
+        is_new = device is None
 
-def mark_offline(session, active_macs: set):
-    for dev in session.query(Device).filter_by(is_online=True).all():
-        if dev.mac_address not in active_macs:
-            dev.is_online = False
-            print(f"[-] Device offline: {dev.ip_address} ({dev.mac_address})")
+        if is_new:
+            device = Device(
+                mac_address=mac,
+                ip_address=ip,
+                hostname=resolve_hostname(ip),
+                vendor=lookup_vendor(mac),
+                is_online=True,
+                first_seen=now,
+                last_seen=now,
+                deep_scanned=False,
+                miss_count=0,
+            )
+            session.add(device)
+            session.commit()
+            print(f"[+] New device via {source}: {ip} ({mac}) — vendor: {device.vendor}", flush=True)
+            trigger_deep_scan(ip, mac)
+        else:
+            changed_online = not device.is_online
+            device.ip_address = ip
+            device.is_online = True
+            device.last_seen = now
+            device.miss_count = 0
+            if not device.hostname:
+                device.hostname = resolve_hostname(ip)
+            session.commit()
+            if changed_online:
+                print(f"[+] Device back online via {source}: {ip} ({mac})", flush=True)
+    except Exception as e:
+        session.rollback()
+        print(f"[DB] Upsert error for {mac}: {e}", flush=True)
+    finally:
+        session.close()
 
-# ─── Main Loop ─────────────────────────────────────────────────────────────────
+
+def process_arp_packet(packet):
+    if not packet.haslayer(ARP):
+        return
+    arp = packet[ARP]
+    mac = (arp.hwsrc or "").lower()
+    ip = arp.psrc
+    upsert_seen_device(mac, ip, "sniffer")
+
+
+def start_arp_sniffer():
+    print(f"[*] Starting passive ARP sniffer on {INTERFACE}", flush=True)
+    sniff(iface=INTERFACE, filter="arp", store=False, prn=process_arp_packet)
+
+
+def update_presence_from_sweep(session, active_macs: set):
+    devices = session.query(Device).all()
+    for dev in devices:
+        if dev.mac_address in active_macs:
+            dev.is_online = True
+            dev.miss_count = 0
+        else:
+            dev.miss_count = (dev.miss_count or 0) + 1
+            if dev.miss_count >= OFFLINE_MISS_THRESHOLD and dev.is_online:
+                dev.is_online = False
+                print(f"[-] Device offline: {dev.ip_address} ({dev.mac_address})", flush=True)
+
+
 def main():
-    print("[*] InSpectre Probe starting…")
+    print("[*] InSpectre Probe starting…", flush=True)
     wait_for_db()
     init_db()
-    print(f"[*] Scanning {IP_RANGE} on {INTERFACE} every {SCAN_INTERVAL}s")
+    print(
+        f"[*] Scanning {IP_RANGE} on {INTERFACE} every {SCAN_INTERVAL}s "
+        f"(offline threshold: {OFFLINE_MISS_THRESHOLD} missed sweeps)",
+        flush=True,
+    )
+
+    threading.Thread(target=start_arp_sniffer, daemon=True).start()
 
     while True:
+        session = Session()
         try:
-            session     = Session()
-            found       = arp_scan(INTERFACE, IP_RANGE)
+            found = arp_scan(INTERFACE, IP_RANGE)
             active_macs = set()
 
             for entry in found:
-                device, is_new = sync_device(session, entry)
-                active_macs.add(entry["mac"])
-                if is_new:
-                    session.commit()                          # persist device before scanning
-                    trigger_deep_scan(entry["ip"], entry["mac"])
+                mac = entry["mac"]
+                ip = entry["ip"]
+                active_macs.add(mac)
+                upsert_seen_device(mac, ip, "sweep")
 
-            mark_offline(session, active_macs)
+            update_presence_from_sweep(session, active_macs)
             session.commit()
-            print(f"[*] Scan complete — {len(found)} online")
-
+            print(f"[*] Scan complete — {len(active_macs)} online", flush=True)
         except Exception as e:
-            print(f"[!] Scan loop error: {e}")
-            try:
-                session.rollback()
-            except Exception:
-                pass
+            session.rollback()
+            print(f"[!] Scan loop error: {e}", flush=True)
         finally:
-            try:
-                session.close()
-            except Exception:
-                pass
+            session.close()
 
         time.sleep(SCAN_INTERVAL)
+
 
 if __name__ == "__main__":
     main()
