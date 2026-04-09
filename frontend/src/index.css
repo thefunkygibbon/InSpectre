@@ -8,17 +8,34 @@
     --scrollbar-track: #1a1a2e;
     --scrollbar-thumb: #2d2d44;
   }
-  html { @apply antialiased; }
-  body { @apply bg-gray-950 text-gray-100 font-sans; }
 
-  ::-webkit-scrollbar { width: 6px; height: 6px; }
-  ::-webkit-scrollbar-track { background: var(--scrollbar-track); }
-  ::-webkit-scrollbar-thumb { background: var(--scrollbar-thumb); border-radius: 3px; }
+  html        { @apply antialiased; }
+  body        { @apply bg-gray-950 text-gray-100 font-sans transition-colors duration-300; }
+
+  /* Light mode overrides */
+  html:not(.dark) body       { @apply bg-slate-100 text-gray-900; }
+  html:not(.dark) .glass     { background: rgba(255,255,255,0.7) !important; border-color: rgba(0,0,0,0.08) !important; }
+  html:not(.dark) .card      { background: rgba(255,255,255,0.85) !important; border-color: rgba(0,0,0,0.08) !important; }
+  html:not(.dark) .input     { background: rgba(255,255,255,0.9) !important;  border-color: rgba(0,0,0,0.15) !important; color: #111 !important; }
+  html:not(.dark) header     { background: rgba(241,245,249,0.9) !important; }
+  html:not(.dark) .text-gray-100 { color: #111827 !important; }
+  html:not(.dark) .text-gray-200 { color: #1f2937 !important; }
+  html:not(.dark) .text-gray-300 { color: #374151 !important; }
+  html:not(.dark) .text-gray-400 { color: #4b5563 !important; }
+  html:not(.dark) .text-gray-500 { color: #6b7280 !important; }
+  html:not(.dark) .text-gray-600 { color: #9ca3af !important; }
+  html:not(.dark) .bg-gray-950   { background: #f1f5f9 !important; }
+  html:not(.dark) .bg-gray-900   { background: #ffffff !important; }
+  html:not(.dark) .bg-gray-800   { background: #f8fafc !important; }
+  html:not(.dark) .noise-overlay { opacity: 0; }
+
+  ::-webkit-scrollbar        { width: 6px; height: 6px; }
+  ::-webkit-scrollbar-track  { background: var(--scrollbar-track); }
+  ::-webkit-scrollbar-thumb  { background: var(--scrollbar-thumb); border-radius: 3px; }
   ::-webkit-scrollbar-thumb:hover { background: #3d3d5c; }
 }
 
 @layer components {
-  /* Noise texture overlay — defined here to avoid SVG escaping issues in JSX */
   .noise-overlay {
     position: fixed;
     inset: 0;
@@ -26,7 +43,6 @@
     z-index: 0;
     background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='4' height='4'%3E%3Crect width='1' height='1' fill='white' opacity='0.015'/%3E%3C/svg%3E");
   }
-
   .glass {
     @apply bg-gray-900/60 backdrop-blur-xl border border-white/5;
   }
@@ -61,4 +77,12 @@
     @apply inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-xs font-medium
            bg-amber-500/15 text-amber-400 border border-amber-500/20;
   }
+
+  /* List view grid columns: name | ip | mac | vendor | status | last-seen */
+  .list-cols {
+    grid-template-columns: 1fr auto;
+  }
+  @media (min-width: 640px)  { .list-cols { grid-template-columns: 1fr 1fr auto auto; } }
+  @media (min-width: 768px)  { .list-cols { grid-template-columns: 1.5fr 1fr 1fr auto auto; } }
+  @media (min-width: 1024px) { .list-cols { grid-template-columns: 1.5fr 1fr 1.2fr 1fr auto auto; } }
 }
