@@ -17,6 +17,7 @@ from sqlalchemy import (
     create_engine,
     text,
 )
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import declarative_base, sessionmaker
 
 DATABASE_URL = os.environ.get("DATABASE_URL", "postgresql://admin:password123@localhost:5432/inspectre")
@@ -25,11 +26,25 @@ IP_RANGE = os.environ.get("IP_RANGE", "192.168.0.0/24")
 INTERFACE = os.environ.get("INTERFACE", "eth0")
 NMAP_ARGS = os.environ.get(
     "NMAP_ARGS",
-    "-O --osscan-guess --osscan-limit -sV --version-intensity 5 -T4",
+    # Removed --osscan-guess so only confident matches are returned.
+    # --osscan-limit skips OS detection on hosts with no useful port state.
+    "-O --osscan-limit -sV --version-intensity 5 -T4",
 )
+# Only store OS matches at or above this confidence percentage.
+OS_CONFIDENCE_THRESHOLD = int(os.environ.get("OS_CONFIDENCE_THRESHOLD", 85))
 OFFLINE_MISS_THRESHOLD = int(os.environ.get("OFFLINE_MISS_THRESHOLD", 3))
 
 Base = declarative_base()
+
+# Per-MAC mutex so sniffer and sweep threads never race on the same device.
+_upsert_locks: dict[str, threading.Lock] = {}
+_upsert_locks_lock = threading.Lock()
+
+def _get_mac_lock(mac: str) -> threading.Lock:
+    with _upsert_locks_lock:
+        if mac not in _upsert_locks:
+            _upsert_locks[mac] = threading.Lock()
+        return _upsert_locks[mac]
 
 
 class Device(Base):
@@ -51,7 +66,7 @@ class Device(Base):
 engine = create_engine(DATABASE_URL, pool_pre_ping=True)
 Session = sessionmaker(bind=engine)
 _scan_lock = threading.Lock()
-_scanning = set()
+_scanning: set[str] = set()
 
 
 def wait_for_db(retries=10, delay=5):
@@ -123,11 +138,17 @@ def deep_scan(ip: str, mac: str) -> dict:
 
     host = nm[ip]
 
+    # Only include OS matches that meet the confidence threshold.
+    # Without --osscan-guess, nmap won't speculate wildly, but we
+    # add this second gate so low-quality matches are never surfaced.
     for match in host.get("osmatch", [])[:3]:
+        confidence = int(match.get("accuracy", 0))
+        if confidence < OS_CONFIDENCE_THRESHOLD:
+            continue
         host_data["os_matches"].append(
             {
                 "name": match.get("name", ""),
-                "accuracy": int(match.get("accuracy", 0)),
+                "accuracy": confidence,
                 "osclass": [
                     {
                         "type": c.get("type", ""),
@@ -155,8 +176,9 @@ def deep_scan(ip: str, mac: str) -> dict:
                 )
 
     host_data["hostnames"] = [h["name"] for h in host.get("hostnames", []) if h.get("name")]
+    os_label = host_data["os_matches"][0]["name"] if host_data["os_matches"] else "unknown (below confidence threshold)"
     print(
-        f"[nmap] Done: {ip} — {len(host_data['open_ports'])} ports open, OS: {host_data['os_matches'][0]['name'] if host_data['os_matches'] else 'unknown'}",
+        f"[nmap] Done: {ip} — {len(host_data['open_ports'])} ports open, OS: {os_label}",
         flush=True,
     )
     return host_data
@@ -192,47 +214,75 @@ def trigger_deep_scan(ip: str, mac: str):
 
 
 def upsert_seen_device(mac: str, ip: str, source: str):
+    """
+    Atomically insert-or-update a device record using PostgreSQL's
+    INSERT ... ON CONFLICT DO UPDATE. This replaces the previous
+    check-then-insert pattern which caused duplicate-key race conditions
+    between the passive sniffer thread and the active sweep loop.
+    """
     if not mac or mac == "00:00:00:00:00:00":
         return
 
-    session = Session()
-    try:
+    # Per-MAC lock ensures only one thread resolves hostname/vendor
+    # for a brand-new device, avoiding redundant external lookups.
+    mac_lock = _get_mac_lock(mac)
+    with mac_lock:
         now = datetime.now(timezone.utc)
-        device = session.get(Device, mac)
-        is_new = device is None
+        session = Session()
+        try:
+            # Check existence first so we know whether to log "new device"
+            # and trigger a deep scan — both only happen on genuine first-sight.
+            existing = session.get(Device, mac)
+            is_new = existing is None
 
-        if is_new:
-            device = Device(
-                mac_address=mac,
-                ip_address=ip,
-                hostname=resolve_hostname(ip),
-                vendor=lookup_vendor(mac),
-                is_online=True,
-                first_seen=now,
-                last_seen=now,
-                deep_scanned=False,
-                miss_count=0,
+            hostname = resolve_hostname(ip) if is_new else (existing.hostname if existing.hostname else resolve_hostname(ip))
+            vendor = lookup_vendor(mac) if is_new else existing.vendor
+
+            stmt = (
+                pg_insert(Device)
+                .values(
+                    mac_address=mac,
+                    ip_address=ip,
+                    hostname=hostname,
+                    vendor=vendor,
+                    custom_name=None,
+                    is_online=True,
+                    first_seen=now,
+                    last_seen=now,
+                    deep_scanned=False,
+                    miss_count=0,
+                )
+                .on_conflict_do_update(
+                    index_elements=["mac_address"],
+                    set_=dict(
+                        ip_address=ip,
+                        is_online=True,
+                        last_seen=now,
+                        miss_count=0,
+                        # Preserve existing hostname/vendor if already set.
+                        hostname=text(
+                            "CASE WHEN devices.hostname IS NOT NULL THEN devices.hostname "
+                            f"ELSE '{hostname or ''}' END"
+                        ),
+                    ),
+                )
             )
-            session.add(device)
+            session.execute(stmt)
             session.commit()
-            print(f"[+] New device via {source}: {ip} ({mac}) — vendor: {device.vendor}", flush=True)
-            trigger_deep_scan(ip, mac)
-        else:
-            changed_online = not device.is_online
-            device.ip_address = ip
-            device.is_online = True
-            device.last_seen = now
-            device.miss_count = 0
-            if not device.hostname:
-                device.hostname = resolve_hostname(ip)
-            session.commit()
-            if changed_online:
-                print(f"[+] Device back online via {source}: {ip} ({mac})", flush=True)
-    except Exception as e:
-        session.rollback()
-        print(f"[DB] Upsert error for {mac}: {e}", flush=True)
-    finally:
-        session.close()
+
+            if is_new:
+                print(f"[+] New device via {source}: {ip} ({mac}) — vendor: {vendor}", flush=True)
+                trigger_deep_scan(ip, mac)
+            else:
+                came_back_online = not existing.is_online
+                if came_back_online:
+                    print(f"[+] Device back online via {source}: {ip} ({mac})", flush=True)
+
+        except Exception as e:
+            session.rollback()
+            print(f"[DB] Upsert error for {mac}: {e}", flush=True)
+        finally:
+            session.close()
 
 
 def process_arp_packet(packet):
@@ -268,7 +318,8 @@ def main():
     init_db()
     print(
         f"[*] Scanning {IP_RANGE} on {INTERFACE} every {SCAN_INTERVAL}s "
-        f"(offline threshold: {OFFLINE_MISS_THRESHOLD} missed sweeps)",
+        f"(offline threshold: {OFFLINE_MISS_THRESHOLD} missed sweeps)\n"
+        f"[*] OS confidence threshold: {OS_CONFIDENCE_THRESHOLD}%",
         flush=True,
     )
 
