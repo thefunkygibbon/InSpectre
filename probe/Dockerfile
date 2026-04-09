@@ -1,19 +1,13 @@
-FROM python:3.11-slim
+FROM python:3.12-slim
 
-# Install network tools and libpcap for Scapy
-RUN apt-get update && apt-get install -y \
-    nmap \
-    libpcap-dev \
-    gcc \
+# nmap binary is required — python-nmap wraps it via subprocess
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    nmap libpcap-dev gcc \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+COPY main.py .
 
-# Install Python dependencies
-RUN pip install --no-cache-dir scapy sqlalchemy psycopg2-binary
-
-# Copy the code
-COPY . .
-
-# Run the scanner
 CMD ["python", "main.py"]
