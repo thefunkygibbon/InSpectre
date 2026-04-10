@@ -131,29 +131,29 @@ def _get_device_ip(mac: str, db: Session) -> str:
 def _proxy_sse(probe_url: str):
     """
     Open a streaming GET to the probe's internal API and re-yield
-    each SSE chunk directly — zero buffering.
+    each SSE chunk directly -- zero buffering.
     """
     def generator():
         try:
             with httpx.stream("GET", probe_url, timeout=120) as resp:
                 if resp.status_code != 200:
-                    yield f"data: ERROR — probe returned {resp.status_code}\n\n"
-                    yield "event: done\ndata: {}\n\n"
+                    yield f"data: ERROR -- probe returned {resp.status_code}\n\n".encode()
+                    yield b"event: done\ndata: {}\n\n"
                     return
                 for chunk in resp.iter_bytes():
                     if chunk:
                         yield chunk
         except httpx.ConnectError:
-            yield b"data: ERROR — cannot reach probe (is the probe container running?)\n\n"
+            yield b"data: ERROR -- cannot reach probe (is the probe container running?)\n\n"
             yield b"event: done\ndata: {}\n\n"
         except Exception as e:
-            yield f"data: ERROR — {e}\n\n".encode()
+            yield f"data: ERROR -- {e}\n\n".encode()
             yield b"event: done\ndata: {}\n\n"
     return generator()
 
 
 # ---------------------------------------------------------------------------
-# Routes — devices
+# Routes -- devices
 # ---------------------------------------------------------------------------
 @app.get("/")
 def root():
@@ -230,7 +230,7 @@ def get_ip_history(mac: str, db: Session = Depends(get_db)):
 
 @app.get("/devices/{mac}/ping")
 def ping_device(mac: str, db: Session = Depends(get_db)):
-    """SSE stream — proxies ping output from the probe container."""
+    """SSE stream -- proxies ping output from the probe container."""
     ip = _get_device_ip(mac, db)
     return StreamingResponse(
         _proxy_sse(f"{PROBE_URL}/stream/ping/{ip}"),
@@ -240,7 +240,7 @@ def ping_device(mac: str, db: Session = Depends(get_db)):
 
 @app.get("/devices/{mac}/traceroute")
 def traceroute_device(mac: str, db: Session = Depends(get_db)):
-    """SSE stream — proxies traceroute output from the probe container."""
+    """SSE stream -- proxies traceroute output from the probe container."""
     ip = _get_device_ip(mac, db)
     return StreamingResponse(
         _proxy_sse(f"{PROBE_URL}/stream/traceroute/{ip}"),
@@ -258,7 +258,7 @@ def stats(db: Session = Depends(get_db)):
 
 
 # ---------------------------------------------------------------------------
-# Routes — settings
+# Routes -- settings
 # ---------------------------------------------------------------------------
 @app.get("/settings")
 def get_settings(db: Session = Depends(get_db)):
