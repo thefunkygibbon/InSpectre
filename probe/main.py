@@ -24,7 +24,7 @@ from sqlalchemy.orm import declarative_base, sessionmaker
 # ---------------------------------------------------------------------------
 # Version
 # ---------------------------------------------------------------------------
-VERSION = "0.5.0"
+VERSION = "0.5.1"
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -45,6 +45,21 @@ LAN_DNS_SERVER_ENV      = os.environ.get("LAN_DNS_SERVER", "").strip()
 
 PING_COUNT    = 10
 TRACE_MAX_HOP = 30
+
+# IPs that should never be stored, resolved, or rescanned
+_INVALID_IPS = {"0.0.0.0", "", "255.255.255.255"}
+
+def _is_valid_ip(ip: str) -> bool:
+    """Return True only for a non-empty, non-broadcast, non-zero IPv4 address."""
+    if not ip or ip.strip() in _INVALID_IPS:
+        return False
+    import ipaddress
+    try:
+        addr = ipaddress.ip_address(ip.strip())
+        # Reject 0.0.0.0/8, broadcast, loopback treated as invalid probe targets
+        return not (addr.packed[0] == 0 or str(addr) == "255.255.255.255")
+    except ValueError:
+        return False
 
 # ---------------------------------------------------------------------------
 # SQLAlchemy models
@@ -149,8 +164,14 @@ def init_db() -> None:
 
 # ---------------------------------------------------------------------------
 # IP History
+# NOTE: must only be called AFTER the parent device row has been committed.
 # ---------------------------------------------------------------------------
 def record_ip(mac: str, ip: str) -> bool:
+    """Record an IP for a MAC in ip_history. Returns True if this is a brand-new
+    (mac, ip) pair (i.e. first_seen == last_seen within 2 seconds).
+    Skips silently for invalid IPs — the device row must already exist."""
+    if not _is_valid_ip(ip):
+        return False
     now     = datetime.now(timezone.utc)
     session = Session()
     try:
@@ -247,6 +268,10 @@ def _detect_dns_server() -> str | None:
     return None
 
 def resolve_hostname(ip: str) -> str | None:
+    # Skip resolution for invalid/non-routable IPs immediately
+    if not _is_valid_ip(ip):
+        return None
+
     global _DNS_SERVER, _DNS_DETECTED
     if not _DNS_DETECTED:
         _DNS_SERVER   = _detect_dns_server()
@@ -450,6 +475,8 @@ def _run_deep_scan_thread(ip: str, mac: str) -> None:
             _scanning.discard(mac)
 
 def trigger_deep_scan(ip: str, mac: str) -> None:
+    if not _is_valid_ip(ip):
+        return
     with _scan_lock:
         if mac in _scanning:
             return
@@ -458,25 +485,36 @@ def trigger_deep_scan(ip: str, mac: str) -> None:
 
 # ---------------------------------------------------------------------------
 # Device upsert
+#
+# Order of operations (important for FK integrity):
+#   1. Validate mac + ip
+#   2. Upsert the device row (ensures parent exists)
+#   3. Record ip_history AFTER the device row is committed
 # ---------------------------------------------------------------------------
 def upsert_seen_device(mac: str, ip: str, source: str) -> None:
     if not mac or mac == "00:00:00:00:00:00":
         return
-    ip_is_new = record_ip(mac, ip)
-    mac_lock  = _get_mac_lock(mac)
+    # Reject invalid IPs early — 0.0.0.0 from ARP probes must not be stored
+    if not _is_valid_ip(ip):
+        return
+
+    mac_lock = _get_mac_lock(mac)
     with mac_lock:
         now     = datetime.now(timezone.utc)
         session = Session()
         try:
-            existing = session.get(Device, mac)
-            is_new   = existing is None
+            existing   = session.get(Device, mac)
+            is_new     = existing is None
+            old_ip     = None if is_new else (existing.ip_address or "")
+            ip_changed = (not is_new) and (old_ip != ip)
+
             if is_new:
                 hostname = resolve_hostname(ip)
                 vendor   = lookup_vendor(mac)
             else:
                 hostname = existing.hostname or resolve_hostname(ip)
                 vendor   = existing.vendor
-            ip_changed = (not is_new) and (existing.ip_address != ip)
+
             safe_hostname = (hostname or '').replace("'", "''")
             stmt = (
                 pg_insert(Device)
@@ -507,14 +545,17 @@ def upsert_seen_device(mac: str, ip: str, source: str) -> None:
                 )
             )
             session.execute(stmt)
+            # Commit device row FIRST so ip_history FK is satisfied
             session.commit()
+
             if is_new:
                 print(f"[+] New device via {source}: {ip} ({mac}) hostname={hostname} vendor={vendor}", flush=True)
                 trigger_deep_scan(ip, mac)
             elif not existing.is_online:
                 print(f"[~] Back online via {source}: {ip} ({mac})", flush=True)
+
             if ip_changed:
-                print(f"[~] IP changed {existing.ip_address} -> {ip} for {mac} -- queuing rescan", flush=True)
+                print(f"[~] IP changed {old_ip} -> {ip} for {mac} -- queuing rescan", flush=True)
                 session2 = Session()
                 try:
                     dev2 = session2.get(Device, mac)
@@ -527,11 +568,17 @@ def upsert_seen_device(mac: str, ip: str, source: str) -> None:
                 finally:
                     session2.close()
                 trigger_deep_scan(ip, mac)
+
         except Exception as e:
             session.rollback()
             print(f"[DB] Upsert error {mac}: {e}", flush=True)
+            return
         finally:
             session.close()
+
+    # Record IP history AFTER the device row is safely committed
+    # (outside the mac_lock to avoid holding it during a DB write)
+    record_ip(mac, ip)
 
 def refresh_missing_hostnames() -> None:
     """Re-try hostname resolution for all online devices missing a name."""
@@ -543,7 +590,7 @@ def refresh_missing_hostnames() -> None:
         ).all()
         updated = 0
         for dev in unnamed:
-            if not dev.ip_address:
+            if not _is_valid_ip(dev.ip_address):
                 continue
             name = resolve_hostname(dev.ip_address)
             if name:
@@ -566,6 +613,8 @@ def bulk_reresolve_all() -> None:
         all_devs = session.query(Device).filter(Device.ip_address != None).all()
         updated = 0
         for dev in all_devs:
+            if not _is_valid_ip(dev.ip_address):
+                continue
             name = resolve_hostname(dev.ip_address)
             if name and name != dev.hostname:
                 print(f"[hostname] Re-resolved: {dev.ip_address} -> {name}", flush=True)
@@ -590,6 +639,10 @@ def process_arp_packet(packet) -> None:
     mac = (arp.hwsrc or "").lower().strip()
     ip  = (arp.psrc  or "").strip()
     if not mac or not ip or mac == "ff:ff:ff:ff:ff:ff" or mac.startswith("01:"):
+        return
+    # Ignore gratuitous ARP probes with 0.0.0.0 source (host is just checking
+    # for IP conflicts before claiming the address — not a usable record yet)
+    if not _is_valid_ip(ip):
         return
     try:
         _sniffer_queue.put_nowait((mac, ip))
