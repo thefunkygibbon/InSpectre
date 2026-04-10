@@ -96,7 +96,7 @@ def list_devices(online_only: bool = False, db: Session = Depends(get_db)):
     q = db.query(Device)
     if online_only:
         q = q.filter(Device.is_online == True)
-    return [_to_dict(d) for d in q.order_by(Device.last_seen.desc()).all()]
+    return [_to_dict(d) for d in q.order_by(Device.last_seen.desc(), Device.mac_address.asc()).all()]
 
 @app.get("/devices/{mac}")
 def get_device(mac: str, db: Session = Depends(get_db)):
@@ -130,6 +130,21 @@ def resolve_name(mac: str, db: Session = Depends(get_db)):
         db.commit()
         db.refresh(d)
     return {"mac": mac, "resolved": name, "device": _to_dict(d)}
+
+@app.post("/devices/{mac}/rescan")
+def rescan_device(mac: str, db: Session = Depends(get_db)):
+    """
+    Reset deep_scanned so the probe queues a fresh nmap on its next sweep.
+    The probe checks for devices where deep_scanned=False on every cycle.
+    """
+    d = db.get(Device, mac.lower())
+    if not d:
+        raise HTTPException(404, "Device not found")
+    d.deep_scanned = False
+    d.scan_results = None
+    db.commit()
+    db.refresh(d)
+    return {"mac": mac, "status": "queued", "message": "Rescan queued — nmap will run on next probe sweep.", "device": _to_dict(d)}
 
 @app.get("/devices/{mac}/scan")
 def get_scan_results(mac: str, db: Session = Depends(get_db)):
@@ -166,6 +181,5 @@ def _to_dict(d: Device) -> dict:
         "first_seen":   d.first_seen.isoformat() if d.first_seen else None,
         "last_seen":    d.last_seen.isoformat()  if d.last_seen  else None,
         "scan_results": d.scan_results,
-        # Convenience field: best available display name
         "display_name": d.custom_name or d.hostname or d.ip_address,
     }

@@ -15,6 +15,7 @@ export const api = {
   getDevice:     (mac)        => request('GET',   `/devices/${mac}`),
   updateDevice:  (mac, body)  => request('PATCH', `/devices/${mac}`, body),
   resolveName:   (mac)        => request('POST',  `/devices/${mac}/resolve-name`),
+  rescanDevice:  (mac)        => request('POST',  `/devices/${mac}/rescan`),
   getScanResults:(mac)        => request('GET',   `/devices/${mac}/scan`),
   getStats:      ()           => request('GET',   '/stats'),
 }
