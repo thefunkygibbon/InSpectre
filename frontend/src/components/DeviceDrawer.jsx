@@ -3,7 +3,7 @@ import {
   X, Wifi, WifiOff, Cpu, Globe, Clock, Terminal,
   ShieldCheck, ScanLine, RefreshCw, ExternalLink,
   Activity, GitBranch, Bug, RotateCcw, Ban, History,
-  ChevronDown, ChevronRight,
+  ChevronDown, ChevronRight, Square,
 } from 'lucide-react'
 import { OnlineDot } from './OnlineDot'
 import { api } from '../api'
@@ -27,7 +27,6 @@ function portUrl(ip, port) { return `${HTTPS_PORTS.has(port) ? 'https' : 'http'}
 function TerminalBox({ lines, running, onStop }) {
   const containerRef = useRef(null)
 
-  // Scroll only the terminal box itself -- never the outer page
   useEffect(() => {
     const el = containerRef.current
     if (el) el.scrollTop = el.scrollHeight
@@ -37,8 +36,9 @@ function TerminalBox({ lines, running, onStop }) {
   return (
     <div
       ref={containerRef}
-      className="mt-3 rounded-lg bg-[#0d1117] border border-[#30363d] p-3 font-mono text-xs
-                 text-green-400 max-h-64 overflow-y-auto leading-relaxed relative"
+      className="mt-3 rounded-lg bg-[#0d1117] border border-[#30363d] p-3 font-mono
+                 text-green-400 max-h-56 overflow-y-auto relative"
+      style={{ fontSize: '11px', lineHeight: '1.5' }}
     >
       {running && (
         <button
@@ -49,7 +49,9 @@ function TerminalBox({ lines, running, onStop }) {
           <X size={12} />
         </button>
       )}
-      {lines.map((l, i) => <div key={i} className="whitespace-pre-wrap break-all">{l}</div>)}
+      {lines.map((l, i) => (
+        <div key={i} className="whitespace-pre overflow-x-auto">{l}</div>
+      ))}
       {running  && <div className="inline-block animate-pulse">&#9608;</div>}
       {!running && lines.length > 0 && <div className="text-green-600 mt-1">--- done ---</div>}
     </div>
@@ -150,12 +152,20 @@ export function DeviceDrawer({ device, onClose, onRename, onResolveName, onRefre
   }
 
   function handlePing() {
+    if (activeAction === 'ping' && stream.running) {
+      stream.stop()
+      return
+    }
     setActiveAction('ping')
     setStaticLines([])
     stream.start(`/devices/${mac}/ping`)
   }
 
   function handleTraceroute() {
+    if (activeAction === 'traceroute' && stream.running) {
+      stream.stop()
+      return
+    }
     setActiveAction('traceroute')
     setStaticLines([])
     stream.start(`/devices/${mac}/traceroute`)
@@ -169,6 +179,9 @@ export function DeviceDrawer({ device, onClose, onRename, onResolveName, onRefre
 
   const termLines   = stream.lines.length ? stream.lines : staticLines
   const termRunning = stream.running
+
+  const pingRunning  = activeAction === 'ping'       && stream.running
+  const traceRunning = activeAction === 'traceroute' && stream.running
 
   return (
     <>
@@ -204,14 +217,25 @@ export function DeviceDrawer({ device, onClose, onRename, onResolveName, onRefre
           {/* ACTIONS */}
           <Section title="Actions" icon={Activity}>
             <div className="grid grid-cols-2 gap-2 pt-1">
-              <ActionBtn icon={Activity}  label="Ping"
-                active={activeAction === 'ping' && stream.running}
-                loading={activeAction === 'ping' && stream.running}
-                onClick={handlePing} />
-              <ActionBtn icon={GitBranch} label="Traceroute"
-                active={activeAction === 'traceroute' && stream.running}
-                loading={activeAction === 'traceroute' && stream.running}
-                onClick={handleTraceroute} />
+
+              {/* Ping — toggles to Stop while running */}
+              {pingRunning ? (
+                <StopBtn label="Stop Ping" onClick={handlePing} />
+              ) : (
+                <ActionBtn icon={Activity} label="Ping"
+                  active={activeAction === 'ping'}
+                  onClick={handlePing} />
+              )}
+
+              {/* Traceroute — toggles to Stop while running */}
+              {traceRunning ? (
+                <StopBtn label="Stop Trace" onClick={handleTraceroute} />
+              ) : (
+                <ActionBtn icon={GitBranch} label="Traceroute"
+                  active={activeAction === 'traceroute'}
+                  onClick={handleTraceroute} />
+              )}
+
               <ActionBtn icon={RotateCcw} label="Re-scan ports"
                 active={activeAction === 'rescan'}
                 loading={rescanning}
@@ -327,6 +351,7 @@ export function DeviceDrawer({ device, onClose, onRename, onResolveName, onRefre
   )
 }
 
+// Regular action button
 function ActionBtn({ icon: Icon, label, onClick, active, loading }) {
   return (
     <button onClick={onClick} disabled={loading}
@@ -338,6 +363,22 @@ function ActionBtn({ icon: Icon, label, onClick, active, loading }) {
                   }
                   ${ loading ? 'opacity-60 cursor-wait' : '' }`}>
       <Icon size={13} className={loading ? 'animate-spin' : ''} />
+      {label}
+    </button>
+  )
+}
+
+// Stop button — shown in place of Ping/Traceroute while streaming
+function StopBtn({ label, onClick }) {
+  return (
+    <button
+      onClick={onClick}
+      className="flex items-center gap-2 px-3 py-2 rounded-lg border text-xs font-medium
+                 transition-colors duration-150
+                 border-red-500/40 bg-red-500/10 text-red-400
+                 hover:bg-red-500/20 hover:border-red-500/60"
+    >
+      <Square size={12} className="fill-current" />
       {label}
     </button>
   )
