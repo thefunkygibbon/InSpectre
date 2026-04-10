@@ -1,11 +1,14 @@
 FROM python:3.12-slim
 
-# nmap + avahi (mDNS) + samba (NetBIOS) for comprehensive hostname resolution
+# nmap + network tools + iputils (ping) + traceroute
 RUN apt-get update && apt-get install -y --no-install-recommends \
     nmap libpcap-dev gcc \
     avahi-utils \
     samba-common-bin \
     dnsutils \
+    iputils-ping \
+    traceroute \
+    iproute2 \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app

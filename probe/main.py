@@ -1,3 +1,4 @@
+import asyncio
 import os
 import queue
 import socket
@@ -8,6 +9,10 @@ from datetime import datetime, timezone
 
 import nmap
 import requests
+import uvicorn
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from scapy.all import ARP, Ether, sniff, srp
 from sqlalchemy import (
     Boolean, Column, DateTime, Integer, JSON, String, UniqueConstraint,
@@ -19,17 +24,21 @@ from sqlalchemy.orm import declarative_base, sessionmaker
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
-DATABASE_URL           = os.environ.get("DATABASE_URL", "postgresql://admin:password123@localhost:5432/inspectre")
-SCAN_INTERVAL          = int(os.environ.get("SCAN_INTERVAL", 60))
-IP_RANGE               = os.environ.get("IP_RANGE", "192.168.0.0/24")
-INTERFACE              = os.environ.get("INTERFACE", "eth0")
-NMAP_ARGS              = os.environ.get("NMAP_ARGS", "-O --osscan-limit -sV --version-intensity 5 -T4")
-OS_CONFIDENCE_THRESHOLD  = int(os.environ.get("OS_CONFIDENCE_THRESHOLD", 85))
-OFFLINE_MISS_THRESHOLD   = int(os.environ.get("OFFLINE_MISS_THRESHOLD", 3))
-SNIFFER_WORKERS          = int(os.environ.get("SNIFFER_WORKERS", 4))
+DATABASE_URL            = os.environ.get("DATABASE_URL",            "postgresql://admin:password123@localhost:5432/inspectre")
+SCAN_INTERVAL           = int(os.environ.get("SCAN_INTERVAL",           60))
+IP_RANGE                = os.environ.get("IP_RANGE",                "192.168.0.0/24")
+INTERFACE               = os.environ.get("INTERFACE",               "eth0")
+NMAP_ARGS               = os.environ.get("NMAP_ARGS",               "-O --osscan-limit -sV --version-intensity 5 -T4")
+OS_CONFIDENCE_THRESHOLD = int(os.environ.get("OS_CONFIDENCE_THRESHOLD", 85))
+OFFLINE_MISS_THRESHOLD  = int(os.environ.get("OFFLINE_MISS_THRESHOLD",   3))
+SNIFFER_WORKERS         = int(os.environ.get("SNIFFER_WORKERS",          4))
+PROBE_API_PORT          = int(os.environ.get("PROBE_API_PORT",         8001))
+
+PING_COUNT   = 10   # how many ICMP echo requests to send
+TRACE_MAX_HOP = 30  # max TTL hops for traceroute
 
 # ---------------------------------------------------------------------------
-# SQLAlchemy models (local copies — probe doesn't import from backend)
+# SQLAlchemy models
 # ---------------------------------------------------------------------------
 Base = declarative_base()
 
@@ -90,14 +99,12 @@ def wait_for_db(retries: int = 10, delay: int = 5) -> None:
 def init_db() -> None:
     Base.metadata.create_all(engine)
     with engine.connect() as conn:
-        # Safe column migrations for devices table
         try:
             conn.execute(text("ALTER TABLE devices ADD COLUMN IF NOT EXISTS deep_scanned BOOLEAN DEFAULT FALSE"))
             conn.execute(text("ALTER TABLE devices ADD COLUMN IF NOT EXISTS miss_count INTEGER DEFAULT 0"))
             conn.commit()
         except Exception as e:
             print(f"[DB] Migration note: {e}", flush=True)
-        # Safe creation of ip_history table
         conn.execute(text("""
             CREATE TABLE IF NOT EXISTS ip_history (
                 id          SERIAL PRIMARY KEY,
@@ -113,15 +120,10 @@ def init_db() -> None:
     print("[DB] Migrations complete.", flush=True)
 
 # ---------------------------------------------------------------------------
-# IP History — upsert one mac+ip pair, return True if this is a new IP
+# IP History
 # ---------------------------------------------------------------------------
 def record_ip(mac: str, ip: str) -> bool:
-    """
-    Upsert a row in ip_history for (mac, ip).
-    Returns True if this ip is NEW for this mac (first_seen == last_seen after upsert),
-    which signals the caller to trigger a fresh nmap scan.
-    """
-    now = datetime.now(timezone.utc)
+    now     = datetime.now(timezone.utc)
     session = Session()
     try:
         stmt = (
@@ -134,9 +136,8 @@ def record_ip(mac: str, ip: str) -> bool:
             .returning(IPHistory.first_seen, IPHistory.last_seen)
         )
         result = session.execute(stmt)
-        row = result.fetchone()
+        row    = result.fetchone()
         session.commit()
-        # If first_seen == last_seen (within a second), it was a fresh insert
         if row:
             delta = abs((row.last_seen - row.first_seen).total_seconds())
             return delta < 2
@@ -149,23 +150,19 @@ def record_ip(mac: str, ip: str) -> bool:
         session.close()
 
 # ---------------------------------------------------------------------------
-# Hostname resolution — multi-strategy
+# Hostname resolution
 # ---------------------------------------------------------------------------
 def _strip_fqdn(name: str) -> str:
     return name.rstrip('.') if name else ''
 
 def resolve_hostname(ip: str) -> str | None:
-    name = None
     try:
         result = socket.gethostbyaddr(ip)
         candidate = _strip_fqdn(result[0])
         if candidate and candidate != ip:
-            name = candidate
+            return candidate
     except Exception:
         pass
-    if name:
-        return name
-
     try:
         out = subprocess.run(["avahi-resolve", "-a", ip], capture_output=True, text=True, timeout=3)
         for line in out.stdout.splitlines():
@@ -176,7 +173,6 @@ def resolve_hostname(ip: str) -> str | None:
                     return candidate
     except (FileNotFoundError, subprocess.TimeoutExpired):
         pass
-
     try:
         out = subprocess.run(["nmblookup", "-A", ip], capture_output=True, text=True, timeout=4)
         for line in out.stdout.splitlines():
@@ -188,17 +184,6 @@ def resolve_hostname(ip: str) -> str | None:
                         return candidate
     except (FileNotFoundError, subprocess.TimeoutExpired):
         pass
-
-    try:
-        nm = nmap.PortScanner()
-        nm.scan(hosts=ip, arguments="-sn --dns-servers 8.8.8.8")
-        if ip in nm.all_hosts():
-            hostnames = [h["name"] for h in nm[ip].get("hostnames", []) if h.get("name") and h["name"] != ip]
-            if hostnames:
-                return _strip_fqdn(hostnames[0])
-    except Exception:
-        pass
-
     return None
 
 # ---------------------------------------------------------------------------
@@ -217,7 +202,7 @@ def lookup_vendor(mac: str) -> str:
 # ARP sweep
 # ---------------------------------------------------------------------------
 def arp_scan(interface: str, ip_range: str) -> list[dict]:
-    pkt = Ether(dst="ff:ff:ff:ff:ff:ff") / ARP(pdst=ip_range)
+    pkt    = Ether(dst="ff:ff:ff:ff:ff:ff") / ARP(pdst=ip_range)
     result = srp(pkt, iface=interface, timeout=3, verbose=0)[0]
     return [{"ip": rcv.psrc, "mac": rcv.hwsrc.lower()} for _, rcv in result]
 
@@ -244,7 +229,6 @@ def deep_scan(ip: str, mac: str) -> dict:
         return host_data
 
     host = nm[ip]
-
     for match in host.get("osmatch", [])[:3]:
         confidence = int(match.get("accuracy", 0))
         if confidence < OS_CONFIDENCE_THRESHOLD:
@@ -259,7 +243,6 @@ def deep_scan(ip: str, mac: str) -> dict:
                 "osgen":    c.get("osgen", ""),
             } for c in match.get("osclass", [])],
         })
-
     for proto in host.all_protocols():
         for port, info in host[proto].items():
             if info.get("state") == "open":
@@ -271,12 +254,13 @@ def deep_scan(ip: str, mac: str) -> dict:
                     "version": info.get("version", ""),
                     "cpe":     info.get("cpe", ""),
                 })
-
-    host_data["hostnames"] = [h["name"] for h in host.get("hostnames", []) if h.get("name") and h["name"] != ip]
+    host_data["hostnames"] = [
+        h["name"] for h in host.get("hostnames", [])
+        if h.get("name") and h["name"] != ip
+    ]
     os_label = host_data["os_matches"][0]["name"] if host_data["os_matches"] else "unknown"
     print(f"[nmap] Done: {ip} — {len(host_data['open_ports'])} ports, OS: {os_label}", flush=True)
     return host_data
-
 
 def _run_deep_scan_thread(ip: str, mac: str) -> None:
     results = deep_scan(ip, mac)
@@ -297,7 +281,6 @@ def _run_deep_scan_thread(ip: str, mac: str) -> None:
         with _scan_lock:
             _scanning.discard(mac)
 
-
 def trigger_deep_scan(ip: str, mac: str) -> None:
     with _scan_lock:
         if mac in _scanning:
@@ -305,37 +288,28 @@ def trigger_deep_scan(ip: str, mac: str) -> None:
         _scanning.add(mac)
     threading.Thread(target=_run_deep_scan_thread, args=(ip, mac), daemon=True).start()
 
-
 # ---------------------------------------------------------------------------
 # Device upsert
 # ---------------------------------------------------------------------------
 def upsert_seen_device(mac: str, ip: str, source: str) -> None:
     if not mac or mac == "00:00:00:00:00:00":
         return
-
-    # Record IP history; returns True if this IP is new for this MAC
     ip_is_new = record_ip(mac, ip)
-
-    mac_lock = _get_mac_lock(mac)
+    mac_lock  = _get_mac_lock(mac)
     with mac_lock:
         now     = datetime.now(timezone.utc)
         session = Session()
         try:
             existing = session.get(Device, mac)
             is_new   = existing is None
-
             if is_new:
                 hostname = resolve_hostname(ip)
                 vendor   = lookup_vendor(mac)
             else:
                 hostname = existing.hostname or resolve_hostname(ip)
                 vendor   = existing.vendor
-
-            # Detect IP change on an existing device
             ip_changed = (not is_new) and (existing.ip_address != ip)
-
             safe_hostname = (hostname or '').replace("'", "''")
-
             stmt = (
                 pg_insert(Device)
                 .values(
@@ -366,17 +340,13 @@ def upsert_seen_device(mac: str, ip: str, source: str) -> None:
             )
             session.execute(stmt)
             session.commit()
-
             if is_new:
                 print(f"[+] New device via {source}: {ip} ({mac}) hostname={hostname} vendor={vendor}", flush=True)
                 trigger_deep_scan(ip, mac)
             elif not existing.is_online:
                 print(f"[~] Back online via {source}: {ip} ({mac})", flush=True)
-
-            # Auto-rescan when IP changes (device got a new DHCP lease)
             if ip_changed:
                 print(f"[~] IP changed {existing.ip_address} -> {ip} for {mac} — queuing rescan", flush=True)
-                # Clear deep_scanned so probe loop triggers a new nmap
                 session2 = Session()
                 try:
                     dev2 = session2.get(Device, mac)
@@ -389,13 +359,11 @@ def upsert_seen_device(mac: str, ip: str, source: str) -> None:
                 finally:
                     session2.close()
                 trigger_deep_scan(ip, mac)
-
         except Exception as e:
             session.rollback()
             print(f"[DB] Upsert error {mac}: {e}", flush=True)
         finally:
             session.close()
-
 
 def refresh_missing_hostnames() -> None:
     session = Session()
@@ -417,7 +385,6 @@ def refresh_missing_hostnames() -> None:
     finally:
         session.close()
 
-
 # ---------------------------------------------------------------------------
 # Sniffer
 # ---------------------------------------------------------------------------
@@ -434,7 +401,6 @@ def process_arp_packet(packet) -> None:
     except queue.Full:
         pass
 
-
 def _sniffer_worker() -> None:
     while True:
         try:
@@ -446,13 +412,11 @@ def _sniffer_worker() -> None:
         except Exception as e:
             print(f"[sniffer-worker] {e}", flush=True)
 
-
 def start_arp_sniffer() -> None:
     for i in range(SNIFFER_WORKERS):
         threading.Thread(target=_sniffer_worker, name=f"sniffer-worker-{i}", daemon=True).start()
     print(f"[*] Passive ARP sniffer on {INTERFACE} ({SNIFFER_WORKERS} workers)", flush=True)
     sniff(iface=INTERFACE, filter="arp", store=False, prn=process_arp_packet)
-
 
 # ---------------------------------------------------------------------------
 # Presence sweep
@@ -468,6 +432,91 @@ def update_presence_from_sweep(session, active_macs: set) -> None:
                 dev.is_online = False
                 print(f"[-] Offline: {dev.ip_address} ({dev.mac_address})", flush=True)
 
+# ---------------------------------------------------------------------------
+# Probe HTTP API  (port 8001)  — ping & traceroute SSE
+# ---------------------------------------------------------------------------
+probe_api = FastAPI(title="InSpectre Probe Internal API", docs_url=None, redoc_url=None)
+probe_api.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["GET"],
+    allow_headers=["*"],
+)
+
+def _sse_line(data: str) -> str:
+    """Format a single SSE data frame."""
+    # Escape newlines inside the data so SSE framing isn't broken
+    safe = data.replace("\n", " ").replace("\r", "")
+    return f"data: {safe}\n\n"
+
+def _stream_subprocess(cmd: list[str]):
+    """Generator: yield SSE frames from a subprocess line-by-line."""
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+        )
+        for line in proc.stdout:
+            line = line.rstrip()
+            if line:
+                yield _sse_line(line)
+        proc.wait()
+        rc = proc.returncode
+        yield _sse_line(f"--- exit code {rc} ---")
+        yield "event: done\ndata: {}\n\n"
+    except FileNotFoundError as e:
+        yield _sse_line(f"ERROR: command not found — {e}")
+        yield "event: done\ndata: {}\n\n"
+    except Exception as e:
+        yield _sse_line(f"ERROR: {e}")
+        yield "event: done\ndata: {}\n\n"
+
+@probe_api.get("/stream/ping/{ip}")
+def stream_ping(ip: str):
+    # Basic IP sanity check (no shell injection)
+    import ipaddress
+    try:
+        ipaddress.ip_address(ip)
+    except ValueError:
+        raise HTTPException(400, "Invalid IP address")
+    cmd = ["ping", "-c", str(PING_COUNT), "-W", "2", ip]
+    return StreamingResponse(
+        _stream_subprocess(cmd),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+@probe_api.get("/stream/traceroute/{ip}")
+def stream_traceroute(ip: str):
+    import ipaddress
+    try:
+        ipaddress.ip_address(ip)
+    except ValueError:
+        raise HTTPException(400, "Invalid IP address")
+    cmd = ["traceroute", "-m", str(TRACE_MAX_HOP), "-w", "2", ip]
+    return StreamingResponse(
+        _stream_subprocess(cmd),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+@probe_api.get("/health")
+def probe_health():
+    return {"status": "ok"}
+
+def start_probe_api() -> None:
+    """Run the internal FastAPI server in a background thread."""
+    print(f"[*] Probe API listening on :{PROBE_API_PORT}", flush=True)
+    uvicorn.run(probe_api, host="0.0.0.0", port=PROBE_API_PORT, log_level="warning")
 
 # ---------------------------------------------------------------------------
 # Main
@@ -477,45 +526,36 @@ def main() -> None:
     wait_for_db()
     init_db()
 
-    for pkg in ["avahi-utils", "samba-common-bin"]:
-        try:
-            subprocess.run(["apt-get", "install", "-y", "--no-install-recommends", pkg],
-                           capture_output=True, timeout=30)
-        except Exception:
-            pass
-
     print(
         f"[*] Scanning {IP_RANGE} on {INTERFACE} every {SCAN_INTERVAL}s\n"
         f"[*] Offline threshold: {OFFLINE_MISS_THRESHOLD} | OS confidence: {OS_CONFIDENCE_THRESHOLD}%",
         flush=True,
     )
 
-    threading.Thread(target=start_arp_sniffer, daemon=True).start()
+    # Start probe HTTP API in background
+    threading.Thread(target=start_probe_api, daemon=True, name="probe-api").start()
+
+    # Start passive ARP sniffer in background
+    threading.Thread(target=start_arp_sniffer, daemon=True, name="arp-sniffer").start()
 
     while True:
         session = Session()
         try:
-            found       = arp_scan(INTERFACE, IP_RANGE)
+            found        = arp_scan(INTERFACE, IP_RANGE)
             active_macs: set[str] = set()
-
             for entry in found:
                 active_macs.add(entry["mac"])
                 upsert_seen_device(entry["mac"], entry["ip"], "sweep")
-
             update_presence_from_sweep(session, active_macs)
             session.commit()
             print(f"[*] Sweep done — {len(active_macs)} online", flush=True)
-
             threading.Thread(target=refresh_missing_hostnames, daemon=True).start()
-
         except Exception as e:
             session.rollback()
             print(f"[!] Sweep error: {e}", flush=True)
         finally:
             session.close()
-
         time.sleep(SCAN_INTERVAL)
-
 
 if __name__ == "__main__":
     main()

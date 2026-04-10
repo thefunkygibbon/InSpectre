@@ -26,6 +26,11 @@ services:
       - "8000:8000"
     environment:
       DATABASE_URL: postgresql://admin:password123@db:5432/inspectre
+      # Probe runs on the host network — reach it via host.docker.internal
+      # On Linux add  extra_hosts: [host.docker.internal:host-gateway]  (done below)
+      PROBE_URL: http://host.docker.internal:8001
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     depends_on:
       db:
         condition: service_healthy
@@ -42,6 +47,7 @@ services:
       INTERFACE: "eno1"
       SCAN_INTERVAL: "60"
       NMAP_ARGS: "-O --osscan-guess -sV --version-intensity 5 -T4"
+      PROBE_API_PORT: "8001"
       PYTHONUNBUFFERED: "1"
     cap_add:
       - NET_ADMIN

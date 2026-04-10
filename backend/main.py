@@ -1,5 +1,6 @@
 from fastapi import FastAPI, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker, Session
 from pydantic import BaseModel
@@ -7,10 +8,13 @@ from typing import Optional
 import os
 import socket
 import subprocess
+import httpx
 
 from models import Base, Device, IPHistory, Setting
 
 DATABASE_URL = os.environ.get("DATABASE_URL", "postgresql://admin:password123@db:5432/inspectre")
+PROBE_URL    = os.environ.get("PROBE_URL",    "http://localhost:8001")
+
 engine       = create_engine(DATABASE_URL, pool_pre_ping=True)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base.metadata.create_all(bind=engine)
@@ -107,11 +111,45 @@ def _resolve_hostname(ip: str) -> str | None:
                 parts = line.strip().split()
                 if parts:
                     candidate = parts[0].strip()
-                    if candidate and candidate not in ('WORKGROUP', ip, 'Looking'):
+                    if candidate not in ('WORKGROUP', ip, 'Looking'):
                         return candidate
     except Exception:
         pass
     return None
+
+
+def _get_device_ip(mac: str, db: Session) -> str:
+    """Look up a device's current IP, raise 404/409 if not found/offline."""
+    d = db.get(Device, mac.lower())
+    if not d:
+        raise HTTPException(404, "Device not found")
+    if not d.ip_address:
+        raise HTTPException(409, "Device has no recorded IP address")
+    return d.ip_address
+
+
+def _proxy_sse(probe_url: str):
+    """
+    Open a streaming GET to the probe's internal API and re-yield
+    each SSE chunk directly — zero buffering.
+    """
+    def generator():
+        try:
+            with httpx.stream("GET", probe_url, timeout=120) as resp:
+                if resp.status_code != 200:
+                    yield f"data: ERROR — probe returned {resp.status_code}\n\n"
+                    yield "event: done\ndata: {}\n\n"
+                    return
+                for chunk in resp.iter_bytes():
+                    if chunk:
+                        yield chunk
+        except httpx.ConnectError:
+            yield b"data: ERROR — cannot reach probe (is the probe container running?)\n\n"
+            yield b"event: done\ndata: {}\n\n"
+        except Exception as e:
+            yield f"data: ERROR — {e}\n\n".encode()
+            yield b"event: done\ndata: {}\n\n"
+    return generator()
 
 
 # ---------------------------------------------------------------------------
@@ -182,7 +220,6 @@ def get_scan_results(mac: str, db: Session = Depends(get_db)):
 
 @app.get("/devices/{mac}/ip-history")
 def get_ip_history(mac: str, db: Session = Depends(get_db)):
-    """Return all IP addresses this device has ever used, newest first."""
     rows = (
         db.query(IPHistory)
         .filter(IPHistory.mac_address == mac.lower())
@@ -190,6 +227,26 @@ def get_ip_history(mac: str, db: Session = Depends(get_db)):
         .all()
     )
     return [{"ip": r.ip_address, "first_seen": r.first_seen.isoformat(), "last_seen": r.last_seen.isoformat()} for r in rows]
+
+@app.get("/devices/{mac}/ping")
+def ping_device(mac: str, db: Session = Depends(get_db)):
+    """SSE stream — proxies ping output from the probe container."""
+    ip = _get_device_ip(mac, db)
+    return StreamingResponse(
+        _proxy_sse(f"{PROBE_URL}/stream/ping/{ip}"),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+@app.get("/devices/{mac}/traceroute")
+def traceroute_device(mac: str, db: Session = Depends(get_db)):
+    """SSE stream — proxies traceroute output from the probe container."""
+    ip = _get_device_ip(mac, db)
+    return StreamingResponse(
+        _proxy_sse(f"{PROBE_URL}/stream/traceroute/{ip}"),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
 
 @app.get("/stats")
 def stats(db: Session = Depends(get_db)):
