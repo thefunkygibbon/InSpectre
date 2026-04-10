@@ -3,6 +3,7 @@ import {
   Wifi, WifiOff, Monitor, ScanSearch, Settings,
   RefreshCw, Search, Filter, AlertCircle, Activity,
   LayoutGrid, List, Sun, Moon, ChevronDown,
+  Bell, WifiOff as OfflineIcon, X,
 } from 'lucide-react'
 import { useDevices } from './hooks/useDevices'
 import { useTheme }   from './hooks/useTheme'
@@ -21,9 +22,9 @@ const SORT_OPTIONS = [
   { value: 'last_seen_asc',  label: 'Last seen (oldest)' },
   { value: 'ip_asc',         label: 'IP address (asc)'   },
   { value: 'ip_desc',        label: 'IP address (desc)'  },
-  { value: 'name_asc',       label: 'Name (A–Z)'         },
-  { value: 'name_desc',      label: 'Name (Z–A)'         },
-  { value: 'vendor_asc',     label: 'Vendor (A–Z)'       },
+  { value: 'name_asc',       label: 'Name (A\u2013Z)'         },
+  { value: 'name_desc',      label: 'Name (Z\u2013A)'         },
+  { value: 'vendor_asc',     label: 'Vendor (A\u2013Z)'       },
   { value: 'status',         label: 'Status (online first)' },
 ]
 
@@ -56,8 +57,92 @@ function useClock() {
   return time
 }
 
+// ---- Alert banner components ------------------------------------------------
+
+function NewDeviceBanner({ alerts, onDismiss, onDismissAll }) {
+  if (!alerts.length) return null
+  return (
+    <div
+      className="rounded-xl px-4 py-3 text-sm flex flex-col gap-2 animate-fade-in"
+      style={{
+        background: 'color-mix(in oklab, var(--color-primary) 12%, var(--color-surface))',
+        border: '1px solid color-mix(in oklab, var(--color-primary) 30%, transparent)',
+      }}
+    >
+      <div className="flex items-center justify-between">
+        <div className="flex items-center gap-2 font-semibold" style={{ color: 'var(--color-primary)' }}>
+          <Bell size={14} />
+          {alerts.length === 1 ? 'New device detected' : `${alerts.length} new devices detected`}
+        </div>
+        {alerts.length > 1 && (
+          <button onClick={onDismissAll} className="text-xs opacity-60 hover:opacity-100 transition-opacity"
+            style={{ color: 'var(--color-primary)' }}>
+            Dismiss all
+          </button>
+        )}
+      </div>
+      {alerts.map(a => (
+        <div key={a.id} className="flex items-center justify-between gap-2">
+          <span style={{ color: 'var(--color-text)' }}>
+            <span className="font-mono text-xs" style={{ color: 'var(--color-primary)' }}>{a.ip}</span>
+            {' '}&mdash;{' '}
+            {a.hostname || a.vendor}
+            <span className="ml-1.5 text-xs opacity-60 font-mono">{a.mac}</span>
+          </span>
+          <button onClick={() => onDismiss(a.id)} aria-label="Dismiss" className="opacity-50 hover:opacity-100 transition-opacity shrink-0">
+            <X size={13} />
+          </button>
+        </div>
+      ))}
+    </div>
+  )
+}
+
+function OfflineToast({ alerts, onDismiss }) {
+  // Auto-dismiss after 8 s
+  useEffect(() => {
+    if (!alerts.length) return
+    const id = setTimeout(() => alerts.forEach(a => onDismiss(a.id)), 8000)
+    return () => clearTimeout(id)
+  }, [alerts, onDismiss])
+
+  if (!alerts.length) return null
+  return (
+    <div className="fixed bottom-6 right-6 z-50 flex flex-col gap-2 pointer-events-none">
+      {alerts.map(a => (
+        <div
+          key={a.id}
+          className="pointer-events-auto flex items-center gap-3 px-4 py-3 rounded-xl shadow-lg text-sm animate-fade-in"
+          style={{
+            background: 'color-mix(in oklab, #ef4444 10%, var(--color-surface))',
+            border: '1px solid color-mix(in oklab, #ef4444 25%, transparent)',
+            color: 'var(--color-text)',
+          }}
+        >
+          <OfflineIcon size={14} style={{ color: '#ef4444', flexShrink: 0 }} />
+          <span>
+            <span className="font-medium">{a.name}</span>
+            <span className="ml-1.5 text-xs opacity-60">{a.ip}</span>
+            <span className="ml-2 text-xs opacity-50">went offline</span>
+          </span>
+          <button onClick={() => onDismiss(a.id)} aria-label="Dismiss" className="ml-2 opacity-50 hover:opacity-100 transition-opacity">
+            <X size={13} />
+          </button>
+        </div>
+      ))}
+    </div>
+  )
+}
+
+// ---- Main App ---------------------------------------------------------------
+
 export default function App() {
-  const { devices, stats, loading, error, refresh, lastRefresh } = useDevices(10000)
+  const {
+    devices, stats, loading, error, refresh, lastRefresh,
+    newDeviceAlerts, offlineAlerts,
+    dismissNewDevice, dismissOffline,
+    dismissAllNew, dismissAllOffline,
+  } = useDevices(10000)
   const { theme, toggle: toggleTheme } = useTheme()
   const clock = useClock()
 
@@ -68,6 +153,9 @@ export default function App() {
   const [selected, setSelected]         = useState(null)
   const [showSettings, setShowSettings] = useState(false)
   const [refreshing, setRefreshing]     = useState(false)
+  const [showAlertDrop, setShowAlertDrop] = useState(false)
+
+  const totalAlerts = newDeviceAlerts.length
 
   const filtered = useMemo(() => {
     let list = devices
@@ -133,14 +221,79 @@ export default function App() {
 
             {/* Right: live indicator + controls */}
             <div className="flex items-center gap-1">
-              {/* Live indicator */}
+              {/* Live clock */}
               <div className="hidden md:flex items-center gap-2 mr-3">
                 <span className="live-ping" aria-hidden>
                   <span className="live-ping-dot" />
                 </span>
                 <span className="text-xs font-mono" style={{ color: 'var(--color-text-faint)' }}>
-                  live · {clock}
+                  live &middot; {clock}
                 </span>
+              </div>
+
+              {/* Alert bell with badge */}
+              <div className="relative">
+                <button
+                  onClick={() => setShowAlertDrop(v => !v)}
+                  className="btn-ghost p-2 relative"
+                  aria-label={`${totalAlerts} new device alert${totalAlerts !== 1 ? 's' : ''}`}
+                >
+                  <Bell size={16} />
+                  {totalAlerts > 0 && (
+                    <span
+                      className="absolute top-1 right-1 w-4 h-4 rounded-full text-[10px] font-bold
+                                 flex items-center justify-center text-white"
+                      style={{ background: 'var(--color-primary)' }}
+                    >
+                      {totalAlerts > 9 ? '9+' : totalAlerts}
+                    </span>
+                  )}
+                </button>
+
+                {/* Alert dropdown */}
+                {showAlertDrop && (
+                  <>
+                    <div className="fixed inset-0 z-30" onClick={() => setShowAlertDrop(false)} />
+                    <div
+                      className="absolute right-0 top-full mt-2 w-80 rounded-xl shadow-xl z-40 p-4 space-y-3"
+                      style={{ background: 'var(--color-surface)', border: '1px solid var(--color-border)' }}
+                    >
+                      <div className="flex items-center justify-between">
+                        <span className="text-xs font-semibold uppercase tracking-wider" style={{ color: 'var(--color-text-muted)' }}>Alerts</span>
+                        {totalAlerts > 0 && (
+                          <button onClick={() => { dismissAllNew(); setShowAlertDrop(false) }}
+                            className="text-xs opacity-60 hover:opacity-100" style={{ color: 'var(--color-primary)' }}>
+                            Clear all
+                          </button>
+                        )}
+                      </div>
+                      {newDeviceAlerts.length === 0 ? (
+                        <p className="text-xs text-center py-4" style={{ color: 'var(--color-text-faint)' }}>No new alerts</p>
+                      ) : (
+                        newDeviceAlerts.map(a => (
+                          <div key={a.id}
+                            className="flex items-start gap-2 p-2.5 rounded-lg"
+                            style={{ background: 'var(--color-surface-offset)' }}
+                          >
+                            <Bell size={12} className="mt-0.5 shrink-0" style={{ color: 'var(--color-primary)' }} />
+                            <div className="flex-1 min-w-0">
+                              <p className="text-xs font-medium" style={{ color: 'var(--color-text)' }}>
+                                New device: <span className="font-mono" style={{ color: 'var(--color-primary)' }}>{a.ip}</span>
+                              </p>
+                              <p className="text-[11px] mt-0.5 truncate" style={{ color: 'var(--color-text-muted)' }}>
+                                {a.hostname || a.vendor} &middot; {a.mac}
+                              </p>
+                            </div>
+                            <button onClick={() => dismissNewDevice(a.id)} aria-label="Dismiss"
+                              className="opacity-40 hover:opacity-100 transition-opacity shrink-0 mt-0.5">
+                              <X size={11} />
+                            </button>
+                          </div>
+                        ))
+                      )}
+                    </div>
+                  </>
+                )}
               </div>
 
               <button onClick={handleRefresh} className="btn-ghost p-2" aria-label="Refresh">
@@ -180,6 +333,15 @@ export default function App() {
             </div>
           )}
 
+          {/* New device banner */}
+          {newDeviceAlerts.length > 0 && (
+            <NewDeviceBanner
+              alerts={newDeviceAlerts}
+              onDismiss={dismissNewDevice}
+              onDismissAll={dismissAllNew}
+            />
+          )}
+
           {/* Stat cards */}
           <section>
             <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
@@ -196,7 +358,7 @@ export default function App() {
               <Search size={15} className="absolute left-3 top-1/2 -translate-y-1/2 pointer-events-none" style={{ color: 'var(--color-text-muted)' }} />
               <input
                 className="input pl-9"
-                placeholder="Search IP, MAC, hostname, vendor…"
+                placeholder="Search IP, MAC, hostname, vendor\u2026"
                 value={search}
                 onChange={e => setSearch(e.target.value)}
               />
@@ -318,6 +480,9 @@ export default function App() {
           </div>
         </footer>
       </div>
+
+      {/* Offline drop toasts */}
+      <OfflineToast alerts={offlineAlerts} onDismiss={dismissOffline} />
 
       {selected && (
         <DeviceDrawer

@@ -7,8 +7,7 @@ import {
 } from 'lucide-react'
 import { OnlineDot } from './OnlineDot'
 import { api } from '../api'
-
-const BASE = import.meta.env.VITE_API_URL || '/api'
+import { useStreamAction } from '../hooks/useStreamAction'
 
 function fmt(iso) {
   if (!iso) return '--'
@@ -24,51 +23,11 @@ const HTTPS_PORTS = new Set([443, 8443, 4443, 9443])
 function isWebPort(port)   { return HTTP_PORTS.has(port) || HTTPS_PORTS.has(port) }
 function portUrl(ip, port) { return `${HTTPS_PORTS.has(port) ? 'https' : 'http'}://${ip}:${port}` }
 
-// -- SSE hook ----------------------------------------------------------------
-function useSSEStream() {
-  const [lines,   setLines]   = useState([])
-  const [running, setRunning] = useState(false)
-  const esRef = useRef(null)
-
-  function stop() {
-    if (esRef.current) {
-      esRef.current.close()
-      esRef.current = null
-    }
-    setRunning(false)
-  }
-
-  function start(url) {
-    stop()
-    setLines([])
-    setRunning(true)
-    const es = new EventSource(url)
-    esRef.current = es
-    es.onmessage = (e) => {
-      if (e.data) setLines(prev => [...prev, e.data])
-    }
-    es.addEventListener('done', () => {
-      es.close()
-      esRef.current = null
-      setRunning(false)
-    })
-    es.onerror = () => {
-      setLines(prev => [...prev, '--- connection closed ---'])
-      es.close()
-      esRef.current = null
-      setRunning(false)
-    }
-  }
-
-  useEffect(() => () => stop(), [])
-  return { lines, running, start, stop }
-}
-
-// -- Terminal output box -----------------------------------------------------
+// -- Terminal output box -------------------------------------------------------
 function TerminalBox({ lines, running, onStop }) {
   const containerRef = useRef(null)
 
-  // Scroll ONLY the terminal box itself — never the outer page
+  // Scroll only the terminal box itself -- never the outer page
   useEffect(() => {
     const el = containerRef.current
     if (el) el.scrollTop = el.scrollHeight
@@ -97,7 +56,7 @@ function TerminalBox({ lines, running, onStop }) {
   )
 }
 
-// -- Collapsible wrapper -----------------------------------------------------
+// -- Collapsible wrapper -------------------------------------------------------
 function Collapsible({ title, icon: Icon, defaultOpen = false, children }) {
   const [open, setOpen] = useState(defaultOpen)
   return (
@@ -153,16 +112,16 @@ function IpHistorySection({ mac }) {
   )
 }
 
-// -- Main component ----------------------------------------------------------
+// -- Main component -----------------------------------------------------------
 export function DeviceDrawer({ device, onClose, onRename, onResolveName, onRefresh }) {
   if (!device) return null
 
-  const [resolving,  setResolving]  = useState(false)
-  const [rescanning, setRescanning] = useState(false)
+  const [resolving,    setResolving]    = useState(false)
+  const [rescanning,   setRescanning]   = useState(false)
   const [activeAction, setActiveAction] = useState(null)
-  const [staticLines, setStaticLines]   = useState([])
+  const [staticLines,  setStaticLines]  = useState([])
 
-  const stream = useSSEStream()
+  const stream = useStreamAction()
 
   const name = device.custom_name || device.hostname || device.ip_address
   const scan = device.scan_results
@@ -178,6 +137,7 @@ export function DeviceDrawer({ device, onClose, onRename, onResolveName, onRefre
     setRescanning(true)
     setActiveAction('rescan')
     stream.stop()
+    setStaticLines([])
     try {
       await api.rescanDevice(mac)
       setStaticLines(['[RESCAN] Deep scan queued -- results will update shortly.'])
@@ -192,13 +152,13 @@ export function DeviceDrawer({ device, onClose, onRename, onResolveName, onRefre
   function handlePing() {
     setActiveAction('ping')
     setStaticLines([])
-    stream.start(`${BASE}/devices/${mac}/ping`)
+    stream.start(`/devices/${mac}/ping`)
   }
 
   function handleTraceroute() {
     setActiveAction('traceroute')
     setStaticLines([])
-    stream.start(`${BASE}/devices/${mac}/traceroute`)
+    stream.start(`/devices/${mac}/traceroute`)
   }
 
   function handlePlaceholder(label, note) {
@@ -241,7 +201,7 @@ export function DeviceDrawer({ device, onClose, onRename, onResolveName, onRefre
               : <span className="badge-scanning"><ScanLine size={11} className="animate-pulse" />Scan pending</span>}
           </div>
 
-          {/* ── ACTIONS (top) ── */}
+          {/* ACTIONS */}
           <Section title="Actions" icon={Activity}>
             <div className="grid grid-cols-2 gap-2 pt-1">
               <ActionBtn icon={Activity}  label="Ping"

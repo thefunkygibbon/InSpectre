@@ -19,7 +19,7 @@ engine       = create_engine(DATABASE_URL, pool_pre_ping=True)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base.metadata.create_all(bind=engine)
 
-# Safe migration: add ip_history table if this is an existing DB
+# Safe migration
 with engine.connect() as _conn:
     _conn.execute(text("""
         CREATE TABLE IF NOT EXISTS ip_history (
@@ -46,11 +46,11 @@ app.add_middleware(
 # Default settings
 # ---------------------------------------------------------------------------
 DEFAULT_SETTINGS = [
-    {"key": "scan_interval",           "value": "60",                                          "description": "Seconds between ARP sweep cycles."},
-    {"key": "offline_miss_threshold",  "value": "3",                                           "description": "Consecutive missed sweeps before a device is marked offline."},
-    {"key": "os_confidence_threshold", "value": "85",                                          "description": "Minimum nmap OS confidence % to record a match."},
-    {"key": "sniffer_workers",         "value": "4",                                           "description": "Worker threads for the passive ARP sniffer."},
-    {"key": "ip_range",                "value": os.environ.get("IP_RANGE", "192.168.0.0/24"),  "description": "CIDR range to scan."},
+    {"key": "scan_interval",           "value": "60",                                              "description": "Seconds between ARP sweep cycles."},
+    {"key": "offline_miss_threshold",  "value": "3",                                               "description": "Consecutive missed sweeps before a device is marked offline."},
+    {"key": "os_confidence_threshold", "value": "85",                                              "description": "Minimum nmap OS confidence % to record a match."},
+    {"key": "sniffer_workers",         "value": "4",                                               "description": "Worker threads for the passive ARP sniffer."},
+    {"key": "ip_range",                "value": os.environ.get("IP_RANGE", "192.168.0.0/24"),      "description": "CIDR range to scan."},
     {"key": "nmap_args",               "value": "-O --osscan-limit -sV --version-intensity 5 -T4", "description": "Arguments passed to nmap during deep scans."},
 ]
 
@@ -119,7 +119,6 @@ def _resolve_hostname(ip: str) -> str | None:
 
 
 def _get_device_ip(mac: str, db: Session) -> str:
-    """Look up a device's current IP, raise 404/409 if not found/offline."""
     d = db.get(Device, mac.lower())
     if not d:
         raise HTTPException(404, "Device not found")
@@ -128,10 +127,45 @@ def _get_device_ip(mac: str, db: Session) -> str:
     return d.ip_address
 
 
+def _sse_line(data: str) -> bytes:
+    safe = data.replace("\n", " ").replace("\r", "")
+    return f"data: {safe}\n\n".encode()
+
+
+def _stream_cmd(cmd: list[str]):
+    """
+    Run cmd as a subprocess and stream stdout as SSE lines.
+    Runs entirely inside the backend container -- no probe dependency.
+    """
+    def generator():
+        try:
+            proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1,
+            )
+            for line in proc.stdout:
+                line = line.rstrip()
+                if line:
+                    yield _sse_line(line)
+            proc.wait()
+            yield _sse_line(f"--- exit code {proc.returncode} ---")
+            yield b"event: done\ndata: {}\n\n"
+        except FileNotFoundError as e:
+            yield _sse_line(f"ERROR: command not found -- {e}")
+            yield b"event: done\ndata: {}\n\n"
+        except Exception as e:
+            yield _sse_line(f"ERROR: {e}")
+            yield b"event: done\ndata: {}\n\n"
+    return generator()
+
+
 def _proxy_sse(probe_url: str):
     """
-    Open a streaming GET to the probe's internal API and re-yield
-    each SSE chunk directly -- zero buffering.
+    Fallback: proxy an SSE stream from the probe container.
+    Only used for endpoints that must run on the host network.
     """
     def generator():
         try:
@@ -228,25 +262,47 @@ def get_ip_history(mac: str, db: Session = Depends(get_db)):
     )
     return [{"ip": r.ip_address, "first_seen": r.first_seen.isoformat(), "last_seen": r.last_seen.isoformat()} for r in rows]
 
+
 @app.get("/devices/{mac}/ping")
 def ping_device(mac: str, db: Session = Depends(get_db)):
-    """SSE stream -- proxies ping output from the probe container."""
+    """
+    SSE stream of live ping output.
+    Runs ping directly in the backend container -- no probe proxy.
+    """
     ip = _get_device_ip(mac, db)
+    import ipaddress
+    try:
+        ipaddress.ip_address(ip)
+    except ValueError:
+        raise HTTPException(400, "Device has invalid IP address")
+    cmd = ["ping", "-c", "10", "-W", "2", ip]
     return StreamingResponse(
-        _proxy_sse(f"{PROBE_URL}/stream/ping/{ip}"),
+        _stream_cmd(cmd),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
 
+
 @app.get("/devices/{mac}/traceroute")
 def traceroute_device(mac: str, db: Session = Depends(get_db)):
-    """SSE stream -- proxies traceroute output from the probe container."""
+    """
+    SSE stream of live traceroute output.
+    Runs traceroute directly in the backend container -- no probe proxy.
+    """
     ip = _get_device_ip(mac, db)
+    import ipaddress
+    try:
+        ipaddress.ip_address(ip)
+    except ValueError:
+        raise HTTPException(400, "Device has invalid IP address")
+    # prefer traceroute, fall back to tracepath
+    cmd = ["traceroute", "-m", "30", "-w", "2", ip]
     return StreamingResponse(
-        _proxy_sse(f"{PROBE_URL}/stream/traceroute/{ip}"),
+        _stream_cmd(cmd),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
+
 
 @app.get("/stats")
 def stats(db: Session = Depends(get_db)):
