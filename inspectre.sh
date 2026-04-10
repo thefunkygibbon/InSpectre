@@ -10,17 +10,15 @@ chmod +x inspectre.sh
 echo "==> Tearing down all containers, networks and orphans..."
 docker compose down --remove-orphans --volumes 2>/dev/null || true
 
-echo "==> Removing project images..."
+echo "==> Removing InSpectre images only..."
 docker image rm inspectre-probe inspectre-web inspectre-frontend 2>/dev/null || true
-# Also catch compose-prefixed names (e.g. inspectre-inspectre-probe)
-docker images --format '{{.Repository}}' | grep -i inspectre | xargs -r docker image rm 2>/dev/null || true
+# Catch compose-prefixed variants (e.g. inspectre-inspectre-probe)
+docker images --format '{{.Repository}}:{{.Tag}}' \
+  | grep -i '^inspectre' \
+  | xargs -r docker image rm 2>/dev/null || true
 
-echo "==> Pruning build cache and dangling images..."
-docker builder prune -af
-docker image prune -f
-
-echo "==> Pruning unused networks..."
-docker network prune -f
+# NOTE: We do NOT run docker builder prune or docker image prune here.
+# Those are system-wide and would delete cached layers from other projects on this host.
 
 echo "==> Building from scratch..."
 docker compose build --no-cache --pull
