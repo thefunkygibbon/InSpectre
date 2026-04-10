@@ -3,7 +3,7 @@ import {
   Wifi, WifiOff, Monitor, ScanSearch, Settings,
   RefreshCw, Search, Filter, AlertCircle, Activity,
   LayoutGrid, List, Sun, Moon, ChevronDown,
-  Bell, X,
+  Bell, X, Layers,
 } from 'lucide-react'
 import { useDevices } from './hooks/useDevices'
 import { useTheme }   from './hooks/useTheme'
@@ -14,6 +14,7 @@ import { DeviceCard }     from './components/DeviceCard'
 import { DeviceRow }      from './components/DeviceRow'
 import { DeviceDrawer }   from './components/DeviceDrawer'
 import { SettingsPanel }  from './components/SettingsPanel'
+import { CategoryView }   from './components/CategoryView'
 
 const APP_VERSION = '0.1.0'
 
@@ -138,6 +139,7 @@ export default function App() {
   const [search,       setSearch]       = useState('')
   const [filter,       setFilter]       = useState('all')
   const [sort,         setSort]         = useState('last_seen_desc')
+  // layout: 'grid' | 'list' | 'category'
   const [layout,       setLayout]       = useState('grid')
   const [selected,     setSelected]     = useState(null)
   const [showSettings, setShowSettings] = useState(false)
@@ -201,6 +203,9 @@ export default function App() {
   }
 
   const isDark = theme === 'dark'
+
+  // In category mode, sort doesn't apply (groups define order), but search/filter still does
+  const isCategoryMode = layout === 'category'
 
   return (
     <div className="min-h-screen bg-bg flex flex-col transition-colors duration-200">
@@ -377,20 +382,24 @@ export default function App() {
               ))}
             </div>
 
-            <div className="relative">
-              <select
-                value={sort}
-                onChange={e => setSort(e.target.value)}
-                className="input pr-8 appearance-none cursor-pointer"
-                aria-label="Sort devices"
-              >
-                {SORT_OPTIONS.map(o => (
-                  <option key={o.value} value={o.value}>{o.label}</option>
-                ))}
-              </select>
-              <ChevronDown size={14} className="absolute right-3 top-1/2 -translate-y-1/2 pointer-events-none" style={{ color: 'var(--color-text-muted)' }} />
-            </div>
+            {/* Sort — hidden in category mode since ordering is by group */}
+            {!isCategoryMode && (
+              <div className="relative">
+                <select
+                  value={sort}
+                  onChange={e => setSort(e.target.value)}
+                  className="input pr-8 appearance-none cursor-pointer"
+                  aria-label="Sort devices"
+                >
+                  {SORT_OPTIONS.map(o => (
+                    <option key={o.value} value={o.value}>{o.label}</option>
+                  ))}
+                </select>
+                <ChevronDown size={14} className="absolute right-3 top-1/2 -translate-y-1/2 pointer-events-none" style={{ color: 'var(--color-text-muted)' }} />
+              </div>
+            )}
 
+            {/* Layout toggle: grid / list / category */}
             <div className="flex items-center gap-1 glass rounded-xl p-1">
               <button
                 onClick={() => setLayout('grid')}
@@ -400,6 +409,7 @@ export default function App() {
                   : { color: 'var(--color-text-muted)' }
                 }
                 aria-label="Grid layout"
+                title="Grid view"
               >
                 <LayoutGrid size={15} />
               </button>
@@ -411,18 +421,42 @@ export default function App() {
                   : { color: 'var(--color-text-muted)' }
                 }
                 aria-label="List layout"
+                title="List view"
               >
                 <List size={15} />
+              </button>
+              <button
+                onClick={() => setLayout('category')}
+                className="p-2 rounded-lg transition-all duration-150"
+                style={layout === 'category'
+                  ? { background: 'var(--color-brand)', color: 'white' }
+                  : { color: 'var(--color-text-muted)' }
+                }
+                aria-label="Category view"
+                title="Category view — groups devices by type"
+              >
+                <Layers size={15} />
               </button>
             </div>
           </section>
 
-          {/* Device grid / list */}
+          {/* Device grid / list / category */}
           <section>
             {loading ? (
-              <SkeletonGrid layout={layout} />
+              <SkeletonGrid layout={layout === 'category' ? 'grid' : layout} />
             ) : filtered.length === 0 ? (
               <EmptyState search={search} filter={filter} />
+            ) : isCategoryMode ? (
+              <>
+                <p className="text-xs mb-4" style={{ color: 'var(--color-text-faint)' }}>
+                  Showing {filtered.length} of {devices.length} device{devices.length !== 1 ? 's' : ''} &middot; grouped by device type
+                </p>
+                <CategoryView
+                  devices={filtered}
+                  layout="grid"
+                  onDeviceClick={setSelected}
+                />
+              </>
             ) : (
               <>
                 <p className="text-xs mb-4" style={{ color: 'var(--color-text-faint)' }}>
