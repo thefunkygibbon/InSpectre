@@ -1,16 +1,22 @@
 /**
  * deviceCategories.js
- * Multi-signal, weighted scoring categorisation engine.
+ * Multi-signal, tiered confidence-scored categorisation engine.
  *
- * Each device is tested against every category. Signals from multiple sources
- * (MAC OUI prefix, vendor string, hostname, open ports, OS string) each add
- * confidence points. The category with the highest total score wins.
- * A minimum threshold must be met before a category is assigned; otherwise
- * the device falls back to 'unknown'.
+ * Tier 1 — Explicit protocol / OUI fingerprints:  high confidence (80-95 pts)
+ * Tier 2 — Hostname / OS keyword patterns:        medium confidence (55-90 pts)
+ * Tier 3 — OUI for ambiguous mega-vendors:        LOW prior only  (25-35 pts)
+ * Tier 4 — Port/service hints:                    supplementary   (15-55 pts)
  *
- * This approach avoids the single-regex-match fragility that causes
- * miscategorisation — a device needs multiple matching signals to be
- * confidently placed in a category.
+ * A category is only assigned when a device's best score reaches the
+ * CONFIDENCE_THRESHOLD.  Devices below the threshold stay 'unknown' rather
+ * than receiving a guess based on weak evidence.
+ *
+ * AMBIGUOUS MEGA-VENDOR RULE
+ * Brands like Samsung, Apple, LG, Sony, TP-Link, Xiaomi, Huawei manufacture
+ * everything from phones to TVs to routers.  Their OUI alone is not enough
+ * to assign a category.  These entries are given a LOW score (25-35) so they
+ * only tip the balance when keyword or port evidence agrees.  Without that
+ * corroboration the device remains 'unknown'.
  */
 
 export const CATEGORIES = {
@@ -48,53 +54,65 @@ export const CATEGORY_GROUP_ORDER = [
   'Unknown',
 ]
 
+// Minimum score needed before we commit to a category.
+// Raised from 40 → 60 so that a single weak-prior OUI hit is never enough.
+const CONFIDENCE_THRESHOLD = 60
+
 /**
  * MAC OUI prefix → category type + confidence score.
- * Source: curated from the IEEE OUI database, focusing on the most common
- * consumer and prosumer vendors seen on home/SMB networks.
- * Format: [ ouiPrefix6chars, categoryKey, score ]
- * Higher score = stronger signal (unique OUIs score higher than shared ones).
+ *
+ * HIGH scores (80-95): OUI uniquely identifies device type (Nintendo, Hikvision,
+ *   PS/Xbox OUIs, dedicated NIC vendors for consoles/cameras etc.).
+ * LOW scores (25-35):  Ambiguous mega-vendors (Samsung, Apple, LG, Sony, TP-Link,
+ *   Xiaomi, Huawei, Realtek) — act as a weak prior only.
+ *
+ * Format: [ ouiPrefix, categoryKey, score ]
  */
 const OUI_MAP = [
-  // ── Network Infrastructure ──────────────────────────────────────
+  // ── Network Infrastructure — SPECIFIC vendors ─────────────────────────
   ['00105a', 'router', 90], // 3Com
   ['001018', 'router', 90], // Cisco
   ['0015fa', 'router', 90], // Cisco
   ['001e13', 'router', 90], // Cisco
-  ['002155', 'router', 90], // Ubiquiti
+  ['001fc5', 'voip',   90], // Cisco IP Phone
+  ['00085d', 'voip',   90], // Cisco 7900 series
+  ['001a2b', 'router', 85], // Cisco-Linksys
+  ['002155', 'ap',     90], // Ubiquiti
   ['0418d6', 'ap',     90], // Ubiquiti
   ['044bff', 'ap',     90], // Ubiquiti
-  ['0418d6', 'ap',     90], // Ubiquiti
   ['24a43c', 'ap',     90], // Ubiquiti
   ['b4fbe4', 'ap',     90], // Ubiquiti
   ['dc9fdb', 'ap',     90], // Ubiquiti
   ['f09fc2', 'ap',     90], // Ubiquiti
   ['788a20', 'ap',     90], // Ubiquiti
   ['e063da', 'ap',     90], // Ubiquiti
-  ['00e04c', 'router', 80], // Realtek (embedded)
-  ['001a2b', 'router', 85], // Cisco-Linksys
-  ['001cedfe', 'router', 90],
-  ['c025e9', 'router', 85], // TP-Link
-  ['50c7bf', 'router', 85], // TP-Link
-  ['f4f26d', 'router', 85], // TP-Link
-  ['ac84c6', 'router', 85], // TP-Link
-  ['b0be76', 'router', 85], // TP-Link
-  ['30de4b', 'ap',     85], // TP-Link (EAP)
-  ['1c61b4', 'router', 85], // Netgear
-  ['a040a0', 'router', 85], // Netgear
-  ['84167f', 'router', 85], // Netgear
-  ['c04a00', 'router', 85], // Netgear
-  ['e091f5', 'router', 85], // Asus
-  ['107b44', 'router', 85], // Asus
-  ['0050ba', 'router', 80], // D-Link
   ['1caf05', 'router', 85], // MikroTik
   ['b8690e', 'router', 85], // MikroTik
   ['4c5e0c', 'router', 85], // MikroTik
   ['e4008d', 'router', 85], // MikroTik
-  ['000c29', 'server', 70], // VMware (also server)
+  ['1c61b4', 'router', 85], // Netgear
+  ['a040a0', 'router', 85], // Netgear
+  ['84167f', 'router', 85], // Netgear
+  ['c04a00', 'router', 85], // Netgear
+  ['0050ba', 'router', 80], // D-Link
+  ['30de4b', 'ap',     85], // TP-Link EAP (access points — specific)
+
+  // ── TP-Link / Asus / Realtek — AMBIGUOUS (also make phones, IoT, TVs) ──
+  ['c025e9', 'router', 30], // TP-Link — low prior
+  ['50c7bf', 'router', 30], // TP-Link — low prior
+  ['f4f26d', 'router', 30], // TP-Link — low prior
+  ['ac84c6', 'router', 30], // TP-Link — low prior
+  ['b0be76', 'router', 30], // TP-Link — low prior
+  ['48e1e9', 'iot',    30], // TP-Link Kasa smart plug — low prior
+  ['e091f5', 'router', 30], // Asus — low prior
+  ['107b44', 'router', 30], // Asus — low prior
+  ['00e04c', 'router', 25], // Realtek embedded — very weak
+
+  // ── VMware ────────────────────────────────────────────────────────────
+  ['000c29', 'server', 70], // VMware
   ['005056', 'server', 70], // VMware
 
-  // ── Games Consoles ──────────────────────────────────────────────
+  // ── Games Consoles — SPECIFIC OUIs ───────────────────────────────────
   ['001315', 'console', 95], // Nintendo
   ['0009bf', 'console', 95], // Nintendo
   ['002709', 'console', 95], // Nintendo
@@ -109,7 +127,6 @@ const OUI_MAP = [
   ['0019c5', 'console', 95], // Sony PlayStation
   ['001d0d', 'console', 95], // Sony PS3
   ['00041f', 'console', 95], // Sony PS3
-  ['0050f2', 'console', 80], // Sony (shared)
   ['70662a', 'console', 95], // Sony PS4
   ['bc60a7', 'console', 95], // Sony PS4
   ['c863f1', 'console', 95], // Sony PS4
@@ -127,34 +144,46 @@ const OUI_MAP = [
   ['985aeb', 'console', 90], // Valve Steam Deck
   ['d85d4c', 'console', 90], // Valve
 
-  // ── TVs & Streaming ─────────────────────────────────────────────
+  // ── TVs & Streaming — SPECIFIC OUIs ──────────────────────────────────
+  // Samsung Smart TV OUIs known to be TV-only
   ['f0ef86', 'tv', 90], // Samsung Smart TV
   ['8c711c', 'tv', 90], // Samsung Smart TV
-  ['b827eb', 'tv', 80], // Raspberry Pi (shared, lower)
-  ['dc:a6:32', 'server', 60], // Pi 4 (more likely server)
+  // Samsung generic — AMBIGUOUS (phones, tablets, TVs, printers)
+  ['8c8590', 'phone', 30], // Samsung — weak phone prior
+  ['0024e9', 'phone', 30], // Samsung — weak phone prior
+  ['28988b', 'phone', 30], // Samsung — weak phone prior
+  ['0000f0', 'printer',25], // Samsung printer chipset — weak
+  // Streaming boxes — SPECIFIC
   ['dc4a3e', 'streamer', 95], // Amazon Fire TV
   ['f0272d', 'streamer', 95], // Amazon Fire TV
   ['74c246', 'streamer', 95], // Amazon Fire TV Stick
   ['a002dc', 'streamer', 95], // Amazon Echo/Fire
   ['0c2758', 'streamer', 95], // Amazon Fire TV
-  ['68d93c', 'streamer', 95], // Amazon (Alexa/Echo)
+  ['68d93c', 'streamer', 95], // Amazon Alexa/Echo
   ['18742e', 'streamer', 95], // Amazon Echo
-  ['4c:ef:c0', 'streamer', 95], // Roku
+  ['4cefc0', 'streamer', 95], // Roku
   ['b86ce5', 'streamer', 95], // Roku
-  ['cc:6d:a0', 'streamer', 95], // Roku
-  ['d0:4d:2c', 'streamer', 95], // Roku
+  ['cc6da0', 'streamer', 95], // Roku
+  ['d04d2c', 'streamer', 95], // Roku
   ['28ef01', 'streamer', 95], // Google Chromecast
   ['54600a', 'streamer', 95], // Google Chromecast
-  ['6c:ad:f8', 'streamer', 95], // Google Chromecast
-  ['f4f5d8', 'tv', 90],  // LG Smart TV
-  ['8875d0', 'tv', 90],  // LG
+  ['6cadf8', 'streamer', 95], // Google Chromecast
+  // LG — AMBIGUOUS (TVs, phones, monitors)
+  ['f4f5d8', 'tv', 30],  // LG — weak TV prior
+  ['8875d0', 'tv', 30],  // LG — weak TV prior
+  // Sony Bravia — SPECIFIC
   ['a8bb50', 'tv', 90],  // Sony Bravia
   ['ac9b0a', 'tv', 90],  // Sony Bravia
   ['0019e3', 'tv', 90],  // Sony Bravia
+  // Sony generic — AMBIGUOUS
+  ['0050f2', 'phone', 25], // Sony generic — very weak
+  // Nvidia Shield — SPECIFIC
   ['3422fb', 'tv', 90],  // Nvidia Shield
-  ['f4:f5:d8', 'tv', 90], // LG
+  // Raspberry Pi — multi-purpose, use only as faint prior
+  ['b827eb', 'server', 30], // Raspberry Pi — weak server prior
+  ['dca632', 'server', 30], // Raspberry Pi 4
 
-  // ── Cameras & Security ──────────────────────────────────────────
+  // ── Cameras & Security — SPECIFIC OUIs ───────────────────────────────
   ['000f0d', 'camera', 95], // Hikvision
   ['283b96', 'camera', 95], // Hikvision
   ['4c11ae', 'camera', 95], // Hikvision
@@ -172,10 +201,10 @@ const OUI_MAP = [
   ['9cfc01', 'camera', 90], // Foscam
   ['000c43', 'camera', 85], // Ralink (doorbell/cam chipset)
 
-  // ── Printers ────────────────────────────────────────────────────
+  // ── Printers — SPECIFIC OUIs ─────────────────────────────────────────
   ['000208', 'printer', 95], // Canon
   ['001c62', 'printer', 95], // Canon
-  ['00:17:c8', 'printer', 95], // Canon
+  ['0017c8', 'printer', 95], // Canon
   ['00004c', 'printer', 90], // HP
   ['001083', 'printer', 90], // HP
   ['3c2af4', 'printer', 90], // HP
@@ -188,32 +217,32 @@ const OUI_MAP = [
   ['000a5e', 'printer', 90], // Brother
   ['001ba9', 'printer', 90], // Brother
   ['002477', 'printer', 90], // Brother
-  ['0000f0', 'printer', 85], // Samsung printer
   ['00c0ee', 'printer', 85], // Xerox
 
-  // ── Mobile Devices ──────────────────────────────────────────────
-  ['f8a9d0', 'phone', 90], // Apple iPhone (various)
-  ['3c5282', 'phone', 90], // Apple
-  ['a4c361', 'phone', 90], // Apple iPhone
-  ['d8bb2c', 'tablet', 90], // Apple iPad
-  ['405d82', 'phone', 90], // Apple
-  ['8c8590', 'phone', 85], // Samsung mobile
-  ['0024e9', 'phone', 85], // Samsung mobile
-  ['28988b', 'phone', 85], // Samsung
+  // ── Mobile Devices — SPECIFIC Apple OUIs ─────────────────────────────
+  // Apple generic OUIs are AMBIGUOUS (iPhone, iPad, Mac, Watch, TV)
+  // Only mark known phone-heavy OUI ranges with a LOW prior
+  ['f8a9d0', 'phone', 30], // Apple — weak phone prior
+  ['3c5282', 'phone', 30], // Apple — weak phone prior
+  ['a4c361', 'phone', 30], // Apple — weak phone prior
+  ['d8bb2c', 'tablet', 30], // Apple — weak tablet prior
+  ['405d82', 'phone', 30], // Apple — weak phone prior
+  // Google Pixel — SPECIFIC
   ['acee9e', 'phone', 90], // Google Pixel
   ['f88fca', 'phone', 90], // Google Pixel
+  // OnePlus — SPECIFIC
   ['3ce9f7', 'phone', 85], // OnePlus
-  ['40b0fa', 'phone', 85], // Xiaomi
-  ['28d1278', 'phone', 85],// Xiaomi
-  ['748484', 'phone', 85], // Huawei
-  ['7c1f00', 'phone', 85], // Oppo
+  // Xiaomi / Huawei / Oppo — AMBIGUOUS
+  ['40b0fa', 'phone', 30], // Xiaomi — weak prior
+  ['748484', 'phone', 30], // Huawei — weak prior
+  ['7c1f00', 'phone', 30], // Oppo — weak prior
 
-  // ── IoT Devices ─────────────────────────────────────────────────
-  ['68a40e', 'iot', 90], // Tuya Smart (huge IoT chipset vendor)
+  // ── IoT Devices — SPECIFIC chipset vendors ────────────────────────────
+  ['68a40e', 'iot', 90], // Tuya Smart
   ['50d4f7', 'iot', 90], // Tuya
-  ['a8032a', 'iot', 90], // Espressif / ESP8266/ESP32
+  ['a8032a', 'iot', 90], // Espressif ESP8266/ESP32
   ['2462ab', 'iot', 90], // Espressif
-  ['3c61054', 'iot', 90],// Espressif
+  ['3c6105', 'iot', 90], // Espressif
   ['2cf432', 'iot', 90], // Espressif
   ['84cca8', 'iot', 90], // Espressif
   ['e89f6d', 'iot', 90], // Espressif
@@ -227,22 +256,20 @@ const OUI_MAP = [
   ['ecb5fa', 'iot', 85], // Philips
   ['b00413', 'iot', 85], // Shelly
   ['c45bbe', 'iot', 85], // Shelly
-  ['3494b3', 'iot', 85], // Sonos (often counts as IoT)
+  ['3494b3', 'iot', 85], // Sonos
   ['78281b', 'iot', 85], // Sonos
   ['5caafd', 'iot', 90], // Nest/Google Home
   ['80927f', 'iot', 90], // Google Home / Nest
-  ['1c:56:fe', 'iot', 90], // Google Nest
+  ['1c56fe', 'iot', 90], // Google Nest
   ['a88664', 'iot', 85], // Wemo / IoT bridge
   ['d46e5c', 'iot', 90], // Meross
-  ['48e1e9', 'iot', 85], // TP-Link Kasa smart plug
-  ['50c7bf', 'iot', 80], // TP-Link (shared w/ router, lower)
-  ['b8:27:eb', 'iot', 60], // Raspberry Pi (can be IoT too)
+  ['b827eb', 'iot',  25], // Raspberry Pi — also IoT, very weak
 
-  // ── Servers & NAS ───────────────────────────────────────────────
-  ['001517', 'nas', 90], // Synology
-  ['0011326', 'nas', 90],// QNAP
-  ['24:5e:be', 'nas', 90], // QNAP
-  ['000d93', 'nas', 90], // Apple Xserve / older Apple
+  // ── Servers & NAS — SPECIFIC ──────────────────────────────────────────
+  ['001517', 'nas',    90], // Synology
+  ['001132', 'nas',    90], // QNAP
+  ['245ebe', 'nas',    90], // QNAP
+  ['000d93', 'nas',    90], // Apple Xserve / older Apple server
   ['001d09', 'server', 90], // IBM
   ['d4ae52', 'server', 85], // Dell iDRAC
   ['001a4b', 'server', 85], // Supermicro
@@ -250,19 +277,17 @@ const OUI_MAP = [
   ['3cecef', 'server', 85], // HP iLO
   ['9c8e99', 'server', 85], // HP ProLiant
 
-  // ── VoIP ─────────────────────────────────────────────────────────
+  // ── VoIP — SPECIFIC ──────────────────────────────────────────────────
   ['000413', 'voip', 90], // Polycom
-  ['00:90:7a', 'voip', 90], // Snom
-  ['001fc5', 'voip', 90], // Cisco IP Phone
+  ['00907a', 'voip', 90], // Snom
   ['8838b4', 'voip', 90], // Yealink
   ['805ec0', 'voip', 90], // Yealink
   ['541efe', 'voip', 90], // Yealink
-  ['00085d', 'voip', 90], // Cisco 7900 series
 ]
 
 /** Keyword rules applied to vendor + hostname + OS strings combined.
  *  Format: [ regex, categoryKey, score ]
- *  Order doesn't matter — all matching rules contribute their score.
+ *  All matching rules contribute their score.
  */
 const KEYWORD_RULES = [
   // ── Network Infrastructure ────────────────────────────────────
@@ -270,7 +295,7 @@ const KEYWORD_RULES = [
   [/\b(cisco|juniper|aruba|brocade|extreme networks)\b/i,          'router',  75],
   [/\b(netgear|zyxel|draytek|edgerouter|edgeswitch)\b/i,           'router',  70],
   [/\b(unifi|ubiquiti|mikrotik|routeros)\b/i,                      'router',  80],
-  [/\b(tp-?link|tplink)\b/i,                                       'router',  55],  // also makes IoT stuff
+  [/\b(tp-?link|tplink)\b/i,                                       'router',  40],  // ambiguous — also makes IoT/phones
   [/\b(switch|vlan|poe\s*switch|managed switch)\b/i,               'switch',  70],
   [/\b(access.?point|WAP|wifi.?ap|eap[0-9])\b/i,                  'ap',      75],
   [/\b(asus.?rt|rt-[a-z]{2}[0-9])\b/i,                            'router',  80],
@@ -312,7 +337,7 @@ const KEYWORD_RULES = [
   [/\b(synology|qnap|freenas|truenas|openmediavault|unraid)\b/i,  'nas',     90],
   [/\b(proxmox|esxi|vmware|hyperv|hyper-v|xen|virtualbox)\b/i,   'server',  90],
   [/\b(ubuntu.?server|debian|centos|fedora.?server|rhel|rocky)\b/i,'server', 80],
-  [/\b(raspberry.?pi|raspbian|raspberrypi)\b/i,                    'server',  55],  // Pi can be many things
+  [/\b(raspberry.?pi|raspbian|raspberrypi)\b/i,                    'server',  55],
   [/\b(nas\b|network.?attached|file.?server)\b/i,                  'nas',     80],
   [/\b(docker|container|k8s|kubernetes)\b/i,                       'server',  70],
   [/\b(server|srv\b|host\b)\b/i,                                   'server',  50],
@@ -348,47 +373,42 @@ const KEYWORD_RULES = [
  *  Format: [ portNumber, categoryKey, score ]
  */
 const PORT_RULES = [
-  [80,   'server',  20], [443,  'server',  20], // generic web → weak server signal
-  [22,   'server',  25], // SSH → more likely server/NAS/router
-  [21,   'server',  20], // FTP
-  [23,   'router',  30], // Telnet → often network gear
-  [53,   'router',  35], // DNS → router/server
-  [67,   'router',  40], // DHCP server
-  [179,  'router',  40], // BGP
+  [80,   'server',  20], [443,  'server',  20],
+  [22,   'server',  25],
+  [21,   'server',  20],
+  [23,   'router',  30],
+  [53,   'router',  35],
+  [67,   'router',  40],
+  [179,  'router',  40],
   [8291, 'router',  50], // MikroTik Winbox
   [8728, 'router',  50], // MikroTik API
   [2601, 'router',  45], // Quagga/Zebra
-  [443,  'camera',   5], // cameras often run HTTPS but score is low (shared)
   [554,  'camera',  50], // RTSP — strong camera signal
   [8000, 'camera',  20], // Hikvision default
-  [34567,'camera',  45], // Dahua DVR port
-  [9527, 'camera',  45], // common IP cam port
-  [5353, 'iot',     20], // mDNS — IoT devices use this a lot
-  [1900, 'iot',     20], // SSDP / UPnP
-  [8883, 'iot',     35], // MQTT over TLS
+  [34567,'camera',  45], // Dahua DVR
+  [9527, 'camera',  45], // common IP cam
+  [5353, 'iot',     20], // mDNS
+  [1900, 'iot',     20], // SSDP/UPnP
+  [8883, 'iot',     35], // MQTT/TLS
   [1883, 'iot',     35], // MQTT
-  [9100, 'printer', 55], // JetDirect printing
-  [515,  'printer', 55], // LPD printing
-  [631,  'printer', 50], // IPP (CUPS)
+  [9100, 'printer', 55], // JetDirect
+  [515,  'printer', 55], // LPD
+  [631,  'printer', 50], // IPP/CUPS
   [5060, 'voip',    55], // SIP
   [5061, 'voip',    55], // SIP/TLS
-  [3478, 'console', 30], // STUN (Xbox/PS often probe this)
   [3074, 'console', 40], // Xbox Live
-  [3478, 'console', 40], // PS Network
+  [3478, 'console', 40], // PS Network / STUN
   [9295, 'console', 50], // PS Remote Play
   [2049, 'nas',     50], // NFS
   [445,  'nas',     40], // SMB/CIFS
-  [548,  'nas',     50], // AFP (Mac file sharing)
+  [548,  'nas',     50], // AFP
   [5000, 'nas',     30], // Synology DSM
   [5001, 'nas',     35], // Synology DSM HTTPS
-  [8080, 'server',  15], // generic web
+  [8080, 'server',  15],
 ]
 
 // ── Scoring engine ───────────────────────────────────────────────────────────
 
-/**
- * Normalise a MAC address to a plain 12-char hex string (lowercase, no colons).
- */
 function normaliseMac(mac) {
   return (mac || '').toLowerCase().replace(/[^0-9a-f]/g, '')
 }
@@ -399,7 +419,6 @@ function normaliseMac(mac) {
  * @returns {string}       — category key (e.g. 'router', 'console', 'unknown')
  */
 export function classifyDevice(device) {
-  // If user has manually overridden the type, always respect that.
   if (device.device_type_override) return device.device_type_override
 
   const scores = {}
@@ -440,9 +459,6 @@ export function classifyDevice(device) {
     }
   }
 
-  // 4. Normalise: 'router', 'switch', 'ap' all belong to the same display group
-  //    but keep them separate so we can pick the right icon later.
-
   // Find winner
   const entries = Object.entries(scores)
   if (!entries.length) return 'unknown'
@@ -450,8 +466,8 @@ export function classifyDevice(device) {
   entries.sort((a, b) => b[1] - a[1])
   const [bestKey, bestScore] = entries[0]
 
-  // Minimum confidence threshold — below this we say 'unknown'
-  if (bestScore < 40) return 'unknown'
+  // Must meet the confidence threshold — below this we say 'unknown'
+  if (bestScore < CONFIDENCE_THRESHOLD) return 'unknown'
 
   return bestKey
 }
@@ -477,12 +493,10 @@ export function groupDevicesByCategory(devices) {
     groups.get(label).push(device)
   }
 
-  // Sort groups in canonical order; anything else goes at end
   const ordered = new Map()
   for (const groupLabel of CATEGORY_GROUP_ORDER) {
     if (groups.has(groupLabel)) ordered.set(groupLabel, groups.get(groupLabel))
   }
-  // append any unrecognised groups
   for (const [k, v] of groups) {
     if (!ordered.has(k)) ordered.set(k, v)
   }
