@@ -36,27 +36,31 @@ async function streamSSE(path, onLine, signal) {
         const text = line.slice(5).trim()
         if (text) onLine(text)
       }
-      // 'event: done' signals the server is finished -- reader.read() will
-      // return done=true shortly after, so we don't need to handle it explicitly
     }
   }
 }
 
 export const api = {
   // Devices
-  getDevices:    ()           => request('GET',   '/devices'),
-  getDevice:     (mac)        => request('GET',   `/devices/${mac}`),
-  updateDevice:  (mac, body)  => request('PATCH', `/devices/${mac}`, body),
-  resolveName:   (mac)        => request('POST',  `/devices/${mac}/resolve-name`),
-  rescanDevice:  (mac)        => request('POST',  `/devices/${mac}/rescan`),
-  getScanResults:(mac)        => request('GET',   `/devices/${mac}/scan`),
-  getIpHistory:  (mac)        => request('GET',   `/devices/${mac}/ip-history`),
-  getStats:      ()           => request('GET',   '/stats'),
+  getDevices:      ()           => request('GET',   '/devices'),
+  getDevice:       (mac)        => request('GET',   `/devices/${mac}`),
+  updateDevice:    (mac, body)  => request('PATCH', `/devices/${mac}`, body),
+  updateIdentity:  (mac, body)  => request('PATCH', `/devices/${mac}/identity`, body),
+  resolveName:     (mac)        => request('POST',  `/devices/${mac}/resolve-name`),
+  rescanDevice:    (mac)        => request('POST',  `/devices/${mac}/rescan`),
+  getScanResults:  (mac)        => request('GET',   `/devices/${mac}/scan`),
+  getIpHistory:    (mac)        => request('GET',   `/devices/${mac}/ip-history`),
+  getStats:        ()           => request('GET',   '/stats'),
+
+  // Fingerprint DB
+  getFingerprints: (params)     => request('GET',   '/fingerprints' + (params ? `?${new URLSearchParams(params)}` : '')),
+  getFingerprintStats: ()       => request('GET',   '/fingerprints/stats'),
+  deleteFingerprint: (id)       => request('DELETE', `/fingerprints/${id}`),
 
   // Settings
-  getSettings:   ()           => request('GET',  '/settings'),
-  updateSetting: (key, value) => request('PUT',  `/settings/${key}`, { value: String(value) }),
-  resetSettings: ()           => request('POST', '/settings/reset'),
+  getSettings:     ()           => request('GET',  '/settings'),
+  updateSetting:   (key, value) => request('PUT',  `/settings/${key}`, { value: String(value) }),
+  resetSettings:   ()           => request('POST', '/settings/reset'),
 
   // Streaming (returns { start(onLine), stop() })
   streamPing:       (mac, signal) => streamSSE(`/devices/${mac}/ping`,       (l) => l, signal),

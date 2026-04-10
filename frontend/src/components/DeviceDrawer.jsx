@@ -3,11 +3,12 @@ import {
   X, Wifi, WifiOff, Cpu, Globe, Clock, Terminal,
   ShieldCheck, ScanLine, RefreshCw, ExternalLink,
   Activity, GitBranch, Bug, RotateCcw, Ban, History,
-  ChevronDown, ChevronRight, Square,
+  ChevronDown, ChevronRight, Square, Tag, CheckCircle2,
 } from 'lucide-react'
 import { OnlineDot } from './OnlineDot'
 import { api } from '../api'
 import { useStreamAction } from '../hooks/useStreamAction'
+import { CATEGORIES, OVERRIDE_OPTIONS } from '../deviceCategories'
 
 function fmt(iso) {
   if (!iso) return '--'
@@ -114,20 +115,128 @@ function IpHistorySection({ mac }) {
   )
 }
 
+// -- Identity Edit Form --------------------------------------------------------
+// Allows the user to manually confirm or correct the vendor name and device
+// type. Saved values are persisted to the DB AND recorded as a FingerprintEntry
+// so they contribute to the local fingerprint training database.
+function IdentityForm({ device, onSaved }) {
+  const [vendor,     setVendor]     = useState(device.vendor_override || device.vendor || '')
+  const [typeKey,    setTypeKey]    = useState(device.device_type_override || '')
+  const [saving,     setSaving]     = useState(false)
+  const [saved,      setSaved]      = useState(false)
+  const [error,      setError]      = useState(null)
+
+  // Detect category for the currently auto-detected type to show as placeholder
+  const autoType = device.device_type_override ? null : null // will be 'Unknown' if not overridden
+
+  async function handleSave(e) {
+    e.preventDefault()
+    setSaving(true)
+    setError(null)
+    setSaved(false)
+    try {
+      const updated = await api.updateIdentity(device.mac_address, {
+        vendor_override:      vendor.trim()  || null,
+        device_type_override: typeKey         || null,
+      })
+      setSaved(true)
+      setTimeout(() => setSaved(false), 2500)
+      if (onSaved) onSaved(updated)
+    } catch (err) {
+      setError(err.message)
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  function handleClear(e) {
+    e.preventDefault()
+    setVendor('')
+    setTypeKey('')
+  }
+
+  return (
+    <form onSubmit={handleSave} className="space-y-3">
+
+      {/* Vendor */}
+      <div>
+        <label className="block text-xs text-text-muted mb-1">Vendor</label>
+        <input
+          className="input w-full"
+          value={vendor}
+          onChange={e => setVendor(e.target.value)}
+          placeholder={device.vendor || 'e.g. Samsung, Ubiquiti, Hikvision…'}
+        />
+      </div>
+
+      {/* Device type */}
+      <div>
+        <label className="block text-xs text-text-muted mb-1">Device Type</label>
+        <div className="relative">
+          <select
+            className="input w-full appearance-none pr-8"
+            value={typeKey}
+            onChange={e => setTypeKey(e.target.value)}
+          >
+            {OVERRIDE_OPTIONS.map(opt => (
+              <option key={opt.value} value={opt.value}>
+                {opt.value && CATEGORIES[opt.value]
+                  ? `${CATEGORIES[opt.value].label} — ${opt.label}`
+                  : opt.label}
+              </option>
+            ))}
+          </select>
+          <ChevronDown size={13} className="pointer-events-none absolute right-2.5 top-1/2 -translate-y-1/2 text-text-faint" />
+        </div>
+      </div>
+
+      {/* Fingerprint notice */}
+      <p className="text-[11px] text-text-faint leading-relaxed">
+        Saving a device type also records a fingerprint entry in your local
+        database. In a future release you will be able to anonymously share
+        these corrections to help improve classification for all InSpectre users.
+      </p>
+
+      {error && <p className="text-xs text-red-400">{error}</p>}
+
+      <div className="flex gap-2">
+        <button type="submit" disabled={saving} className="btn-primary flex items-center gap-1.5 shrink-0">
+          {saved
+            ? <><CheckCircle2 size={13} /> Saved!</>
+            : saving ? 'Saving…' : 'Save Identity'
+          }
+        </button>
+        <button
+          type="button"
+          onClick={handleClear}
+          className="btn-ghost text-xs text-text-faint hover:text-text"
+          title="Clear overrides — revert to auto-detection"
+        >
+          Reset to auto
+        </button>
+      </div>
+    </form>
+  )
+}
+
 // -- Main component -----------------------------------------------------------
 export function DeviceDrawer({ device, onClose, onRename, onResolveName, onRefresh }) {
   if (!device) return null
 
+  const [localDevice,  setLocalDevice]  = useState(device)
   const [resolving,    setResolving]    = useState(false)
   const [rescanning,   setRescanning]   = useState(false)
   const [activeAction, setActiveAction] = useState(null)
   const [staticLines,  setStaticLines]  = useState([])
 
+  // Keep localDevice in sync if the parent re-renders with new data
+  useEffect(() => { setLocalDevice(device) }, [device])
+
   const stream = useStreamAction()
 
-  const name = device.custom_name || device.hostname || device.ip_address
-  const scan = device.scan_results
-  const mac  = device.mac_address
+  const name = localDevice.custom_name || localDevice.hostname || localDevice.ip_address
+  const scan = localDevice.scan_results
+  const mac  = localDevice.mac_address
 
   async function handleResolve() {
     setResolving(true)
@@ -192,7 +301,7 @@ export function DeviceDrawer({ device, onClose, onRename, onResolveName, onRefre
         {/* Header */}
         <div className="flex items-center justify-between px-6 py-5 border-b border-border">
           <div className="flex items-center gap-3">
-            <OnlineDot online={device.is_online} />
+            <OnlineDot online={localDevice.is_online} />
             <div>
               <h2 className="font-semibold text-text">{name}</h2>
               <p className="text-xs text-text-muted font-mono">{mac}</p>
@@ -206,12 +315,17 @@ export function DeviceDrawer({ device, onClose, onRename, onResolveName, onRefre
 
           {/* Status badges */}
           <div className="flex gap-2 flex-wrap">
-            {device.is_online
+            {localDevice.is_online
               ? <span className="badge-online"><Wifi size={11} />Online</span>
               : <span className="badge-offline"><WifiOff size={11} />Offline</span>}
-            {device.deep_scanned
+            {localDevice.deep_scanned
               ? <span className="badge-online"><ShieldCheck size={11} />Scanned</span>
               : <span className="badge-scanning"><ScanLine size={11} className="animate-pulse" />Scan pending</span>}
+            {localDevice.device_type_override && (
+              <span className="badge-online" style={{ background: 'rgba(20,184,166,0.12)', color: '#14b8a6', border: '1px solid rgba(20,184,166,0.3)' }}>
+                <Tag size={11} />Identity confirmed
+              </span>
+            )}
           </div>
 
           {/* ACTIONS */}
@@ -263,14 +377,14 @@ export function DeviceDrawer({ device, onClose, onRename, onResolveName, onRefre
 
           {/* Network */}
           <Section title="Network" icon={Globe}>
-            <Row label="IP Address"  value={device.ip_address} mono />
+            <Row label="IP Address"  value={localDevice.ip_address} mono />
             <Row label="MAC Address" value={mac} mono />
-            <Row label="Vendor"      value={device.vendor || 'Unknown'} />
+            <Row label="Vendor"      value={localDevice.vendor_override || localDevice.vendor || 'Unknown'} />
             <Row
               label="Hostname"
               value={
                 <span className="flex items-center gap-2">
-                  <span className="truncate">{device.hostname || '--'}</span>
+                  <span className="truncate">{localDevice.hostname || '--'}</span>
                   <button onClick={handleResolve} disabled={resolving}
                     className="shrink-0 text-brand hover:text-brand-light transition-colors"
                     title="Re-resolve hostname" aria-label="Re-resolve hostname">
@@ -279,8 +393,8 @@ export function DeviceDrawer({ device, onClose, onRename, onResolveName, onRefre
                 </span>
               }
             />
-            {device.custom_name && <Row label="Custom name" value={device.custom_name} />}
-            {device.miss_count  !== undefined && <Row label="Miss count" value={device.miss_count} />}
+            {localDevice.custom_name && <Row label="Custom name" value={localDevice.custom_name} />}
+            {localDevice.miss_count  !== undefined && <Row label="Miss count" value={localDevice.miss_count} />}
           </Section>
 
           {/* IP History */}
@@ -290,8 +404,8 @@ export function DeviceDrawer({ device, onClose, onRename, onResolveName, onRefre
 
           {/* Timeline */}
           <Section title="Timeline" icon={Clock}>
-            <Row label="First seen" value={fmt(device.first_seen)} />
-            <Row label="Last seen"  value={fmt(device.last_seen)} />
+            <Row label="First seen" value={fmt(localDevice.first_seen)} />
+            <Row label="Last seen"  value={fmt(localDevice.last_seen)} />
             {scan?.scanned_at && <Row label="Scanned at" value={fmt(scan.scanned_at)} />}
           </Section>
 
@@ -316,7 +430,7 @@ export function DeviceDrawer({ device, onClose, onRename, onResolveName, onRefre
             <Section title={`Open Ports (${scan.open_ports.length})`} icon={Terminal}>
               {scan.open_ports.map((p, i) => {
                 const web = isWebPort(p.port)
-                const url = web ? portUrl(device.ip_address, p.port) : null
+                const url = web ? portUrl(localDevice.ip_address, p.port) : null
                 return (
                   <div key={i} className="flex items-center gap-3 py-1.5 border-b border-border last:border-0">
                     {web ? (
@@ -340,9 +454,20 @@ export function DeviceDrawer({ device, onClose, onRename, onResolveName, onRefre
             </Section>
           )}
 
+          {/* Identity — vendor + device type editing */}
+          <Section title="Device Identity" icon={Tag}>
+            <IdentityForm
+              device={localDevice}
+              onSaved={updated => {
+                setLocalDevice(updated)
+                if (onRefresh) onRefresh()
+              }}
+            />
+          </Section>
+
           {/* Rename */}
           <Section title="Rename Device" icon={null}>
-            <RenameForm device={device} onRename={onRename} />
+            <RenameForm device={localDevice} onRename={onRename} />
           </Section>
 
         </div>

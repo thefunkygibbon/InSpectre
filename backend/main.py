@@ -13,9 +13,9 @@ from pydantic import BaseModel
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker, Session
 
-from models import Base, Device
+from models import Base, Device, FingerprintEntry
 
-VERSION = "0.5.0"
+VERSION = "0.6.0"
 
 DATABASE_URL  = os.environ.get("DATABASE_URL",  "postgresql://admin:password123@db:5432/inspectre")
 # URL of the probe's internal HTTP API.  The probe runs with network_mode:host
@@ -51,6 +51,17 @@ class DeviceUpdate(BaseModel):
     vendor_override:      Optional[str] = None
 
 
+class IdentityUpdate(BaseModel):
+    """
+    Payload for PATCH /devices/{mac}/identity.
+    The user has manually confirmed the vendor and/or device type for this
+    device.  We save it to the Device row AND record a FingerprintEntry so
+    it can train the local fingerprint database.
+    """
+    vendor_override:      Optional[str] = None   # free-text, e.g. "Samsung"
+    device_type_override: Optional[str] = None   # category key, e.g. "tv"
+
+
 # ── helpers ───────────────────────────────────────────────────────────────────
 
 def _get_device_or_404(mac: str, db: Session) -> Device:
@@ -58,6 +69,10 @@ def _get_device_or_404(mac: str, db: Session) -> Device:
     if not d:
         raise HTTPException(404, "Device not found")
     return d
+
+
+def _normalise_mac(mac: str) -> str:
+    return mac.lower().replace(':', '').replace('-', '').replace('.', '')
 
 
 async def _stream_subprocess(cmd: list[str]) -> AsyncIterator[str]:
@@ -73,6 +88,65 @@ async def _stream_subprocess(cmd: list[str]) -> AsyncIterator[str]:
             yield f"data: {line}\n\n"
     await proc.wait()
     yield "data: __done__\n\n"
+
+
+def _upsert_fingerprint(
+    db: Session,
+    *,
+    source_mac:       str,
+    oui_prefix:       Optional[str],
+    open_ports:       Optional[list],
+    device_type:      str,
+    vendor_name:      Optional[str],
+) -> FingerprintEntry:
+    """
+    Upsert a fingerprint entry for a manually-confirmed device identity.
+
+    If an entry already exists for this (oui_prefix, device_type) pair we
+    increment its hit_count and update the vendor name.  Otherwise we create
+    a new entry with confidence_score=1.0 and source='manual'.
+
+    This is the foundation of the community training loop:
+      local manual corrections  →  FingerprintEntry rows  →  (future) export
+      for anonymous community upload  →  aggregated DB improves auto-classify.
+    """
+    existing = None
+    if oui_prefix:
+        existing = (
+            db.query(FingerprintEntry)
+            .filter(
+                FingerprintEntry.oui_prefix == oui_prefix,
+                FingerprintEntry.device_type == device_type,
+            )
+            .first()
+        )
+
+    if existing:
+        existing.hit_count        += 1
+        existing.vendor_name       = vendor_name or existing.vendor_name
+        existing.source_mac        = source_mac
+        if open_ports:
+            # merge port lists
+            merged = list(set((existing.open_ports or []) + open_ports))
+            existing.open_ports = merged
+        db.commit()
+        db.refresh(existing)
+        return existing
+    else:
+        entry = FingerprintEntry(
+            oui_prefix       = oui_prefix,
+            open_ports       = open_ports or [],
+            device_type      = device_type,
+            vendor_name      = vendor_name,
+            confidence_score = 1.0,
+            hit_count        = 1,
+            source           = 'manual',
+            source_mac       = source_mac,
+        )
+        db.add(entry)
+        db.commit()
+        db.refresh(entry)
+        return entry
 
 
 # ── read endpoints ─────────────────────────────────────────────────────────────
@@ -111,6 +185,99 @@ def update_device(mac: str, payload: DeviceUpdate, db: Session = Depends(get_db)
     db.commit()
     db.refresh(d)
     return _to_dict(d)
+
+
+@app.patch("/devices/{mac}/identity")
+def update_identity(mac: str, payload: IdentityUpdate, db: Session = Depends(get_db)):
+    """
+    Save a user-confirmed vendor + device type for a device.
+
+    In addition to updating the Device row this endpoint upserts a
+    FingerprintEntry row, recording the OUI prefix and any known open ports
+    so the local fingerprint database gradually learns from corrections.
+
+    In a future release the fingerprint rows can be exported / anonymously
+    contributed to a shared community database to improve classification for
+    all InSpectre users.
+    """
+    d = _get_device_or_404(mac, db)
+
+    # Apply overrides to the device
+    if payload.vendor_override is not None:
+        d.vendor_override = payload.vendor_override or None
+    if payload.device_type_override is not None:
+        d.device_type_override = payload.device_type_override or None
+
+    db.commit()
+    db.refresh(d)
+
+    # Record fingerprint contribution when we have a confirmed device type
+    if payload.device_type_override:
+        normalised = _normalise_mac(mac)
+        oui        = normalised[:6] if len(normalised) >= 6 else None
+        ports      = None
+        if d.scan_results and isinstance(d.scan_results.get('open_ports'), list):
+            ports = [p.get('port') for p in d.scan_results['open_ports'] if p.get('port')]
+
+        _upsert_fingerprint(
+            db,
+            source_mac  = mac.lower(),
+            oui_prefix  = oui,
+            open_ports  = ports,
+            device_type = payload.device_type_override,
+            vendor_name = payload.vendor_override or d.vendor or None,
+        )
+
+    return _to_dict(d)
+
+
+# ── fingerprint DB endpoints ──────────────────────────────────────────────────
+
+@app.get("/fingerprints")
+def list_fingerprints(
+    device_type: Optional[str] = None,
+    source:      Optional[str] = None,
+    db: Session = Depends(get_db),
+):
+    """
+    Return the local fingerprint database entries.
+    Filterable by device_type and source ('manual' | 'auto' | 'community').
+    Ordered by hit_count desc so the most-confirmed entries come first.
+    """
+    q = db.query(FingerprintEntry)
+    if device_type:
+        q = q.filter(FingerprintEntry.device_type == device_type)
+    if source:
+        q = q.filter(FingerprintEntry.source == source)
+    entries = q.order_by(FingerprintEntry.hit_count.desc()).all()
+    return [_fp_to_dict(e) for e in entries]
+
+
+@app.get("/fingerprints/stats")
+def fingerprint_stats(db: Session = Depends(get_db)):
+    """Summary counts for the fingerprint DB — useful for a future settings/dashboard widget."""
+    from sqlalchemy import func
+    total   = db.query(func.count(FingerprintEntry.id)).scalar()
+    manual  = db.query(func.count(FingerprintEntry.id)).filter(FingerprintEntry.source == 'manual').scalar()
+    auto    = db.query(func.count(FingerprintEntry.id)).filter(FingerprintEntry.source == 'auto').scalar()
+    comm    = db.query(func.count(FingerprintEntry.id)).filter(FingerprintEntry.source == 'community').scalar()
+    return {
+        "total":     total,
+        "manual":    manual,
+        "auto":      auto,
+        "community": comm,
+    }
+
+
+@app.delete("/fingerprints/{fp_id}")
+def delete_fingerprint(fp_id: int, db: Session = Depends(get_db)):
+    """Remove a single fingerprint entry."""
+    entry = db.get(FingerprintEntry, fp_id)
+    if not entry:
+        raise HTTPException(404, "Fingerprint entry not found")
+    db.delete(entry)
+    db.commit()
+    return {"ok": True, "deleted_id": fp_id}
 
 
 @app.post("/devices/{mac}/resolve-name")
@@ -266,7 +433,7 @@ async def stream_vuln_scan(mac: str, db: Session = Depends(get_db)):
     )
 
 
-# ── serialiser ─────────────────────────────────────────────────────────────────
+# ── serialisers ────────────────────────────────────────────────────────────────
 
 def _to_dict(d: Device) -> dict:
     return {
@@ -282,4 +449,20 @@ def _to_dict(d: Device) -> dict:
         "scan_results":         d.scan_results,
         "device_type_override": getattr(d, 'device_type_override', None),
         "vendor_override":      getattr(d, 'vendor_override',      None),
+    }
+
+
+def _fp_to_dict(e: FingerprintEntry) -> dict:
+    return {
+        "id":               e.id,
+        "oui_prefix":       e.oui_prefix,
+        "hostname_pattern": e.hostname_pattern,
+        "open_ports":       e.open_ports,
+        "device_type":      e.device_type,
+        "vendor_name":      e.vendor_name,
+        "confidence_score": e.confidence_score,
+        "hit_count":        e.hit_count,
+        "source":           e.source,
+        "created_at":       e.created_at.isoformat() if e.created_at else None,
+        "updated_at":       e.updated_at.isoformat() if e.updated_at else None,
     }
