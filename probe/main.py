@@ -10,14 +10,8 @@ import nmap
 import requests
 from scapy.all import ARP, Ether, sniff, srp
 from sqlalchemy import (
-    Boolean,
-    Column,
-    DateTime,
-    Integer,
-    JSON,
-    String,
-    create_engine,
-    text,
+    Boolean, Column, DateTime, Integer, JSON, String, UniqueConstraint,
+    create_engine, text,
 )
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import declarative_base, sessionmaker
@@ -25,17 +19,17 @@ from sqlalchemy.orm import declarative_base, sessionmaker
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
-DATABASE_URL          = os.environ.get("DATABASE_URL", "postgresql://admin:password123@localhost:5432/inspectre")
-SCAN_INTERVAL         = int(os.environ.get("SCAN_INTERVAL", 60))
-IP_RANGE              = os.environ.get("IP_RANGE", "192.168.0.0/24")
-INTERFACE             = os.environ.get("INTERFACE", "eth0")
-NMAP_ARGS             = os.environ.get("NMAP_ARGS", "-O --osscan-limit -sV --version-intensity 5 -T4")
-OS_CONFIDENCE_THRESHOLD = int(os.environ.get("OS_CONFIDENCE_THRESHOLD", 85))
-OFFLINE_MISS_THRESHOLD  = int(os.environ.get("OFFLINE_MISS_THRESHOLD", 3))
-SNIFFER_WORKERS         = int(os.environ.get("SNIFFER_WORKERS", 4))
+DATABASE_URL           = os.environ.get("DATABASE_URL", "postgresql://admin:password123@localhost:5432/inspectre")
+SCAN_INTERVAL          = int(os.environ.get("SCAN_INTERVAL", 60))
+IP_RANGE               = os.environ.get("IP_RANGE", "192.168.0.0/24")
+INTERFACE              = os.environ.get("INTERFACE", "eth0")
+NMAP_ARGS              = os.environ.get("NMAP_ARGS", "-O --osscan-limit -sV --version-intensity 5 -T4")
+OS_CONFIDENCE_THRESHOLD  = int(os.environ.get("OS_CONFIDENCE_THRESHOLD", 85))
+OFFLINE_MISS_THRESHOLD   = int(os.environ.get("OFFLINE_MISS_THRESHOLD", 3))
+SNIFFER_WORKERS          = int(os.environ.get("SNIFFER_WORKERS", 4))
 
 # ---------------------------------------------------------------------------
-# SQLAlchemy model
+# SQLAlchemy models (local copies — probe doesn't import from backend)
 # ---------------------------------------------------------------------------
 Base = declarative_base()
 
@@ -52,6 +46,15 @@ class Device(Base):
     scan_results = Column(JSON,    nullable=True)
     deep_scanned = Column(Boolean, default=False)
     miss_count   = Column(Integer, default=0)
+
+class IPHistory(Base):
+    __tablename__ = "ip_history"
+    __table_args__ = (UniqueConstraint("mac_address", "ip_address", name="uq_ip_history_mac_ip"),)
+    id          = Column(Integer, primary_key=True, autoincrement=True)
+    mac_address = Column(String, nullable=False, index=True)
+    ip_address  = Column(String, nullable=False)
+    first_seen  = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+    last_seen   = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
 
 engine  = create_engine(DATABASE_URL, pool_pre_ping=True)
 Session = sessionmaker(bind=engine)
@@ -87,40 +90,75 @@ def wait_for_db(retries: int = 10, delay: int = 5) -> None:
 def init_db() -> None:
     Base.metadata.create_all(engine)
     with engine.connect() as conn:
+        # Safe column migrations for devices table
         try:
             conn.execute(text("ALTER TABLE devices ADD COLUMN IF NOT EXISTS deep_scanned BOOLEAN DEFAULT FALSE"))
             conn.execute(text("ALTER TABLE devices ADD COLUMN IF NOT EXISTS miss_count INTEGER DEFAULT 0"))
             conn.commit()
         except Exception as e:
             print(f"[DB] Migration note: {e}", flush=True)
+        # Safe creation of ip_history table
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS ip_history (
+                id          SERIAL PRIMARY KEY,
+                mac_address VARCHAR NOT NULL,
+                ip_address  VARCHAR NOT NULL,
+                first_seen  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                last_seen   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                CONSTRAINT uq_ip_history_mac_ip UNIQUE (mac_address, ip_address)
+            )
+        """))
+        conn.execute(text("CREATE INDEX IF NOT EXISTS ix_ip_history_mac ON ip_history (mac_address)"))
+        conn.commit()
+    print("[DB] Migrations complete.", flush=True)
 
 # ---------------------------------------------------------------------------
-# Hostname resolution  --  multi-strategy
+# IP History — upsert one mac+ip pair, return True if this is a new IP
+# ---------------------------------------------------------------------------
+def record_ip(mac: str, ip: str) -> bool:
+    """
+    Upsert a row in ip_history for (mac, ip).
+    Returns True if this ip is NEW for this mac (first_seen == last_seen after upsert),
+    which signals the caller to trigger a fresh nmap scan.
+    """
+    now = datetime.now(timezone.utc)
+    session = Session()
+    try:
+        stmt = (
+            pg_insert(IPHistory)
+            .values(mac_address=mac, ip_address=ip, first_seen=now, last_seen=now)
+            .on_conflict_do_update(
+                constraint="uq_ip_history_mac_ip",
+                set_={"last_seen": now},
+            )
+            .returning(IPHistory.first_seen, IPHistory.last_seen)
+        )
+        result = session.execute(stmt)
+        row = result.fetchone()
+        session.commit()
+        # If first_seen == last_seen (within a second), it was a fresh insert
+        if row:
+            delta = abs((row.last_seen - row.first_seen).total_seconds())
+            return delta < 2
+        return False
+    except Exception as e:
+        session.rollback()
+        print(f"[ip_history] record error {mac}/{ip}: {e}", flush=True)
+        return False
+    finally:
+        session.close()
+
+# ---------------------------------------------------------------------------
+# Hostname resolution — multi-strategy
 # ---------------------------------------------------------------------------
 def _strip_fqdn(name: str) -> str:
-    """Remove trailing dot from FQDN and return the shortest useful label."""
     return name.rstrip('.') if name else ''
 
 def resolve_hostname(ip: str) -> str | None:
-    """
-    Try multiple strategies in order of speed / reliability:
-      1. Standard reverse-DNS (gethostbyaddr) — works if router pushes names
-         into the local DNS server.
-      2. mDNS / Bonjour via `avahi-resolve` (if available) — catches Apple,
-         Android, Linux devices advertising .local names.
-      3. NetBIOS via `nmblookup -A` (if available) — catches Windows PCs
-         and Samba servers.
-      4. LLMNR via `dig` @ff02::1:3 (if available, IPv6 networks).
-      5. Nmap -sn fallback — last resort, slower but thorough.
-    Returns the best name found, or None.
-    """
     name = None
-
-    # 1. Reverse DNS
     try:
         result = socket.gethostbyaddr(ip)
         candidate = _strip_fqdn(result[0])
-        # Reject bare-IP results the resolver sometimes hands back
         if candidate and candidate != ip:
             name = candidate
     except Exception:
@@ -128,12 +166,8 @@ def resolve_hostname(ip: str) -> str | None:
     if name:
         return name
 
-    # 2. mDNS / Avahi  (avahi-resolve -a <ip>)
     try:
-        out = subprocess.run(
-            ["avahi-resolve", "-a", ip],
-            capture_output=True, text=True, timeout=3
-        )
+        out = subprocess.run(["avahi-resolve", "-a", ip], capture_output=True, text=True, timeout=3)
         for line in out.stdout.splitlines():
             parts = line.split()
             if len(parts) >= 2:
@@ -143,14 +177,9 @@ def resolve_hostname(ip: str) -> str | None:
     except (FileNotFoundError, subprocess.TimeoutExpired):
         pass
 
-    # 3. NetBIOS  (nmblookup -A <ip>)
     try:
-        out = subprocess.run(
-            ["nmblookup", "-A", ip],
-            capture_output=True, text=True, timeout=4
-        )
+        out = subprocess.run(["nmblookup", "-A", ip], capture_output=True, text=True, timeout=4)
         for line in out.stdout.splitlines():
-            # Lines look like:  	HOSTNAME         <00> -         B <ACTIVE>
             if '<00>' in line and '<GROUP>' not in line:
                 parts = line.strip().split()
                 if parts:
@@ -160,7 +189,6 @@ def resolve_hostname(ip: str) -> str | None:
     except (FileNotFoundError, subprocess.TimeoutExpired):
         pass
 
-    # 4. nmap -sn hostname extraction (slowest fallback)
     try:
         nm = nmap.PortScanner()
         nm.scan(hosts=ip, arguments="-sn --dns-servers 8.8.8.8")
@@ -258,7 +286,6 @@ def _run_deep_scan_thread(ip: str, mac: str) -> None:
         if device:
             device.scan_results = results
             device.deep_scanned = True
-            # Promote nmap hostname if we still don't have one
             if not device.hostname and results.get("hostnames"):
                 device.hostname = _strip_fqdn(results["hostnames"][0])
             session.commit()
@@ -286,6 +313,9 @@ def upsert_seen_device(mac: str, ip: str, source: str) -> None:
     if not mac or mac == "00:00:00:00:00:00":
         return
 
+    # Record IP history; returns True if this IP is new for this MAC
+    ip_is_new = record_ip(mac, ip)
+
     mac_lock = _get_mac_lock(mac)
     with mac_lock:
         now     = datetime.now(timezone.utc)
@@ -294,14 +324,15 @@ def upsert_seen_device(mac: str, ip: str, source: str) -> None:
             existing = session.get(Device, mac)
             is_new   = existing is None
 
-            # For new devices try all resolution strategies.
-            # For existing devices: only re-resolve if hostname is still None.
             if is_new:
                 hostname = resolve_hostname(ip)
                 vendor   = lookup_vendor(mac)
             else:
                 hostname = existing.hostname or resolve_hostname(ip)
                 vendor   = existing.vendor
+
+            # Detect IP change on an existing device
+            ip_changed = (not is_new) and (existing.ip_address != ip)
 
             safe_hostname = (hostname or '').replace("'", "''")
 
@@ -342,6 +373,23 @@ def upsert_seen_device(mac: str, ip: str, source: str) -> None:
             elif not existing.is_online:
                 print(f"[~] Back online via {source}: {ip} ({mac})", flush=True)
 
+            # Auto-rescan when IP changes (device got a new DHCP lease)
+            if ip_changed:
+                print(f"[~] IP changed {existing.ip_address} -> {ip} for {mac} — queuing rescan", flush=True)
+                # Clear deep_scanned so probe loop triggers a new nmap
+                session2 = Session()
+                try:
+                    dev2 = session2.get(Device, mac)
+                    if dev2:
+                        dev2.deep_scanned = False
+                        dev2.scan_results = None
+                        session2.commit()
+                except Exception:
+                    session2.rollback()
+                finally:
+                    session2.close()
+                trigger_deep_scan(ip, mac)
+
         except Exception as e:
             session.rollback()
             print(f"[DB] Upsert error {mac}: {e}", flush=True)
@@ -349,8 +397,6 @@ def upsert_seen_device(mac: str, ip: str, source: str) -> None:
             session.close()
 
 
-# Re-attempt hostname resolution for devices that still have none.
-# Runs after every sweep so persistent devices eventually get named.
 def refresh_missing_hostnames() -> None:
     session = Session()
     try:
@@ -431,7 +477,6 @@ def main() -> None:
     wait_for_db()
     init_db()
 
-    # Install NetBIOS tools if available (best-effort; won't crash if absent)
     for pkg in ["avahi-utils", "samba-common-bin"]:
         try:
             subprocess.run(["apt-get", "install", "-y", "--no-install-recommends", pkg],
@@ -448,7 +493,7 @@ def main() -> None:
     threading.Thread(target=start_arp_sniffer, daemon=True).start()
 
     while True:
-        session     = Session()
+        session = Session()
         try:
             found       = arp_scan(INTERFACE, IP_RANGE)
             active_macs: set[str] = set()
@@ -461,7 +506,6 @@ def main() -> None:
             session.commit()
             print(f"[*] Sweep done — {len(active_macs)} online", flush=True)
 
-            # Background: try to resolve hostnames for any still-unnamed devices
             threading.Thread(target=refresh_missing_hostnames, daemon=True).start()
 
         except Exception as e:

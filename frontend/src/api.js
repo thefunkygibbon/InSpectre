@@ -18,10 +18,11 @@ export const api = {
   resolveName:   (mac)        => request('POST',  `/devices/${mac}/resolve-name`),
   rescanDevice:  (mac)        => request('POST',  `/devices/${mac}/rescan`),
   getScanResults:(mac)        => request('GET',   `/devices/${mac}/scan`),
+  getIpHistory:  (mac)        => request('GET',   `/devices/${mac}/ip-history`),
   getStats:      ()           => request('GET',   '/stats'),
 
   // Settings
-  getSettings:   ()                    => request('GET',   '/settings'),
-  updateSetting: (key, value)          => request('PUT',   `/settings/${key}`, { value: String(value) }),
-  resetSettings: ()                    => request('POST',  '/settings/reset'),
+  getSettings:   ()           => request('GET',  '/settings'),
+  updateSetting: (key, value) => request('PUT',  `/settings/${key}`, { value: String(value) }),
+  resetSettings: ()           => request('POST', '/settings/reset'),
 }

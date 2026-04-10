@@ -1,9 +1,9 @@
-import { useState } from 'react'
+import { useState, useEffect } from 'react'
 import {
   X, Wifi, WifiOff, Cpu, Globe, Clock, Terminal,
   ShieldCheck, ScanLine, RefreshCw, ExternalLink,
-  Activity, GitBranch, Bug, RotateCcw, Ban,
-  ChevronDown, ChevronRight
+  Activity, GitBranch, Bug, RotateCcw, Ban, History,
+  ChevronDown, ChevronRight,
 } from 'lucide-react'
 import { OnlineDot } from './OnlineDot'
 import { api } from '../api'
@@ -13,17 +13,18 @@ function fmt(iso) {
   return new Date(iso).toLocaleString()
 }
 
+function fmtDate(iso) {
+  if (!iso) return '—'
+  return new Date(iso).toLocaleDateString(undefined, { month: 'short', day: 'numeric', year: 'numeric' })
+}
+
 // Ports that a browser can meaningfully open
 const HTTP_PORTS  = new Set([80, 8080, 8000, 3000, 5000, 8888, 8008, 8081, 8082, 8090, 9000, 9090, 1880])
 const HTTPS_PORTS = new Set([443, 8443, 4443, 9443])
 
-function isWebPort(port) {
-  return HTTP_PORTS.has(port) || HTTPS_PORTS.has(port)
-}
-
+function isWebPort(port)  { return HTTP_PORTS.has(port) || HTTPS_PORTS.has(port) }
 function portUrl(ip, port) {
-  const scheme = HTTPS_PORTS.has(port) ? 'https' : 'http'
-  return `${scheme}://${ip}:${port}`
+  return `${HTTPS_PORTS.has(port) ? 'https' : 'http'}://${ip}:${port}`
 }
 
 // ── Terminal output box ────────────────────────────────────────────────────
@@ -32,15 +33,92 @@ function TerminalBox({ lines, running }) {
   return (
     <div className="mt-3 rounded-lg bg-[#0d1117] border border-[#30363d] p-3 font-mono text-xs
                     text-green-400 max-h-52 overflow-y-auto leading-relaxed">
-      {lines.map((l, i) => (
-        <div key={i} className="whitespace-pre-wrap break-all">{l}</div>
+      {lines.map((l, i) => <div key={i} className="whitespace-pre-wrap break-all">{l}</div>)}
+      {running  && <div className="inline-block animate-pulse">▌</div>}
+      {!running && lines.length > 0 && <div className="text-green-600 mt-1">─── done ───</div>}
+    </div>
+  )
+}
+
+// ── Collapsible wrapper ────────────────────────────────────────────────────
+function Collapsible({ title, icon: Icon, defaultOpen = false, badge, children }) {
+  const [open, setOpen] = useState(defaultOpen)
+  return (
+    <div>
+      <button
+        onClick={() => setOpen(o => !o)}
+        className="w-full flex items-center gap-2 mb-2 group"
+      >
+        {Icon && <Icon size={14} className="text-brand" />}
+        <span className="text-xs font-semibold text-text-muted uppercase tracking-wider flex-1 text-left">
+          {title}
+        </span>
+        {badge != null && (
+          <span className="text-[10px] px-1.5 py-0.5 rounded-full bg-surface-offset text-text-faint tabular-nums">
+            {badge}
+          </span>
+        )}
+        {open
+          ? <ChevronDown  size={13} className="text-text-faint shrink-0" />
+          : <ChevronRight size={13} className="text-text-faint shrink-0" />}
+      </button>
+      {open && <div className="card p-4 space-y-0.5">{children}</div>}
+    </div>
+  )
+}
+
+// ── IP History section ─────────────────────────────────────────────────────
+function IpHistorySection({ mac }) {
+  const [history, setHistory] = useState(null)   // null = loading, [] = empty
+  const [error,   setError]   = useState(null)
+  const [loaded,  setLoaded]  = useState(false)
+
+  // Lazy-load: fetch only when the collapsible is first rendered
+  useEffect(() => {
+    if (loaded) return
+    setLoaded(true)
+    api.getIpHistory(mac)
+      .then(setHistory)
+      .catch(e => { setError(e.message); setHistory([]) })
+  }, [mac, loaded])
+
+  if (history === null) {
+    return (
+      <div className="space-y-2">
+        {[...Array(2)].map((_, i) => (
+          <div key={i} className="skeleton h-8 rounded-lg" />
+        ))}
+      </div>
+    )
+  }
+
+  if (error) {
+    return <p className="text-xs text-red-400">{error}</p>
+  }
+
+  if (history.length === 0) {
+    return <p className="text-xs text-text-muted italic">No IP history recorded yet.</p>
+  }
+
+  return (
+    <div className="space-y-0">
+      {/* column header */}
+      <div className="grid grid-cols-[1fr_1fr_1fr] gap-2 pb-1.5 border-b border-border">
+        <span className="text-[10px] font-semibold uppercase tracking-wider text-text-faint">IP Address</span>
+        <span className="text-[10px] font-semibold uppercase tracking-wider text-text-faint">First seen</span>
+        <span className="text-[10px] font-semibold uppercase tracking-wider text-text-faint">Last seen</span>
+      </div>
+      {history.map((row, i) => (
+        <div
+          key={i}
+          className="grid grid-cols-[1fr_1fr_1fr] gap-2 py-1.5 border-b border-border last:border-0
+                     items-center"
+        >
+          <span className="font-mono text-xs text-brand">{row.ip}</span>
+          <span className="text-xs text-text-muted">{fmtDate(row.first_seen)}</span>
+          <span className="text-xs text-text-muted">{fmtDate(row.last_seen)}</span>
+        </div>
       ))}
-      {running && (
-        <div className="inline-block animate-pulse">▌</div>
-      )}
-      {!running && lines.length > 0 && (
-        <div className="text-green-600 mt-1">─── done ───</div>
-      )}
     </div>
   )
 }
@@ -49,11 +127,11 @@ function TerminalBox({ lines, running }) {
 export function DeviceDrawer({ device, onClose, onRename, onResolveName, onRefresh }) {
   if (!device) return null
 
-  const [resolving,    setResolving]    = useState(false)
-  const [rescanning,   setRescanning]   = useState(false)
-  const [actionLines,  setActionLines]  = useState([])
-  const [actionRunning,setActionRunning]= useState(false)
-  const [activeAction, setActiveAction] = useState(null)   // 'ping'|'traceroute'|'vuln'|null
+  const [resolving,     setResolving]     = useState(false)
+  const [rescanning,    setRescanning]    = useState(false)
+  const [actionLines,   setActionLines]   = useState([])
+  const [actionRunning, setActionRunning] = useState(false)
+  const [activeAction,  setActiveAction]  = useState(null)
 
   const name = device.custom_name || device.hostname || device.ip_address
   const scan = device.scan_results
@@ -64,7 +142,6 @@ export function DeviceDrawer({ device, onClose, onRename, onResolveName, onRefre
     setResolving(false)
   }
 
-  // Reset deep_scanned so probe picks it up on next sweep
   async function handleRescan() {
     setRescanning(true)
     setActiveAction('rescan')
@@ -144,6 +221,11 @@ export function DeviceDrawer({ device, onClose, onRename, onResolveName, onRefre
             {device.miss_count !== undefined && <Row label="Miss count" value={device.miss_count} />}
           </Section>
 
+          {/* IP History — collapsible, lazy-loaded */}
+          <Collapsible title="IP History" icon={History} defaultOpen={false}>
+            <IpHistorySection mac={device.mac_address} />
+          </Collapsible>
+
           {/* Timestamps */}
           <Section title="Timeline" icon={Clock}>
             <Row label="First seen" value={fmt(device.first_seen)} />
@@ -167,7 +249,7 @@ export function DeviceDrawer({ device, onClose, onRename, onResolveName, onRefre
             </Section>
           )}
 
-          {/* Open ports — with clickable HTTP/HTTPS links */}
+          {/* Open ports — clickable HTTP/HTTPS */}
           {scan?.open_ports?.length > 0 && (
             <Section title={`Open Ports (${scan.open_ports.length})`} icon={Terminal}>
               {scan.open_ports.map((p, i) => {
@@ -175,7 +257,6 @@ export function DeviceDrawer({ device, onClose, onRename, onResolveName, onRefre
                 const url = web ? portUrl(device.ip_address, p.port) : null
                 return (
                   <div key={i} className="flex items-center gap-3 py-1.5 border-b border-border last:border-0">
-                    {/* Port number — teal link or plain label */}
                     {web ? (
                       <a
                         href={url}
@@ -193,9 +274,7 @@ export function DeviceDrawer({ device, onClose, onRename, onResolveName, onRefre
                     )}
                     <span className="text-sm text-text">{p.service}</span>
                     {p.product && (
-                      <span className="text-xs text-text-muted ml-auto truncate">
-                        {p.product} {p.version}
-                      </span>
+                      <span className="text-xs text-text-muted ml-auto truncate">{p.product} {p.version}</span>
                     )}
                   </div>
                 )
@@ -203,50 +282,18 @@ export function DeviceDrawer({ device, onClose, onRename, onResolveName, onRefre
             </Section>
           )}
 
-          {/* ── Actions ─────────────────────────────────────────────────── */}
+          {/* Actions */}
           <Section title="Actions" icon={Activity}>
             <div className="grid grid-cols-2 gap-2 pt-1">
-              {/* Ping */}
-              <ActionBtn
-                icon={Activity}
-                label="Ping"
-                active={activeAction === 'ping'}
-                onClick={() => handlePlaceholderAction(
-                  'ping',
-                  'Streaming ping ready — probe-side SSE endpoint coming in Phase 3.'
-                )}
-              />
-              {/* Traceroute */}
-              <ActionBtn
-                icon={GitBranch}
-                label="Traceroute"
-                active={activeAction === 'traceroute'}
-                onClick={() => handlePlaceholderAction(
-                  'traceroute',
-                  'Streaming traceroute ready — probe-side SSE endpoint coming in Phase 3.'
-                )}
-              />
-              {/* Re-scan ports — live */}
-              <ActionBtn
-                icon={RotateCcw}
-                label="Re-scan ports"
-                active={activeAction === 'rescan'}
-                loading={rescanning}
-                onClick={handleRescan}
-              />
-              {/* Vuln scan */}
-              <ActionBtn
-                icon={Bug}
-                label="Vuln scan"
-                active={activeAction === 'vuln'}
-                onClick={() => handlePlaceholderAction(
-                  'vuln',
-                  'Vulnerability scan ready — probe-side SSE endpoint coming in Phase 3.'
-                )}
-              />
+              <ActionBtn icon={Activity}  label="Ping"         active={activeAction === 'ping'}
+                onClick={() => handlePlaceholderAction('ping', 'Streaming ping ready — probe-side SSE endpoint coming in Phase 3.')} />
+              <ActionBtn icon={GitBranch} label="Traceroute"   active={activeAction === 'traceroute'}
+                onClick={() => handlePlaceholderAction('traceroute', 'Streaming traceroute ready — probe-side SSE endpoint coming in Phase 3.')} />
+              <ActionBtn icon={RotateCcw} label="Re-scan ports" active={activeAction === 'rescan'}
+                loading={rescanning} onClick={handleRescan} />
+              <ActionBtn icon={Bug}       label="Vuln scan"    active={activeAction === 'vuln'}
+                onClick={() => handlePlaceholderAction('vuln', 'Vulnerability scan ready — probe-side SSE endpoint coming in Phase 3.')} />
             </div>
-
-            {/* Block internet — Phase 4 */}
             <button
               disabled
               className="mt-2 w-full flex items-center justify-center gap-2 py-2 rounded-lg
@@ -257,8 +304,6 @@ export function DeviceDrawer({ device, onClose, onRename, onResolveName, onRefre
               Block internet access
               <span className="ml-auto text-[10px] bg-surface-offset px-1.5 py-0.5 rounded">Phase 4</span>
             </button>
-
-            {/* Terminal output */}
             <TerminalBox lines={actionLines} running={actionRunning} />
           </Section>
 
@@ -273,7 +318,6 @@ export function DeviceDrawer({ device, onClose, onRename, onResolveName, onRefre
   )
 }
 
-// ── Action button ──────────────────────────────────────────────────────────
 function ActionBtn({ icon: Icon, label, onClick, active, loading }) {
   return (
     <button
@@ -293,7 +337,6 @@ function ActionBtn({ icon: Icon, label, onClick, active, loading }) {
   )
 }
 
-// ── Section wrapper ────────────────────────────────────────────────────────
 function Section({ title, icon: Icon, children }) {
   return (
     <div>
@@ -306,7 +349,6 @@ function Section({ title, icon: Icon, children }) {
   )
 }
 
-// ── Key-value row ──────────────────────────────────────────────────────────
 function Row({ label, value, mono }) {
   return (
     <div className="flex items-center justify-between py-1.5 gap-4 border-b border-border last:border-0">
@@ -318,7 +360,6 @@ function Row({ label, value, mono }) {
   )
 }
 
-// ── Rename form ────────────────────────────────────────────────────────────
 function RenameForm({ device, onRename }) {
   const [val, setVal]       = useState(device.custom_name || '')
   const [saving, setSaving] = useState(false)
