@@ -66,15 +66,21 @@ function useSSEStream() {
 
 // -- Terminal output box -----------------------------------------------------
 function TerminalBox({ lines, running, onStop }) {
-  const bottomRef = useRef(null)
+  const containerRef = useRef(null)
+
+  // Scroll ONLY the terminal box itself — never the outer page
   useEffect(() => {
-    bottomRef.current?.scrollIntoView({ behavior: 'smooth' })
+    const el = containerRef.current
+    if (el) el.scrollTop = el.scrollHeight
   }, [lines])
 
   if (!lines.length && !running) return null
   return (
-    <div className="mt-3 rounded-lg bg-[#0d1117] border border-[#30363d] p-3 font-mono text-xs
-                    text-green-400 max-h-64 overflow-y-auto leading-relaxed relative">
+    <div
+      ref={containerRef}
+      className="mt-3 rounded-lg bg-[#0d1117] border border-[#30363d] p-3 font-mono text-xs
+                 text-green-400 max-h-64 overflow-y-auto leading-relaxed relative"
+    >
       {running && (
         <button
           onClick={onStop}
@@ -87,7 +93,6 @@ function TerminalBox({ lines, running, onStop }) {
       {lines.map((l, i) => <div key={i} className="whitespace-pre-wrap break-all">{l}</div>)}
       {running  && <div className="inline-block animate-pulse">&#9608;</div>}
       {!running && lines.length > 0 && <div className="text-green-600 mt-1">--- done ---</div>}
-      <div ref={bottomRef} />
     </div>
   )
 }

@@ -505,27 +505,19 @@ def probe_health():
 
 def start_probe_api() -> None:
     """
-    Run the probe's internal FastAPI server in a dedicated event loop.
-    Using uvicorn.Server directly avoids the signal-handler error that
-    occurs when uvicorn.run() is called from a non-main thread.
+    Run uvicorn in a background thread.
+    loop="none" tells uvicorn NOT to install signal handlers or manage
+    an event loop itself -- it creates one internally per-thread, which
+    is safe when called from a non-main thread.
     """
     print(f"[*] Probe API listening on :{PROBE_API_PORT}", flush=True)
-    config = uvicorn.Config(
+    uvicorn.run(
         probe_api,
         host="0.0.0.0",
         port=PROBE_API_PORT,
         log_level="warning",
-        loop="asyncio",
+        loop="none",
     )
-    server = uvicorn.Server(config)
-    # Create a fresh event loop for this thread so there's no conflict
-    # with the main thread's loop (or lack thereof).
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    try:
-        loop.run_until_complete(server.serve())
-    finally:
-        loop.close()
 
 # ---------------------------------------------------------------------------
 # Main
@@ -541,11 +533,11 @@ def main() -> None:
         flush=True,
     )
 
-    # Start probe HTTP API in background (own event loop -- thread-safe)
+    # Start probe HTTP API in background thread
     threading.Thread(target=start_probe_api, daemon=True, name="probe-api").start()
 
-    # Give the API a moment to bind before the sweep starts
-    time.sleep(1)
+    # Give the API time to bind before the first sweep
+    time.sleep(2)
 
     # Start passive ARP sniffer in background
     threading.Thread(target=start_arp_sniffer, daemon=True, name="arp-sniffer").start()
