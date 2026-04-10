@@ -2,6 +2,17 @@ import { useState, useEffect, useRef, useCallback } from 'react'
 import { api } from '../api'
 
 /**
+ * Enrich a raw device object from the API with a computed display_name.
+ * Priority: custom_name > hostname > ip_address
+ */
+function enrich(d) {
+  return {
+    ...d,
+    display_name: d.custom_name || d.hostname || d.ip_address || d.mac_address,
+  }
+}
+
+/**
  * useDevices
  *
  * Polls /devices and /stats on an interval.
@@ -25,7 +36,8 @@ export function useDevices(intervalMs = 10000) {
 
   const fetchData = useCallback(async () => {
     try {
-      const [devList, st] = await Promise.all([api.getDevices(), api.getStats()])
+      const [rawList, st] = await Promise.all([api.getDevices(), api.getStats()])
+      const devList = rawList.map(enrich)
 
       // ---- New device detection ----
       if (knownMacsRef.current === null) {
