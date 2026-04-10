@@ -8,7 +8,7 @@ import os
 import socket
 import subprocess
 
-from models import Base, Device
+from models import Base, Device, Setting
 
 DATABASE_URL = os.environ.get("DATABASE_URL", "postgresql://admin:password123@db:5432/inspectre")
 engine       = create_engine(DATABASE_URL, pool_pre_ping=True)
@@ -23,6 +23,26 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# ---------------------------------------------------------------------------
+# Default settings — seeded on first run
+# ---------------------------------------------------------------------------
+DEFAULT_SETTINGS = [
+    {"key": "scan_interval",           "value": "60",                                         "description": "Seconds between ARP sweep cycles."},
+    {"key": "offline_miss_threshold",  "value": "3",                                          "description": "Consecutive missed sweeps before a device is marked offline."},
+    {"key": "os_confidence_threshold", "value": "85",                                         "description": "Minimum nmap OS confidence % to record a match."},
+    {"key": "sniffer_workers",         "value": "4",                                          "description": "Worker threads for the passive ARP sniffer."},
+    {"key": "ip_range",                "value": os.environ.get("IP_RANGE", "192.168.0.0/24"), "description": "CIDR range to scan."},
+    {"key": "nmap_args",               "value": "-O --osscan-limit -sV --version-intensity 5 -T4", "description": "Arguments passed to nmap during deep scans."},
+]
+
+def seed_default_settings(db: Session) -> None:
+    """Insert default settings if they don't already exist."""
+    for s in DEFAULT_SETTINGS:
+        if not db.get(Setting, s["key"]):
+            db.add(Setting(key=s["key"], value=s["value"], description=s["description"]))
+    db.commit()
+
+
 def get_db():
     db = SessionLocal()
     try:
@@ -30,19 +50,31 @@ def get_db():
     finally:
         db.close()
 
+
+# Seed defaults at startup
+with SessionLocal() as _db:
+    seed_default_settings(_db)
+
+
+# ---------------------------------------------------------------------------
+# Pydantic models
+# ---------------------------------------------------------------------------
 class DeviceUpdate(BaseModel):
     custom_name: Optional[str] = None
     hostname:    Optional[str] = None
 
+class SettingUpdate(BaseModel):
+    value: str
+
+
 # ---------------------------------------------------------------------------
-# Hostname resolution helpers (mirrors probe logic so API can re-resolve)
+# Hostname resolution helpers
 # ---------------------------------------------------------------------------
 def _strip_fqdn(name: str) -> str:
     return name.rstrip('.') if name else ''
 
 def _resolve_hostname(ip: str) -> str | None:
     """Multi-strategy hostname resolution — reverse DNS, mDNS, NetBIOS."""
-    # 1. Reverse DNS
     try:
         result = socket.gethostbyaddr(ip)
         candidate = _strip_fqdn(result[0])
@@ -51,7 +83,6 @@ def _resolve_hostname(ip: str) -> str | None:
     except Exception:
         pass
 
-    # 2. mDNS (avahi)
     try:
         out = subprocess.run(
             ["avahi-resolve", "-a", ip],
@@ -66,7 +97,6 @@ def _resolve_hostname(ip: str) -> str | None:
     except Exception:
         pass
 
-    # 3. NetBIOS (nmblookup)
     try:
         out = subprocess.run(
             ["nmblookup", "-A", ip],
@@ -84,8 +114,9 @@ def _resolve_hostname(ip: str) -> str | None:
 
     return None
 
+
 # ---------------------------------------------------------------------------
-# Routes
+# Routes — devices
 # ---------------------------------------------------------------------------
 @app.get("/")
 def root():
@@ -120,7 +151,6 @@ def update_device(mac: str, payload: DeviceUpdate, db: Session = Depends(get_db)
 
 @app.post("/devices/{mac}/resolve-name")
 def resolve_name(mac: str, db: Session = Depends(get_db)):
-    """Trigger an on-demand hostname resolution for a device."""
     d = db.get(Device, mac.lower())
     if not d:
         raise HTTPException(404, "Device not found")
@@ -135,7 +165,6 @@ def resolve_name(mac: str, db: Session = Depends(get_db)):
 def rescan_device(mac: str, db: Session = Depends(get_db)):
     """
     Reset deep_scanned so the probe queues a fresh nmap on its next sweep.
-    The probe checks for devices where deep_scanned=False on every cycle.
     """
     d = db.get(Device, mac.lower())
     if not d:
@@ -168,6 +197,47 @@ def stats(db: Session = Depends(get_db)):
         "deep_scanned":  scanned,
     }
 
+
+# ---------------------------------------------------------------------------
+# Routes — settings
+# ---------------------------------------------------------------------------
+@app.get("/settings")
+def get_settings(db: Session = Depends(get_db)):
+    """Return all settings as a list of {key, value, description} objects."""
+    rows = db.query(Setting).order_by(Setting.key).all()
+    return [_setting_dict(s) for s in rows]
+
+@app.put("/settings/{key}")
+def update_setting(key: str, payload: SettingUpdate, db: Session = Depends(get_db)):
+    """Create or update a single setting by key."""
+    s = db.get(Setting, key)
+    if s:
+        s.value = payload.value
+    else:
+        # Allow new keys (e.g. future features writing their own settings)
+        s = Setting(key=key, value=payload.value)
+        db.add(s)
+    db.commit()
+    db.refresh(s)
+    return _setting_dict(s)
+
+@app.post("/settings/reset")
+def reset_settings(db: Session = Depends(get_db)):
+    """Reset all settings back to their default values."""
+    for default in DEFAULT_SETTINGS:
+        s = db.get(Setting, default["key"])
+        if s:
+            s.value = default["value"]
+        else:
+            db.add(Setting(key=default["key"], value=default["value"], description=default["description"]))
+    db.commit()
+    rows = db.query(Setting).order_by(Setting.key).all()
+    return [_setting_dict(s) for s in rows]
+
+
+# ---------------------------------------------------------------------------
+# Serialisers
+# ---------------------------------------------------------------------------
 def _to_dict(d: Device) -> dict:
     return {
         "mac_address":  d.mac_address,
@@ -182,4 +252,12 @@ def _to_dict(d: Device) -> dict:
         "last_seen":    d.last_seen.isoformat()  if d.last_seen  else None,
         "scan_results": d.scan_results,
         "display_name": d.custom_name or d.hostname or d.ip_address,
+    }
+
+def _setting_dict(s: Setting) -> dict:
+    return {
+        "key":         s.key,
+        "value":       s.value,
+        "description": s.description or '',
+        "updated_at":  s.updated_at.isoformat() if s.updated_at else None,
     }
