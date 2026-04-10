@@ -51,6 +51,13 @@ services:
       NMAP_ARGS: "-O --osscan-guess -sV --version-intensity 5 -T4"
       PROBE_API_PORT: "8001"
       PYTHONUNBUFFERED: "1"
+      # ── DNS / Hostname resolution ──────────────────────────────────────────
+      # Set this to your router/DNS server IP so the probe can resolve LAN
+      # hostnames via PTR (reverse DNS) lookups.
+      # Example: LAN_DNS_SERVER: "192.168.0.1"
+      # Without this, the probe tries to auto-detect from /etc/resolv.conf and
+      # the default gateway, but an explicit value is always more reliable.
+      LAN_DNS_SERVER: "192.168.0.1"
     cap_add:
       - NET_ADMIN
       - NET_RAW

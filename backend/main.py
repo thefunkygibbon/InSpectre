@@ -15,6 +15,8 @@ from sqlalchemy.orm import sessionmaker, Session
 
 from models import Base, Device
 
+VERSION = "0.5.0"
+
 DATABASE_URL  = os.environ.get("DATABASE_URL",  "postgresql://admin:password123@db:5432/inspectre")
 # URL of the probe's internal HTTP API.  The probe runs with network_mode:host
 # so from the backend (bridge network) we reach it via host.docker.internal.
@@ -24,7 +26,7 @@ engine       = create_engine(DATABASE_URL, pool_pre_ping=True)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base.metadata.create_all(bind=engine)
 
-app = FastAPI(title="InSpectre API", version="0.4.0")
+app = FastAPI(title="InSpectre API", version=VERSION)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -42,11 +44,11 @@ def get_db():
 
 
 class DeviceUpdate(BaseModel):
-    custom_name:         Optional[str] = None
-    hostname:            Optional[str] = None
-    vendor:              Optional[str] = None
+    custom_name:          Optional[str] = None
+    hostname:             Optional[str] = None
+    vendor:               Optional[str] = None
     device_type_override: Optional[str] = None
-    vendor_override:     Optional[str] = None
+    vendor_override:      Optional[str] = None
 
 
 # ── helpers ───────────────────────────────────────────────────────────────────
@@ -77,7 +79,7 @@ async def _stream_subprocess(cmd: list[str]) -> AsyncIterator[str]:
 
 @app.get("/")
 def root():
-    return {"message": "InSpectre API is online", "version": "0.4.0"}
+    return {"message": "InSpectre API is online", "version": VERSION}
 
 
 @app.get("/devices")
@@ -130,7 +132,6 @@ async def resolve_name(mac: str, db: Session = Depends(get_db)):
                 data     = resp.json()
                 hostname = data.get("hostname") or None
     except Exception as e:
-        # Probe unreachable — surface a useful error rather than a silent failure
         raise HTTPException(
             503,
             f"Could not reach probe API at {PROBE_API_URL}. "
@@ -159,9 +160,7 @@ async def request_rescan(mac: str, db: Session = Depends(get_db)):
                 raise HTTPException(resp.status_code, resp.text)
     except HTTPException:
         raise
-    except Exception as e:
-        # Probe unreachable — fall back to just marking deep_scanned=False
-        # so it will be picked up on the next sweep cycle
+    except Exception:
         pass
 
     d.deep_scanned = False

@@ -22,6 +22,11 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import declarative_base, sessionmaker
 
 # ---------------------------------------------------------------------------
+# Version
+# ---------------------------------------------------------------------------
+VERSION = "0.5.0"
+
+# ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
 DATABASE_URL            = os.environ.get("DATABASE_URL",            "postgresql://admin:password123@localhost:5432/inspectre")
@@ -33,6 +38,10 @@ OS_CONFIDENCE_THRESHOLD = int(os.environ.get("OS_CONFIDENCE_THRESHOLD", 85))
 OFFLINE_MISS_THRESHOLD  = int(os.environ.get("OFFLINE_MISS_THRESHOLD",   3))
 SNIFFER_WORKERS         = int(os.environ.get("SNIFFER_WORKERS",          4))
 PROBE_API_PORT          = int(os.environ.get("PROBE_API_PORT",         8001))
+# Explicit LAN DNS server override. Set this to your router/DNS IP (e.g. 192.168.0.1)
+# in docker-compose. When set it is used as the primary DNS target for PTR lookups
+# and skips the /etc/resolv.conf detection entirely.
+LAN_DNS_SERVER_ENV      = os.environ.get("LAN_DNS_SERVER", "").strip()
 
 PING_COUNT    = 10
 TRACE_MAX_HOP = 30
@@ -99,12 +108,16 @@ def wait_for_db(retries: int = 10, delay: int = 5) -> None:
 def init_db() -> None:
     Base.metadata.create_all(engine)
     with engine.connect() as conn:
+        # ── Column migrations ──
         try:
             conn.execute(text("ALTER TABLE devices ADD COLUMN IF NOT EXISTS deep_scanned BOOLEAN DEFAULT FALSE"))
             conn.execute(text("ALTER TABLE devices ADD COLUMN IF NOT EXISTS miss_count INTEGER DEFAULT 0"))
             conn.commit()
         except Exception as e:
-            print(f"[DB] Migration note: {e}", flush=True)
+            print(f"[DB] Column migration note: {e}", flush=True)
+            conn.rollback()
+
+        # ── ip_history table (idempotent) ──
         conn.execute(text("""
             CREATE TABLE IF NOT EXISTS ip_history (
                 id          SERIAL PRIMARY KEY,
@@ -117,6 +130,21 @@ def init_db() -> None:
         """))
         conn.execute(text("CREATE INDEX IF NOT EXISTS ix_ip_history_mac ON ip_history (mac_address)"))
         conn.commit()
+
+        # ── CRITICAL: add the unique constraint to existing tables that were
+        #    created before this constraint existed.  DO_NOTHING means if it
+        #    already exists (fresh install) this is a no-op. ──
+        try:
+            conn.execute(text("""
+                ALTER TABLE ip_history
+                    ADD CONSTRAINT uq_ip_history_mac_ip UNIQUE (mac_address, ip_address)
+            """))
+            conn.commit()
+            print("[DB] Added uq_ip_history_mac_ip constraint.", flush=True)
+        except Exception:
+            # Constraint already exists — that's fine
+            conn.rollback()
+
     print("[DB] Migrations complete.", flush=True)
 
 # ---------------------------------------------------------------------------
@@ -158,31 +186,75 @@ def _strip_fqdn(name: str) -> str:
 _DNS_SERVER: str | None = None
 _DNS_DETECTED = False
 
+def _get_default_gateway() -> str | None:
+    """Read the default gateway from 'ip route' — usually the router, which is
+    also the LAN DNS server on most home networks."""
+    try:
+        out = subprocess.run(
+            ["ip", "route", "show", "default"],
+            capture_output=True, text=True, timeout=3,
+        )
+        for line in out.stdout.splitlines():
+            parts = line.split()
+            # Format: default via <gateway_ip> dev <iface> ...
+            if len(parts) >= 3 and parts[0] == "default" and parts[1] == "via":
+                gw = parts[2]
+                if not gw.startswith("127.") and not gw.startswith("169.254."):
+                    print(f"[hostname] Default gateway detected: {gw}", flush=True)
+                    return gw
+    except Exception as e:
+        print(f"[hostname] Gateway detection failed: {e}", flush=True)
+    return None
+
 def _detect_dns_server() -> str | None:
-    """Read the first non-loopback nameserver from /etc/resolv.conf (usually the router)."""
+    """Determine the best DNS server to use for PTR lookups.
+
+    Priority:
+      1. LAN_DNS_SERVER env var (explicit override — most reliable)
+      2. First non-loopback nameserver from /etc/resolv.conf
+      3. Default gateway from 'ip route' (router usually also answers DNS)
+    """
+    # 1. Explicit env override
+    if LAN_DNS_SERVER_ENV:
+        print(f"[hostname] DNS server from env (LAN_DNS_SERVER): {LAN_DNS_SERVER_ENV}", flush=True)
+        return LAN_DNS_SERVER_ENV
+
+    # 2. /etc/resolv.conf — skip loopback addresses (127.x, 169.254.x)
+    #    Docker injects 127.0.0.11 (its embedded resolver) and systemd-resolved
+    #    uses 127.0.0.53 — neither can answer PTR queries for LAN hostnames.
     try:
         with open("/etc/resolv.conf") as f:
             for line in f:
                 parts = line.strip().split()
                 if parts and parts[0] == "nameserver" and len(parts) >= 2:
                     ip = parts[1]
-                    # Skip loopback / link-local
                     if not ip.startswith("127.") and not ip.startswith("169.254."):
-                        print(f"[hostname] Using DNS server: {ip}", flush=True)
+                        print(f"[hostname] DNS server from resolv.conf: {ip}", flush=True)
                         return ip
+                    else:
+                        print(f"[hostname] Skipping loopback nameserver: {ip}", flush=True)
     except Exception:
         pass
+
+    # 3. Fall back to default gateway (works for most home/office routers)
+    gw = _get_default_gateway()
+    if gw:
+        print(f"[hostname] Using default gateway as DNS server: {gw}", flush=True)
+        return gw
+
+    print("[hostname] WARNING: no usable DNS server found. "
+          "Set LAN_DNS_SERVER=<router_ip> in docker-compose.yml.", flush=True)
     return None
 
 def resolve_hostname(ip: str) -> str | None:
     global _DNS_SERVER, _DNS_DETECTED
     if not _DNS_DETECTED:
-        _DNS_SERVER = _detect_dns_server()
+        _DNS_SERVER   = _detect_dns_server()
         _DNS_DETECTED = True
 
     print(f"[hostname] Resolving {ip} (DNS server: {_DNS_SERVER})", flush=True)
 
-    # ── Method 1: dig PTR against the local DNS/router ──
+    # ── Method 1: dig PTR against the LAN DNS/router ──
     # Most reliable for .lan / .home / router-assigned names
     if _DNS_SERVER:
         try:
@@ -190,12 +262,13 @@ def resolve_hostname(ip: str) -> str | None:
                 ["dig", "+short", "+time=2", "+tries=1", f"@{_DNS_SERVER}", "-x", ip],
                 capture_output=True, text=True, timeout=5,
             )
-            print(f"[hostname] dig stdout: {out.stdout.strip()!r}  stderr: {out.stderr.strip()!r}", flush=True)
             for line in out.stdout.splitlines():
                 candidate = _strip_fqdn(line.strip())
                 if candidate and candidate != ip and not candidate.startswith(";"):
                     print(f"[hostname] dig resolved {ip} -> {candidate}", flush=True)
                     return candidate
+            if out.stdout.strip():
+                print(f"[hostname] dig stdout: {out.stdout.strip()!r}", flush=True)
         except Exception as e:
             print(f"[hostname] dig failed: {e}", flush=True)
 
@@ -209,14 +282,13 @@ def resolve_hostname(ip: str) -> str | None:
     except Exception as e:
         print(f"[hostname] gethostbyaddr failed for {ip}: {e}", flush=True)
 
-    # ── Method 3: host command against local DNS ──
+    # ── Method 3: host command against LAN DNS ──
     if _DNS_SERVER:
         try:
             out = subprocess.run(
                 ["host", ip, _DNS_SERVER],
                 capture_output=True, text=True, timeout=5,
             )
-            print(f"[hostname] host stdout: {out.stdout.strip()!r}", flush=True)
             for line in out.stdout.splitlines():
                 if "domain name pointer" in line:
                     parts = line.strip().split()
@@ -234,7 +306,6 @@ def resolve_hostname(ip: str) -> str | None:
         if _DNS_SERVER:
             cmd.append(_DNS_SERVER)
         out = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
-        print(f"[hostname] nslookup stdout: {out.stdout.strip()!r}", flush=True)
         for line in out.stdout.splitlines():
             line_l = line.lower()
             if "name =" in line_l or "name=" in line_l:
@@ -558,9 +629,13 @@ def update_presence_from_sweep(session, active_macs: set) -> None:
 
 # ---------------------------------------------------------------------------
 # Probe HTTP API (port 8001)
-# Handles: ping/traceroute SSE, hostname resolution, nmap rescan trigger
 # ---------------------------------------------------------------------------
-probe_api = FastAPI(title="InSpectre Probe Internal API", docs_url=None, redoc_url=None)
+probe_api = FastAPI(
+    title="InSpectre Probe Internal API",
+    version=VERSION,
+    docs_url=None,
+    redoc_url=None,
+)
 probe_api.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -573,7 +648,6 @@ def _sse_line(data: str) -> str:
     return f"data: {safe}\n\n"
 
 def _stream_subprocess(cmd: list[str]):
-    """Generator: yield SSE frames from a subprocess line-by-line."""
     try:
         proc = subprocess.Popen(
             cmd,
@@ -599,7 +673,7 @@ def _stream_subprocess(cmd: list[str]):
 
 @probe_api.get("/health")
 def probe_health():
-    return {"status": "ok", "dns_server": _DNS_SERVER}
+    return {"status": "ok", "version": VERSION, "dns_server": _DNS_SERVER}
 
 
 @probe_api.get("/resolve/{ip}")
@@ -620,10 +694,6 @@ def probe_resolve(ip: str):
 
 @probe_api.post("/rescan/{mac}")
 def probe_rescan(mac: str):
-    """
-    Immediately queue a deep nmap scan for the given MAC address.
-    Called by the backend when the user clicks 'Re-scan ports'.
-    """
     session = Session()
     try:
         device = session.get(Device, mac.lower())
@@ -671,7 +741,7 @@ def stream_traceroute(ip: str):
 
 
 def start_probe_api() -> None:
-    print(f"[*] Probe API listening on :{PROBE_API_PORT}", flush=True)
+    print(f"[*] Probe API v{VERSION} listening on :{PROBE_API_PORT}", flush=True)
     uvicorn.run(
         probe_api,
         host="0.0.0.0",
@@ -684,7 +754,7 @@ def start_probe_api() -> None:
 # Main
 # ---------------------------------------------------------------------------
 def main() -> None:
-    print("[*] InSpectre Probe starting...", flush=True)
+    print(f"[*] InSpectre Probe v{VERSION} starting...", flush=True)
     wait_for_db()
     init_db()
 
@@ -696,14 +766,12 @@ def main() -> None:
 
     # Detect DNS server early so it's available before first scan
     global _DNS_SERVER, _DNS_DETECTED
-    _DNS_SERVER  = _detect_dns_server()
+    _DNS_SERVER   = _detect_dns_server()
     _DNS_DETECTED = True
-    print(f"[*] DNS server detected: {_DNS_SERVER}", flush=True)
+    print(f"[*] DNS server: {_DNS_SERVER or 'NOT DETECTED — set LAN_DNS_SERVER in docker-compose!'}", flush=True)
 
     # Start probe HTTP API in background thread
     threading.Thread(target=start_probe_api, daemon=True, name="probe-api").start()
-
-    # Give the API time to bind before the first sweep
     time.sleep(2)
 
     # Resolve hostnames for all existing devices on startup (background)
