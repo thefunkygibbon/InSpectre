@@ -115,19 +115,63 @@ function IpHistorySection({ mac }) {
   )
 }
 
-// -- Identity Edit Form --------------------------------------------------------
-// Allows the user to manually confirm or correct the vendor name and device
-// type. Saved values are persisted to the DB AND recorded as a FingerprintEntry
-// so they contribute to the local fingerprint training database.
-function IdentityForm({ device, onSaved }) {
-  const [vendor,     setVendor]     = useState(device.vendor_override || device.vendor || '')
-  const [typeKey,    setTypeKey]    = useState(device.device_type_override || '')
-  const [saving,     setSaving]     = useState(false)
-  const [saved,      setSaved]      = useState(false)
-  const [error,      setError]      = useState(null)
+// -- Vendor autocomplete input -------------------------------------------------
+// Fetches all unique vendor names from the DB once, then offers them as
+// <datalist> suggestions. The user can still type anything free-form.
+const DATALIST_ID = 'vendor-suggestions'
 
-  // Detect category for the currently auto-detected type to show as placeholder
-  const autoType = device.device_type_override ? null : null // will be 'Unknown' if not overridden
+function VendorInput({ value, onChange, placeholder }) {
+  const [vendors, setVendors] = useState([])
+
+  // Load once globally — subsequent mounts reuse the cached list
+  useEffect(() => {
+    if (VendorInput._cache) {
+      setVendors(VendorInput._cache)
+      return
+    }
+    api.getVendors()
+      .then(list => {
+        // list is an array of strings; deduplicate and sort
+        const sorted = [...new Set(list.filter(Boolean))].sort((a, b) =>
+          a.toLowerCase().localeCompare(b.toLowerCase())
+        )
+        VendorInput._cache = sorted
+        setVendors(sorted)
+      })
+      .catch(() => {}) // silently degrade — still usable as free-text
+  }, [])
+
+  return (
+    <>
+      <datalist id={DATALIST_ID}>
+        {vendors.map(v => <option key={v} value={v} />)}
+      </datalist>
+      <input
+        list={DATALIST_ID}
+        className="input w-full"
+        value={value}
+        onChange={e => onChange(e.target.value)}
+        placeholder={placeholder}
+        autoComplete="off"
+        spellCheck={false}
+      />
+      {vendors.length > 0 && (
+        <p className="text-[10px] text-text-faint mt-1">
+          {vendors.length} known vendor{vendors.length !== 1 ? 's' : ''} — start typing to filter
+        </p>
+      )}
+    </>
+  )
+}
+VendorInput._cache = null  // module-level cache so it survives re-renders
+
+// -- Identity Edit Form --------------------------------------------------------
+function IdentityForm({ device, onSaved }) {
+  const [vendor,  setVendor]  = useState(device.vendor_override || device.vendor || '')
+  const [typeKey, setTypeKey] = useState(device.device_type_override || '')
+  const [saving,  setSaving]  = useState(false)
+  const [saved,   setSaved]   = useState(false)
+  const [error,   setError]   = useState(null)
 
   async function handleSave(e) {
     e.preventDefault()
@@ -136,10 +180,12 @@ function IdentityForm({ device, onSaved }) {
     setSaved(false)
     try {
       const updated = await api.updateIdentity(device.mac_address, {
-        vendor_override:      vendor.trim()  || null,
-        device_type_override: typeKey         || null,
+        vendor_override:      vendor.trim() || null,
+        device_type_override: typeKey        || null,
       })
       setSaved(true)
+      // Bust the vendor cache so the new name appears immediately next time
+      VendorInput._cache = null
       setTimeout(() => setSaved(false), 2500)
       if (onSaved) onSaved(updated)
     } catch (err) {
@@ -158,14 +204,13 @@ function IdentityForm({ device, onSaved }) {
   return (
     <form onSubmit={handleSave} className="space-y-3">
 
-      {/* Vendor */}
+      {/* Vendor — autocomplete from DB */}
       <div>
         <label className="block text-xs text-text-muted mb-1">Vendor</label>
-        <input
-          className="input w-full"
+        <VendorInput
           value={vendor}
-          onChange={e => setVendor(e.target.value)}
-          placeholder={device.vendor || 'e.g. Samsung, Ubiquiti, Hikvision…'}
+          onChange={setVendor}
+          placeholder={device.vendor || 'e.g. Amazon Technologies Inc.'}
         />
       </div>
 
@@ -181,7 +226,7 @@ function IdentityForm({ device, onSaved }) {
             {OVERRIDE_OPTIONS.map(opt => (
               <option key={opt.value} value={opt.value}>
                 {opt.value && CATEGORIES[opt.value]
-                  ? `${CATEGORIES[opt.value].label} — ${opt.label}`
+                  ? `${CATEGORIES[opt.value].label} \u2014 ${opt.label}`
                   : opt.label}
               </option>
             ))}
@@ -203,14 +248,14 @@ function IdentityForm({ device, onSaved }) {
         <button type="submit" disabled={saving} className="btn-primary flex items-center gap-1.5 shrink-0">
           {saved
             ? <><CheckCircle2 size={13} /> Saved!</>
-            : saving ? 'Saving…' : 'Save Identity'
+            : saving ? 'Saving\u2026' : 'Save Identity'
           }
         </button>
         <button
           type="button"
           onClick={handleClear}
           className="btn-ghost text-xs text-text-faint hover:text-text"
-          title="Clear overrides — revert to auto-detection"
+          title="Clear overrides \u2014 revert to auto-detection"
         >
           Reset to auto
         </button>
@@ -229,7 +274,6 @@ export function DeviceDrawer({ device, onClose, onRename, onResolveName, onRefre
   const [activeAction, setActiveAction] = useState(null)
   const [staticLines,  setStaticLines]  = useState([])
 
-  // Keep localDevice in sync if the parent re-renders with new data
   useEffect(() => { setLocalDevice(device) }, [device])
 
   const stream = useStreamAction()
@@ -261,20 +305,14 @@ export function DeviceDrawer({ device, onClose, onRename, onResolveName, onRefre
   }
 
   function handlePing() {
-    if (activeAction === 'ping' && stream.running) {
-      stream.stop()
-      return
-    }
+    if (activeAction === 'ping' && stream.running) { stream.stop(); return }
     setActiveAction('ping')
     setStaticLines([])
     stream.start(`/devices/${mac}/ping`)
   }
 
   function handleTraceroute() {
-    if (activeAction === 'traceroute' && stream.running) {
-      stream.stop()
-      return
-    }
+    if (activeAction === 'traceroute' && stream.running) { stream.stop(); return }
     setActiveAction('traceroute')
     setStaticLines([])
     stream.start(`/devices/${mac}/traceroute`)
@@ -288,7 +326,6 @@ export function DeviceDrawer({ device, onClose, onRename, onResolveName, onRefre
 
   const termLines   = stream.lines.length ? stream.lines : staticLines
   const termRunning = stream.running
-
   const pingRunning  = activeAction === 'ping'       && stream.running
   const traceRunning = activeAction === 'traceroute' && stream.running
 
@@ -331,34 +368,15 @@ export function DeviceDrawer({ device, onClose, onRename, onResolveName, onRefre
           {/* ACTIONS */}
           <Section title="Actions" icon={Activity}>
             <div className="grid grid-cols-2 gap-2 pt-1">
-
-              {/* Ping — toggles to Stop while running */}
-              {pingRunning ? (
-                <StopBtn label="Stop Ping" onClick={handlePing} />
-              ) : (
-                <ActionBtn icon={Activity} label="Ping"
-                  active={activeAction === 'ping'}
-                  onClick={handlePing} />
-              )}
-
-              {/* Traceroute — toggles to Stop while running */}
-              {traceRunning ? (
-                <StopBtn label="Stop Trace" onClick={handleTraceroute} />
-              ) : (
-                <ActionBtn icon={GitBranch} label="Traceroute"
-                  active={activeAction === 'traceroute'}
-                  onClick={handleTraceroute} />
-              )}
-
-              <ActionBtn icon={RotateCcw} label="Re-scan ports"
-                active={activeAction === 'rescan'}
-                loading={rescanning}
-                onClick={handleRescan} />
-              <ActionBtn icon={Bug}       label="Vuln scan"
-                active={activeAction === 'vuln'}
-                onClick={() => handlePlaceholder('vuln', 'Vulnerability scan -- coming in Phase 3.')} />
+              {pingRunning
+                ? <StopBtn label="Stop Ping"  onClick={handlePing} />
+                : <ActionBtn icon={Activity}  label="Ping"       active={activeAction === 'ping'}       onClick={handlePing} />}
+              {traceRunning
+                ? <StopBtn label="Stop Trace" onClick={handleTraceroute} />
+                : <ActionBtn icon={GitBranch} label="Traceroute" active={activeAction === 'traceroute'} onClick={handleTraceroute} />}
+              <ActionBtn icon={RotateCcw} label="Re-scan ports" active={activeAction === 'rescan'} loading={rescanning} onClick={handleRescan} />
+              <ActionBtn icon={Bug}       label="Vuln scan"     active={activeAction === 'vuln'}   onClick={() => handlePlaceholder('vuln', 'Vulnerability scan -- coming in Phase 3.')} />
             </div>
-
             <button disabled
               className="mt-2 w-full flex items-center justify-center gap-2 py-2 rounded-lg
                          border border-dashed border-border text-xs text-text-faint
@@ -367,12 +385,7 @@ export function DeviceDrawer({ device, onClose, onRename, onResolveName, onRefre
               Block internet access
               <span className="ml-auto text-[10px] bg-surface-offset px-1.5 py-0.5 rounded">Phase 4</span>
             </button>
-
-            <TerminalBox
-              lines={termLines}
-              running={termRunning}
-              onStop={stream.stop}
-            />
+            <TerminalBox lines={termLines} running={termRunning} onStop={stream.stop} />
           </Section>
 
           {/* Network */}
@@ -394,7 +407,7 @@ export function DeviceDrawer({ device, onClose, onRename, onResolveName, onRefre
               }
             />
             {localDevice.custom_name && <Row label="Custom name" value={localDevice.custom_name} />}
-            {localDevice.miss_count  !== undefined && <Row label="Miss count" value={localDevice.miss_count} />}
+            {localDevice.miss_count !== undefined && <Row label="Miss count" value={localDevice.miss_count} />}
           </Section>
 
           {/* IP History */}
@@ -454,7 +467,7 @@ export function DeviceDrawer({ device, onClose, onRename, onResolveName, onRefre
             </Section>
           )}
 
-          {/* Identity — vendor + device type editing */}
+          {/* Identity */}
           <Section title="Device Identity" icon={Tag}>
             <IdentityForm
               device={localDevice}
@@ -476,7 +489,6 @@ export function DeviceDrawer({ device, onClose, onRename, onResolveName, onRefre
   )
 }
 
-// Regular action button
 function ActionBtn({ icon: Icon, label, onClick, active, loading }) {
   return (
     <button onClick={onClick} disabled={loading}
@@ -493,16 +505,13 @@ function ActionBtn({ icon: Icon, label, onClick, active, loading }) {
   )
 }
 
-// Stop button — shown in place of Ping/Traceroute while streaming
 function StopBtn({ label, onClick }) {
   return (
-    <button
-      onClick={onClick}
+    <button onClick={onClick}
       className="flex items-center gap-2 px-3 py-2 rounded-lg border text-xs font-medium
                  transition-colors duration-150
                  border-red-500/40 bg-red-500/10 text-red-400
-                 hover:bg-red-500/20 hover:border-red-500/60"
-    >
+                 hover:bg-red-500/20 hover:border-red-500/60">
       <Square size={12} className="fill-current" />
       {label}
     </button>

@@ -51,6 +51,9 @@ export const api = {
   getIpHistory:    (mac)        => request('GET',   `/devices/${mac}/ip-history`),
   getStats:        ()           => request('GET',   '/stats'),
 
+  // Vendor list for autocomplete
+  getVendors:      ()           => request('GET',   '/vendors'),
+
   // Fingerprint DB
   getFingerprints:     (params) => request('GET',    '/fingerprints' + (params ? `?${new URLSearchParams(params)}` : '')),
   getFingerprintStats: ()       => request('GET',    '/fingerprints/stats'),
