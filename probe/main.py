@@ -34,8 +34,8 @@ OFFLINE_MISS_THRESHOLD  = int(os.environ.get("OFFLINE_MISS_THRESHOLD",   3))
 SNIFFER_WORKERS         = int(os.environ.get("SNIFFER_WORKERS",          4))
 PROBE_API_PORT          = int(os.environ.get("PROBE_API_PORT",         8001))
 
-PING_COUNT   = 10   # how many ICMP echo requests to send
-TRACE_MAX_HOP = 30  # max TTL hops for traceroute
+PING_COUNT    = 10
+TRACE_MAX_HOP = 30
 
 # ---------------------------------------------------------------------------
 # SQLAlchemy models
@@ -259,7 +259,7 @@ def deep_scan(ip: str, mac: str) -> dict:
         if h.get("name") and h["name"] != ip
     ]
     os_label = host_data["os_matches"][0]["name"] if host_data["os_matches"] else "unknown"
-    print(f"[nmap] Done: {ip} — {len(host_data['open_ports'])} ports, OS: {os_label}", flush=True)
+    print(f"[nmap] Done: {ip} -- {len(host_data['open_ports'])} ports, OS: {os_label}", flush=True)
     return host_data
 
 def _run_deep_scan_thread(ip: str, mac: str) -> None:
@@ -346,7 +346,7 @@ def upsert_seen_device(mac: str, ip: str, source: str) -> None:
             elif not existing.is_online:
                 print(f"[~] Back online via {source}: {ip} ({mac})", flush=True)
             if ip_changed:
-                print(f"[~] IP changed {existing.ip_address} -> {ip} for {mac} — queuing rescan", flush=True)
+                print(f"[~] IP changed {existing.ip_address} -> {ip} for {mac} -- queuing rescan", flush=True)
                 session2 = Session()
                 try:
                     dev2 = session2.get(Device, mac)
@@ -433,7 +433,7 @@ def update_presence_from_sweep(session, active_macs: set) -> None:
                 print(f"[-] Offline: {dev.ip_address} ({dev.mac_address})", flush=True)
 
 # ---------------------------------------------------------------------------
-# Probe HTTP API  (port 8001)  — ping & traceroute SSE
+# Probe HTTP API (port 8001) -- ping & traceroute SSE
 # ---------------------------------------------------------------------------
 probe_api = FastAPI(title="InSpectre Probe Internal API", docs_url=None, redoc_url=None)
 probe_api.add_middleware(
@@ -444,8 +444,6 @@ probe_api.add_middleware(
 )
 
 def _sse_line(data: str) -> str:
-    """Format a single SSE data frame."""
-    # Escape newlines inside the data so SSE framing isn't broken
     safe = data.replace("\n", " ").replace("\r", "")
     return f"data: {safe}\n\n"
 
@@ -464,11 +462,10 @@ def _stream_subprocess(cmd: list[str]):
             if line:
                 yield _sse_line(line)
         proc.wait()
-        rc = proc.returncode
-        yield _sse_line(f"--- exit code {rc} ---")
+        yield _sse_line(f"--- exit code {proc.returncode} ---")
         yield "event: done\ndata: {}\n\n"
     except FileNotFoundError as e:
-        yield _sse_line(f"ERROR: command not found — {e}")
+        yield _sse_line(f"ERROR: command not found -- {e}")
         yield "event: done\ndata: {}\n\n"
     except Exception as e:
         yield _sse_line(f"ERROR: {e}")
@@ -476,7 +473,6 @@ def _stream_subprocess(cmd: list[str]):
 
 @probe_api.get("/stream/ping/{ip}")
 def stream_ping(ip: str):
-    # Basic IP sanity check (no shell injection)
     import ipaddress
     try:
         ipaddress.ip_address(ip)
@@ -486,10 +482,7 @@ def stream_ping(ip: str):
     return StreamingResponse(
         _stream_subprocess(cmd),
         media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache",
-            "X-Accel-Buffering": "no",
-        },
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
 
 @probe_api.get("/stream/traceroute/{ip}")
@@ -503,10 +496,7 @@ def stream_traceroute(ip: str):
     return StreamingResponse(
         _stream_subprocess(cmd),
         media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache",
-            "X-Accel-Buffering": "no",
-        },
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
 
 @probe_api.get("/health")
@@ -514,15 +504,34 @@ def probe_health():
     return {"status": "ok"}
 
 def start_probe_api() -> None:
-    """Run the internal FastAPI server in a background thread."""
+    """
+    Run the probe's internal FastAPI server in a dedicated event loop.
+    Using uvicorn.Server directly avoids the signal-handler error that
+    occurs when uvicorn.run() is called from a non-main thread.
+    """
     print(f"[*] Probe API listening on :{PROBE_API_PORT}", flush=True)
-    uvicorn.run(probe_api, host="0.0.0.0", port=PROBE_API_PORT, log_level="warning")
+    config = uvicorn.Config(
+        probe_api,
+        host="0.0.0.0",
+        port=PROBE_API_PORT,
+        log_level="warning",
+        loop="asyncio",
+    )
+    server = uvicorn.Server(config)
+    # Create a fresh event loop for this thread so there's no conflict
+    # with the main thread's loop (or lack thereof).
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        loop.run_until_complete(server.serve())
+    finally:
+        loop.close()
 
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 def main() -> None:
-    print("[*] InSpectre Probe starting…", flush=True)
+    print("[*] InSpectre Probe starting...", flush=True)
     wait_for_db()
     init_db()
 
@@ -532,8 +541,11 @@ def main() -> None:
         flush=True,
     )
 
-    # Start probe HTTP API in background
+    # Start probe HTTP API in background (own event loop -- thread-safe)
     threading.Thread(target=start_probe_api, daemon=True, name="probe-api").start()
+
+    # Give the API a moment to bind before the sweep starts
+    time.sleep(1)
 
     # Start passive ARP sniffer in background
     threading.Thread(target=start_arp_sniffer, daemon=True, name="arp-sniffer").start()
@@ -548,7 +560,7 @@ def main() -> None:
                 upsert_seen_device(entry["mac"], entry["ip"], "sweep")
             update_presence_from_sweep(session, active_macs)
             session.commit()
-            print(f"[*] Sweep done — {len(active_macs)} online", flush=True)
+            print(f"[*] Sweep done -- {len(active_macs)} online", flush=True)
             threading.Thread(target=refresh_missing_hostnames, daemon=True).start()
         except Exception as e:
             session.rollback()

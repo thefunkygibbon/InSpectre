@@ -11,11 +11,11 @@ import { api } from '../api'
 const BASE = import.meta.env.VITE_API_URL || '/api'
 
 function fmt(iso) {
-  if (!iso) return '—'
+  if (!iso) return '--'
   return new Date(iso).toLocaleString()
 }
 function fmtDate(iso) {
-  if (!iso) return '—'
+  if (!iso) return '--'
   return new Date(iso).toLocaleDateString(undefined, { month: 'short', day: 'numeric', year: 'numeric' })
 }
 
@@ -24,12 +24,7 @@ const HTTPS_PORTS = new Set([443, 8443, 4443, 9443])
 function isWebPort(port)   { return HTTP_PORTS.has(port) || HTTPS_PORTS.has(port) }
 function portUrl(ip, port) { return `${HTTPS_PORTS.has(port) ? 'https' : 'http'}://${ip}:${port}` }
 
-// ── SSE hook ────────────────────────────────────────────────────────────────
-/**
- * useSSEStream — opens an EventSource to `url` when `active` is true.
- * Appends each `data:` line to `lines`. Closes cleanly on `done` event or unmount.
- * Returns { lines, running, start, stop }.
- */
+// -- SSE hook ----------------------------------------------------------------
 function useSSEStream() {
   const [lines,   setLines]   = useState([])
   const [running, setRunning] = useState(false)
@@ -44,24 +39,19 @@ function useSSEStream() {
   }
 
   function start(url) {
-    stop()                         // close any previous stream
+    stop()
     setLines([])
     setRunning(true)
-
     const es = new EventSource(url)
     esRef.current = es
-
     es.onmessage = (e) => {
       if (e.data) setLines(prev => [...prev, e.data])
     }
-
-    // `done` event signals the process has exited
     es.addEventListener('done', () => {
       es.close()
       esRef.current = null
       setRunning(false)
     })
-
     es.onerror = () => {
       setLines(prev => [...prev, '--- connection closed ---'])
       es.close()
@@ -70,13 +60,11 @@ function useSSEStream() {
     }
   }
 
-  // Clean up on unmount
   useEffect(() => () => stop(), [])
-
   return { lines, running, start, stop }
 }
 
-// ── Terminal output box ──────────────────────────────────────────────────────
+// -- Terminal output box -----------------------------------------------------
 function TerminalBox({ lines, running, onStop }) {
   const bottomRef = useRef(null)
   useEffect(() => {
@@ -97,14 +85,14 @@ function TerminalBox({ lines, running, onStop }) {
         </button>
       )}
       {lines.map((l, i) => <div key={i} className="whitespace-pre-wrap break-all">{l}</div>)}
-      {running  && <div className="inline-block animate-pulse">▌</div>}
-      {!running && lines.length > 0 && <div className="text-green-600 mt-1">─── done ───</div>}
+      {running  && <div className="inline-block animate-pulse">&#9608;</div>}
+      {!running && lines.length > 0 && <div className="text-green-600 mt-1">--- done ---</div>}
       <div ref={bottomRef} />
     </div>
   )
 }
 
-// ── Collapsible wrapper ──────────────────────────────────────────────────────
+// -- Collapsible wrapper -----------------------------------------------------
 function Collapsible({ title, icon: Icon, defaultOpen = false, children }) {
   const [open, setOpen] = useState(defaultOpen)
   return (
@@ -120,7 +108,7 @@ function Collapsible({ title, icon: Icon, defaultOpen = false, children }) {
   )
 }
 
-// ── IP History section ───────────────────────────────────────────────────────
+// -- IP History section -------------------------------------------------------
 function IpHistorySection({ mac }) {
   const [history, setHistory] = useState(null)
   const [error,   setError]   = useState(null)
@@ -160,15 +148,15 @@ function IpHistorySection({ mac }) {
   )
 }
 
-// ── Main component ───────────────────────────────────────────────────────────
+// -- Main component ----------------------------------------------------------
 export function DeviceDrawer({ device, onClose, onRename, onResolveName, onRefresh }) {
   if (!device) return null
 
   const [resolving,  setResolving]  = useState(false)
   const [rescanning, setRescanning] = useState(false)
   const [activeAction, setActiveAction] = useState(null)
+  const [staticLines, setStaticLines]   = useState([])
 
-  // One SSE stream shared across all streaming actions
   const stream = useSSEStream()
 
   const name = device.custom_name || device.hostname || device.ip_address
@@ -187,10 +175,9 @@ export function DeviceDrawer({ device, onClose, onRename, onResolveName, onRefre
     stream.stop()
     try {
       await api.rescanDevice(mac)
-      // Show feedback in terminal box by using fake lines
-      // (no SSE for this action — it's just a DB flag flip)
+      setStaticLines(['[RESCAN] Deep scan queued -- results will update shortly.'])
     } catch (e) {
-      console.error(e)
+      setStaticLines([`[RESCAN] Error: ${e.message}`])
     } finally {
       setRescanning(false)
       if (onRefresh) onRefresh()
@@ -199,27 +186,23 @@ export function DeviceDrawer({ device, onClose, onRename, onResolveName, onRefre
 
   function handlePing() {
     setActiveAction('ping')
+    setStaticLines([])
     stream.start(`${BASE}/devices/${mac}/ping`)
   }
 
   function handleTraceroute() {
     setActiveAction('traceroute')
+    setStaticLines([])
     stream.start(`${BASE}/devices/${mac}/traceroute`)
   }
 
   function handlePlaceholder(label, note) {
     setActiveAction(label)
-    // use the stream lines state to show the note
     stream.stop()
-    // manually push a line by calling start on a fake URL that errors immediately
-    // instead, just show in a one-shot way:
-    // We'll repurpose the terminal box with a static note
-    _setStaticLines([`[${label.toUpperCase()}] ${note}`])
+    setStaticLines([`[${label.toUpperCase()}] ${note}`])
   }
 
-  // For non-SSE actions that still want the terminal box
-  const [staticLines, _setStaticLines] = useState([])
-  const termLines  = stream.lines.length ? stream.lines : staticLines
+  const termLines   = stream.lines.length ? stream.lines : staticLines
   const termRunning = stream.running
 
   return (
@@ -253,6 +236,42 @@ export function DeviceDrawer({ device, onClose, onRename, onResolveName, onRefre
               : <span className="badge-scanning"><ScanLine size={11} className="animate-pulse" />Scan pending</span>}
           </div>
 
+          {/* ── ACTIONS (top) ── */}
+          <Section title="Actions" icon={Activity}>
+            <div className="grid grid-cols-2 gap-2 pt-1">
+              <ActionBtn icon={Activity}  label="Ping"
+                active={activeAction === 'ping' && stream.running}
+                loading={activeAction === 'ping' && stream.running}
+                onClick={handlePing} />
+              <ActionBtn icon={GitBranch} label="Traceroute"
+                active={activeAction === 'traceroute' && stream.running}
+                loading={activeAction === 'traceroute' && stream.running}
+                onClick={handleTraceroute} />
+              <ActionBtn icon={RotateCcw} label="Re-scan ports"
+                active={activeAction === 'rescan'}
+                loading={rescanning}
+                onClick={handleRescan} />
+              <ActionBtn icon={Bug}       label="Vuln scan"
+                active={activeAction === 'vuln'}
+                onClick={() => handlePlaceholder('vuln', 'Vulnerability scan -- coming in Phase 3.')} />
+            </div>
+
+            <button disabled
+              className="mt-2 w-full flex items-center justify-center gap-2 py-2 rounded-lg
+                         border border-dashed border-border text-xs text-text-faint
+                         cursor-not-allowed opacity-60">
+              <Ban size={12} />
+              Block internet access
+              <span className="ml-auto text-[10px] bg-surface-offset px-1.5 py-0.5 rounded">Phase 4</span>
+            </button>
+
+            <TerminalBox
+              lines={termLines}
+              running={termRunning}
+              onStop={stream.stop}
+            />
+          </Section>
+
           {/* Network */}
           <Section title="Network" icon={Globe}>
             <Row label="IP Address"  value={device.ip_address} mono />
@@ -262,7 +281,7 @@ export function DeviceDrawer({ device, onClose, onRename, onResolveName, onRefre
               label="Hostname"
               value={
                 <span className="flex items-center gap-2">
-                  <span className="truncate">{device.hostname || '—'}</span>
+                  <span className="truncate">{device.hostname || '--'}</span>
                   <button onClick={handleResolve} disabled={resolving}
                     className="shrink-0 text-brand hover:text-brand-light transition-colors"
                     title="Re-resolve hostname" aria-label="Re-resolve hostname">
@@ -332,42 +351,6 @@ export function DeviceDrawer({ device, onClose, onRename, onResolveName, onRefre
             </Section>
           )}
 
-          {/* Actions */}
-          <Section title="Actions" icon={Activity}>
-            <div className="grid grid-cols-2 gap-2 pt-1">
-              <ActionBtn icon={Activity}  label="Ping"
-                active={activeAction === 'ping' && stream.running}
-                loading={activeAction === 'ping' && stream.running}
-                onClick={handlePing} />
-              <ActionBtn icon={GitBranch} label="Traceroute"
-                active={activeAction === 'traceroute' && stream.running}
-                loading={activeAction === 'traceroute' && stream.running}
-                onClick={handleTraceroute} />
-              <ActionBtn icon={RotateCcw} label="Re-scan ports"
-                active={activeAction === 'rescan'}
-                loading={rescanning}
-                onClick={handleRescan} />
-              <ActionBtn icon={Bug}       label="Vuln scan"
-                active={activeAction === 'vuln'}
-                onClick={() => handlePlaceholder('vuln', 'Vulnerability scan — coming in Phase 3.')} />
-            </div>
-
-            <button disabled
-              className="mt-2 w-full flex items-center justify-center gap-2 py-2 rounded-lg
-                         border border-dashed border-border text-xs text-text-faint
-                         cursor-not-allowed opacity-60">
-              <Ban size={12} />
-              Block internet access
-              <span className="ml-auto text-[10px] bg-surface-offset px-1.5 py-0.5 rounded">Phase 4</span>
-            </button>
-
-            <TerminalBox
-              lines={termLines}
-              running={termRunning}
-              onStop={stream.stop}
-            />
-          </Section>
-
           {/* Rename */}
           <Section title="Rename Device" icon={null}>
             <RenameForm device={device} onRename={onRename} />
@@ -412,7 +395,7 @@ function Row({ label, value, mono }) {
     <div className="flex items-center justify-between py-1.5 gap-4 border-b border-border last:border-0">
       <span className="text-xs text-text-muted shrink-0">{label}</span>
       <span className={`text-sm text-text text-right truncate ${mono ? 'font-mono text-xs' : ''}`}>
-        {value ?? '—'}
+        {value ?? '--'}
       </span>
     </div>
   )
@@ -432,9 +415,9 @@ function RenameForm({ device, onRename }) {
   return (
     <form onSubmit={handleSave} className="flex gap-2">
       <input className="input" value={val} onChange={e => setVal(e.target.value)}
-        placeholder={device.hostname || device.ip_address || 'Custom name…'} />
+        placeholder={device.hostname || device.ip_address || 'Custom name...'} />
       <button type="submit" disabled={saving} className="btn-primary shrink-0">
-        {saving ? '…' : 'Save'}
+        {saving ? '...' : 'Save'}
       </button>
     </form>
   )
