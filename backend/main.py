@@ -1,25 +1,26 @@
+import csv
+import io
+import json
 import os
 import re
 import shutil
 import subprocess
 import asyncio
-from typing import Optional, AsyncIterator
+from typing import Optional, AsyncIterator, List
 
 import httpx
-from fastapi import FastAPI, HTTPException, Depends
+from fastapi import FastAPI, HTTPException, Depends, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker, Session
 
-from models import Base, Device, FingerprintEntry
+from models import Base, Device, FingerprintEntry, Setting
 
-VERSION = "0.6.0"
+VERSION = "0.7.0"
 
 DATABASE_URL  = os.environ.get("DATABASE_URL",  "postgresql://admin:password123@db:5432/inspectre")
-# URL of the probe's internal HTTP API.  The probe runs with network_mode:host
-# so from the backend (bridge network) we reach it via host.docker.internal.
 PROBE_API_URL = os.environ.get("PROBE_API_URL", "http://host.docker.internal:8001")
 
 engine       = create_engine(DATABASE_URL, pool_pre_ping=True)
@@ -34,6 +35,31 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# ── default settings seed ─────────────────────────────────────────────────────
+
+DEFAULT_SETTINGS = [
+    {"key": "scan_interval",           "value": "60",   "description": "Seconds between ARP sweep cycles"},
+    {"key": "offline_miss_threshold",  "value": "3",    "description": "Missed sweeps before a device is marked offline"},
+    {"key": "os_confidence_threshold", "value": "75",   "description": "Minimum OS detection confidence % to display"},
+    {"key": "sniffer_workers",         "value": "4",    "description": "Number of parallel deep-scan worker threads"},
+    {"key": "ip_range",                "value": "",     "description": "CIDR range to scan, e.g. 192.168.1.0/24 (blank = auto-detect)"},
+    {"key": "nmap_args",               "value": "-T4",  "description": "Extra arguments passed to nmap deep scans"},
+    {"key": "notifications_enabled",   "value": "true", "description": "Show popup toasts when devices appear or go offline"},
+]
+
+
+def _seed_settings(db: Session):
+    """Insert default settings rows if the table is empty."""
+    if db.query(Setting).count() == 0:
+        for s in DEFAULT_SETTINGS:
+            db.add(Setting(key=s["key"], value=s["value"], description=s["description"]))
+        db.commit()
+
+
+# seed on startup
+with SessionLocal() as _startup_db:
+    _seed_settings(_startup_db)
+
 
 def get_db():
     db = SessionLocal()
@@ -42,6 +68,8 @@ def get_db():
     finally:
         db.close()
 
+
+# ── Pydantic models ───────────────────────────────────────────────────────────
 
 class DeviceUpdate(BaseModel):
     custom_name:          Optional[str] = None
@@ -52,14 +80,23 @@ class DeviceUpdate(BaseModel):
 
 
 class IdentityUpdate(BaseModel):
-    """
-    Payload for PATCH /devices/{mac}/identity.
-    The user has manually confirmed the vendor and/or device type for this
-    device.  We save it to the Device row AND record a FingerprintEntry so
-    it can train the local fingerprint database.
-    """
-    vendor_override:      Optional[str] = None   # free-text, e.g. "Samsung"
-    device_type_override: Optional[str] = None   # category key, e.g. "tv"
+    vendor_override:      Optional[str] = None
+    device_type_override: Optional[str] = None
+
+
+class SettingUpdate(BaseModel):
+    value: str
+
+
+class FingerprintImportRow(BaseModel):
+    oui_prefix:       Optional[str]       = None
+    hostname_pattern: Optional[str]       = None
+    open_ports:       Optional[List[int]] = None
+    device_type:      str
+    vendor_name:      Optional[str]       = None
+    confidence_score: float               = 1.0
+    hit_count:        int                 = 1
+    source:           str                 = "community"
 
 
 # ── helpers ───────────────────────────────────────────────────────────────────
@@ -98,18 +135,10 @@ def _upsert_fingerprint(
     open_ports:       Optional[list],
     device_type:      str,
     vendor_name:      Optional[str],
+    source:           str = "manual",
+    confidence_score: float = 1.0,
+    hit_count_add:    int = 1,
 ) -> FingerprintEntry:
-    """
-    Upsert a fingerprint entry for a manually-confirmed device identity.
-
-    If an entry already exists for this (oui_prefix, device_type) pair we
-    increment its hit_count and update the vendor name.  Otherwise we create
-    a new entry with confidence_score=1.0 and source='manual'.
-
-    This is the foundation of the community training loop:
-      local manual corrections  →  FingerprintEntry rows  →  (future) export
-      for anonymous community upload  →  aggregated DB improves auto-classify.
-    """
     existing = None
     if oui_prefix:
         existing = (
@@ -122,11 +151,13 @@ def _upsert_fingerprint(
         )
 
     if existing:
-        existing.hit_count        += 1
+        existing.hit_count        += hit_count_add
         existing.vendor_name       = vendor_name or existing.vendor_name
         existing.source_mac        = source_mac
+        # bump confidence toward supplied value if higher
+        if confidence_score > existing.confidence_score:
+            existing.confidence_score = confidence_score
         if open_ports:
-            # merge port lists
             merged = list(set((existing.open_ports or []) + open_ports))
             existing.open_ports = merged
         db.commit()
@@ -138,9 +169,9 @@ def _upsert_fingerprint(
             open_ports       = open_ports or [],
             device_type      = device_type,
             vendor_name      = vendor_name,
-            confidence_score = 1.0,
-            hit_count        = 1,
-            source           = 'manual',
+            confidence_score = confidence_score,
+            hit_count        = hit_count_add,
+            source           = source,
             source_mac       = source_mac,
         )
         db.add(entry)
@@ -149,12 +180,14 @@ def _upsert_fingerprint(
         return entry
 
 
-# ── read endpoints ─────────────────────────────────────────────────────────────
+# ── root ──────────────────────────────────────────────────────────────────────
 
 @app.get("/")
 def root():
     return {"message": "InSpectre API is online", "version": VERSION}
 
+
+# ── devices ───────────────────────────────────────────────────────────────────
 
 @app.get("/devices")
 def list_devices(online_only: bool = False, db: Session = Depends(get_db)):
@@ -189,29 +222,14 @@ def update_device(mac: str, payload: DeviceUpdate, db: Session = Depends(get_db)
 
 @app.patch("/devices/{mac}/identity")
 def update_identity(mac: str, payload: IdentityUpdate, db: Session = Depends(get_db)):
-    """
-    Save a user-confirmed vendor + device type for a device.
-
-    In addition to updating the Device row this endpoint upserts a
-    FingerprintEntry row, recording the OUI prefix and any known open ports
-    so the local fingerprint database gradually learns from corrections.
-
-    In a future release the fingerprint rows can be exported / anonymously
-    contributed to a shared community database to improve classification for
-    all InSpectre users.
-    """
     d = _get_device_or_404(mac, db)
-
-    # Apply overrides to the device
     if payload.vendor_override is not None:
         d.vendor_override = payload.vendor_override or None
     if payload.device_type_override is not None:
         d.device_type_override = payload.device_type_override or None
-
     db.commit()
     db.refresh(d)
 
-    # Record fingerprint contribution when we have a confirmed device type
     if payload.device_type_override:
         normalised = _normalise_mac(mac)
         oui        = normalised[:6] if len(normalised) >= 6 else None
@@ -231,7 +249,43 @@ def update_identity(mac: str, payload: IdentityUpdate, db: Session = Depends(get
     return _to_dict(d)
 
 
-# ── fingerprint DB endpoints ──────────────────────────────────────────────────
+# ── settings ──────────────────────────────────────────────────────────────────
+
+@app.get("/settings")
+def get_settings(db: Session = Depends(get_db)):
+    """Return all settings rows.  Seeded with defaults on first call."""
+    _seed_settings(db)
+    return [
+        {"key": s.key, "value": s.value, "description": s.description}
+        for s in db.query(Setting).order_by(Setting.key).all()
+    ]
+
+
+@app.put("/settings/{key}")
+def update_setting(key: str, payload: SettingUpdate, db: Session = Depends(get_db)):
+    s = db.get(Setting, key)
+    if not s:
+        raise HTTPException(404, f"Unknown setting key: {key}")
+    s.value = payload.value
+    db.commit()
+    db.refresh(s)
+    return {"key": s.key, "value": s.value}
+
+
+@app.post("/settings/reset")
+def reset_settings(db: Session = Depends(get_db)):
+    """Restore every setting to its factory default."""
+    for d in DEFAULT_SETTINGS:
+        s = db.get(Setting, d["key"])
+        if s:
+            s.value = d["value"]
+        else:
+            db.add(Setting(key=d["key"], value=d["value"], description=d["description"]))
+    db.commit()
+    return {"ok": True}
+
+
+# ── fingerprint DB ────────────────────────────────────────────────────────────
 
 @app.get("/fingerprints")
 def list_fingerprints(
@@ -239,39 +293,26 @@ def list_fingerprints(
     source:      Optional[str] = None,
     db: Session = Depends(get_db),
 ):
-    """
-    Return the local fingerprint database entries.
-    Filterable by device_type and source ('manual' | 'auto' | 'community').
-    Ordered by hit_count desc so the most-confirmed entries come first.
-    """
     q = db.query(FingerprintEntry)
     if device_type:
         q = q.filter(FingerprintEntry.device_type == device_type)
     if source:
         q = q.filter(FingerprintEntry.source == source)
-    entries = q.order_by(FingerprintEntry.hit_count.desc()).all()
-    return [_fp_to_dict(e) for e in entries]
+    return [_fp_to_dict(e) for e in q.order_by(FingerprintEntry.hit_count.desc()).all()]
 
 
 @app.get("/fingerprints/stats")
 def fingerprint_stats(db: Session = Depends(get_db)):
-    """Summary counts for the fingerprint DB — useful for a future settings/dashboard widget."""
     from sqlalchemy import func
-    total   = db.query(func.count(FingerprintEntry.id)).scalar()
-    manual  = db.query(func.count(FingerprintEntry.id)).filter(FingerprintEntry.source == 'manual').scalar()
-    auto    = db.query(func.count(FingerprintEntry.id)).filter(FingerprintEntry.source == 'auto').scalar()
-    comm    = db.query(func.count(FingerprintEntry.id)).filter(FingerprintEntry.source == 'community').scalar()
-    return {
-        "total":     total,
-        "manual":    manual,
-        "auto":      auto,
-        "community": comm,
-    }
+    total  = db.query(func.count(FingerprintEntry.id)).scalar()
+    manual = db.query(func.count(FingerprintEntry.id)).filter(FingerprintEntry.source == 'manual').scalar()
+    auto   = db.query(func.count(FingerprintEntry.id)).filter(FingerprintEntry.source == 'auto').scalar()
+    comm   = db.query(func.count(FingerprintEntry.id)).filter(FingerprintEntry.source == 'community').scalar()
+    return {"total": total, "manual": manual, "auto": auto, "community": comm}
 
 
 @app.delete("/fingerprints/{fp_id}")
 def delete_fingerprint(fp_id: int, db: Session = Depends(get_db)):
-    """Remove a single fingerprint entry."""
     entry = db.get(FingerprintEntry, fp_id)
     if not entry:
         raise HTTPException(404, "Fingerprint entry not found")
@@ -280,13 +321,172 @@ def delete_fingerprint(fp_id: int, db: Session = Depends(get_db)):
     return {"ok": True, "deleted_id": fp_id}
 
 
+# ── export / import ───────────────────────────────────────────────────────────
+
+@app.get("/export/devices")
+def export_devices_csv(db: Session = Depends(get_db)):
+    """
+    Export every device as a CSV file download.
+    Columns: mac_address, ip_address, hostname, vendor, vendor_override,
+             device_type_override, custom_name, is_online, first_seen, last_seen
+    """
+    devices = db.query(Device).order_by(Device.last_seen.desc()).all()
+
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow([
+        "mac_address", "ip_address", "hostname", "vendor", "vendor_override",
+        "device_type_override", "custom_name", "is_online", "first_seen", "last_seen",
+    ])
+    for d in devices:
+        writer.writerow([
+            d.mac_address,
+            d.ip_address or "",
+            d.hostname or "",
+            d.vendor or "",
+            getattr(d, "vendor_override", "") or "",
+            getattr(d, "device_type_override", "") or "",
+            d.custom_name or "",
+            "yes" if d.is_online else "no",
+            d.first_seen.isoformat() if d.first_seen else "",
+            d.last_seen.isoformat()  if d.last_seen  else "",
+        ])
+
+    output.seek(0)
+    return StreamingResponse(
+        iter([output.getvalue()]),
+        media_type="text/csv",
+        headers={"Content-Disposition": "attachment; filename=inspectre-devices.csv"},
+    )
+
+
+@app.get("/export/fingerprints")
+def export_fingerprints_json(db: Session = Depends(get_db)):
+    """
+    Export the trained fingerprint DB as a JSON file download.
+    The source_mac field is intentionally omitted for privacy —
+    this file is safe to share with other InSpectre users.
+    """
+    entries = db.query(FingerprintEntry).order_by(FingerprintEntry.hit_count.desc()).all()
+    rows = []
+    for e in entries:
+        rows.append({
+            "oui_prefix":       e.oui_prefix,
+            "hostname_pattern": e.hostname_pattern,
+            "open_ports":       e.open_ports,
+            "device_type":      e.device_type,
+            "vendor_name":      e.vendor_name,
+            "confidence_score": e.confidence_score,
+            "hit_count":        e.hit_count,
+            "source":           e.source,
+            # source_mac intentionally excluded
+        })
+
+    payload = json.dumps({"version": VERSION, "entries": rows}, indent=2)
+    return StreamingResponse(
+        iter([payload]),
+        media_type="application/json",
+        headers={"Content-Disposition": "attachment; filename=inspectre-fingerprints.json"},
+    )
+
+
+@app.post("/import/fingerprints")
+async def import_fingerprints_json(file: UploadFile = File(...), db: Session = Depends(get_db)):
+    """
+    Import a fingerprint DB JSON file (as produced by /export/fingerprints).
+
+    Merge strategy:
+      - If an entry with the same (oui_prefix, device_type) already exists,
+        increment hit_count by the imported value and update vendor_name if blank.
+      - Otherwise insert a new row with source='community'.
+
+    After import, any device whose current device_type_override is blank and
+    whose OUI now has a high-confidence fingerprint entry will be automatically
+    corrected (device_type_override set).
+    """
+    raw = await file.read()
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise HTTPException(400, f"Invalid JSON: {exc}")
+
+    entries = data if isinstance(data, list) else data.get("entries", [])
+    if not entries:
+        raise HTTPException(400, "No fingerprint entries found in file")
+
+    inserted  = 0
+    merged    = 0
+    corrected = 0
+
+    for row in entries:
+        try:
+            validated = FingerprintImportRow(**row)
+        except Exception:
+            continue  # skip malformed rows
+
+        result_before = db.query(FingerprintEntry).filter(
+            FingerprintEntry.oui_prefix  == validated.oui_prefix,
+            FingerprintEntry.device_type == validated.device_type,
+        ).first()
+
+        was_new = result_before is None
+
+        _upsert_fingerprint(
+            db,
+            source_mac       = "import",
+            oui_prefix       = validated.oui_prefix,
+            open_ports       = validated.open_ports,
+            device_type      = validated.device_type,
+            vendor_name      = validated.vendor_name,
+            source           = "community",
+            confidence_score = validated.confidence_score,
+            hit_count_add    = validated.hit_count,
+        )
+
+        if was_new:
+            inserted += 1
+        else:
+            merged += 1
+
+    # ── auto-correct unclassified devices whose OUI now matches a fingerprint ──
+    all_fps = db.query(FingerprintEntry).filter(
+        FingerprintEntry.oui_prefix != None,
+        FingerprintEntry.confidence_score >= 0.8,
+    ).order_by(FingerprintEntry.hit_count.desc()).all()
+
+    # Build best-match map: oui_prefix -> FingerprintEntry with highest hit_count
+    best: dict[str, FingerprintEntry] = {}
+    for fp in all_fps:
+        if fp.oui_prefix and fp.oui_prefix not in best:
+            best[fp.oui_prefix] = fp
+
+    unclassified = db.query(Device).filter(
+        Device.device_type_override == None,
+    ).all()
+
+    for device in unclassified:
+        oui = _normalise_mac(device.mac_address)[:6]
+        if oui in best:
+            fp = best[oui]
+            device.device_type_override = fp.device_type
+            if not getattr(device, "vendor_override", None) and fp.vendor_name:
+                device.vendor_override = fp.vendor_name
+            corrected += 1
+
+    db.commit()
+
+    return {
+        "ok":        True,
+        "inserted":  inserted,
+        "merged":    merged,
+        "corrected": corrected,
+    }
+
+
+# ── other device endpoints ────────────────────────────────────────────────────
+
 @app.post("/devices/{mac}/resolve-name")
 async def resolve_name(mac: str, db: Session = Depends(get_db)):
-    """
-    Re-resolve the hostname for this device.
-    Delegates to the probe's /resolve/{ip} endpoint because the probe has
-    host networking and can reach LAN DNS servers; the backend cannot.
-    """
     d = _get_device_or_404(mac, db)
     if not d.ip_address:
         raise HTTPException(422, "Device has no IP address recorded")
@@ -301,8 +501,7 @@ async def resolve_name(mac: str, db: Session = Depends(get_db)):
     except Exception as e:
         raise HTTPException(
             503,
-            f"Could not reach probe API at {PROBE_API_URL}. "
-            f"Make sure the probe container is running. Detail: {e}"
+            f"Could not reach probe API at {PROBE_API_URL}. Detail: {e}"
         )
 
     if hostname:
@@ -315,7 +514,6 @@ async def resolve_name(mac: str, db: Session = Depends(get_db)):
 
 @app.post("/devices/{mac}/rescan")
 async def request_rescan(mac: str, db: Session = Depends(get_db)):
-    """Immediately trigger a fresh nmap deep scan via the probe."""
     d = _get_device_or_404(mac, db)
     if not d.ip_address:
         raise HTTPException(422, "Device has no IP address recorded")

@@ -13,13 +13,12 @@ async function request(method, path, body) {
 /**
  * Stream an SSE endpoint, calling onLine(text) for each data line.
  * Pass an AbortSignal to cancel mid-stream.
- * Returns a promise that resolves when the stream ends or is aborted.
  */
 async function streamSSE(path, onLine, signal) {
   const res = await fetch(`${BASE}${path}`, { signal })
   if (!res.ok) throw new Error(`GET ${path} \u2192 ${res.status}`)
 
-  const reader = res.body.getReader()
+  const reader  = res.body.getReader()
   const decoder = new TextDecoder()
   let buf = ''
 
@@ -29,7 +28,7 @@ async function streamSSE(path, onLine, signal) {
     if (done) break
     buf += decoder.decode(value, { stream: true })
     const parts = buf.split('\n')
-    buf = parts.pop() // keep incomplete last chunk
+    buf = parts.pop()
     for (const part of parts) {
       const line = part.trim()
       if (line.startsWith('data:')) {
@@ -53,16 +52,28 @@ export const api = {
   getStats:        ()           => request('GET',   '/stats'),
 
   // Fingerprint DB
-  getFingerprints: (params)     => request('GET',   '/fingerprints' + (params ? `?${new URLSearchParams(params)}` : '')),
-  getFingerprintStats: ()       => request('GET',   '/fingerprints/stats'),
-  deleteFingerprint: (id)       => request('DELETE', `/fingerprints/${id}`),
+  getFingerprints:     (params) => request('GET',    '/fingerprints' + (params ? `?${new URLSearchParams(params)}` : '')),
+  getFingerprintStats: ()       => request('GET',    '/fingerprints/stats'),
+  deleteFingerprint:   (id)     => request('DELETE', `/fingerprints/${id}`),
 
   // Settings
   getSettings:     ()           => request('GET',  '/settings'),
   updateSetting:   (key, value) => request('PUT',  `/settings/${key}`, { value: String(value) }),
   resetSettings:   ()           => request('POST', '/settings/reset'),
 
-  // Streaming (returns { start(onLine), stop() })
+  // Export — returns a Response so the caller can trigger a file download
+  exportDevicesCsv:       ()     => fetch(`${BASE}/export/devices`),
+  exportFingerprintsJson: ()     => fetch(`${BASE}/export/fingerprints`),
+
+  // Import — multipart file upload
+  importFingerprintsJson: (file) => {
+    const form = new FormData()
+    form.append('file', file)
+    return fetch(`${BASE}/import/fingerprints`, { method: 'POST', body: form })
+      .then(r => { if (!r.ok) throw new Error(`Import failed: ${r.status}`); return r.json() })
+  },
+
+  // Streaming
   streamPing:       (mac, signal) => streamSSE(`/devices/${mac}/ping`,       (l) => l, signal),
   streamTraceroute: (mac, signal) => streamSSE(`/devices/${mac}/traceroute`, (l) => l, signal),
 }
