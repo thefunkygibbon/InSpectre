@@ -1,9 +1,9 @@
-import { useState, useMemo, useEffect } from 'react'
+import { useState, useMemo, useEffect, useCallback } from 'react'
 import {
   Wifi, WifiOff, Monitor, ScanSearch, Settings,
   RefreshCw, Search, Filter, AlertCircle, Activity,
   LayoutGrid, List, Sun, Moon, ChevronDown,
-  Bell, WifiOff as OfflineIcon, X,
+  Bell, X,
 } from 'lucide-react'
 import { useDevices } from './hooks/useDevices'
 import { useTheme }   from './hooks/useTheme'
@@ -22,9 +22,9 @@ const SORT_OPTIONS = [
   { value: 'last_seen_asc',  label: 'Last seen (oldest)' },
   { value: 'ip_asc',         label: 'IP address (asc)'   },
   { value: 'ip_desc',        label: 'IP address (desc)'  },
-  { value: 'name_asc',       label: 'Name (A\u2013Z)'         },
-  { value: 'name_desc',      label: 'Name (Z\u2013A)'         },
-  { value: 'vendor_asc',     label: 'Vendor (A\u2013Z)'       },
+  { value: 'name_asc',       label: 'Name (A\u2013Z)'    },
+  { value: 'name_desc',      label: 'Name (Z\u2013A)'    },
+  { value: 'vendor_asc',     label: 'Vendor (A\u2013Z)'  },
   { value: 'status',         label: 'Status (online first)' },
 ]
 
@@ -57,75 +57,63 @@ function useClock() {
   return time
 }
 
-// ---- Alert banner components ------------------------------------------------
-
-function NewDeviceBanner({ alerts, onDismiss, onDismissAll }) {
-  if (!alerts.length) return null
+// ── Toast notification stack (top-right corner) ───────────────────────────
+function NotificationToasts({ newAlerts, offlineAlerts, onDismissNew, onDismissOffline }) {
+  const all = [
+    ...newAlerts.map(a  => ({ ...a, kind: 'new'     })),
+    ...offlineAlerts.map(a => ({ ...a, kind: 'offline' })),
+  ]
+  if (!all.length) return null
   return (
     <div
-      className="rounded-xl px-4 py-3 text-sm flex flex-col gap-2 animate-fade-in"
-      style={{
-        background: 'color-mix(in oklab, var(--color-primary) 12%, var(--color-surface))',
-        border: '1px solid color-mix(in oklab, var(--color-primary) 30%, transparent)',
-      }}
+      className="fixed z-50 flex flex-col gap-2"
+      style={{ top: '5rem', right: '1rem', width: '320px', pointerEvents: 'none' }}
     >
-      <div className="flex items-center justify-between">
-        <div className="flex items-center gap-2 font-semibold" style={{ color: 'var(--color-primary)' }}>
-          <Bell size={14} />
-          {alerts.length === 1 ? 'New device detected' : `${alerts.length} new devices detected`}
-        </div>
-        {alerts.length > 1 && (
-          <button onClick={onDismissAll} className="text-xs opacity-60 hover:opacity-100 transition-opacity"
-            style={{ color: 'var(--color-primary)' }}>
-            Dismiss all
-          </button>
-        )}
-      </div>
-      {alerts.map(a => (
-        <div key={a.id} className="flex items-center justify-between gap-2">
-          <span style={{ color: 'var(--color-text)' }}>
-            <span className="font-mono text-xs" style={{ color: 'var(--color-primary)' }}>{a.ip}</span>
-            {' '}&mdash;{' '}
-            {a.hostname || a.vendor}
-            <span className="ml-1.5 text-xs opacity-60 font-mono">{a.mac}</span>
-          </span>
-          <button onClick={() => onDismiss(a.id)} aria-label="Dismiss" className="opacity-50 hover:opacity-100 transition-opacity shrink-0">
-            <X size={13} />
-          </button>
-        </div>
-      ))}
-    </div>
-  )
-}
-
-function OfflineToast({ alerts, onDismiss }) {
-  // Auto-dismiss after 8 s
-  useEffect(() => {
-    if (!alerts.length) return
-    const id = setTimeout(() => alerts.forEach(a => onDismiss(a.id)), 8000)
-    return () => clearTimeout(id)
-  }, [alerts, onDismiss])
-
-  if (!alerts.length) return null
-  return (
-    <div className="fixed bottom-6 right-6 z-50 flex flex-col gap-2 pointer-events-none">
-      {alerts.map(a => (
+      {all.map(a => (
         <div
-          key={a.id}
-          className="pointer-events-auto flex items-center gap-3 px-4 py-3 rounded-xl shadow-lg text-sm animate-fade-in"
+          key={`${a.kind}-${a.id}`}
+          className="flex items-start gap-3 px-4 py-3 rounded-xl shadow-lg text-sm animate-fade-in"
           style={{
-            background: 'color-mix(in oklab, #ef4444 10%, var(--color-surface))',
-            border: '1px solid color-mix(in oklab, #ef4444 25%, transparent)',
-            color: 'var(--color-text)',
+            pointerEvents: 'auto',
+            ...(a.kind === 'new' ? {
+              background: 'color-mix(in oklab, var(--color-primary) 12%, var(--color-surface))',
+              border: '1px solid color-mix(in oklab, var(--color-primary) 30%, transparent)',
+            } : {
+              background: 'color-mix(in oklab, #ef4444 10%, var(--color-surface))',
+              border: '1px solid color-mix(in oklab, #ef4444 25%, transparent)',
+            }),
           }}
         >
-          <OfflineIcon size={14} style={{ color: '#ef4444', flexShrink: 0 }} />
-          <span>
-            <span className="font-medium">{a.name}</span>
-            <span className="ml-1.5 text-xs opacity-60">{a.ip}</span>
-            <span className="ml-2 text-xs opacity-50">went offline</span>
-          </span>
-          <button onClick={() => onDismiss(a.id)} aria-label="Dismiss" className="ml-2 opacity-50 hover:opacity-100 transition-opacity">
+          {a.kind === 'new'
+            ? <Bell   size={14} style={{ color: 'var(--color-primary)', flexShrink: 0, marginTop: 2 }} />
+            : <WifiOff size={14} style={{ color: '#ef4444',              flexShrink: 0, marginTop: 2 }} />
+          }
+          <div className="flex-1 min-w-0">
+            {a.kind === 'new' ? (
+              <>
+                <p className="font-semibold" style={{ color: 'var(--color-primary)' }}>New device detected</p>
+                <p className="text-xs mt-0.5 truncate" style={{ color: 'var(--color-text)' }}>
+                  <span className="font-mono">{a.ip}</span>
+                  {(a.hostname || a.vendor) && <> &mdash; {a.hostname || a.vendor}</>}
+                </p>
+                <p className="mt-0.5 font-mono opacity-50" style={{ fontSize: '11px' }}>{a.mac}</p>
+              </>
+            ) : (
+              <>
+                <p className="font-semibold" style={{ color: '#ef4444' }}>Device went offline</p>
+                <p className="text-xs mt-0.5" style={{ color: 'var(--color-text)' }}>
+                  <span className="font-medium">{a.name}</span>
+                  <span className="ml-1.5 opacity-60">{a.ip}</span>
+                </p>
+              </>
+            )}
+          </div>
+          <button
+            onClick={() => a.kind === 'new' ? onDismissNew(a.id) : onDismissOffline(a.id)}
+            aria-label="Dismiss notification"
+            className="opacity-40 hover:opacity-100 transition-opacity shrink-0"
+            style={{ marginTop: 2 }}
+          >
             <X size={13} />
           </button>
         </div>
@@ -134,8 +122,7 @@ function OfflineToast({ alerts, onDismiss }) {
   )
 }
 
-// ---- Main App ---------------------------------------------------------------
-
+// ── Main App ─────────────────────────────────────────────────────────────
 export default function App() {
   const {
     devices, stats, loading, error, refresh, lastRefresh,
@@ -146,14 +133,30 @@ export default function App() {
   const { theme, toggle: toggleTheme } = useTheme()
   const clock = useClock()
 
-  const [search, setSearch]             = useState('')
-  const [filter, setFilter]             = useState('all')
-  const [sort, setSort]                 = useState('last_seen_desc')
-  const [layout, setLayout]             = useState('grid')
-  const [selected, setSelected]         = useState(null)
+  const [search,       setSearch]       = useState('')
+  const [filter,       setFilter]       = useState('all')
+  const [sort,         setSort]         = useState('last_seen_desc')
+  const [layout,       setLayout]       = useState('grid')
+  const [selected,     setSelected]     = useState(null)
   const [showSettings, setShowSettings] = useState(false)
-  const [refreshing, setRefreshing]     = useState(false)
+  const [refreshing,   setRefreshing]   = useState(false)
   const [showAlertDrop, setShowAlertDrop] = useState(false)
+  const [notificationsEnabled, setNotificationsEnabled] = useState(true)
+
+  // Load notification preference from settings on mount
+  useEffect(() => {
+    api.getSettings().then(s => {
+      const n = s.find(x => x.key === 'notifications_enabled')
+      if (n) setNotificationsEnabled(n.value === 'true')
+    }).catch(() => {})
+  }, [])
+
+  // Auto-dismiss offline toasts after 8s
+  useEffect(() => {
+    if (!offlineAlerts.length) return
+    const id = setTimeout(() => offlineAlerts.forEach(a => dismissOffline(a.id)), 8000)
+    return () => clearTimeout(id)
+  }, [offlineAlerts, dismissOffline])
 
   const totalAlerts = newDeviceAlerts.length
 
@@ -164,12 +167,12 @@ export default function App() {
     if (search.trim()) {
       const q = search.toLowerCase()
       list = list.filter(d =>
-        (d.ip_address    || '').toLowerCase().includes(q) ||
-        (d.mac_address   || '').toLowerCase().includes(q) ||
-        (d.hostname      || '').toLowerCase().includes(q) ||
-        (d.custom_name   || '').toLowerCase().includes(q) ||
-        (d.vendor        || '').toLowerCase().includes(q) ||
-        (d.display_name  || '').toLowerCase().includes(q)
+        (d.ip_address   || '').toLowerCase().includes(q) ||
+        (d.mac_address  || '').toLowerCase().includes(q) ||
+        (d.hostname     || '').toLowerCase().includes(q) ||
+        (d.custom_name  || '').toLowerCase().includes(q) ||
+        (d.vendor       || '').toLowerCase().includes(q) ||
+        (d.display_name || '').toLowerCase().includes(q)
       )
     }
     return sortDevices(list, sort)
@@ -280,7 +283,7 @@ export default function App() {
                               <p className="text-xs font-medium" style={{ color: 'var(--color-text)' }}>
                                 New device: <span className="font-mono" style={{ color: 'var(--color-primary)' }}>{a.ip}</span>
                               </p>
-                              <p className="text-[11px] mt-0.5 truncate" style={{ color: 'var(--color-text-muted)' }}>
+                              <p className="text-xs mt-0.5 truncate" style={{ color: 'var(--color-text-muted)', fontSize: '11px' }}>
                                 {a.hostname || a.vendor} &middot; {a.mac}
                               </p>
                             </div>
@@ -333,15 +336,6 @@ export default function App() {
             </div>
           )}
 
-          {/* New device banner */}
-          {newDeviceAlerts.length > 0 && (
-            <NewDeviceBanner
-              alerts={newDeviceAlerts}
-              onDismiss={dismissNewDevice}
-              onDismissAll={dismissAllNew}
-            />
-          )}
-
           {/* Stat cards */}
           <section>
             <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
@@ -370,7 +364,7 @@ export default function App() {
                 <button
                   key={f}
                   onClick={() => setFilter(f)}
-                  className={`px-3 py-1.5 rounded-lg text-xs font-medium capitalize transition-all duration-150`}
+                  className="px-3 py-1.5 rounded-lg text-xs font-medium capitalize transition-all duration-150"
                   style={filter === f
                     ? { background: 'var(--color-brand)', color: 'white' }
                     : { color: 'var(--color-text-muted)' }
@@ -481,8 +475,15 @@ export default function App() {
         </footer>
       </div>
 
-      {/* Offline drop toasts */}
-      <OfflineToast alerts={offlineAlerts} onDismiss={dismissOffline} />
+      {/* ── Top-right toast notifications ── */}
+      {notificationsEnabled && (
+        <NotificationToasts
+          newAlerts={newDeviceAlerts}
+          offlineAlerts={offlineAlerts}
+          onDismissNew={dismissNewDevice}
+          onDismissOffline={dismissOffline}
+        />
+      )}
 
       {selected && (
         <DeviceDrawer
@@ -493,7 +494,10 @@ export default function App() {
         />
       )}
       {showSettings && (
-        <SettingsPanel onClose={() => setShowSettings(false)} />
+        <SettingsPanel
+          onClose={() => setShowSettings(false)}
+          onNotificationsChange={setNotificationsEnabled}
+        />
       )}
     </div>
   )

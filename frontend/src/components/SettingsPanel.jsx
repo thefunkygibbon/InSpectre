@@ -3,15 +3,17 @@ import { Save, RotateCcw, Settings2, X } from 'lucide-react'
 import { api } from '../api'
 
 const SETTING_META = {
-  scan_interval:          { label: 'Scan Interval',     unit: 'seconds',       type: 'number', min: 5,   max: 3600 },
-  offline_miss_threshold: { label: 'Offline Threshold', unit: 'missed sweeps', type: 'number', min: 1,   max: 20   },
-  os_confidence_threshold:{ label: 'OS Confidence Min', unit: '%',             type: 'number', min: 50,  max: 100  },
-  sniffer_workers:        { label: 'Sniffer Workers',   unit: 'threads',       type: 'number', min: 1,   max: 16   },
-  ip_range:               { label: 'IP Range',          unit: '',              type: 'text'  },
-  nmap_args:              { label: 'Nmap Arguments',    unit: '',              type: 'text'  },
+  scan_interval:           { label: 'Scan Interval',        unit: 'seconds',       type: 'number',  min: 5,  max: 3600 },
+  offline_miss_threshold:  { label: 'Offline Threshold',    unit: 'missed sweeps', type: 'number',  min: 1,  max: 20   },
+  os_confidence_threshold: { label: 'OS Confidence Min',    unit: '%',             type: 'number',  min: 50, max: 100  },
+  sniffer_workers:         { label: 'Sniffer Workers',      unit: 'threads',       type: 'number',  min: 1,  max: 16   },
+  ip_range:                { label: 'IP Range',             unit: '',              type: 'text'                        },
+  nmap_args:               { label: 'Nmap Arguments',       unit: '',              type: 'text'                        },
+  notifications_enabled:   { label: 'Device Notifications', unit: '',              type: 'toggle',
+                             description: 'Show popup toasts when new devices appear or devices go offline.' },
 }
 
-export function SettingsPanel({ onClose }) {
+export function SettingsPanel({ onClose, onNotificationsChange }) {
   const [settings, setSettings] = useState([])
   const [dirty,    setDirty]    = useState({})
   const [saving,   setSaving]   = useState(false)
@@ -23,6 +25,9 @@ export function SettingsPanel({ onClose }) {
 
   function handleChange(key, value) {
     setDirty(d => ({ ...d, [key]: value }))
+    if (key === 'notifications_enabled' && onNotificationsChange) {
+      onNotificationsChange(value === 'true')
+    }
   }
 
   async function handleSave() {
@@ -40,7 +45,12 @@ export function SettingsPanel({ onClose }) {
   async function handleReset() {
     if (!confirm('Reset all settings to defaults?')) return
     await api.resetSettings()
-    api.getSettings().then(s => { setSettings(s); setDirty({}) })
+    api.getSettings().then(s => {
+      setSettings(s)
+      setDirty({})
+      const notif = s.find(x => x.key === 'notifications_enabled')
+      if (notif && onNotificationsChange) onNotificationsChange(notif.value === 'true')
+    })
   }
 
   const hasDirty = Object.keys(dirty).length > 0
@@ -100,9 +110,45 @@ export function SettingsPanel({ onClose }) {
           )}
 
           {settings.map(s => {
-            const meta  = SETTING_META[s.key] || { label: s.key, type: 'text', unit: '' }
-            const value = dirty[s.key] ?? s.value
+            const meta    = SETTING_META[s.key] || { label: s.key, type: 'text', unit: '' }
+            const value   = dirty[s.key] ?? s.value
             const isDirty = dirty[s.key] !== undefined
+
+            if (meta.type === 'toggle') {
+              const isOn = value === 'true'
+              return (
+                <div key={s.key} className="card p-4 space-y-2">
+                  <div className="flex items-center justify-between">
+                    <label className="text-sm font-medium" style={{ color: 'var(--color-text)' }}>
+                      {meta.label}
+                    </label>
+                    <button
+                      type="button"
+                      onClick={() => handleChange(s.key, isOn ? 'false' : 'true')}
+                      className="relative inline-flex h-6 w-11 items-center rounded-full transition-colors duration-200 focus:outline-none focus-visible:ring-2"
+                      style={{
+                        background: isOn ? 'var(--color-brand)' : 'var(--color-border)',
+                        flexShrink: 0,
+                      }}
+                      role="switch"
+                      aria-checked={isOn}
+                      aria-label={meta.label}
+                    >
+                      <span
+                        className="inline-block h-4 w-4 rounded-full bg-white shadow transition-transform duration-200"
+                        style={{ transform: isOn ? 'translateX(22px)' : 'translateX(4px)' }}
+                      />
+                    </button>
+                  </div>
+                  {(meta.description || s.description) && (
+                    <p className="text-xs" style={{ color: 'var(--color-text-faint)' }}>
+                      {meta.description || s.description}
+                    </p>
+                  )}
+                </div>
+              )
+            }
+
             return (
               <div key={s.key} className="card p-4 space-y-2">
                 <div className="flex items-center justify-between">

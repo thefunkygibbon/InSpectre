@@ -155,7 +155,47 @@ def record_ip(mac: str, ip: str) -> bool:
 def _strip_fqdn(name: str) -> str:
     return name.rstrip('.') if name else ''
 
+_DNS_SERVER: str | None = None
+_DNS_DETECTED = False
+
+def _detect_dns_server() -> str | None:
+    """Read the first nameserver from /etc/resolv.conf (usually the router)."""
+    try:
+        with open("/etc/resolv.conf") as f:
+            for line in f:
+                parts = line.strip().split()
+                if parts and parts[0] == "nameserver" and len(parts) >= 2:
+                    ip = parts[1]
+                    # Skip loopback / link-local
+                    if not ip.startswith("127.") and not ip.startswith("169.254."):
+                        print(f"[hostname] Using DNS server: {ip}", flush=True)
+                        return ip
+    except Exception:
+        pass
+    return None
+
 def resolve_hostname(ip: str) -> str | None:
+    global _DNS_SERVER, _DNS_DETECTED
+    if not _DNS_DETECTED:
+        _DNS_SERVER = _detect_dns_server()
+        _DNS_DETECTED = True
+
+    # ── Method 1: dig PTR against the local DNS/router ──
+    # This is the most reliable method for .lan / .home / router-assigned names
+    if _DNS_SERVER:
+        try:
+            out = subprocess.run(
+                ["dig", "+short", "+time=2", "+tries=1", f"@{_DNS_SERVER}", "-x", ip],
+                capture_output=True, text=True, timeout=4,
+            )
+            for line in out.stdout.splitlines():
+                candidate = _strip_fqdn(line.strip())
+                if candidate and candidate != ip and not candidate.startswith(";"):
+                    return candidate
+        except Exception:
+            pass
+
+    # ── Method 2: system gethostbyaddr ──
     try:
         result = socket.gethostbyaddr(ip)
         candidate = _strip_fqdn(result[0])
@@ -163,8 +203,47 @@ def resolve_hostname(ip: str) -> str | None:
             return candidate
     except Exception:
         pass
+
+    # ── Method 3: host command against local DNS ──
+    if _DNS_SERVER:
+        try:
+            out = subprocess.run(
+                ["host", ip, _DNS_SERVER],
+                capture_output=True, text=True, timeout=4,
+            )
+            for line in out.stdout.splitlines():
+                if "domain name pointer" in line:
+                    parts = line.strip().split()
+                    if parts:
+                        candidate = _strip_fqdn(parts[-1])
+                        if candidate and candidate != ip:
+                            return candidate
+        except Exception:
+            pass
+
+    # ── Method 4: nslookup ──
     try:
-        out = subprocess.run(["avahi-resolve", "-a", ip], capture_output=True, text=True, timeout=3)
+        cmd = ["nslookup", ip]
+        if _DNS_SERVER:
+            cmd.append(_DNS_SERVER)
+        out = subprocess.run(cmd, capture_output=True, text=True, timeout=4)
+        for line in out.stdout.splitlines():
+            line_l = line.lower()
+            if "name =" in line_l or "name=" in line_l:
+                parts = line.strip().split("=")
+                if len(parts) >= 2:
+                    candidate = _strip_fqdn(parts[-1].strip())
+                    if candidate and candidate != ip:
+                        return candidate
+    except Exception:
+        pass
+
+    # ── Method 5: avahi-resolve (mDNS .local names) ──
+    try:
+        out = subprocess.run(
+            ["avahi-resolve", "-a", ip],
+            capture_output=True, text=True, timeout=4,
+        )
         for line in out.stdout.splitlines():
             parts = line.split()
             if len(parts) >= 2:
@@ -173,17 +252,23 @@ def resolve_hostname(ip: str) -> str | None:
                     return candidate
     except (FileNotFoundError, subprocess.TimeoutExpired):
         pass
+
+    # ── Method 6: nmblookup (NetBIOS/Windows names) ──
     try:
-        out = subprocess.run(["nmblookup", "-A", ip], capture_output=True, text=True, timeout=4)
+        out = subprocess.run(
+            ["nmblookup", "-A", ip],
+            capture_output=True, text=True, timeout=4,
+        )
         for line in out.stdout.splitlines():
-            if '<00>' in line and '<GROUP>' not in line:
+            if "<00>" in line and "<GROUP>" not in line:
                 parts = line.strip().split()
                 if parts:
                     candidate = parts[0].strip()
-                    if candidate and candidate not in ('WORKGROUP', ip, 'Looking'):
+                    if candidate and candidate not in ("WORKGROUP", ip, "Looking"):
                         return candidate
     except (FileNotFoundError, subprocess.TimeoutExpired):
         pass
+
     return None
 
 # ---------------------------------------------------------------------------
@@ -366,22 +451,49 @@ def upsert_seen_device(mac: str, ip: str, source: str) -> None:
             session.close()
 
 def refresh_missing_hostnames() -> None:
+    """Re-try hostname resolution for all online devices missing a name."""
     session = Session()
     try:
         unnamed = session.query(Device).filter(
             Device.is_online == True,
             Device.hostname  == None,
         ).all()
+        updated = 0
         for dev in unnamed:
+            if not dev.ip_address:
+                continue
             name = resolve_hostname(dev.ip_address)
             if name:
                 dev.hostname = name
-                print(f"[hostname] Resolved late: {dev.ip_address} -> {name}", flush=True)
-        if unnamed:
+                updated += 1
+                print(f"[hostname] Resolved: {dev.ip_address} -> {name}", flush=True)
+        if updated:
             session.commit()
+            print(f"[hostname] Resolved {updated} new hostnames this pass.", flush=True)
     except Exception as e:
         session.rollback()
         print(f"[hostname] Refresh error: {e}", flush=True)
+    finally:
+        session.close()
+
+def bulk_reresolve_all() -> None:
+    """On startup, attempt to resolve hostnames for every device in the DB."""
+    session = Session()
+    try:
+        all_devs = session.query(Device).filter(Device.ip_address != None).all()
+        updated = 0
+        for dev in all_devs:
+            name = resolve_hostname(dev.ip_address)
+            if name and name != dev.hostname:
+                print(f"[hostname] Re-resolved: {dev.ip_address} -> {name}", flush=True)
+                dev.hostname = name
+                updated += 1
+        if updated:
+            session.commit()
+        print(f"[hostname] Startup re-resolve complete: {updated}/{len(all_devs)} updated.", flush=True)
+    except Exception as e:
+        session.rollback()
+        print(f"[hostname] Bulk re-resolve error: {e}", flush=True)
     finally:
         session.close()
 
@@ -504,12 +616,6 @@ def probe_health():
     return {"status": "ok"}
 
 def start_probe_api() -> None:
-    """
-    Run uvicorn in a background thread.
-    loop="none" tells uvicorn NOT to install signal handlers or manage
-    an event loop itself -- it creates one internally per-thread, which
-    is safe when called from a non-main thread.
-    """
     print(f"[*] Probe API listening on :{PROBE_API_PORT}", flush=True)
     uvicorn.run(
         probe_api,
@@ -538,6 +644,10 @@ def main() -> None:
 
     # Give the API time to bind before the first sweep
     time.sleep(2)
+
+    # Resolve hostnames for all existing devices on startup (background)
+    print("[*] Running startup hostname resolution pass...", flush=True)
+    threading.Thread(target=bulk_reresolve_all, daemon=True, name="startup-resolve").start()
 
     # Start passive ARP sniffer in background
     threading.Thread(target=start_arp_sniffer, daemon=True, name="arp-sniffer").start()

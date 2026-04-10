@@ -46,12 +46,13 @@ app.add_middleware(
 # Default settings
 # ---------------------------------------------------------------------------
 DEFAULT_SETTINGS = [
-    {"key": "scan_interval",           "value": "60",                                              "description": "Seconds between ARP sweep cycles."},
-    {"key": "offline_miss_threshold",  "value": "3",                                               "description": "Consecutive missed sweeps before a device is marked offline."},
-    {"key": "os_confidence_threshold", "value": "85",                                              "description": "Minimum nmap OS confidence % to record a match."},
-    {"key": "sniffer_workers",         "value": "4",                                               "description": "Worker threads for the passive ARP sniffer."},
-    {"key": "ip_range",                "value": os.environ.get("IP_RANGE", "192.168.0.0/24"),      "description": "CIDR range to scan."},
-    {"key": "nmap_args",               "value": "-O --osscan-limit -sV --version-intensity 5 -T4", "description": "Arguments passed to nmap during deep scans."},
+    {"key": "scan_interval",            "value": "60",                                              "description": "Seconds between ARP sweep cycles."},
+    {"key": "offline_miss_threshold",   "value": "3",                                               "description": "Consecutive missed sweeps before a device is marked offline."},
+    {"key": "os_confidence_threshold",  "value": "85",                                              "description": "Minimum nmap OS confidence % to record a match."},
+    {"key": "sniffer_workers",          "value": "4",                                               "description": "Worker threads for the passive ARP sniffer."},
+    {"key": "ip_range",                 "value": os.environ.get("IP_RANGE", "192.168.0.0/24"),      "description": "CIDR range to scan."},
+    {"key": "nmap_args",                "value": "-O --osscan-limit -sV --version-intensity 5 -T4", "description": "Arguments passed to nmap during deep scans."},
+    {"key": "notifications_enabled",    "value": "true",                                            "description": "Show popup notifications for new and offline devices."},
 ]
 
 def seed_default_settings(db: Session) -> None:
@@ -133,10 +134,6 @@ def _sse_line(data: str) -> bytes:
 
 
 def _stream_cmd(cmd: list[str]):
-    """
-    Run cmd as a subprocess and stream stdout as SSE lines.
-    Runs entirely inside the backend container -- no probe dependency.
-    """
     def generator():
         try:
             proc = subprocess.Popen(
@@ -163,10 +160,6 @@ def _stream_cmd(cmd: list[str]):
 
 
 def _proxy_sse(probe_url: str):
-    """
-    Fallback: proxy an SSE stream from the probe container.
-    Only used for endpoints that must run on the host network.
-    """
     def generator():
         try:
             with httpx.stream("GET", probe_url, timeout=120) as resp:
@@ -265,10 +258,6 @@ def get_ip_history(mac: str, db: Session = Depends(get_db)):
 
 @app.get("/devices/{mac}/ping")
 def ping_device(mac: str, db: Session = Depends(get_db)):
-    """
-    SSE stream of live ping output.
-    Runs ping directly in the backend container -- no probe proxy.
-    """
     ip = _get_device_ip(mac, db)
     import ipaddress
     try:
@@ -285,17 +274,12 @@ def ping_device(mac: str, db: Session = Depends(get_db)):
 
 @app.get("/devices/{mac}/traceroute")
 def traceroute_device(mac: str, db: Session = Depends(get_db)):
-    """
-    SSE stream of live traceroute output.
-    Runs traceroute directly in the backend container -- no probe proxy.
-    """
     ip = _get_device_ip(mac, db)
     import ipaddress
     try:
         ipaddress.ip_address(ip)
     except ValueError:
         raise HTTPException(400, "Device has invalid IP address")
-    # prefer traceroute, fall back to tracepath
     cmd = ["traceroute", "-m", "30", "-w", "2", ip]
     return StreamingResponse(
         _stream_cmd(cmd),

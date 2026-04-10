@@ -6,21 +6,22 @@ import { api } from '../api'
  *
  * Polls /devices and /stats on an interval.
  * Detects new MACs and devices dropping offline between polls,
- * exposing alert state for the UI to render banners/toasts.
+ * exposing alert state for the UI to render toasts.
+ * New-device alerts auto-dismiss after 8 seconds.
  */
 export function useDevices(intervalMs = 10000) {
-  const [devices,       setDevices]       = useState([])
-  const [stats,         setStats]         = useState(null)
-  const [loading,       setLoading]       = useState(true)
-  const [error,         setError]         = useState(null)
-  const [lastRefresh,   setLastRefresh]   = useState(null)
+  const [devices,     setDevices]     = useState([])
+  const [stats,       setStats]       = useState(null)
+  const [loading,     setLoading]     = useState(true)
+  const [error,       setError]       = useState(null)
+  const [lastRefresh, setLastRefresh] = useState(null)
 
   // Alert state
-  const [newDeviceAlerts,  setNewDeviceAlerts]  = useState([]) // [{ mac, ip, vendor, hostname }]
-  const [offlineAlerts,    setOfflineAlerts]    = useState([]) // [{ mac, ip, name }]
+  const [newDeviceAlerts, setNewDeviceAlerts] = useState([]) // [{ id, mac, ip, vendor, hostname }]
+  const [offlineAlerts,   setOfflineAlerts]   = useState([]) // [{ id, mac, ip, name }]
 
-  const knownMacsRef    = useRef(null)   // Set<string> -- null = first load
-  const prevOnlineRef   = useRef(new Map()) // mac -> was_online
+  const knownMacsRef  = useRef(null)        // Set<string> -- null = first load
+  const prevOnlineRef = useRef(new Map())   // mac -> was_online
 
   const fetchData = useCallback(async () => {
     try {
@@ -33,17 +34,20 @@ export function useDevices(intervalMs = 10000) {
       } else {
         const newOnes = devList.filter(d => !knownMacsRef.current.has(d.mac_address))
         if (newOnes.length) {
-          setNewDeviceAlerts(prev => [
-            ...prev,
-            ...newOnes.map(d => ({
-              id:       d.mac_address,
-              mac:      d.mac_address,
-              ip:       d.ip_address,
-              vendor:   d.vendor   || 'Unknown vendor',
-              hostname: d.hostname || null,
-            })),
-          ])
+          const alerts = newOnes.map(d => ({
+            id:       d.mac_address,
+            mac:      d.mac_address,
+            ip:       d.ip_address,
+            vendor:   d.vendor   || 'Unknown vendor',
+            hostname: d.hostname || null,
+          }))
+          setNewDeviceAlerts(prev => [...prev, ...alerts])
           newOnes.forEach(d => knownMacsRef.current.add(d.mac_address))
+          // Auto-dismiss after 8 seconds
+          setTimeout(() => {
+            const ids = new Set(alerts.map(a => a.id))
+            setNewDeviceAlerts(prev => prev.filter(a => !ids.has(a.id)))
+          }, 8000)
         }
       }
 
@@ -92,7 +96,7 @@ export function useDevices(intervalMs = 10000) {
     setOfflineAlerts(prev => prev.filter(a => a.id !== id))
   }
 
-  function dismissAllNew() { setNewDeviceAlerts([]) }
+  function dismissAllNew()     { setNewDeviceAlerts([]) }
   function dismissAllOffline() { setOfflineAlerts([]) }
 
   return {
