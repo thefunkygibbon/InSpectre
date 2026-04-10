@@ -15,6 +15,8 @@ import { DeviceRow }      from './components/DeviceRow'
 import { DeviceDrawer }   from './components/DeviceDrawer'
 import { SettingsPanel }  from './components/SettingsPanel'
 
+const APP_VERSION = '0.1.0'
+
 const FILTERS = ['all', 'online', 'offline']
 
 const SORT_OPTIONS = [
@@ -76,34 +78,34 @@ function NotificationToasts({ newAlerts, offlineAlerts, onDismissNew, onDismissO
           style={{
             pointerEvents: 'auto',
             ...(a.kind === 'new' ? {
-              background: 'color-mix(in oklab, var(--color-primary) 12%, var(--color-surface))',
-              border: '1px solid color-mix(in oklab, var(--color-primary) 30%, transparent)',
+              background: 'var(--toast-new-bg)',
+              border: '1px solid var(--toast-new-border)',
             } : {
-              background: 'color-mix(in oklab, #ef4444 10%, var(--color-surface))',
-              border: '1px solid color-mix(in oklab, #ef4444 25%, transparent)',
+              background: 'var(--toast-offline-bg)',
+              border: '1px solid var(--toast-offline-border)',
             }),
           }}
         >
           {a.kind === 'new'
-            ? <Bell   size={14} style={{ color: 'var(--color-primary)', flexShrink: 0, marginTop: 2 }} />
-            : <WifiOff size={14} style={{ color: '#ef4444',              flexShrink: 0, marginTop: 2 }} />
+            ? <Bell   size={14} style={{ color: 'var(--color-brand)', flexShrink: 0, marginTop: 2 }} />
+            : <WifiOff size={14} style={{ color: '#ef4444',            flexShrink: 0, marginTop: 2 }} />
           }
           <div className="flex-1 min-w-0">
             {a.kind === 'new' ? (
               <>
-                <p className="font-semibold" style={{ color: 'var(--color-primary)' }}>New device detected</p>
+                <p className="font-semibold" style={{ color: 'var(--color-brand)' }}>New device detected</p>
                 <p className="text-xs mt-0.5 truncate" style={{ color: 'var(--color-text)' }}>
                   <span className="font-mono">{a.ip}</span>
                   {(a.hostname || a.vendor) && <> &mdash; {a.hostname || a.vendor}</>}
                 </p>
-                <p className="mt-0.5 font-mono opacity-50" style={{ fontSize: '11px' }}>{a.mac}</p>
+                <p className="mt-0.5 font-mono" style={{ fontSize: '11px', color: 'var(--color-text-muted)' }}>{a.mac}</p>
               </>
             ) : (
               <>
                 <p className="font-semibold" style={{ color: '#ef4444' }}>Device went offline</p>
                 <p className="text-xs mt-0.5" style={{ color: 'var(--color-text)' }}>
                   <span className="font-medium">{a.name}</span>
-                  <span className="ml-1.5 opacity-60">{a.ip}</span>
+                  <span className="ml-1.5" style={{ color: 'var(--color-text-muted)' }}>{a.ip}</span>
                 </p>
               </>
             )}
@@ -111,7 +113,7 @@ function NotificationToasts({ newAlerts, offlineAlerts, onDismissNew, onDismissO
           <button
             onClick={() => a.kind === 'new' ? onDismissNew(a.id) : onDismissOffline(a.id)}
             aria-label="Dismiss notification"
-            className="opacity-40 hover:opacity-100 transition-opacity shrink-0"
+            className="opacity-50 hover:opacity-100 transition-opacity shrink-0"
             style={{ marginTop: 2 }}
           >
             <X size={13} />
@@ -246,7 +248,7 @@ export default function App() {
                     <span
                       className="absolute top-1 right-1 w-4 h-4 rounded-full text-[10px] font-bold
                                  flex items-center justify-center text-white"
-                      style={{ background: 'var(--color-primary)' }}
+                      style={{ background: 'var(--color-brand)' }}
                     >
                       {totalAlerts > 9 ? '9+' : totalAlerts}
                     </span>
@@ -265,7 +267,7 @@ export default function App() {
                         <span className="text-xs font-semibold uppercase tracking-wider" style={{ color: 'var(--color-text-muted)' }}>Alerts</span>
                         {totalAlerts > 0 && (
                           <button onClick={() => { dismissAllNew(); setShowAlertDrop(false) }}
-                            className="text-xs opacity-60 hover:opacity-100" style={{ color: 'var(--color-primary)' }}>
+                            className="text-xs opacity-60 hover:opacity-100" style={{ color: 'var(--color-brand)' }}>
                             Clear all
                           </button>
                         )}
@@ -278,10 +280,10 @@ export default function App() {
                             className="flex items-start gap-2 p-2.5 rounded-lg"
                             style={{ background: 'var(--color-surface-offset)' }}
                           >
-                            <Bell size={12} className="mt-0.5 shrink-0" style={{ color: 'var(--color-primary)' }} />
+                            <Bell size={12} className="mt-0.5 shrink-0" style={{ color: 'var(--color-brand)' }} />
                             <div className="flex-1 min-w-0">
                               <p className="text-xs font-medium" style={{ color: 'var(--color-text)' }}>
-                                New device: <span className="font-mono" style={{ color: 'var(--color-primary)' }}>{a.ip}</span>
+                                New device: <span className="font-mono" style={{ color: 'var(--color-brand)' }}>{a.ip}</span>
                               </p>
                               <p className="text-xs mt-0.5 truncate" style={{ color: 'var(--color-text-muted)', fontSize: '11px' }}>
                                 {a.hostname || a.vendor} &middot; {a.mac}
@@ -352,7 +354,7 @@ export default function App() {
               <Search size={15} className="absolute left-3 top-1/2 -translate-y-1/2 pointer-events-none" style={{ color: 'var(--color-text-muted)' }} />
               <input
                 className="input pl-9"
-                placeholder="Search IP, MAC, hostname, vendor\u2026"
+                placeholder="Search IP, MAC, hostname\u2026"
                 value={search}
                 onChange={e => setSearch(e.target.value)}
               />
@@ -463,10 +465,23 @@ export default function App() {
 
         {/* Footer */}
         <footer className="border-t py-4" style={{ borderColor: 'var(--color-border)' }}>
-          <div className="max-w-[1400px] mx-auto px-4 sm:px-6 flex items-center justify-between">
-            <span className="text-xs" style={{ color: 'var(--color-text-faint)' }}>
-              InSpectre &copy; {new Date().getFullYear()}
-            </span>
+          <div className="max-w-[1400px] mx-auto px-4 sm:px-6 flex flex-wrap items-center justify-between gap-2">
+            <div className="flex items-center gap-3 text-xs" style={{ color: 'var(--color-text-faint)' }}>
+              <span>InSpectre &copy; {new Date().getFullYear()}</span>
+              <span style={{ color: 'var(--color-border)' }}>|</span>
+              <span>v{APP_VERSION}</span>
+              <span style={{ color: 'var(--color-border)' }}>|</span>
+              <span>
+                Developed by{' '}
+                <a
+                  href="mailto:inspectre@thefunkygibbon.net"
+                  style={{ color: 'var(--color-brand)' }}
+                  className="hover:underline"
+                >
+                  thefunkygibbon
+                </a>
+              </span>
+            </div>
             <div className="flex items-center gap-1.5 text-xs" style={{ color: '#10b981' }}>
               <Activity size={12} />
               <span>API connected</span>

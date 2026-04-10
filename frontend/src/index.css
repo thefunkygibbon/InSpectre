@@ -17,6 +17,12 @@
   --color-brand:         #0d7a82;
   --color-brand-light:   #1a9ea8;
   --noise-opacity: 0.025;
+
+  /* Toast backgrounds — fully opaque for readability */
+  --toast-new-bg:          #e8f6f7;
+  --toast-new-border:      #9dd4d8;
+  --toast-offline-bg:      #fdecea;
+  --toast-offline-border:  #f5a8a0;
 }
 
 [data-theme="dark"] {
@@ -32,6 +38,12 @@
   --color-brand:         #4fa8b0;
   --color-brand-light:   #6bbfc7;
   --noise-opacity: 0.015;
+
+  /* Toast backgrounds — fully opaque for readability */
+  --toast-new-bg:          #152527;
+  --toast-new-border:      #2a5a60;
+  --toast-offline-bg:      #2a1515;
+  --toast-offline-border:  #5a2a2a;
 }
 
 /* Default to dark */
@@ -211,7 +223,7 @@
     50%       { opacity: 0; }
   }
   .terminal-cursor::after {
-    content: '▌';
+    content: '\u258c';
     display: inline-block;
     margin-left: 2px;
     animation: blink-cursor 1s step-end infinite;
