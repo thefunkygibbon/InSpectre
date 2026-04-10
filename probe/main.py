@@ -159,7 +159,7 @@ _DNS_SERVER: str | None = None
 _DNS_DETECTED = False
 
 def _detect_dns_server() -> str | None:
-    """Read the first nameserver from /etc/resolv.conf (usually the router)."""
+    """Read the first non-loopback nameserver from /etc/resolv.conf (usually the router)."""
     try:
         with open("/etc/resolv.conf") as f:
             for line in f:
@@ -180,53 +180,61 @@ def resolve_hostname(ip: str) -> str | None:
         _DNS_SERVER = _detect_dns_server()
         _DNS_DETECTED = True
 
+    print(f"[hostname] Resolving {ip} (DNS server: {_DNS_SERVER})", flush=True)
+
     # ── Method 1: dig PTR against the local DNS/router ──
-    # This is the most reliable method for .lan / .home / router-assigned names
+    # Most reliable for .lan / .home / router-assigned names
     if _DNS_SERVER:
         try:
             out = subprocess.run(
                 ["dig", "+short", "+time=2", "+tries=1", f"@{_DNS_SERVER}", "-x", ip],
-                capture_output=True, text=True, timeout=4,
+                capture_output=True, text=True, timeout=5,
             )
+            print(f"[hostname] dig stdout: {out.stdout.strip()!r}  stderr: {out.stderr.strip()!r}", flush=True)
             for line in out.stdout.splitlines():
                 candidate = _strip_fqdn(line.strip())
                 if candidate and candidate != ip and not candidate.startswith(";"):
+                    print(f"[hostname] dig resolved {ip} -> {candidate}", flush=True)
                     return candidate
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"[hostname] dig failed: {e}", flush=True)
 
     # ── Method 2: system gethostbyaddr ──
     try:
         result = socket.gethostbyaddr(ip)
         candidate = _strip_fqdn(result[0])
         if candidate and candidate != ip:
+            print(f"[hostname] gethostbyaddr resolved {ip} -> {candidate}", flush=True)
             return candidate
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"[hostname] gethostbyaddr failed for {ip}: {e}", flush=True)
 
     # ── Method 3: host command against local DNS ──
     if _DNS_SERVER:
         try:
             out = subprocess.run(
                 ["host", ip, _DNS_SERVER],
-                capture_output=True, text=True, timeout=4,
+                capture_output=True, text=True, timeout=5,
             )
+            print(f"[hostname] host stdout: {out.stdout.strip()!r}", flush=True)
             for line in out.stdout.splitlines():
                 if "domain name pointer" in line:
                     parts = line.strip().split()
                     if parts:
                         candidate = _strip_fqdn(parts[-1])
                         if candidate and candidate != ip:
+                            print(f"[hostname] host resolved {ip} -> {candidate}", flush=True)
                             return candidate
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"[hostname] host cmd failed: {e}", flush=True)
 
     # ── Method 4: nslookup ──
     try:
         cmd = ["nslookup", ip]
         if _DNS_SERVER:
             cmd.append(_DNS_SERVER)
-        out = subprocess.run(cmd, capture_output=True, text=True, timeout=4)
+        out = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
+        print(f"[hostname] nslookup stdout: {out.stdout.strip()!r}", flush=True)
         for line in out.stdout.splitlines():
             line_l = line.lower()
             if "name =" in line_l or "name=" in line_l:
@@ -234,9 +242,10 @@ def resolve_hostname(ip: str) -> str | None:
                 if len(parts) >= 2:
                     candidate = _strip_fqdn(parts[-1].strip())
                     if candidate and candidate != ip:
+                        print(f"[hostname] nslookup resolved {ip} -> {candidate}", flush=True)
                         return candidate
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"[hostname] nslookup failed: {e}", flush=True)
 
     # ── Method 5: avahi-resolve (mDNS .local names) ──
     try:
@@ -249,6 +258,7 @@ def resolve_hostname(ip: str) -> str | None:
             if len(parts) >= 2:
                 candidate = _strip_fqdn(parts[1])
                 if candidate and candidate != ip:
+                    print(f"[hostname] avahi resolved {ip} -> {candidate}", flush=True)
                     return candidate
     except (FileNotFoundError, subprocess.TimeoutExpired):
         pass
@@ -265,10 +275,12 @@ def resolve_hostname(ip: str) -> str | None:
                 if parts:
                     candidate = parts[0].strip()
                     if candidate and candidate not in ("WORKGROUP", ip, "Looking"):
+                        print(f"[hostname] nmblookup resolved {ip} -> {candidate}", flush=True)
                         return candidate
     except (FileNotFoundError, subprocess.TimeoutExpired):
         pass
 
+    print(f"[hostname] All methods failed for {ip}", flush=True)
     return None
 
 # ---------------------------------------------------------------------------
@@ -545,13 +557,14 @@ def update_presence_from_sweep(session, active_macs: set) -> None:
                 print(f"[-] Offline: {dev.ip_address} ({dev.mac_address})", flush=True)
 
 # ---------------------------------------------------------------------------
-# Probe HTTP API (port 8001) -- ping & traceroute SSE
+# Probe HTTP API (port 8001)
+# Handles: ping/traceroute SSE, hostname resolution, nmap rescan trigger
 # ---------------------------------------------------------------------------
 probe_api = FastAPI(title="InSpectre Probe Internal API", docs_url=None, redoc_url=None)
 probe_api.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_methods=["GET"],
+    allow_methods=["GET", "POST"],
     allow_headers=["*"],
 )
 
@@ -583,6 +596,50 @@ def _stream_subprocess(cmd: list[str]):
         yield _sse_line(f"ERROR: {e}")
         yield "event: done\ndata: {}\n\n"
 
+
+@probe_api.get("/health")
+def probe_health():
+    return {"status": "ok", "dns_server": _DNS_SERVER}
+
+
+@probe_api.get("/resolve/{ip}")
+def probe_resolve(ip: str):
+    """
+    Resolve a hostname for the given IP using the probe's full resolution stack.
+    Called by the backend when the user clicks the 'refresh hostname' button.
+    The probe has host networking so it can reach LAN DNS; the backend cannot.
+    """
+    import ipaddress
+    try:
+        ipaddress.ip_address(ip)
+    except ValueError:
+        raise HTTPException(400, "Invalid IP address")
+    name = resolve_hostname(ip)
+    return {"ip": ip, "hostname": name}
+
+
+@probe_api.post("/rescan/{mac}")
+def probe_rescan(mac: str):
+    """
+    Immediately queue a deep nmap scan for the given MAC address.
+    Called by the backend when the user clicks 'Re-scan ports'.
+    """
+    session = Session()
+    try:
+        device = session.get(Device, mac.lower())
+        if not device:
+            raise HTTPException(404, "Device not found")
+        if not device.ip_address:
+            raise HTTPException(422, "Device has no IP address")
+        device.deep_scanned = False
+        device.scan_results = None
+        session.commit()
+        trigger_deep_scan(device.ip_address, device.mac_address)
+        return {"queued": True, "mac": mac, "ip": device.ip_address}
+    finally:
+        session.close()
+
+
 @probe_api.get("/stream/ping/{ip}")
 def stream_ping(ip: str):
     import ipaddress
@@ -596,6 +653,7 @@ def stream_ping(ip: str):
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
+
 
 @probe_api.get("/stream/traceroute/{ip}")
 def stream_traceroute(ip: str):
@@ -611,9 +669,6 @@ def stream_traceroute(ip: str):
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
 
-@probe_api.get("/health")
-def probe_health():
-    return {"status": "ok"}
 
 def start_probe_api() -> None:
     print(f"[*] Probe API listening on :{PROBE_API_PORT}", flush=True)
@@ -638,6 +693,12 @@ def main() -> None:
         f"[*] Offline threshold: {OFFLINE_MISS_THRESHOLD} | OS confidence: {OS_CONFIDENCE_THRESHOLD}%",
         flush=True,
     )
+
+    # Detect DNS server early so it's available before first scan
+    global _DNS_SERVER, _DNS_DETECTED
+    _DNS_SERVER  = _detect_dns_server()
+    _DNS_DETECTED = True
+    print(f"[*] DNS server detected: {_DNS_SERVER}", flush=True)
 
     # Start probe HTTP API in background thread
     threading.Thread(target=start_probe_api, daemon=True, name="probe-api").start()

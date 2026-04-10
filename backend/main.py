@@ -1,38 +1,28 @@
+import os
+import re
+import shutil
+import subprocess
+import asyncio
+from typing import Optional, AsyncIterator
+
+import httpx
 from fastapi import FastAPI, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
-from sqlalchemy import create_engine, text
-from sqlalchemy.orm import sessionmaker, Session
 from pydantic import BaseModel
-from typing import Optional
-import os
-import socket
-import subprocess
-import httpx
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker, Session
 
-from models import Base, Device, IPHistory, Setting
+from models import Base, Device
 
-DATABASE_URL = os.environ.get("DATABASE_URL", "postgresql://admin:password123@db:5432/inspectre")
-PROBE_URL    = os.environ.get("PROBE_URL",    "http://localhost:8001")
+DATABASE_URL  = os.environ.get("DATABASE_URL",  "postgresql://admin:password123@db:5432/inspectre")
+# URL of the probe's internal HTTP API.  The probe runs with network_mode:host
+# so from the backend (bridge network) we reach it via host.docker.internal.
+PROBE_API_URL = os.environ.get("PROBE_API_URL", "http://host.docker.internal:8001")
 
 engine       = create_engine(DATABASE_URL, pool_pre_ping=True)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base.metadata.create_all(bind=engine)
-
-# Safe migration
-with engine.connect() as _conn:
-    _conn.execute(text("""
-        CREATE TABLE IF NOT EXISTS ip_history (
-            id          SERIAL PRIMARY KEY,
-            mac_address VARCHAR NOT NULL,
-            ip_address  VARCHAR NOT NULL,
-            first_seen  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-            last_seen   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-            CONSTRAINT uq_ip_history_mac_ip UNIQUE (mac_address, ip_address)
-        )
-    """))
-    _conn.execute(text("CREATE INDEX IF NOT EXISTS ix_ip_history_mac ON ip_history (mac_address)"))
-    _conn.commit()
 
 app = FastAPI(title="InSpectre API", version="0.4.0")
 app.add_middleware(
@@ -42,32 +32,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ---------------------------------------------------------------------------
-# Default settings
-# ---------------------------------------------------------------------------
-DEFAULT_SETTINGS = [
-    {"key": "scan_interval",            "value": "60",                                              "description": "Seconds between ARP sweep cycles."},
-    {"key": "offline_miss_threshold",   "value": "3",                                               "description": "Consecutive missed sweeps before a device is marked offline."},
-    {"key": "os_confidence_threshold",  "value": "85",                                              "description": "Minimum nmap OS confidence % to record a match."},
-    {"key": "sniffer_workers",          "value": "4",                                               "description": "Worker threads for the passive ARP sniffer."},
-    {"key": "ip_range",                 "value": os.environ.get("IP_RANGE", "192.168.0.0/24"),      "description": "CIDR range to scan."},
-    {"key": "nmap_args",                "value": "-O --osscan-limit -sV --version-intensity 5 -T4", "description": "Arguments passed to nmap during deep scans."},
-    {"key": "notifications_enabled",    "value": "true",                                            "description": "Show popup notifications for new and offline devices."},
-]
 
-def seed_default_settings(db: Session) -> None:
-    for s in DEFAULT_SETTINGS:
-        if not db.get(Setting, s["key"]):
-            db.add(Setting(key=s["key"], value=s["value"], description=s["description"]))
-    db.commit()
-
-with SessionLocal() as _db:
-    seed_default_settings(_db)
-
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
 def get_db():
     db = SessionLocal()
     try:
@@ -77,282 +42,245 @@ def get_db():
 
 
 class DeviceUpdate(BaseModel):
-    custom_name: Optional[str] = None
-    hostname:    Optional[str] = None
-
-class SettingUpdate(BaseModel):
-    value: str
-
-
-def _strip_fqdn(name: str) -> str:
-    return name.rstrip('.') if name else ''
-
-def _resolve_hostname(ip: str) -> str | None:
-    try:
-        result = socket.gethostbyaddr(ip)
-        candidate = _strip_fqdn(result[0])
-        if candidate and candidate != ip:
-            return candidate
-    except Exception:
-        pass
-    try:
-        out = subprocess.run(["avahi-resolve", "-a", ip], capture_output=True, text=True, timeout=3)
-        for line in out.stdout.splitlines():
-            parts = line.split()
-            if len(parts) >= 2:
-                candidate = _strip_fqdn(parts[1])
-                if candidate and candidate != ip:
-                    return candidate
-    except Exception:
-        pass
-    try:
-        out = subprocess.run(["nmblookup", "-A", ip], capture_output=True, text=True, timeout=4)
-        for line in out.stdout.splitlines():
-            if '<00>' in line and '<GROUP>' not in line:
-                parts = line.strip().split()
-                if parts:
-                    candidate = parts[0].strip()
-                    if candidate not in ('WORKGROUP', ip, 'Looking'):
-                        return candidate
-    except Exception:
-        pass
-    return None
+    custom_name:         Optional[str] = None
+    hostname:            Optional[str] = None
+    vendor:              Optional[str] = None
+    device_type_override: Optional[str] = None
+    vendor_override:     Optional[str] = None
 
 
-def _get_device_ip(mac: str, db: Session) -> str:
+# ── helpers ───────────────────────────────────────────────────────────────────
+
+def _get_device_or_404(mac: str, db: Session) -> Device:
     d = db.get(Device, mac.lower())
     if not d:
         raise HTTPException(404, "Device not found")
-    if not d.ip_address:
-        raise HTTPException(409, "Device has no recorded IP address")
-    return d.ip_address
+    return d
 
 
-def _sse_line(data: str) -> bytes:
-    safe = data.replace("\n", " ").replace("\r", "")
-    return f"data: {safe}\n\n".encode()
+async def _stream_subprocess(cmd: list[str]) -> AsyncIterator[str]:
+    proc = await asyncio.create_subprocess_exec(
+        *cmd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.STDOUT,
+    )
+    assert proc.stdout is not None
+    async for raw in proc.stdout:
+        line = raw.decode(errors="replace").rstrip()
+        if line:
+            yield f"data: {line}\n\n"
+    await proc.wait()
+    yield "data: __done__\n\n"
 
 
-def _stream_cmd(cmd: list[str]):
-    def generator():
-        try:
-            proc = subprocess.Popen(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                bufsize=1,
-            )
-            for line in proc.stdout:
-                line = line.rstrip()
-                if line:
-                    yield _sse_line(line)
-            proc.wait()
-            yield _sse_line(f"--- exit code {proc.returncode} ---")
-            yield b"event: done\ndata: {}\n\n"
-        except FileNotFoundError as e:
-            yield _sse_line(f"ERROR: command not found -- {e}")
-            yield b"event: done\ndata: {}\n\n"
-        except Exception as e:
-            yield _sse_line(f"ERROR: {e}")
-            yield b"event: done\ndata: {}\n\n"
-    return generator()
+# ── read endpoints ─────────────────────────────────────────────────────────────
 
-
-def _proxy_sse(probe_url: str):
-    def generator():
-        try:
-            with httpx.stream("GET", probe_url, timeout=120) as resp:
-                if resp.status_code != 200:
-                    yield f"data: ERROR -- probe returned {resp.status_code}\n\n".encode()
-                    yield b"event: done\ndata: {}\n\n"
-                    return
-                for chunk in resp.iter_bytes():
-                    if chunk:
-                        yield chunk
-        except httpx.ConnectError:
-            yield b"data: ERROR -- cannot reach probe (is the probe container running?)\n\n"
-            yield b"event: done\ndata: {}\n\n"
-        except Exception as e:
-            yield f"data: ERROR -- {e}\n\n".encode()
-            yield b"event: done\ndata: {}\n\n"
-    return generator()
-
-
-# ---------------------------------------------------------------------------
-# Routes -- devices
-# ---------------------------------------------------------------------------
 @app.get("/")
 def root():
-    return {"message": "InSpectre API", "version": "0.4.0"}
+    return {"message": "InSpectre API is online", "version": "0.4.0"}
+
 
 @app.get("/devices")
 def list_devices(online_only: bool = False, db: Session = Depends(get_db)):
     q = db.query(Device)
     if online_only:
         q = q.filter(Device.is_online == True)
-    return [_to_dict(d) for d in q.order_by(Device.last_seen.desc(), Device.mac_address.asc()).all()]
+    return [_to_dict(d) for d in q.order_by(Device.last_seen.desc()).all()]
+
 
 @app.get("/devices/{mac}")
 def get_device(mac: str, db: Session = Depends(get_db)):
-    d = db.get(Device, mac.lower())
-    if not d:
-        raise HTTPException(404, "Device not found")
-    return _to_dict(d)
+    return _to_dict(_get_device_or_404(mac, db))
+
 
 @app.patch("/devices/{mac}")
 def update_device(mac: str, payload: DeviceUpdate, db: Session = Depends(get_db)):
-    d = db.get(Device, mac.lower())
-    if not d:
-        raise HTTPException(404, "Device not found")
+    d = _get_device_or_404(mac, db)
     if payload.custom_name is not None:
-        d.custom_name = payload.custom_name
+        d.custom_name = payload.custom_name or None
     if payload.hostname is not None:
-        d.hostname = payload.hostname
+        d.hostname = payload.hostname or None
+    if payload.vendor is not None:
+        d.vendor = payload.vendor or None
+    if payload.device_type_override is not None:
+        d.device_type_override = payload.device_type_override or None
+    if payload.vendor_override is not None:
+        d.vendor_override = payload.vendor_override or None
     db.commit()
     db.refresh(d)
     return _to_dict(d)
 
+
 @app.post("/devices/{mac}/resolve-name")
-def resolve_name(mac: str, db: Session = Depends(get_db)):
-    d = db.get(Device, mac.lower())
-    if not d:
-        raise HTTPException(404, "Device not found")
-    name = _resolve_hostname(d.ip_address)
-    if name:
-        d.hostname = name
+async def resolve_name(mac: str, db: Session = Depends(get_db)):
+    """
+    Re-resolve the hostname for this device.
+    Delegates to the probe's /resolve/{ip} endpoint because the probe has
+    host networking and can reach LAN DNS servers; the backend cannot.
+    """
+    d = _get_device_or_404(mac, db)
+    if not d.ip_address:
+        raise HTTPException(422, "Device has no IP address recorded")
+
+    hostname = None
+    try:
+        async with httpx.AsyncClient(timeout=12.0) as client:
+            resp = await client.get(f"{PROBE_API_URL}/resolve/{d.ip_address}")
+            if resp.status_code == 200:
+                data     = resp.json()
+                hostname = data.get("hostname") or None
+    except Exception as e:
+        # Probe unreachable — surface a useful error rather than a silent failure
+        raise HTTPException(
+            503,
+            f"Could not reach probe API at {PROBE_API_URL}. "
+            f"Make sure the probe container is running. Detail: {e}"
+        )
+
+    if hostname:
+        d.hostname = hostname
         db.commit()
         db.refresh(d)
-    return {"mac": mac, "resolved": name, "device": _to_dict(d)}
+
+    return _to_dict(d)
+
 
 @app.post("/devices/{mac}/rescan")
-def rescan_device(mac: str, db: Session = Depends(get_db)):
-    d = db.get(Device, mac.lower())
-    if not d:
-        raise HTTPException(404, "Device not found")
-    d.deep_scanned = False
-    d.scan_results = None
-    db.commit()
-    db.refresh(d)
-    return {"mac": mac, "status": "queued", "message": "Rescan queued.", "device": _to_dict(d)}
+async def request_rescan(mac: str, db: Session = Depends(get_db)):
+    """Immediately trigger a fresh nmap deep scan via the probe."""
+    d = _get_device_or_404(mac, db)
+    if not d.ip_address:
+        raise HTTPException(422, "Device has no IP address recorded")
 
-@app.get("/devices/{mac}/scan")
-def get_scan_results(mac: str, db: Session = Depends(get_db)):
-    d = db.get(Device, mac.lower())
-    if not d:
-        raise HTTPException(404, "Device not found")
-    if not d.deep_scanned:
-        return {"status": "pending", "message": "Deep scan not yet completed"}
-    return {"status": "complete", "mac": mac, "data": d.scan_results}
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.post(f"{PROBE_API_URL}/rescan/{mac.lower()}")
+            if resp.status_code not in (200, 404):
+                raise HTTPException(resp.status_code, resp.text)
+    except HTTPException:
+        raise
+    except Exception as e:
+        # Probe unreachable — fall back to just marking deep_scanned=False
+        # so it will be picked up on the next sweep cycle
+        pass
+
+    d.deep_scanned = False
+    db.commit()
+    return {"queued": True, "mac": mac}
+
 
 @app.get("/devices/{mac}/ip-history")
 def get_ip_history(mac: str, db: Session = Depends(get_db)):
-    rows = (
-        db.query(IPHistory)
-        .filter(IPHistory.mac_address == mac.lower())
-        .order_by(IPHistory.last_seen.desc())
-        .all()
-    )
-    return [{"ip": r.ip_address, "first_seen": r.first_seen.isoformat(), "last_seen": r.last_seen.isoformat()} for r in rows]
+    d = _get_device_or_404(mac, db)
+    if d.ip_address:
+        return [{"ip": d.ip_address, "first_seen": d.first_seen, "last_seen": d.last_seen}]
+    return []
 
 
-@app.get("/devices/{mac}/ping")
-def ping_device(mac: str, db: Session = Depends(get_db)):
-    ip = _get_device_ip(mac, db)
-    import ipaddress
-    try:
-        ipaddress.ip_address(ip)
-    except ValueError:
-        raise HTTPException(400, "Device has invalid IP address")
-    cmd = ["ping", "-c", "10", "-W", "2", ip]
-    return StreamingResponse(
-        _stream_cmd(cmd),
-        media_type="text/event-stream",
-        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
-    )
-
-
-@app.get("/devices/{mac}/traceroute")
-def traceroute_device(mac: str, db: Session = Depends(get_db)):
-    ip = _get_device_ip(mac, db)
-    import ipaddress
-    try:
-        ipaddress.ip_address(ip)
-    except ValueError:
-        raise HTTPException(400, "Device has invalid IP address")
-    cmd = ["traceroute", "-m", "30", "-w", "2", ip]
-    return StreamingResponse(
-        _stream_cmd(cmd),
-        media_type="text/event-stream",
-        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
-    )
+@app.get("/devices/{mac}/scan")
+def get_scan_results(mac: str, db: Session = Depends(get_db)):
+    d = _get_device_or_404(mac, db)
+    if not d.deep_scanned:
+        return {"status": "pending", "message": "Deep scan not yet completed"}
+    return {"status": "complete", "mac": mac, "data": d.scan_results}
 
 
 @app.get("/stats")
 def stats(db: Session = Depends(get_db)):
     total   = db.query(Device).count()
     online  = db.query(Device).filter(Device.is_online == True).count()
-    offline = db.query(Device).filter(Device.is_online == False).count()
+    offline = total - online
     scanned = db.query(Device).filter(Device.deep_scanned == True).count()
     return {"total_devices": total, "online": online, "offline": offline, "deep_scanned": scanned}
 
 
-# ---------------------------------------------------------------------------
-# Routes -- settings
-# ---------------------------------------------------------------------------
-@app.get("/settings")
-def get_settings(db: Session = Depends(get_db)):
-    rows = db.query(Setting).order_by(Setting.key).all()
-    return [_setting_dict(s) for s in rows]
+@app.get("/alerts")
+def get_alerts(unseen_only: bool = False):
+    return []
 
-@app.put("/settings/{key}")
-def update_setting(key: str, payload: SettingUpdate, db: Session = Depends(get_db)):
-    s = db.get(Setting, key)
-    if s:
-        s.value = payload.value
+
+@app.get("/alerts/unseen-count")
+def get_unseen_count():
+    return {"count": 0}
+
+
+@app.post("/alerts/mark-all-seen")
+def mark_all_seen():
+    return {"ok": True}
+
+
+@app.delete("/alerts")
+def clear_alerts():
+    return {"ok": True}
+
+
+# ── streaming endpoints ────────────────────────────────────────────────────────
+
+@app.get("/devices/{mac}/ping")
+async def stream_ping(mac: str, count: int = 4, db: Session = Depends(get_db)):
+    d    = _get_device_or_404(mac, db)
+    ip   = d.ip_address
+    if not ip:
+        raise HTTPException(422, "Device has no IP address recorded")
+    count    = max(1, min(count, 20))
+    ping_bin = shutil.which("ping")
+    if not ping_bin:
+        raise HTTPException(503, "ping binary not found in container")
+    return StreamingResponse(
+        _stream_subprocess([ping_bin, "-c", str(count), ip]),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+@app.get("/devices/{mac}/traceroute")
+async def stream_traceroute(mac: str, db: Session = Depends(get_db)):
+    d  = _get_device_or_404(mac, db)
+    ip = d.ip_address
+    if not ip:
+        raise HTTPException(422, "Device has no IP address recorded")
+    tr_bin = shutil.which("traceroute") or shutil.which("tracepath")
+    if not tr_bin:
+        raise HTTPException(503, "traceroute/tracepath not found in container")
+    return StreamingResponse(
+        _stream_subprocess([tr_bin, ip]),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+@app.get("/devices/{mac}/vuln-scan")
+async def stream_vuln_scan(mac: str, db: Session = Depends(get_db)):
+    d  = _get_device_or_404(mac, db)
+    ip = d.ip_address
+    if not ip:
+        raise HTTPException(422, "Device has no IP address recorded")
+    nmap_bin = shutil.which("nmap")
+    if nmap_bin:
+        cmd = [nmap_bin, "-sV", "--script=vuln", "-T4", "--open", ip]
     else:
-        s = Setting(key=key, value=payload.value)
-        db.add(s)
-    db.commit()
-    db.refresh(s)
-    return _setting_dict(s)
-
-@app.post("/settings/reset")
-def reset_settings(db: Session = Depends(get_db)):
-    for default in DEFAULT_SETTINGS:
-        s = db.get(Setting, default["key"])
-        if s:
-            s.value = default["value"]
-        else:
-            db.add(Setting(key=default["key"], value=default["value"], description=default["description"]))
-    db.commit()
-    rows = db.query(Setting).order_by(Setting.key).all()
-    return [_setting_dict(s) for s in rows]
+        cmd = ["nmap", "-sV", "-T4", ip]
+    return StreamingResponse(
+        _stream_subprocess(cmd),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
 
 
-# ---------------------------------------------------------------------------
-# Serialisers
-# ---------------------------------------------------------------------------
+# ── serialiser ─────────────────────────────────────────────────────────────────
+
 def _to_dict(d: Device) -> dict:
     return {
-        "mac_address":  d.mac_address,
-        "ip_address":   d.ip_address,
-        "hostname":     d.hostname,
-        "vendor":       d.vendor,
-        "custom_name":  d.custom_name,
-        "is_online":    d.is_online,
-        "deep_scanned": d.deep_scanned,
-        "miss_count":   getattr(d, 'miss_count', 0),
-        "first_seen":   d.first_seen.isoformat() if d.first_seen else None,
-        "last_seen":    d.last_seen.isoformat()  if d.last_seen  else None,
-        "scan_results": d.scan_results,
-        "display_name": d.custom_name or d.hostname or d.ip_address,
-    }
-
-def _setting_dict(s: Setting) -> dict:
-    return {
-        "key":         s.key,
-        "value":       s.value,
-        "description": s.description or '',
-        "updated_at":  s.updated_at.isoformat() if s.updated_at else None,
+        "mac_address":          d.mac_address,
+        "ip_address":           d.ip_address,
+        "hostname":             d.hostname,
+        "vendor":               d.vendor,
+        "custom_name":          d.custom_name,
+        "is_online":            d.is_online,
+        "deep_scanned":         d.deep_scanned,
+        "first_seen":           d.first_seen.isoformat() if d.first_seen else None,
+        "last_seen":            d.last_seen.isoformat()  if d.last_seen  else None,
+        "scan_results":         d.scan_results,
+        "device_type_override": getattr(d, 'device_type_override', None),
+        "vendor_override":      getattr(d, 'vendor_override',      None),
     }
