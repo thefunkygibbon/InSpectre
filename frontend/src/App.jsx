@@ -16,7 +16,7 @@ import { DeviceDrawer }   from './components/DeviceDrawer'
 import { SettingsPanel }  from './components/SettingsPanel'
 import { CategoryView }   from './components/CategoryView'
 
-const APP_VERSION = '0.1.0'
+const APP_VERSION = '0.5.0'
 
 const FILTERS = ['all', 'online', 'offline']
 
@@ -139,7 +139,6 @@ export default function App() {
   const [search,       setSearch]       = useState('')
   const [filter,       setFilter]       = useState('all')
   const [sort,         setSort]         = useState('last_seen_desc')
-  // layout: 'grid' | 'list' | 'category'
   const [layout,       setLayout]       = useState('grid')
   const [selected,     setSelected]     = useState(null)
   const [showSettings, setShowSettings] = useState(false)
@@ -147,7 +146,6 @@ export default function App() {
   const [showAlertDrop, setShowAlertDrop] = useState(false)
   const [notificationsEnabled, setNotificationsEnabled] = useState(true)
 
-  // Load notification preference from settings on mount
   useEffect(() => {
     api.getSettings().then(s => {
       const n = s.find(x => x.key === 'notifications_enabled')
@@ -155,7 +153,6 @@ export default function App() {
     }).catch(() => {})
   }, [])
 
-  // Auto-dismiss offline toasts after 8s
   useEffect(() => {
     if (!offlineAlerts.length) return
     const id = setTimeout(() => offlineAlerts.forEach(a => dismissOffline(a.id)), 8000)
@@ -203,8 +200,6 @@ export default function App() {
   }
 
   const isDark = theme === 'dark'
-
-  // In category mode, sort doesn't apply (groups define order), but search/filter still does
   const isCategoryMode = layout === 'category'
 
   return (
@@ -217,8 +212,6 @@ export default function App() {
         {/* ── Navbar ── */}
         <header className="sticky top-0 z-30 border-b border-border bg-surface/80 backdrop-blur-xl">
           <div className="max-w-[1400px] mx-auto px-4 sm:px-6 h-16 flex items-center justify-between gap-4">
-
-            {/* Left: Logo + title */}
             <div className="flex items-center gap-3">
               <Logo size={30} />
               <div>
@@ -229,9 +222,7 @@ export default function App() {
               </div>
             </div>
 
-            {/* Right: live indicator + controls */}
             <div className="flex items-center gap-1">
-              {/* Live clock */}
               <div className="hidden md:flex items-center gap-2 mr-3">
                 <span className="live-ping" aria-hidden>
                   <span className="live-ping-dot" />
@@ -241,7 +232,6 @@ export default function App() {
                 </span>
               </div>
 
-              {/* Alert bell with badge */}
               <div className="relative">
                 <button
                   onClick={() => setShowAlertDrop(v => !v)}
@@ -260,7 +250,6 @@ export default function App() {
                   )}
                 </button>
 
-                {/* Alert dropdown */}
                 {showAlertDrop && (
                   <>
                     <div className="fixed inset-0 z-30" onClick={() => setShowAlertDrop(false)} />
@@ -343,7 +332,6 @@ export default function App() {
             </div>
           )}
 
-          {/* Stat cards */}
           <section>
             <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
               <StatCard label="Total Devices" value={stats?.total_devices} icon={Monitor}   color="brand"   />
@@ -353,13 +341,12 @@ export default function App() {
             </div>
           </section>
 
-          {/* Toolbar */}
           <section className="flex flex-col sm:flex-row gap-3 items-stretch sm:items-center">
             <div className="relative flex-1">
               <Search size={15} className="absolute left-3 top-1/2 -translate-y-1/2 pointer-events-none" style={{ color: 'var(--color-text-muted)' }} />
               <input
                 className="input pl-9"
-                placeholder="Search IP, MAC, hostname, vendor…"
+                placeholder="Search IP, MAC, hostname, vendor\u2026"
                 value={search}
                 onChange={e => setSearch(e.target.value)}
               />
@@ -382,7 +369,6 @@ export default function App() {
               ))}
             </div>
 
-            {/* Sort — hidden in category mode since ordering is by group */}
             {!isCategoryMode && (
               <div className="relative">
                 <select
@@ -399,48 +385,28 @@ export default function App() {
               </div>
             )}
 
-            {/* Layout toggle: grid / list / category */}
             <div className="flex items-center gap-1 glass rounded-xl p-1">
               <button
                 onClick={() => setLayout('grid')}
                 className="p-2 rounded-lg transition-all duration-150"
-                style={layout === 'grid'
-                  ? { background: 'var(--color-brand)', color: 'white' }
-                  : { color: 'var(--color-text-muted)' }
-                }
-                aria-label="Grid layout"
-                title="Grid view"
-              >
-                <LayoutGrid size={15} />
-              </button>
+                style={layout === 'grid' ? { background: 'var(--color-brand)', color: 'white' } : { color: 'var(--color-text-muted)' }}
+                aria-label="Grid layout" title="Grid view"
+              ><LayoutGrid size={15} /></button>
               <button
                 onClick={() => setLayout('list')}
                 className="p-2 rounded-lg transition-all duration-150"
-                style={layout === 'list'
-                  ? { background: 'var(--color-brand)', color: 'white' }
-                  : { color: 'var(--color-text-muted)' }
-                }
-                aria-label="List layout"
-                title="List view"
-              >
-                <List size={15} />
-              </button>
+                style={layout === 'list' ? { background: 'var(--color-brand)', color: 'white' } : { color: 'var(--color-text-muted)' }}
+                aria-label="List layout" title="List view"
+              ><List size={15} /></button>
               <button
                 onClick={() => setLayout('category')}
                 className="p-2 rounded-lg transition-all duration-150"
-                style={layout === 'category'
-                  ? { background: 'var(--color-brand)', color: 'white' }
-                  : { color: 'var(--color-text-muted)' }
-                }
-                aria-label="Category view"
-                title="Category view — groups devices by type"
-              >
-                <Layers size={15} />
-              </button>
+                style={layout === 'category' ? { background: 'var(--color-brand)', color: 'white' } : { color: 'var(--color-text-muted)' }}
+                aria-label="Category view" title="Category view"
+              ><Layers size={15} /></button>
             </div>
           </section>
 
-          {/* Device grid / list / category */}
           <section>
             {loading ? (
               <SkeletonGrid layout={layout === 'category' ? 'grid' : layout} />
@@ -451,11 +417,7 @@ export default function App() {
                 <p className="text-xs mb-4" style={{ color: 'var(--color-text-faint)' }}>
                   Showing {filtered.length} of {devices.length} device{devices.length !== 1 ? 's' : ''} &middot; grouped by device type
                 </p>
-                <CategoryView
-                  devices={filtered}
-                  layout="grid"
-                  onDeviceClick={setSelected}
-                />
+                <CategoryView devices={filtered} layout="grid" onDeviceClick={setSelected} />
               </>
             ) : (
               <>
@@ -474,20 +436,10 @@ export default function App() {
                       className="grid grid-cols-[1.5rem_2fr_1fr_1fr_1fr_6rem] gap-4 px-4 py-2.5 border-b text-xs font-semibold uppercase tracking-wider"
                       style={{ borderColor: 'var(--color-border)', color: 'var(--color-text-muted)' }}
                     >
-                      <span />
-                      <span>Name / IP</span>
-                      <span>MAC</span>
-                      <span>Vendor</span>
-                      <span>Last Seen</span>
-                      <span>Status</span>
+                      <span /><span>Name / IP</span><span>MAC</span><span>Vendor</span><span>Last Seen</span><span>Status</span>
                     </div>
                     {filtered.map((d, i) => (
-                      <DeviceRow
-                        key={d.mac_address}
-                        device={d}
-                        onClick={() => setSelected(d)}
-                        striped={i % 2 === 1}
-                      />
+                      <DeviceRow key={d.mac_address} device={d} onClick={() => setSelected(d)} striped={i % 2 === 1} />
                     ))}
                   </div>
                 )}
@@ -524,7 +476,6 @@ export default function App() {
         </footer>
       </div>
 
-      {/* ── Top-right toast notifications ── */}
       {notificationsEnabled && (
         <NotificationToasts
           newAlerts={newDeviceAlerts}
@@ -557,11 +508,8 @@ function SkeletonGrid({ layout }) {
     return (
       <div className="card overflow-hidden">
         {[...Array(6)].map((_, i) => (
-          <div
-            key={i}
-            className="grid grid-cols-[1.5rem_2fr_1fr_1fr_1fr_6rem] gap-4 px-4 py-3 border-b last:border-0"
-            style={{ borderColor: 'var(--color-border)' }}
-          >
+          <div key={i} className="grid grid-cols-[1.5rem_2fr_1fr_1fr_1fr_6rem] gap-4 px-4 py-3 border-b last:border-0"
+            style={{ borderColor: 'var(--color-border)' }}>
             <div className="skeleton w-2.5 h-2.5 rounded-full mt-1" />
             <div className="skeleton h-4 w-3/4" />
             <div className="skeleton h-4 w-4/5" />

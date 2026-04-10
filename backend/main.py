@@ -1,27 +1,60 @@
-from fastapi import FastAPI, HTTPException, Depends
+from fastapi import FastAPI, HTTPException, Depends, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker, Session
 from pydantic import BaseModel
 from typing import Optional, List
 import os
+import json
 import socket
 import subprocess
 
-from models import Base, Device
+from models import Base, Device, FingerprintEntry, Setting
 
 DATABASE_URL = os.environ.get("DATABASE_URL", "postgresql://admin:password123@db:5432/inspectre")
 engine       = create_engine(DATABASE_URL, pool_pre_ping=True)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base.metadata.create_all(bind=engine)
 
-app = FastAPI(title="InSpectre API", version="0.4.0")
+# ---------------------------------------------------------------------------
+# Default settings (seeded on first run / after reset)
+# ---------------------------------------------------------------------------
+DEFAULT_SETTINGS = {
+    "scan_interval":           ("60",    "How often to sweep the network, in seconds."),
+    "offline_miss_threshold":  ("3",     "Number of missed sweeps before a device is marked offline."),
+    "os_confidence_threshold": ("85",    "Minimum nmap OS-match confidence (%) to record."),
+    "sniffer_workers":         ("4",     "Number of parallel scanner threads."),
+    "ip_range":                ("192.168.0.0/24", "CIDR range to scan."),
+    "nmap_args":               ("-O --osscan-limit -sV --version-intensity 5 -T4", "Extra arguments passed to nmap."),
+    "notifications_enabled":   ("true",  "Show popup toasts when new devices appear or go offline."),
+}
+
+
+def _seed_settings(db: Session):
+    """Insert any missing settings rows using DEFAULT_SETTINGS."""
+    for key, (value, description) in DEFAULT_SETTINGS.items():
+        if not db.get(Setting, key):
+            db.add(Setting(key=key, value=value, description=description))
+    db.commit()
+
+
+app = FastAPI(title="InSpectre API", version="0.5.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.on_event("startup")
+def on_startup():
+    db = SessionLocal()
+    try:
+        _seed_settings(db)
+    finally:
+        db.close()
+
 
 def get_db():
     db = SessionLocal()
@@ -30,13 +63,16 @@ def get_db():
     finally:
         db.close()
 
+
 class DeviceUpdate(BaseModel):
     custom_name: Optional[str] = None
     hostname:    Optional[str] = None
 
+
 class IdentityUpdate(BaseModel):
     vendor_override:      Optional[str] = None
     device_type_override: Optional[str] = None
+
 
 # ---------------------------------------------------------------------------
 # Hostname resolution helpers
@@ -44,8 +80,8 @@ class IdentityUpdate(BaseModel):
 def _strip_fqdn(name: str) -> str:
     return name.rstrip('.') if name else ''
 
+
 def _resolve_hostname(ip: str) -> str | None:
-    """Multi-strategy hostname resolution — reverse DNS, mDNS, NetBIOS."""
     try:
         result = socket.gethostbyaddr(ip)
         candidate = _strip_fqdn(result[0])
@@ -53,12 +89,8 @@ def _resolve_hostname(ip: str) -> str | None:
             return candidate
     except Exception:
         pass
-
     try:
-        out = subprocess.run(
-            ["avahi-resolve", "-a", ip],
-            capture_output=True, text=True, timeout=3
-        )
+        out = subprocess.run(["avahi-resolve", "-a", ip], capture_output=True, text=True, timeout=3)
         for line in out.stdout.splitlines():
             parts = line.split()
             if len(parts) >= 2:
@@ -67,12 +99,8 @@ def _resolve_hostname(ip: str) -> str | None:
                     return candidate
     except Exception:
         pass
-
     try:
-        out = subprocess.run(
-            ["nmblookup", "-A", ip],
-            capture_output=True, text=True, timeout=4
-        )
+        out = subprocess.run(["nmblookup", "-A", ip], capture_output=True, text=True, timeout=4)
         for line in out.stdout.splitlines():
             if '<00>' in line and '<GROUP>' not in line:
                 parts = line.strip().split()
@@ -82,15 +110,56 @@ def _resolve_hostname(ip: str) -> str | None:
                         return candidate
     except Exception:
         pass
-
     return None
+
+
+# ---------------------------------------------------------------------------
+# Fingerprint matching helpers
+# ---------------------------------------------------------------------------
+def _oui(mac: str) -> str:
+    """Return the first 6 hex chars of a MAC (no colons/dashes, lower-case)."""
+    return mac.replace(':', '').replace('-', '').lower()[:6]
+
+
+def _match_fingerprints(device: Device, fingerprints: list[FingerprintEntry]) -> FingerprintEntry | None:
+    """
+    Return the best-matching FingerprintEntry for a device, or None.
+    Scoring: OUI match = 3pts, open-port overlap = 1pt each.
+    Ties broken by confidence_score then hit_count.
+    Only entries with score > 0 are considered.
+    """
+    device_oui   = _oui(device.mac_address)
+    device_ports = set()
+    if device.scan_results:
+        device_ports = {p.get('port') for p in (device.scan_results.get('open_ports') or []) if p.get('port')}
+
+    best_score = 0
+    best_fp    = None
+
+    for fp in fingerprints:
+        score = 0
+        if fp.oui_prefix and fp.oui_prefix.lower() == device_oui:
+            score += 3
+        if fp.open_ports:
+            score += len(device_ports & set(fp.open_ports))
+        if score > best_score or (
+            score == best_score and score > 0 and best_fp is not None and
+            (fp.confidence_score, fp.hit_count) > (best_fp.confidence_score, best_fp.hit_count)
+        ):
+            if score > 0:
+                best_score = score
+                best_fp    = fp
+
+    return best_fp
+
 
 # ---------------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------------
 @app.get("/")
 def root():
-    return {"message": "InSpectre API", "version": "0.4.0"}
+    return {"message": "InSpectre API", "version": "0.5.0"}
+
 
 @app.get("/devices")
 def list_devices(online_only: bool = False, db: Session = Depends(get_db)):
@@ -99,12 +168,14 @@ def list_devices(online_only: bool = False, db: Session = Depends(get_db)):
         q = q.filter(Device.is_online == True)
     return [_to_dict(d) for d in q.order_by(Device.last_seen.desc(), Device.mac_address.asc()).all()]
 
+
 @app.get("/devices/{mac}")
 def get_device(mac: str, db: Session = Depends(get_db)):
     d = db.get(Device, mac.lower())
     if not d:
         raise HTTPException(404, "Device not found")
     return _to_dict(d)
+
 
 @app.patch("/devices/{mac}")
 def update_device(mac: str, payload: DeviceUpdate, db: Session = Depends(get_db)):
@@ -119,9 +190,9 @@ def update_device(mac: str, payload: DeviceUpdate, db: Session = Depends(get_db)
     db.refresh(d)
     return _to_dict(d)
 
+
 @app.patch("/devices/{mac}/identity")
 def update_identity(mac: str, payload: IdentityUpdate, db: Session = Depends(get_db)):
-    """Set vendor_override and/or device_type_override on a device."""
     d = db.get(Device, mac.lower())
     if not d:
         raise HTTPException(404, "Device not found")
@@ -132,6 +203,7 @@ def update_identity(mac: str, payload: IdentityUpdate, db: Session = Depends(get
     db.commit()
     db.refresh(d)
     return _to_dict(d)
+
 
 @app.post("/devices/{mac}/resolve-name")
 def resolve_name(mac: str, db: Session = Depends(get_db)):
@@ -145,15 +217,16 @@ def resolve_name(mac: str, db: Session = Depends(get_db)):
         db.refresh(d)
     return {"mac": mac, "resolved": name, "device": _to_dict(d)}
 
+
 @app.post("/devices/{mac}/rescan")
 def rescan_device(mac: str, db: Session = Depends(get_db)):
-    """Reset deep_scanned so the probe queues a fresh nmap on the next sweep."""
     d = db.get(Device, mac.lower())
     if not d:
         raise HTTPException(404, "Device not found")
     d.deep_scanned = False
     db.commit()
     return {"mac": mac, "queued": True}
+
 
 @app.get("/devices/{mac}/scan")
 def get_scan_results(mac: str, db: Session = Depends(get_db)):
@@ -164,10 +237,9 @@ def get_scan_results(mac: str, db: Session = Depends(get_db)):
         return {"status": "pending", "message": "Deep scan not yet completed"}
     return {"status": "complete", "mac": mac, "data": d.scan_results}
 
+
 @app.get("/devices/{mac}/ip-history")
 def get_ip_history(mac: str, db: Session = Depends(get_db)):
-    """Return IP address history for a device (stub if table not yet created)."""
-    from sqlalchemy import text
     try:
         rows = db.execute(
             text("SELECT ip_address, first_seen, last_seen FROM ip_history WHERE mac_address = :mac ORDER BY last_seen DESC"),
@@ -177,16 +249,11 @@ def get_ip_history(mac: str, db: Session = Depends(get_db)):
     except Exception:
         return []
 
+
 @app.get("/vendors", response_model=List[str])
 def list_vendors(db: Session = Depends(get_db)):
-    """
-    Return a deduplicated, sorted list of all vendor names currently in the
-    database (combining both the raw vendor field and any vendor_override
-    values).  Used by the frontend autocomplete datalist.
-    """
-    from sqlalchemy import text
+    """Deduplicated sorted vendor names for autocomplete."""
     try:
-        # Pull vendor_override first (user-corrected names), then raw vendor
         rows = db.execute(text(
             "SELECT DISTINCT vendor_override FROM devices WHERE vendor_override IS NOT NULL AND vendor_override != '' "
             "UNION "
@@ -197,30 +264,27 @@ def list_vendors(db: Session = Depends(get_db)):
     except Exception:
         return []
 
+
 @app.get("/stats")
 def stats(db: Session = Depends(get_db)):
     total   = db.query(Device).count()
     online  = db.query(Device).filter(Device.is_online == True).count()
     offline = db.query(Device).filter(Device.is_online == False).count()
     scanned = db.query(Device).filter(Device.deep_scanned == True).count()
-    return {
-        "total_devices": total,
-        "online":        online,
-        "offline":       offline,
-        "deep_scanned":  scanned,
-    }
+    return {"total_devices": total, "online": online, "offline": offline, "deep_scanned": scanned}
+
 
 # ---------------------------------------------------------------------------
 # Settings
 # ---------------------------------------------------------------------------
 @app.get("/settings")
 def get_settings(db: Session = Depends(get_db)):
-    from models import Setting
+    _seed_settings(db)  # ensure any newly-added keys are present
     return [{"key": s.key, "value": s.value, "description": s.description} for s in db.query(Setting).all()]
+
 
 @app.put("/settings/{key}")
 def update_setting(key: str, payload: dict, db: Session = Depends(get_db)):
-    from models import Setting
     s = db.get(Setting, key)
     if not s:
         raise HTTPException(404, "Setting not found")
@@ -228,38 +292,60 @@ def update_setting(key: str, payload: dict, db: Session = Depends(get_db)):
     db.commit()
     return {"key": key, "value": s.value}
 
+
 @app.post("/settings/reset")
 def reset_settings(db: Session = Depends(get_db)):
-    from models import Setting
-    defaults = {
-        "scan_interval": "60",
-        "offline_miss_threshold": "3",
-        "os_confidence_threshold": "85",
-        "sniffer_workers": "4",
-        "ip_range": "192.168.0.0/24",
-        "nmap_args": "-O --osscan-limit -sV --version-intensity 5 -T4",
-    }
-    for k, v in defaults.items():
-        s = db.get(Setting, k)
+    for key, (value, _) in DEFAULT_SETTINGS.items():
+        s = db.get(Setting, key)
         if s:
-            s.value = v
+            s.value = value
     db.commit()
+    _seed_settings(db)
     return {"reset": True}
 
+
 # ---------------------------------------------------------------------------
-# Fingerprints (stubs — Phase 3)
+# Fingerprints
 # ---------------------------------------------------------------------------
 @app.get("/fingerprints")
-def get_fingerprints():
-    return []
+def get_fingerprints(db: Session = Depends(get_db)):
+    fps = db.query(FingerprintEntry).order_by(FingerprintEntry.updated_at.desc()).all()
+    return [
+        {
+            "id":               fp.id,
+            "oui_prefix":       fp.oui_prefix,
+            "hostname_pattern": fp.hostname_pattern,
+            "open_ports":       fp.open_ports,
+            "device_type":      fp.device_type,
+            "vendor_name":      fp.vendor_name,
+            "confidence_score": fp.confidence_score,
+            "hit_count":        fp.hit_count,
+            "source":           fp.source,
+            "created_at":       fp.created_at.isoformat() if fp.created_at else None,
+            "updated_at":       fp.updated_at.isoformat() if fp.updated_at else None,
+        }
+        for fp in fps
+    ]
+
 
 @app.get("/fingerprints/stats")
-def fingerprint_stats():
-    return {"total": 0}
+def fingerprint_stats(db: Session = Depends(get_db)):
+    total     = db.query(FingerprintEntry).count()
+    manual    = db.query(FingerprintEntry).filter(FingerprintEntry.source == 'manual').count()
+    community = db.query(FingerprintEntry).filter(FingerprintEntry.source == 'community').count()
+    auto      = db.query(FingerprintEntry).filter(FingerprintEntry.source == 'auto').count()
+    return {"total": total, "manual": manual, "community": community, "auto": auto}
+
 
 @app.delete("/fingerprints/{fid}")
-def delete_fingerprint(fid: int):
-    raise HTTPException(404, "Not found")
+def delete_fingerprint(fid: int, db: Session = Depends(get_db)):
+    fp = db.get(FingerprintEntry, fid)
+    if not fp:
+        raise HTTPException(404, "Fingerprint not found")
+    db.delete(fp)
+    db.commit()
+    return {"deleted": fid}
+
 
 @app.get("/export/devices")
 def export_devices_csv(db: Session = Depends(get_db)):
@@ -267,20 +353,189 @@ def export_devices_csv(db: Session = Depends(get_db)):
     import csv, io
     buf = io.StringIO()
     writer = csv.writer(buf)
-    writer.writerow(["mac_address","ip_address","hostname","vendor","custom_name","is_online","first_seen","last_seen"])
+    writer.writerow(["mac_address","ip_address","hostname","vendor","vendor_override","device_type_override","custom_name","is_online","first_seen","last_seen"])
     for d in db.query(Device).all():
-        writer.writerow([d.mac_address, d.ip_address, d.hostname, d.vendor, d.custom_name, d.is_online, d.first_seen, d.last_seen])
+        writer.writerow([d.mac_address, d.ip_address, d.hostname, d.vendor,
+                         getattr(d,'vendor_override',None), getattr(d,'device_type_override',None),
+                         d.custom_name, d.is_online, d.first_seen, d.last_seen])
     buf.seek(0)
-    return StreamingResponse(buf, media_type="text/csv", headers={"Content-Disposition": "attachment; filename=devices.csv"})
+    return StreamingResponse(buf, media_type="text/csv",
+                             headers={"Content-Disposition": "attachment; filename=inspectre-devices.csv"})
+
 
 @app.get("/export/fingerprints")
-def export_fingerprints_json():
-    from fastapi.responses import JSONResponse
-    return JSONResponse(content=[], headers={"Content-Disposition": "attachment; filename=fingerprints.json"})
+def export_fingerprints_json(db: Session = Depends(get_db)):
+    """
+    Export all fingerprint entries as JSON.  MAC addresses (source_mac) are
+    stripped so the file is safe to share publicly.
+    """
+    from fastapi.responses import Response
+    fps = db.query(FingerprintEntry).all()
+    data = [
+        {
+            "oui_prefix":       fp.oui_prefix,
+            "hostname_pattern": fp.hostname_pattern,
+            "open_ports":       fp.open_ports,
+            "device_type":      fp.device_type,
+            "vendor_name":      fp.vendor_name,
+            "confidence_score": fp.confidence_score,
+            "hit_count":        fp.hit_count,
+            "source":           fp.source,
+        }
+        for fp in fps
+    ]
+    return Response(
+        content=json.dumps(data, indent=2),
+        media_type="application/json",
+        headers={"Content-Disposition": "attachment; filename=inspectre-fingerprints.json"},
+    )
+
 
 @app.post("/import/fingerprints")
-def import_fingerprints_json():
-    return {"imported": 0}
+async def import_fingerprints_json(file: UploadFile = File(...), db: Session = Depends(get_db)):
+    """
+    Import a fingerprints.json file.
+
+    - Inserts new entries (deduplication by oui_prefix + device_type).
+    - Merges duplicate entries by incrementing hit_count and taking the
+      higher confidence_score.
+    - After import, re-applies all fingerprints to every device that does
+      NOT already have a device_type_override set by the user, so newly
+      imported patterns immediately correct unclassified devices.
+    - Returns counts: inserted, merged, corrected (devices updated).
+    """
+    content = await file.read()
+    try:
+        entries = json.loads(content)
+        if not isinstance(entries, list):
+            raise ValueError("Expected a JSON array")
+    except Exception as exc:
+        raise HTTPException(400, f"Invalid JSON: {exc}")
+
+    inserted  = 0
+    merged    = 0
+
+    for entry in entries:
+        device_type = entry.get("device_type", "").strip()
+        if not device_type:
+            continue  # skip malformed entries
+
+        oui_prefix  = (entry.get("oui_prefix") or "").strip().lower() or None
+        vendor_name = (entry.get("vendor_name") or "").strip() or None
+        open_ports  = entry.get("open_ports") or None
+        hostname_pattern = (entry.get("hostname_pattern") or "").strip() or None
+        confidence  = float(entry.get("confidence_score", 1.0))
+        hit_count   = int(entry.get("hit_count", 1))
+        source      = entry.get("source", "community")
+
+        # Dedup: match on oui_prefix + device_type (both can be None for
+        # port-only entries, so fall back to checking open_ports equality)
+        existing = None
+        if oui_prefix:
+            existing = (
+                db.query(FingerprintEntry)
+                .filter(
+                    FingerprintEntry.oui_prefix  == oui_prefix,
+                    FingerprintEntry.device_type == device_type,
+                )
+                .first()
+            )
+
+        if existing:
+            # Merge: keep higher confidence, sum hit counts
+            existing.hit_count        += hit_count
+            existing.confidence_score  = max(existing.confidence_score, confidence)
+            if vendor_name and not existing.vendor_name:
+                existing.vendor_name = vendor_name
+            merged += 1
+        else:
+            db.add(FingerprintEntry(
+                oui_prefix       = oui_prefix,
+                hostname_pattern = hostname_pattern,
+                open_ports       = open_ports,
+                device_type      = device_type,
+                vendor_name      = vendor_name,
+                confidence_score = confidence,
+                hit_count        = hit_count,
+                source           = source if source in ('manual', 'community', 'auto') else 'community',
+            ))
+            inserted += 1
+
+    db.commit()
+
+    # ── Apply fingerprints to existing devices ────────────────────────────
+    # Only touch devices that have NO user-set device_type_override.
+    # We re-query fingerprints after the commit so merged entries are current.
+    all_fps    = db.query(FingerprintEntry).all()
+    devices    = db.query(Device).filter(
+        (Device.device_type_override == None) | (Device.device_type_override == "")
+    ).all()
+
+    corrected = 0
+    for device in devices:
+        best = _match_fingerprints(device, all_fps)
+        if best:
+            device.device_type_override = best.device_type
+            if best.vendor_name and not device.vendor_override:
+                device.vendor_override = best.vendor_name
+            corrected += 1
+            best.hit_count += 1
+
+    db.commit()
+
+    return {"inserted": inserted, "merged": merged, "corrected": corrected}
+
+
+# ---------------------------------------------------------------------------
+# SSE streaming stubs (ping / traceroute) — implemented in probe/scanner
+# ---------------------------------------------------------------------------
+@app.get("/devices/{mac}/ping")
+async def stream_ping(mac: str, db: Session = Depends(get_db)):
+    from fastapi.responses import StreamingResponse
+    import asyncio
+    d = db.get(Device, mac.lower())
+    if not d:
+        raise HTTPException(404, "Device not found")
+
+    async def _gen():
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "ping", "-c", "10", d.ip_address,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+            )
+            async for line in proc.stdout:
+                yield f"data: {line.decode().rstrip()}\n\n"
+            await proc.wait()
+        except Exception as e:
+            yield f"data: [ERROR] {e}\n\n"
+
+    return StreamingResponse(_gen(), media_type="text/event-stream")
+
+
+@app.get("/devices/{mac}/traceroute")
+async def stream_traceroute(mac: str, db: Session = Depends(get_db)):
+    from fastapi.responses import StreamingResponse
+    import asyncio
+    d = db.get(Device, mac.lower())
+    if not d:
+        raise HTTPException(404, "Device not found")
+
+    async def _gen():
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "traceroute", "-n", "-m", "20", d.ip_address,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+            )
+            async for line in proc.stdout:
+                yield f"data: {line.decode().rstrip()}\n\n"
+            await proc.wait()
+        except Exception as e:
+            yield f"data: [ERROR] {e}\n\n"
+
+    return StreamingResponse(_gen(), media_type="text/event-stream")
+
 
 def _to_dict(d: Device) -> dict:
     return {
