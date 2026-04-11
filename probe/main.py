@@ -24,7 +24,7 @@ from sqlalchemy.orm import declarative_base, sessionmaker
 # ---------------------------------------------------------------------------
 # Version
 # ---------------------------------------------------------------------------
-VERSION = "0.5.1"
+VERSION = "0.5.2"
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -35,7 +35,10 @@ IP_RANGE                = os.environ.get("IP_RANGE",                "192.168.0.0
 INTERFACE               = os.environ.get("INTERFACE",               "eth0")
 NMAP_ARGS               = os.environ.get("NMAP_ARGS",               "-O --osscan-limit -sV --version-intensity 5 -T4")
 OS_CONFIDENCE_THRESHOLD = int(os.environ.get("OS_CONFIDENCE_THRESHOLD", 85))
-OFFLINE_MISS_THRESHOLD  = int(os.environ.get("OFFLINE_MISS_THRESHOLD",   3))
+# Raised from 3 to 5 — a device must miss 5 consecutive ARP sweeps before
+# being declared offline. At the default 60s interval that's 5 minutes,
+# which avoids false-offline events from brief ARP gaps / sleeping devices.
+OFFLINE_MISS_THRESHOLD  = int(os.environ.get("OFFLINE_MISS_THRESHOLD",   5))
 SNIFFER_WORKERS         = int(os.environ.get("SNIFFER_WORKERS",          4))
 PROBE_API_PORT          = int(os.environ.get("PROBE_API_PORT",         8001))
 # Explicit LAN DNS server override. Set this to your router/DNS IP (e.g. 192.168.0.1)
@@ -56,7 +59,6 @@ def _is_valid_ip(ip: str) -> bool:
     import ipaddress
     try:
         addr = ipaddress.ip_address(ip.strip())
-        # Reject 0.0.0.0/8, broadcast, loopback treated as invalid probe targets
         return not (addr.packed[0] == 0 or str(addr) == "255.255.255.255")
     except ValueError:
         return False
@@ -123,7 +125,6 @@ def wait_for_db(retries: int = 10, delay: int = 5) -> None:
 def init_db() -> None:
     Base.metadata.create_all(engine)
     with engine.connect() as conn:
-        # ── Column migrations ──
         try:
             conn.execute(text("ALTER TABLE devices ADD COLUMN IF NOT EXISTS deep_scanned BOOLEAN DEFAULT FALSE"))
             conn.execute(text("ALTER TABLE devices ADD COLUMN IF NOT EXISTS miss_count INTEGER DEFAULT 0"))
@@ -132,7 +133,6 @@ def init_db() -> None:
             print(f"[DB] Column migration note: {e}", flush=True)
             conn.rollback()
 
-        # ── ip_history table (idempotent) ──
         conn.execute(text("""
             CREATE TABLE IF NOT EXISTS ip_history (
                 id          SERIAL PRIMARY KEY,
@@ -146,9 +146,6 @@ def init_db() -> None:
         conn.execute(text("CREATE INDEX IF NOT EXISTS ix_ip_history_mac ON ip_history (mac_address)"))
         conn.commit()
 
-        # ── CRITICAL: add the unique constraint to existing tables that were
-        #    created before this constraint existed.  DO_NOTHING means if it
-        #    already exists (fresh install) this is a no-op. ──
         try:
             conn.execute(text("""
                 ALTER TABLE ip_history
@@ -157,19 +154,14 @@ def init_db() -> None:
             conn.commit()
             print("[DB] Added uq_ip_history_mac_ip constraint.", flush=True)
         except Exception:
-            # Constraint already exists — that's fine
             conn.rollback()
 
     print("[DB] Migrations complete.", flush=True)
 
 # ---------------------------------------------------------------------------
 # IP History
-# NOTE: must only be called AFTER the parent device row has been committed.
 # ---------------------------------------------------------------------------
 def record_ip(mac: str, ip: str) -> bool:
-    """Record an IP for a MAC in ip_history. Returns True if this is a brand-new
-    (mac, ip) pair (i.e. first_seen == last_seen within 2 seconds).
-    Skips silently for invalid IPs — the device row must already exist."""
     if not _is_valid_ip(ip):
         return False
     now     = datetime.now(timezone.utc)
@@ -208,8 +200,6 @@ _DNS_SERVER: str | None = None
 _DNS_DETECTED = False
 
 def _get_default_gateway() -> str | None:
-    """Read the default gateway from 'ip route' — usually the router, which is
-    also the LAN DNS server on most home networks."""
     try:
         out = subprocess.run(
             ["ip", "route", "show", "default"],
@@ -217,7 +207,6 @@ def _get_default_gateway() -> str | None:
         )
         for line in out.stdout.splitlines():
             parts = line.split()
-            # Format: default via <gateway_ip> dev <iface> ...
             if len(parts) >= 3 and parts[0] == "default" and parts[1] == "via":
                 gw = parts[2]
                 if not gw.startswith("127.") and not gw.startswith("169.254."):
@@ -228,21 +217,10 @@ def _get_default_gateway() -> str | None:
     return None
 
 def _detect_dns_server() -> str | None:
-    """Determine the best DNS server to use for PTR lookups.
-
-    Priority:
-      1. LAN_DNS_SERVER env var (explicit override — most reliable)
-      2. First non-loopback nameserver from /etc/resolv.conf
-      3. Default gateway from 'ip route' (router usually also answers DNS)
-    """
-    # 1. Explicit env override
     if LAN_DNS_SERVER_ENV:
         print(f"[hostname] DNS server from env (LAN_DNS_SERVER): {LAN_DNS_SERVER_ENV}", flush=True)
         return LAN_DNS_SERVER_ENV
 
-    # 2. /etc/resolv.conf — skip loopback addresses (127.x, 169.254.x)
-    #    Docker injects 127.0.0.11 (its embedded resolver) and systemd-resolved
-    #    uses 127.0.0.53 — neither can answer PTR queries for LAN hostnames.
     try:
         with open("/etc/resolv.conf") as f:
             for line in f:
@@ -257,7 +235,6 @@ def _detect_dns_server() -> str | None:
     except Exception:
         pass
 
-    # 3. Fall back to default gateway (works for most home/office routers)
     gw = _get_default_gateway()
     if gw:
         print(f"[hostname] Using default gateway as DNS server: {gw}", flush=True)
@@ -268,7 +245,6 @@ def _detect_dns_server() -> str | None:
     return None
 
 def resolve_hostname(ip: str) -> str | None:
-    # Skip resolution for invalid/non-routable IPs immediately
     if not _is_valid_ip(ip):
         return None
 
@@ -279,8 +255,6 @@ def resolve_hostname(ip: str) -> str | None:
 
     print(f"[hostname] Resolving {ip} (DNS server: {_DNS_SERVER})", flush=True)
 
-    # ── Method 1: dig PTR against the LAN DNS/router ──
-    # Most reliable for .lan / .home / router-assigned names
     if _DNS_SERVER:
         try:
             out = subprocess.run(
@@ -292,12 +266,9 @@ def resolve_hostname(ip: str) -> str | None:
                 if candidate and candidate != ip and not candidate.startswith(";"):
                     print(f"[hostname] dig resolved {ip} -> {candidate}", flush=True)
                     return candidate
-            if out.stdout.strip():
-                print(f"[hostname] dig stdout: {out.stdout.strip()!r}", flush=True)
         except Exception as e:
             print(f"[hostname] dig failed: {e}", flush=True)
 
-    # ── Method 2: system gethostbyaddr ──
     try:
         result = socket.gethostbyaddr(ip)
         candidate = _strip_fqdn(result[0])
@@ -307,7 +278,6 @@ def resolve_hostname(ip: str) -> str | None:
     except Exception as e:
         print(f"[hostname] gethostbyaddr failed for {ip}: {e}", flush=True)
 
-    # ── Method 3: host command against LAN DNS ──
     if _DNS_SERVER:
         try:
             out = subprocess.run(
@@ -325,7 +295,6 @@ def resolve_hostname(ip: str) -> str | None:
         except Exception as e:
             print(f"[hostname] host cmd failed: {e}", flush=True)
 
-    # ── Method 4: nslookup ──
     try:
         cmd = ["nslookup", ip]
         if _DNS_SERVER:
@@ -343,7 +312,6 @@ def resolve_hostname(ip: str) -> str | None:
     except Exception as e:
         print(f"[hostname] nslookup failed: {e}", flush=True)
 
-    # ── Method 5: avahi-resolve (mDNS .local names) ──
     try:
         out = subprocess.run(
             ["avahi-resolve", "-a", ip],
@@ -359,7 +327,6 @@ def resolve_hostname(ip: str) -> str | None:
     except (FileNotFoundError, subprocess.TimeoutExpired):
         pass
 
-    # ── Method 6: nmblookup (NetBIOS/Windows names) ──
     try:
         out = subprocess.run(
             ["nmblookup", "-A", ip],
@@ -485,16 +452,10 @@ def trigger_deep_scan(ip: str, mac: str) -> None:
 
 # ---------------------------------------------------------------------------
 # Device upsert
-#
-# Order of operations (important for FK integrity):
-#   1. Validate mac + ip
-#   2. Upsert the device row (ensures parent exists)
-#   3. Record ip_history AFTER the device row is committed
 # ---------------------------------------------------------------------------
 def upsert_seen_device(mac: str, ip: str, source: str) -> None:
     if not mac or mac == "00:00:00:00:00:00":
         return
-    # Reject invalid IPs early — 0.0.0.0 from ARP probes must not be stored
     if not _is_valid_ip(ip):
         return
 
@@ -545,7 +506,6 @@ def upsert_seen_device(mac: str, ip: str, source: str) -> None:
                 )
             )
             session.execute(stmt)
-            # Commit device row FIRST so ip_history FK is satisfied
             session.commit()
 
             if is_new:
@@ -576,12 +536,9 @@ def upsert_seen_device(mac: str, ip: str, source: str) -> None:
         finally:
             session.close()
 
-    # Record IP history AFTER the device row is safely committed
-    # (outside the mac_lock to avoid holding it during a DB write)
     record_ip(mac, ip)
 
 def refresh_missing_hostnames() -> None:
-    """Re-try hostname resolution for all online devices missing a name."""
     session = Session()
     try:
         unnamed = session.query(Device).filter(
@@ -607,7 +564,6 @@ def refresh_missing_hostnames() -> None:
         session.close()
 
 def bulk_reresolve_all() -> None:
-    """On startup, attempt to resolve hostnames for every device in the DB."""
     session = Session()
     try:
         all_devs = session.query(Device).filter(Device.ip_address != None).all()
@@ -640,8 +596,6 @@ def process_arp_packet(packet) -> None:
     ip  = (arp.psrc  or "").strip()
     if not mac or not ip or mac == "ff:ff:ff:ff:ff:ff" or mac.startswith("01:"):
         return
-    # Ignore gratuitous ARP probes with 0.0.0.0 source (host is just checking
-    # for IP conflicts before claiming the address — not a usable record yet)
     if not _is_valid_ip(ip):
         return
     try:
@@ -668,17 +622,32 @@ def start_arp_sniffer() -> None:
 
 # ---------------------------------------------------------------------------
 # Presence sweep
+#
+# KEY FIX: if a device's last_seen is within the current scan interval
+# (meaning the sniffer saw it recently), do NOT increment its miss_count.
+# This prevents devices that are actively sending ARP traffic from being
+# wrongly marked offline just because they didn't respond to the sweep probe.
 # ---------------------------------------------------------------------------
 def update_presence_from_sweep(session, active_macs: set) -> None:
+    now = datetime.now(timezone.utc)
     for dev in session.query(Device).all():
         if dev.mac_address in active_macs:
             dev.is_online  = True
             dev.miss_count = 0
         else:
+            # Grace: if the sniffer updated last_seen within the last
+            # scan interval, treat it as "seen" — don't penalise.
+            if dev.last_seen:
+                seconds_since_seen = (now - dev.last_seen).total_seconds()
+                if seconds_since_seen <= SCAN_INTERVAL:
+                    # Seen by sniffer within this sweep window — not absent
+                    dev.miss_count = 0
+                    continue
+
             dev.miss_count = (dev.miss_count or 0) + 1
             if dev.miss_count >= OFFLINE_MISS_THRESHOLD and dev.is_online:
                 dev.is_online = False
-                print(f"[-] Offline: {dev.ip_address} ({dev.mac_address})", flush=True)
+                print(f"[-] Offline: {dev.ip_address} ({dev.mac_address}) after {dev.miss_count} missed sweeps", flush=True)
 
 # ---------------------------------------------------------------------------
 # Probe HTTP API (port 8001)
@@ -731,11 +700,6 @@ def probe_health():
 
 @probe_api.get("/resolve/{ip}")
 def probe_resolve(ip: str):
-    """
-    Resolve a hostname for the given IP using the probe's full resolution stack.
-    Called by the backend when the user clicks the 'refresh hostname' button.
-    The probe has host networking so it can reach LAN DNS; the backend cannot.
-    """
     import ipaddress
     try:
         ipaddress.ip_address(ip)
@@ -813,25 +777,21 @@ def main() -> None:
 
     print(
         f"[*] Scanning {IP_RANGE} on {INTERFACE} every {SCAN_INTERVAL}s\n"
-        f"[*] Offline threshold: {OFFLINE_MISS_THRESHOLD} | OS confidence: {OS_CONFIDENCE_THRESHOLD}%",
+        f"[*] Offline threshold: {OFFLINE_MISS_THRESHOLD} missed sweeps | OS confidence: {OS_CONFIDENCE_THRESHOLD}%",
         flush=True,
     )
 
-    # Detect DNS server early so it's available before first scan
     global _DNS_SERVER, _DNS_DETECTED
     _DNS_SERVER   = _detect_dns_server()
     _DNS_DETECTED = True
     print(f"[*] DNS server: {_DNS_SERVER or 'NOT DETECTED — set LAN_DNS_SERVER in docker-compose!'}", flush=True)
 
-    # Start probe HTTP API in background thread
     threading.Thread(target=start_probe_api, daemon=True, name="probe-api").start()
     time.sleep(2)
 
-    # Resolve hostnames for all existing devices on startup (background)
     print("[*] Running startup hostname resolution pass...", flush=True)
     threading.Thread(target=bulk_reresolve_all, daemon=True, name="startup-resolve").start()
 
-    # Start passive ARP sniffer in background
     threading.Thread(target=start_arp_sniffer, daemon=True, name="arp-sniffer").start()
 
     while True:

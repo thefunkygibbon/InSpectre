@@ -1,4 +1,4 @@
-import { useState, useMemo, useEffect, useCallback } from 'react'
+import { useState, useMemo, useEffect, useCallback, useRef } from 'react'
 import {
   Wifi, WifiOff, Monitor, ScanSearch, Settings,
   RefreshCw, Search, Filter, AlertCircle, Activity,
@@ -31,6 +31,8 @@ const SORT_OPTIONS = [
   { value: 'status',         label: 'Status (online first)' },
 ]
 
+const TOAST_DURATION = 7000 // ms before a toast auto-dismisses
+
 function ipToNum(ip) {
   if (!ip) return 0
   return ip.split('.').reduce((acc, o) => (acc << 8) + parseInt(o, 10), 0) >>> 0
@@ -60,10 +62,80 @@ function useClock() {
   return time
 }
 
+// ── Single toast item with its own auto-dismiss timer ─────────────────────
+function Toast({ alert, kind, onDismiss, onDeviceClick }) {
+  const timerRef = useRef(null)
+
+  useEffect(() => {
+    timerRef.current = setTimeout(() => onDismiss(alert.id), TOAST_DURATION)
+    return () => clearTimeout(timerRef.current)
+  }, [alert.id, onDismiss])
+
+  function handleClick(e) {
+    // Don't open drawer when clicking the X button
+    if (e.target.closest('[data-dismiss]')) return
+    onDeviceClick && onDeviceClick(alert)
+    onDismiss(alert.id)
+  }
+
+  return (
+    <div
+      onClick={handleClick}
+      className="flex items-start gap-3 px-4 py-3 rounded-xl shadow-lg text-sm animate-fade-in"
+      style={{
+        pointerEvents: 'auto',
+        cursor: 'pointer',
+        ...(kind === 'new' ? {
+          background: 'var(--toast-new-bg)',
+          border: '1px solid var(--toast-new-border)',
+        } : {
+          background: 'var(--toast-offline-bg)',
+          border: '1px solid var(--toast-offline-border)',
+        }),
+      }}
+    >
+      {kind === 'new'
+        ? <Bell   size={14} style={{ color: 'var(--color-brand)', flexShrink: 0, marginTop: 2 }} />
+        : <WifiOff size={14} style={{ color: '#ef4444',            flexShrink: 0, marginTop: 2 }} />
+      }
+      <div className="flex-1 min-w-0">
+        {kind === 'new' ? (
+          <>
+            <p className="font-semibold" style={{ color: 'var(--color-brand)' }}>New device detected</p>
+            <p className="text-xs mt-0.5 truncate" style={{ color: 'var(--color-text)' }}>
+              <span className="font-mono">{alert.ip}</span>
+              {(alert.hostname || alert.vendor) && <> &mdash; {alert.hostname || alert.vendor}</>}
+            </p>
+            <p className="mt-0.5 font-mono" style={{ fontSize: '11px', color: 'var(--color-text-muted)' }}>{alert.mac}</p>
+          </>
+        ) : (
+          <>
+            <p className="font-semibold" style={{ color: '#ef4444' }}>Device went offline</p>
+            <p className="text-xs mt-0.5" style={{ color: 'var(--color-text)' }}>
+              <span className="font-medium">{alert.name}</span>
+              <span className="ml-1.5" style={{ color: 'var(--color-text-muted)' }}>{alert.ip}</span>
+            </p>
+          </>
+        )}
+        <p className="text-xs mt-1" style={{ color: 'var(--color-text-faint)', fontSize: '10px' }}>Click to view device</p>
+      </div>
+      <button
+        data-dismiss="true"
+        onClick={e => { e.stopPropagation(); onDismiss(alert.id) }}
+        aria-label="Dismiss notification"
+        className="opacity-50 hover:opacity-100 transition-opacity shrink-0"
+        style={{ marginTop: 2 }}
+      >
+        <X size={13} />
+      </button>
+    </div>
+  )
+}
+
 // ── Toast notification stack (top-right corner) ───────────────────────────
-function NotificationToasts({ newAlerts, offlineAlerts, onDismissNew, onDismissOffline }) {
+function NotificationToasts({ newAlerts, offlineAlerts, onDismissNew, onDismissOffline, onDeviceClick }) {
   const all = [
-    ...newAlerts.map(a  => ({ ...a, kind: 'new'     })),
+    ...newAlerts.map(a     => ({ ...a, kind: 'new'     })),
     ...offlineAlerts.map(a => ({ ...a, kind: 'offline' })),
   ]
   if (!all.length) return null
@@ -73,53 +145,13 @@ function NotificationToasts({ newAlerts, offlineAlerts, onDismissNew, onDismissO
       style={{ top: '5rem', right: '1rem', width: '320px', pointerEvents: 'none' }}
     >
       {all.map(a => (
-        <div
+        <Toast
           key={`${a.kind}-${a.id}`}
-          className="flex items-start gap-3 px-4 py-3 rounded-xl shadow-lg text-sm animate-fade-in"
-          style={{
-            pointerEvents: 'auto',
-            ...(a.kind === 'new' ? {
-              background: 'var(--toast-new-bg)',
-              border: '1px solid var(--toast-new-border)',
-            } : {
-              background: 'var(--toast-offline-bg)',
-              border: '1px solid var(--toast-offline-border)',
-            }),
-          }}
-        >
-          {a.kind === 'new'
-            ? <Bell   size={14} style={{ color: 'var(--color-brand)', flexShrink: 0, marginTop: 2 }} />
-            : <WifiOff size={14} style={{ color: '#ef4444',            flexShrink: 0, marginTop: 2 }} />
-          }
-          <div className="flex-1 min-w-0">
-            {a.kind === 'new' ? (
-              <>
-                <p className="font-semibold" style={{ color: 'var(--color-brand)' }}>New device detected</p>
-                <p className="text-xs mt-0.5 truncate" style={{ color: 'var(--color-text)' }}>
-                  <span className="font-mono">{a.ip}</span>
-                  {(a.hostname || a.vendor) && <> &mdash; {a.hostname || a.vendor}</>}
-                </p>
-                <p className="mt-0.5 font-mono" style={{ fontSize: '11px', color: 'var(--color-text-muted)' }}>{a.mac}</p>
-              </>
-            ) : (
-              <>
-                <p className="font-semibold" style={{ color: '#ef4444' }}>Device went offline</p>
-                <p className="text-xs mt-0.5" style={{ color: 'var(--color-text)' }}>
-                  <span className="font-medium">{a.name}</span>
-                  <span className="ml-1.5" style={{ color: 'var(--color-text-muted)' }}>{a.ip}</span>
-                </p>
-              </>
-            )}
-          </div>
-          <button
-            onClick={() => a.kind === 'new' ? onDismissNew(a.id) : onDismissOffline(a.id)}
-            aria-label="Dismiss notification"
-            className="opacity-50 hover:opacity-100 transition-opacity shrink-0"
-            style={{ marginTop: 2 }}
-          >
-            <X size={13} />
-          </button>
-        </div>
+          alert={a}
+          kind={a.kind}
+          onDismiss={a.kind === 'new' ? onDismissNew : onDismissOffline}
+          onDeviceClick={onDeviceClick}
+        />
       ))}
     </div>
   )
@@ -153,13 +185,16 @@ export default function App() {
     }).catch(() => {})
   }, [])
 
-  useEffect(() => {
-    if (!offlineAlerts.length) return
-    const id = setTimeout(() => offlineAlerts.forEach(a => dismissOffline(a.id)), 8000)
-    return () => clearTimeout(id)
-  }, [offlineAlerts, dismissOffline])
-
   const totalAlerts = newDeviceAlerts.length
+
+  // When a toast is clicked, find the full device object and open its drawer
+  function handleToastDeviceClick(alert) {
+    // alert has .mac (new) or .mac_address (offline)
+    const mac = alert.mac || alert.mac_address
+    if (!mac) return
+    const device = devices.find(d => d.mac_address === mac)
+    if (device) setSelected(device)
+  }
 
   const filtered = useMemo(() => {
     let list = devices
@@ -271,8 +306,13 @@ export default function App() {
                       ) : (
                         newDeviceAlerts.map(a => (
                           <div key={a.id}
-                            className="flex items-start gap-2 p-2.5 rounded-lg"
+                            className="flex items-start gap-2 p-2.5 rounded-lg cursor-pointer hover:opacity-80 transition-opacity"
                             style={{ background: 'var(--color-surface-offset)' }}
+                            onClick={() => {
+                              handleToastDeviceClick(a)
+                              dismissNewDevice(a.id)
+                              setShowAlertDrop(false)
+                            }}
                           >
                             <Bell size={12} className="mt-0.5 shrink-0" style={{ color: 'var(--color-brand)' }} />
                             <div className="flex-1 min-w-0">
@@ -283,7 +323,7 @@ export default function App() {
                                 {a.hostname || a.vendor} &middot; {a.mac}
                               </p>
                             </div>
-                            <button onClick={() => dismissNewDevice(a.id)} aria-label="Dismiss"
+                            <button onClick={e => { e.stopPropagation(); dismissNewDevice(a.id) }} aria-label="Dismiss"
                               className="opacity-40 hover:opacity-100 transition-opacity shrink-0 mt-0.5">
                               <X size={11} />
                             </button>
@@ -482,6 +522,7 @@ export default function App() {
           offlineAlerts={offlineAlerts}
           onDismissNew={dismissNewDevice}
           onDismissOffline={dismissOffline}
+          onDeviceClick={handleToastDeviceClick}
         />
       )}
 
