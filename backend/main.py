@@ -154,6 +154,61 @@ def _match_fingerprints(device: Device, fingerprints: list[FingerprintEntry]) ->
 
 
 # ---------------------------------------------------------------------------
+# Fingerprint upsert helper (used by update_identity)
+# ---------------------------------------------------------------------------
+def _upsert_manual_fingerprint(db: Session, device: Device, vendor_name: Optional[str], device_type: Optional[str]):
+    """
+    Create or update a manual FingerprintEntry whenever the user saves
+    vendor/type overrides on a device.  Deduplication key: oui_prefix +
+    device_type (same logic as the import endpoint).
+    Skipped if device_type is empty/None — a vendor-only override still
+    records an entry keyed on OUI alone so the export is never blank.
+    """
+    oui = _oui(device.mac_address) if device.mac_address else None
+    # Build the open-ports list from the last scan if available
+    open_ports = None
+    if device.scan_results:
+        ports = [p.get('port') for p in (device.scan_results.get('open_ports') or []) if p.get('port')]
+        open_ports = ports if ports else None
+
+    effective_type = (device_type or "").strip() or None
+    effective_vendor = (vendor_name or "").strip() or None
+
+    # Try to find an existing manual entry for this OUI + type combo
+    existing = None
+    if oui:
+        q = db.query(FingerprintEntry).filter(
+            FingerprintEntry.oui_prefix == oui,
+            FingerprintEntry.source == 'manual',
+        )
+        if effective_type:
+            q = q.filter(FingerprintEntry.device_type == effective_type)
+        existing = q.first()
+
+    if existing:
+        # Update fields, increment hit count
+        if effective_vendor:
+            existing.vendor_name = effective_vendor
+        if effective_type:
+            existing.device_type = effective_type
+        if open_ports:
+            existing.open_ports = open_ports
+        existing.hit_count        += 1
+        existing.confidence_score  = 1.0  # manual = full confidence
+    else:
+        db.add(FingerprintEntry(
+            oui_prefix       = oui,
+            hostname_pattern = None,
+            open_ports       = open_ports,
+            device_type      = effective_type or "unknown",
+            vendor_name      = effective_vendor,
+            confidence_score = 1.0,
+            hit_count        = 1,
+            source           = 'manual',
+        ))
+
+
+# ---------------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------------
 @app.get("/")
@@ -196,10 +251,21 @@ def update_identity(mac: str, payload: IdentityUpdate, db: Session = Depends(get
     d = db.get(Device, mac.lower())
     if not d:
         raise HTTPException(404, "Device not found")
+
     if payload.vendor_override is not None:
         d.vendor_override = payload.vendor_override or None
     if payload.device_type_override is not None:
         d.device_type_override = payload.device_type_override or None
+
+    # --- NEW: persist a manual FingerprintEntry so stats/export are populated ---
+    _upsert_manual_fingerprint(
+        db,
+        device      = d,
+        vendor_name = d.vendor_override,
+        device_type = d.device_type_override,
+    )
+    # ----------------------------------------------------------------------------
+
     db.commit()
     db.refresh(d)
     return _to_dict(d)
