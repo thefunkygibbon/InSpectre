@@ -18,7 +18,16 @@ import { CategoryView }   from './components/CategoryView'
 
 const APP_VERSION = '0.5.0'
 
+// filter values — 'scanned' is new, maps to deep_scanned=true
 const FILTERS = ['all', 'online', 'offline']
+
+// Map stat card colour key -> filter value
+const CARD_FILTER_MAP = {
+  all:     'all',
+  online:  'online',
+  offline: 'offline',
+  scanned: 'scanned',
+}
 
 const SORT_OPTIONS = [
   { value: 'last_seen_desc', label: 'Last seen (newest)' },
@@ -31,7 +40,7 @@ const SORT_OPTIONS = [
   { value: 'status',         label: 'Status (online first)' },
 ]
 
-const TOAST_DURATION = 7000 // ms before a toast auto-dismisses
+const TOAST_DURATION = 7000
 
 function ipToNum(ip) {
   if (!ip) return 0
@@ -62,7 +71,7 @@ function useClock() {
   return time
 }
 
-// ── Single toast item with its own auto-dismiss timer ─────────────────────
+// ── Single toast item ────────────────────────────────────────────────────
 function Toast({ alert, kind, onDismiss, onDeviceClick }) {
   const timerRef = useRef(null)
 
@@ -72,7 +81,6 @@ function Toast({ alert, kind, onDismiss, onDeviceClick }) {
   }, [alert.id, onDismiss])
 
   function handleClick(e) {
-    // Don't open drawer when clicking the X button
     if (e.target.closest('[data-dismiss]')) return
     onDeviceClick && onDeviceClick(alert)
     onDismiss(alert.id)
@@ -132,7 +140,7 @@ function Toast({ alert, kind, onDismiss, onDeviceClick }) {
   )
 }
 
-// ── Toast notification stack (top-right corner) ───────────────────────────
+// ── Toast stack ───────────────────────────────────────────────────────────
 function NotificationToasts({ newAlerts, offlineAlerts, onDismissNew, onDismissOffline, onDeviceClick }) {
   const all = [
     ...newAlerts.map(a     => ({ ...a, kind: 'new'     })),
@@ -187,9 +195,12 @@ export default function App() {
 
   const totalAlerts = newDeviceAlerts.length
 
-  // When a toast is clicked, find the full device object and open its drawer
+  // Toggle a stat-card filter: clicking the active card resets to 'all'
+  function handleCardFilter(cardKey) {
+    setFilter(prev => prev === cardKey ? 'all' : cardKey)
+  }
+
   function handleToastDeviceClick(alert) {
-    // alert has .mac (new) or .mac_address (offline)
     const mac = alert.mac || alert.mac_address
     if (!mac) return
     const device = devices.find(d => d.mac_address === mac)
@@ -200,6 +211,7 @@ export default function App() {
     let list = devices
     if (filter === 'online')  list = list.filter(d => d.is_online)
     if (filter === 'offline') list = list.filter(d => !d.is_online)
+    if (filter === 'scanned') list = list.filter(d => d.deep_scanned)
     if (search.trim()) {
       const q = search.toLowerCase()
       list = list.filter(d =>
@@ -236,6 +248,10 @@ export default function App() {
 
   const isDark = theme === 'dark'
   const isCategoryMode = layout === 'category'
+
+  // The filter buttons only show all/online/offline (not scanned — that comes from the card)
+  // but we keep them in sync: if filter is 'scanned' the pill buttons show nothing highlighted
+  const pillFilter = FILTERS.includes(filter) ? filter : 'all'
 
   return (
     <div className="min-h-screen bg-bg flex flex-col transition-colors duration-200">
@@ -372,12 +388,29 @@ export default function App() {
             </div>
           )}
 
+          {/* ── Stat cards — each one is a filter shortcut ── */}
           <section>
             <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
-              <StatCard label="Total Devices" value={stats?.total_devices} icon={Monitor}   color="brand"   />
-              <StatCard label="Online"        value={stats?.online}        icon={Wifi}       color="emerald" />
-              <StatCard label="Offline"       value={stats?.offline}       icon={WifiOff}    color="red"     />
-              <StatCard label="Deep Scanned"  value={stats?.deep_scanned}  icon={ScanSearch} color="amber"   />
+              <StatCard
+                label="Total Devices" value={stats?.total_devices} icon={Monitor}   color="brand"
+                onClick={() => handleCardFilter('all')}
+                active={filter === 'all'}
+              />
+              <StatCard
+                label="Online"        value={stats?.online}        icon={Wifi}       color="emerald"
+                onClick={() => handleCardFilter('online')}
+                active={filter === 'online'}
+              />
+              <StatCard
+                label="Offline"       value={stats?.offline}       icon={WifiOff}    color="red"
+                onClick={() => handleCardFilter('offline')}
+                active={filter === 'offline'}
+              />
+              <StatCard
+                label="Deep Scanned"  value={stats?.deep_scanned}  icon={ScanSearch} color="amber"
+                onClick={() => handleCardFilter('scanned')}
+                active={filter === 'scanned'}
+              />
             </div>
           </section>
 
@@ -397,7 +430,7 @@ export default function App() {
               {FILTERS.map(f => (
                 <button
                   key={f}
-                  onClick={() => setFilter(f)}
+                  onClick={() => setFilter(prev => prev === f ? 'all' : f)}
                   className="px-3 py-1.5 rounded-lg text-xs font-medium capitalize transition-all duration-150"
                   style={filter === f
                     ? { background: 'var(--color-brand)', color: 'white' }
@@ -463,6 +496,14 @@ export default function App() {
               <>
                 <p className="text-xs mb-4" style={{ color: 'var(--color-text-faint)' }}>
                   Showing {filtered.length} of {devices.length} device{devices.length !== 1 ? 's' : ''}
+                  {filter !== 'all' && (
+                    <span
+                      className="ml-2 px-2 py-0.5 rounded-full text-[10px] font-semibold uppercase"
+                      style={{ background: 'var(--color-brand)', color: 'white' }}
+                    >
+                      {filter}
+                    </span>
+                  )}
                 </p>
                 {layout === 'grid' ? (
                   <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-4">

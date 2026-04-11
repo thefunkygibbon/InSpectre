@@ -14,7 +14,6 @@ function useCountUp(target, duration = 600) {
     const tick = (now) => {
       const elapsed = now - start
       const progress = Math.min(elapsed / duration, 1)
-      // cubic ease-out
       const ease = 1 - Math.pow(1 - progress, 3)
       setDisplay(Math.round(from + (to - from) * ease))
       if (progress < 1) raf.current = requestAnimationFrame(tick)
@@ -28,21 +27,31 @@ function useCountUp(target, duration = 600) {
 }
 
 const COLOR_MAP = {
-  brand:   { gradient: 'from-[color:var(--color-brand)]/10 to-transparent', icon: 'text-[color:var(--color-brand)]', blob: 'bg-[color:var(--color-brand)]/8' },
-  emerald: { gradient: 'from-emerald-500/10 to-transparent', icon: 'text-emerald-400', blob: 'bg-emerald-500/8' },
-  red:     { gradient: 'from-red-500/10 to-transparent',     icon: 'text-red-400',     blob: 'bg-red-500/8'     },
-  amber:   { gradient: 'from-amber-500/10 to-transparent',   icon: 'text-amber-400',   blob: 'bg-amber-500/8'   },
+  brand:   { gradient: 'from-[color:var(--color-brand)]/10 to-transparent', icon: 'text-[color:var(--color-brand)]', ring: 'var(--color-brand)'   },
+  emerald: { gradient: 'from-emerald-500/10 to-transparent',                icon: 'text-emerald-400',               ring: 'rgb(16,185,129)'      },
+  red:     { gradient: 'from-red-500/10 to-transparent',                    icon: 'text-red-400',                   ring: 'rgb(239,68,68)'       },
+  amber:   { gradient: 'from-amber-500/10 to-transparent',                  icon: 'text-amber-400',                 ring: 'rgb(245,158,11)'      },
 }
 
-export function StatCard({ label, value, icon: Icon, color = 'brand', sub }) {
+export function StatCard({ label, value, icon: Icon, color = 'brand', sub, onClick, active }) {
   const counted = useCountUp(value)
   const c = COLOR_MAP[color] || COLOR_MAP.brand
+  const isClickable = typeof onClick === 'function'
 
   return (
     <div
-      className={`card bg-gradient-to-br ${c.gradient} p-5 flex flex-col gap-3 relative overflow-hidden`}
+      onClick={onClick}
+      role={isClickable ? 'button' : undefined}
+      tabIndex={isClickable ? 0 : undefined}
+      onKeyDown={isClickable ? (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); onClick() } } : undefined}
+      aria-pressed={isClickable ? active : undefined}
+      className={`card bg-gradient-to-br ${c.gradient} p-5 flex flex-col gap-3 relative overflow-hidden transition-all duration-150
+        ${isClickable ? 'cursor-pointer select-none hover:brightness-105 active:scale-[0.98]' : ''}
+      `}
       style={{
-        '--stat-blob': c.blob,
+        outline: active ? `2px solid ${c.ring}` : '2px solid transparent',
+        outlineOffset: '2px',
+        boxShadow: active ? `0 0 0 4px color-mix(in srgb, ${c.ring} 15%, transparent)` : undefined,
       }}
     >
       {/* Glow blob */}
@@ -59,7 +68,7 @@ export function StatCard({ label, value, icon: Icon, color = 'brand', sub }) {
         {Icon && (
           <span
             className="w-8 h-8 rounded-lg flex items-center justify-center"
-            style={{ background: `color-mix(in srgb, var(--color-brand) 12%, transparent)` }}
+            style={{ background: `color-mix(in srgb, ${c.ring} 15%, transparent)` }}
           >
             <Icon size={16} className={c.icon} />
           </span>
@@ -75,6 +84,15 @@ export function StatCard({ label, value, icon: Icon, color = 'brand', sub }) {
         </span>
         {sub && <span className="text-xs mb-1" style={{ color: 'var(--color-text-faint)' }}>{sub}</span>}
       </div>
+
+      {isClickable && (
+        <span
+          className="absolute bottom-2 right-3 text-[10px] font-medium uppercase tracking-wider opacity-40"
+          style={{ color: c.ring }}
+        >
+          {active ? 'filtering ✕' : 'click to filter'}
+        </span>
+      )}
     </div>
   )
 }
