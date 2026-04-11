@@ -24,7 +24,7 @@ from sqlalchemy.orm import declarative_base, sessionmaker
 # ---------------------------------------------------------------------------
 # Version
 # ---------------------------------------------------------------------------
-VERSION = "0.5.2"
+VERSION = "0.5.3"
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -35,15 +35,9 @@ IP_RANGE                = os.environ.get("IP_RANGE",                "192.168.0.0
 INTERFACE               = os.environ.get("INTERFACE",               "eth0")
 NMAP_ARGS               = os.environ.get("NMAP_ARGS",               "-O --osscan-limit -sV --version-intensity 5 -T4")
 OS_CONFIDENCE_THRESHOLD = int(os.environ.get("OS_CONFIDENCE_THRESHOLD", 85))
-# Raised from 3 to 5 — a device must miss 5 consecutive ARP sweeps before
-# being declared offline. At the default 60s interval that's 5 minutes,
-# which avoids false-offline events from brief ARP gaps / sleeping devices.
 OFFLINE_MISS_THRESHOLD  = int(os.environ.get("OFFLINE_MISS_THRESHOLD",   5))
 SNIFFER_WORKERS         = int(os.environ.get("SNIFFER_WORKERS",          4))
 PROBE_API_PORT          = int(os.environ.get("PROBE_API_PORT",         8001))
-# Explicit LAN DNS server override. Set this to your router/DNS IP (e.g. 192.168.0.1)
-# in docker-compose. When set it is used as the primary DNS target for PTR lookups
-# and skips the /etc/resolv.conf detection entirely.
 LAN_DNS_SERVER_ENV      = os.environ.get("LAN_DNS_SERVER", "").strip()
 
 PING_COUNT    = 10
@@ -53,7 +47,6 @@ TRACE_MAX_HOP = 30
 _INVALID_IPS = {"0.0.0.0", "", "255.255.255.255"}
 
 def _is_valid_ip(ip: str) -> bool:
-    """Return True only for a non-empty, non-broadcast, non-zero IPv4 address."""
     if not ip or ip.strip() in _INVALID_IPS:
         return False
     import ipaddress
@@ -162,6 +155,11 @@ def init_db() -> None:
 # IP History
 # ---------------------------------------------------------------------------
 def record_ip(mac: str, ip: str) -> bool:
+    """
+    Upserts the IP into ip_history. Returns True only if this is a BRAND NEW
+    mac+ip combination (first_seen == last_seen within 2s), i.e. a genuine
+    new IP assignment rather than a repeat seen-again update.
+    """
     if not _is_valid_ip(ip):
         return False
     now     = datetime.now(timezone.utc)
@@ -477,6 +475,14 @@ def upsert_seen_device(mac: str, ip: str, source: str) -> None:
                 vendor   = existing.vendor
 
             safe_hostname = (hostname or '').replace("'", "''")
+
+            # ----------------------------------------------------------------
+            # The on_conflict SET clause deliberately omits deep_scanned and
+            # scan_results — those columns are ONLY written by the nmap thread
+            # (_run_deep_scan_thread) or the explicit rescan endpoint.
+            # Preserving them here stops routine ARP upserts from ever
+            # resetting the deep-scan state.
+            # ----------------------------------------------------------------
             stmt = (
                 pg_insert(Device)
                 .values(
@@ -488,7 +494,7 @@ def upsert_seen_device(mac: str, ip: str, source: str) -> None:
                     is_online    = True,
                     first_seen   = now,
                     last_seen    = now,
-                    deep_scanned = False,
+                    deep_scanned = False,   # only used for brand-new INSERT rows
                     miss_count   = 0,
                 )
                 .on_conflict_do_update(
@@ -498,6 +504,8 @@ def upsert_seen_device(mac: str, ip: str, source: str) -> None:
                         is_online  = True,
                         last_seen  = now,
                         miss_count = 0,
+                        # deep_scanned and scan_results intentionally NOT here
+                        # — they must never be overwritten by a routine upsert.
                         hostname   = text(
                             "CASE WHEN devices.hostname IS NOT NULL AND devices.hostname != '' "
                             f"THEN devices.hostname ELSE '{safe_hostname}' END"
@@ -514,20 +522,26 @@ def upsert_seen_device(mac: str, ip: str, source: str) -> None:
             elif not existing.is_online:
                 print(f"[~] Back online via {source}: {ip} ({mac})", flush=True)
 
+            # ----------------------------------------------------------------
+            # IP-change handling.
+            #
+            # We only want to treat this as a real IP change (and thus
+            # invalidate the existing deep-scan) if the NEW ip is genuinely
+            # stable, not just a transient gratuitous ARP or a brief
+            # multi-interface flap.
+            #
+            # Strategy: record_ip() returns True only when the mac+ip combo
+            # has JUST been inserted for the first time (first_seen ≈ now).
+            # We check that AND that the device was previously deep-scanned
+            # before wiping anything.  This means:
+            #   - same IP seen again -> record_ip returns False -> no rescan
+            #   - new IP first appearance -> record_ip returns True -> rescan
+            #     only if the device was already deep-scanned (otherwise
+            #     there's nothing to invalidate; the pending scan will pick
+            #     up the correct IP anyway)
+            # ----------------------------------------------------------------
             if ip_changed:
-                print(f"[~] IP changed {old_ip} -> {ip} for {mac} -- queuing rescan", flush=True)
-                session2 = Session()
-                try:
-                    dev2 = session2.get(Device, mac)
-                    if dev2:
-                        dev2.deep_scanned = False
-                        dev2.scan_results = None
-                        session2.commit()
-                except Exception:
-                    session2.rollback()
-                finally:
-                    session2.close()
-                trigger_deep_scan(ip, mac)
+                print(f"[~] IP change detected {old_ip} -> {ip} for {mac} (source={source})", flush=True)
 
         except Exception as e:
             session.rollback()
@@ -536,7 +550,31 @@ def upsert_seen_device(mac: str, ip: str, source: str) -> None:
         finally:
             session.close()
 
-    record_ip(mac, ip)
+    # record_ip is called OUTSIDE the session so the upsert is committed first.
+    # It returns True only for a genuinely new mac+ip combo.
+    is_brand_new_ip = record_ip(mac, ip)
+
+    if ip_changed and is_brand_new_ip:
+        # Confirmed stable IP change — invalidate scan only if one existed.
+        session2 = Session()
+        try:
+            dev2 = session2.get(Device, mac)
+            if dev2 and dev2.deep_scanned:
+                print(f"[~] Stable IP change {old_ip} -> {ip} for {mac} — invalidating deep scan", flush=True)
+                dev2.deep_scanned = False
+                dev2.scan_results = None
+                session2.commit()
+                trigger_deep_scan(ip, mac)
+            elif dev2 and not dev2.deep_scanned:
+                # Not yet scanned — the in-flight or pending scan will use
+                # whatever IP is current; no action needed.
+                print(f"[~] IP change for unscanned device {mac} — scan will use new IP {ip}", flush=True)
+        except Exception as e:
+            session2.rollback()
+            print(f"[DB] IP-change rescan error {mac}: {e}", flush=True)
+        finally:
+            session2.close()
+
 
 def refresh_missing_hostnames() -> None:
     session = Session()
@@ -622,11 +660,6 @@ def start_arp_sniffer() -> None:
 
 # ---------------------------------------------------------------------------
 # Presence sweep
-#
-# KEY FIX: if a device's last_seen is within the current scan interval
-# (meaning the sniffer saw it recently), do NOT increment its miss_count.
-# This prevents devices that are actively sending ARP traffic from being
-# wrongly marked offline just because they didn't respond to the sweep probe.
 # ---------------------------------------------------------------------------
 def update_presence_from_sweep(session, active_macs: set) -> None:
     now = datetime.now(timezone.utc)
@@ -635,12 +668,9 @@ def update_presence_from_sweep(session, active_macs: set) -> None:
             dev.is_online  = True
             dev.miss_count = 0
         else:
-            # Grace: if the sniffer updated last_seen within the last
-            # scan interval, treat it as "seen" — don't penalise.
             if dev.last_seen:
                 seconds_since_seen = (now - dev.last_seen).total_seconds()
                 if seconds_since_seen <= SCAN_INTERVAL:
-                    # Seen by sniffer within this sweep window — not absent
                     dev.miss_count = 0
                     continue
 
