@@ -10,19 +10,12 @@ async function request(method, path, body) {
   return res.json()
 }
 
-/**
- * Stream an SSE endpoint, calling onLine(text) for each data line.
- * Pass an AbortSignal to cancel mid-stream.
- */
 async function streamSSE(path, onLine, signal) {
   const res = await fetch(`${BASE}${path}`, { signal })
   if (!res.ok) throw new Error(`GET ${path} \u2192 ${res.status}`)
-
   const reader  = res.body.getReader()
   const decoder = new TextDecoder()
   let buf = ''
-
-  // eslint-disable-next-line no-constant-condition
   while (true) {
     const { done, value } = await reader.read()
     if (done) break
@@ -45,11 +38,21 @@ export const api = {
   getDevice:       (mac)        => request('GET',   `/devices/${mac}`),
   updateDevice:    (mac, body)  => request('PATCH', `/devices/${mac}`, body),
   updateIdentity:  (mac, body)  => request('PATCH', `/devices/${mac}/identity`, body),
+  updateMetadata:  (mac, body)  => request('PATCH', `/devices/${mac}/metadata`, body),
   resolveName:     (mac)        => request('POST',  `/devices/${mac}/resolve-name`),
   rescanDevice:    (mac)        => request('POST',  `/devices/${mac}/rescan`),
   getScanResults:  (mac)        => request('GET',   `/devices/${mac}/scan`),
   getIpHistory:    (mac)        => request('GET',   `/devices/${mac}/ip-history`),
+  getDeviceEvents: (mac, limit) => request('GET',   `/devices/${mac}/events${limit ? `?limit=${limit}` : ''}`),
   getStats:        ()           => request('GET',   '/stats'),
+
+  // Global events feed
+  getAllEvents:    (limit, type) => {
+    const p = new URLSearchParams()
+    if (limit) p.set('limit', limit)
+    if (type)  p.set('event_type', type)
+    return request('GET', `/events${p.toString() ? '?' + p : ''}`)
+  },
 
   // Vendor list for autocomplete
   getVendors:      ()           => request('GET',   '/vendors'),
@@ -64,11 +67,11 @@ export const api = {
   updateSetting:   (key, value) => request('PUT',  `/settings/${key}`, { value: String(value) }),
   resetSettings:   ()           => request('POST', '/settings/reset'),
 
-  // Export — returns a Response so the caller can trigger a file download
+  // Export
   exportDevicesCsv:       ()     => fetch(`${BASE}/export/devices`),
   exportFingerprintsJson: ()     => fetch(`${BASE}/export/fingerprints`),
 
-  // Import — multipart file upload
+  // Import
   importFingerprintsJson: (file) => {
     const form = new FormData()
     form.append('file', file)

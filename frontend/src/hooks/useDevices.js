@@ -1,25 +1,14 @@
 import { useState, useEffect, useRef, useCallback } from 'react'
 import { api } from '../api'
 
-/**
- * Enrich a raw device object from the API with a computed display_name.
- * Priority: custom_name > hostname > ip_address
- */
 function enrich(d) {
   return {
     ...d,
     display_name: d.custom_name || d.hostname || d.ip_address || d.mac_address,
+    tags_array: d.tags ? d.tags.split(',').map(t => t.trim()).filter(Boolean) : [],
   }
 }
 
-/**
- * useDevices
- *
- * Polls /devices and /stats on an interval.
- * Detects new MACs and devices dropping offline between polls,
- * exposing alert state for the UI to render toasts.
- * New-device alerts auto-dismiss after 8 seconds.
- */
 export function useDevices(intervalMs = 10000) {
   const [devices,     setDevices]     = useState([])
   const [stats,       setStats]       = useState(null)
@@ -28,20 +17,19 @@ export function useDevices(intervalMs = 10000) {
   const [lastRefresh, setLastRefresh] = useState(null)
 
   // Alert state
-  const [newDeviceAlerts, setNewDeviceAlerts] = useState([]) // [{ id, mac, ip, vendor, hostname }]
-  const [offlineAlerts,   setOfflineAlerts]   = useState([]) // [{ id, mac, ip, name }]
+  const [newDeviceAlerts, setNewDeviceAlerts] = useState([])
+  const [offlineAlerts,   setOfflineAlerts]   = useState([])
 
-  const knownMacsRef  = useRef(null)        // Set<string> -- null = first load
-  const prevOnlineRef = useRef(new Map())   // mac -> was_online
+  const knownMacsRef  = useRef(null)
+  const prevOnlineRef = useRef(new Map())
 
   const fetchData = useCallback(async () => {
     try {
       const [rawList, st] = await Promise.all([api.getDevices(), api.getStats()])
       const devList = rawList.map(enrich)
 
-      // ---- New device detection ----
+      // New device detection
       if (knownMacsRef.current === null) {
-        // First load -- seed known MACs, no alerts
         knownMacsRef.current = new Set(devList.map(d => d.mac_address))
       } else {
         const newOnes = devList.filter(d => !knownMacsRef.current.has(d.mac_address))
@@ -50,12 +38,11 @@ export function useDevices(intervalMs = 10000) {
             id:       d.mac_address,
             mac:      d.mac_address,
             ip:       d.ip_address,
-            vendor:   d.vendor   || 'Unknown vendor',
+            vendor:   d.vendor || 'Unknown vendor',
             hostname: d.hostname || null,
           }))
           setNewDeviceAlerts(prev => [...prev, ...alerts])
           newOnes.forEach(d => knownMacsRef.current.add(d.mac_address))
-          // Auto-dismiss after 8 seconds
           setTimeout(() => {
             const ids = new Set(alerts.map(a => a.id))
             setNewDeviceAlerts(prev => prev.filter(a => !ids.has(a.id)))
@@ -63,7 +50,7 @@ export function useDevices(intervalMs = 10000) {
         }
       }
 
-      // ---- Offline drop detection ----
+      // Offline drop detection — important devices get their own alert class
       const prevOnline = prevOnlineRef.current
       const droppedOff = devList.filter(d => {
         const wasOnline = prevOnline.get(d.mac_address)
@@ -73,14 +60,14 @@ export function useDevices(intervalMs = 10000) {
         setOfflineAlerts(prev => [
           ...prev,
           ...droppedOff.map(d => ({
-            id:   d.mac_address,
-            mac:  d.mac_address,
-            ip:   d.ip_address,
-            name: d.display_name || d.ip_address,
+            id:          d.mac_address,
+            mac:         d.mac_address,
+            ip:          d.ip_address,
+            name:        d.display_name || d.ip_address,
+            is_important: d.is_important,
           })),
         ])
       }
-      // Update previous online map
       prevOnlineRef.current = new Map(devList.map(d => [d.mac_address, d.is_online]))
 
       setDevices(devList)
@@ -100,16 +87,17 @@ export function useDevices(intervalMs = 10000) {
     return () => clearInterval(id)
   }, [fetchData, intervalMs])
 
-  function dismissNewDevice(id) {
-    setNewDeviceAlerts(prev => prev.filter(a => a.id !== id))
+  // Optimistic update helpers — keeps UI snappy without waiting for next poll
+  function optimisticUpdate(mac, patch) {
+    setDevices(prev =>
+      prev.map(d => d.mac_address === mac ? enrich({ ...d, ...patch }) : d)
+    )
   }
 
-  function dismissOffline(id) {
-    setOfflineAlerts(prev => prev.filter(a => a.id !== id))
-  }
-
-  function dismissAllNew()     { setNewDeviceAlerts([]) }
-  function dismissAllOffline() { setOfflineAlerts([]) }
+  function dismissNewDevice(id)    { setNewDeviceAlerts(prev => prev.filter(a => a.id !== id)) }
+  function dismissOffline(id)      { setOfflineAlerts(prev => prev.filter(a => a.id !== id)) }
+  function dismissAllNew()         { setNewDeviceAlerts([]) }
+  function dismissAllOffline()     { setOfflineAlerts([]) }
 
   return {
     devices,
@@ -118,6 +106,7 @@ export function useDevices(intervalMs = 10000) {
     error,
     lastRefresh,
     refresh: fetchData,
+    optimisticUpdate,
     newDeviceAlerts,
     offlineAlerts,
     dismissNewDevice,
