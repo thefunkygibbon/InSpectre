@@ -1,54 +1,27 @@
 #!/usr/bin/env bash
-set -e
+set -euo pipefail
 
-echo "==> Pulling latest code..."
-git fetch origin
-git reset --hard origin/main
-git clean -fd
-chmod +x inspectre.sh
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$ROOT_DIR"
 
-echo "==> Tearing down all containers, networks and orphans..."
-docker compose down --remove-orphans --volumes 2>/dev/null || true
+PROJECT_NAME="inspectre"
 
-echo "==> Removing InSpectre images only..."
-docker image rm inspectre-probe inspectre-web inspectre-frontend 2>/dev/null || true
-# Catch compose-prefixed variants (e.g. inspectre-inspectre-probe)
-docker images --format '{{.Repository}}:{{.Tag}}' \
-  | grep -i '^inspectre' \
-  | xargs -r docker image rm 2>/dev/null || true
+echo "[inspectre] Stopping stack..."
+docker compose -p "$PROJECT_NAME" down --remove-orphans --volumes || true
 
-# NOTE: We do NOT run docker builder prune or docker image prune here.
-# Those are system-wide and would delete cached layers from other projects on this host.
+echo "[inspectre] Removing leftover project containers..."
+docker ps -aq --filter "label=com.docker.compose.project=$PROJECT_NAME" | xargs -r docker rm -f
 
-echo "==> Building from scratch..."
-docker compose build --no-cache --pull
+echo "[inspectre] Removing leftover project volumes..."
+docker volume ls -q --filter "label=com.docker.compose.project=$PROJECT_NAME" | xargs -r docker volume rm -f
 
-echo "==> Starting stack..."
-docker compose up -d --force-recreate
+echo "[inspectre] Removing leftover project network..."
+docker network ls -q --filter "label=com.docker.compose.project=$PROJECT_NAME" | xargs -r docker network rm
 
-echo "==> Waiting for containers to settle (15s)..."
-sleep 15
+echo "[inspectre] Removing leftover project images..."
+docker images -q --filter "label=com.docker.compose.project=$PROJECT_NAME" | xargs -r docker rmi -f
 
-echo "==> Container status:"
-docker compose ps
+echo "[inspectre] Rebuilding fresh..."
+docker compose -p "$PROJECT_NAME" up -d --build
 
-echo ""
-echo "==> Checking probe internal API health..."
-if docker exec inspectre-probe curl -sf http://localhost:8001/health > /dev/null 2>&1; then
-    echo "    [OK] Probe API is up on :8001"
-else
-    echo "    [WARN] Probe API not responding on :8001 -- check logs:"
-    docker logs inspectre-probe --tail 30
-fi
-
-echo ""
-echo "==> Checking web API health..."
-if curl -sf http://localhost:8000/ > /dev/null 2>&1; then
-    echo "    [OK] Web API is up on :8000"
-else
-    echo "    [WARN] Web API not responding on :8000 -- check logs:"
-    docker logs inspectre-web --tail 30
-fi
-
-echo ""
-echo "==> Done. Frontend: http://localhost:3000  API: http://localhost:8000"
+echo "[inspectre] Done."
