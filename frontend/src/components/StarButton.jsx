@@ -1,37 +1,32 @@
 import { Star } from 'lucide-react'
-import { api } from '../api'
 
 /**
- * Star / important toggle button.
- * Calls the metadata PATCH endpoint and fires onToggled(updatedDevice)
- * with the response so the parent can update its state.
+ * StarButton — toggle is_important on a device.
+ * Calls onToggle(mac, newValue) and optimistically updates UI.
  */
-export function StarButton({ device, onToggled, size = 16, className = '' }) {
-  const important = Boolean(device.is_important)
+export function StarButton({ device, onToggle, size = 16 }) {
+  const active = Boolean(device.is_important)
 
-  async function handleClick(e) {
-    e.stopPropagation() // don't bubble to card click
-    try {
-      const updated = await api.updateMetadata(device.mac_address, {
-        is_important: !important,
-      })
-      onToggled?.(updated)
-    } catch (err) {
-      console.error('Star toggle failed', err)
-    }
+  function handleClick(e) {
+    e.stopPropagation()
+    onToggle(device.mac_address, !active)
   }
 
   return (
     <button
       onClick={handleClick}
-      title={important ? 'Unwatch device' : 'Watch / mark important'}
-      className={`transition-all ${className}`}
-      style={{ color: important ? '#f59e0b' : 'var(--color-text-faint)', lineHeight: 0 }}
+      aria-label={active ? 'Unwatch device' : 'Watch device'}
+      title={active ? 'Remove from watched devices' : 'Mark as watched device'}
+      className="transition-all duration-150 rounded-md p-1 hover:scale-110"
+      style={{
+        color: active ? 'var(--color-brand)' : 'var(--color-text-faint)',
+        background: active ? 'var(--color-brand-subtle, rgba(99,102,241,0.1))' : 'transparent',
+      }}
     >
       <Star
         size={size}
-        fill={important ? '#f59e0b' : 'none'}
-        stroke={important ? '#f59e0b' : 'currentColor'}
+        fill={active ? 'currentColor' : 'none'}
+        strokeWidth={active ? 0 : 1.5}
       />
     </button>
   )
