@@ -12,7 +12,7 @@ import io
 import socket
 import subprocess
 
-from models import Base, Device, DeviceEvent, FingerprintEntry, Setting
+from models import Base, Device, DeviceEvent, FingerprintEntry, Setting, VulnReport
 
 DATABASE_URL = os.environ.get("DATABASE_URL", "postgresql://admin:password123@db:5432/inspectre")
 engine       = create_engine(DATABASE_URL, pool_pre_ping=True)
@@ -37,9 +37,30 @@ def _migrate(db: Session):
             created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
         )
         """,
-        "CREATE INDEX IF NOT EXISTS ix_device_events_mac ON device_events(mac_address)",
-        "CREATE INDEX IF NOT EXISTS ix_device_events_type ON device_events(type)",
+        "CREATE INDEX IF NOT EXISTS ix_device_events_mac     ON device_events(mac_address)",
+        "CREATE INDEX IF NOT EXISTS ix_device_events_type    ON device_events(type)",
         "CREATE INDEX IF NOT EXISTS ix_device_events_created ON device_events(created_at)",
+        # Phase 3 — vuln reports
+        """
+        CREATE TABLE IF NOT EXISTS vuln_reports (
+            id          SERIAL PRIMARY KEY,
+            mac_address VARCHAR NOT NULL REFERENCES devices(mac_address) ON DELETE CASCADE,
+            ip_address  VARCHAR,
+            scanned_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            duration_s  FLOAT,
+            severity    VARCHAR NOT NULL DEFAULT 'clean',
+            vuln_count  INTEGER NOT NULL DEFAULT 0,
+            findings    JSONB,
+            raw_output  TEXT,
+            nmap_args   VARCHAR
+        )
+        """,
+        "CREATE INDEX IF NOT EXISTS ix_vuln_reports_mac       ON vuln_reports(mac_address)",
+        "CREATE INDEX IF NOT EXISTS ix_vuln_reports_scanned   ON vuln_reports(scanned_at)",
+        "CREATE INDEX IF NOT EXISTS ix_vuln_reports_severity  ON vuln_reports(severity)",
+        # vuln_last_scanned column on devices
+        "ALTER TABLE devices ADD COLUMN IF NOT EXISTS vuln_last_scanned TIMESTAMPTZ",
+        "ALTER TABLE devices ADD COLUMN IF NOT EXISTS vuln_severity VARCHAR",
     ]
     for sql in migrations:
         try:
@@ -60,6 +81,11 @@ DEFAULT_SETTINGS = {
     "ip_range":                ("192.168.0.0/24", "CIDR range to scan."),
     "nmap_args":               ("-O --osscan-limit -sV --version-intensity 5 -T4", "Extra arguments passed to nmap."),
     "notifications_enabled":   ("true",  "Show popup toasts when new devices appear or go offline."),
+    "vuln_scan_scripts":       (
+        "vulners,http-vuln-cve2017-5638,http-shellshock,smb-vuln-ms17-010,"
+        "smb-vuln-cve-2020-0796,ssl-heartbleed,ssl-poodle,ftp-vsftpd-backdoor,ftp-anon",
+        "Comma-separated Nmap NSE scripts used for vulnerability scanning."
+    ),
 }
 
 
@@ -160,101 +186,69 @@ def _resolve_hostname(ip: str) -> str | None:
 # Identity scoring & device type inference
 # ---------------------------------------------------------------------------
 def _identity_score(d: Device) -> dict:
-    """Return a 0-100 score + reasons explaining how well we know this device."""
     score   = 0
     reasons = []
-
     vendor = getattr(d, 'vendor_override', None) or d.vendor
     if vendor and vendor.lower() not in ("unknown", ""):
-        score += 20
-        reasons.append("vendor_known")
-
+        score += 20; reasons.append("vendor_known")
     if d.hostname:
-        score += 20
-        reasons.append("hostname_known")
-
+        score += 20; reasons.append("hostname_known")
     if d.custom_name:
-        score += 10
-        reasons.append("named_by_user")
-
+        score += 10; reasons.append("named_by_user")
     if d.deep_scanned:
-        score += 20
-        reasons.append("deep_scanned")
-
+        score += 20; reasons.append("deep_scanned")
     scan  = d.scan_results or {}
     ports = scan.get("open_ports") or []
     if ports:
-        score += 15
-        reasons.append("ports_identified")
-
+        score += 15; reasons.append("ports_identified")
     if scan.get("os_matches"):
-        score += 15
-        reasons.append("os_identified")
-
+        score += 15; reasons.append("os_identified")
     return {"score": min(score, 100), "reasons": reasons}
 
 
 def _infer_device_type(d: Device) -> str | None:
-    """Rule-based device type inference from hostname, vendor, ports, OS."""
     if getattr(d, 'device_type_override', None):
         return d.device_type_override
-
     hostname = (d.hostname or d.custom_name or "").lower()
     vendor   = (getattr(d, 'vendor_override', None) or d.vendor or "").lower()
     scan     = d.scan_results or {}
     ports    = {p.get("port") for p in (scan.get("open_ports") or []) if p.get("port")}
     os_guess = (scan.get("os_matches") or [{}])[0].get("name", "").lower() if scan.get("os_matches") else ""
-
-    # Cameras / NVR
     if any(k in hostname for k in ("cam", "camera", "nvr", "reolink", "dahua", "hikvision", "arlo", "ring", "nest")):
         return "camera"
     if any(k in vendor for k in ("reolink", "hikvision", "dahua", "axis", "hanwha")):
         return "camera"
-    # Phones / tablets
     if any(k in hostname for k in ("iphone", "android", "phone", "pixel", "galaxy", "ipad", "tablet", "redmi", "oneplus")):
         return "phone"
     if "android" in os_guess or "ios" in os_guess:
         return "phone"
-    # Smart plugs / IoT
     if any(k in hostname for k in ("shelly", "plug", "switch", "tasmota", "sonoff", "gosund", "kasa", "tapo")):
         return "smart_plug"
     if any(k in vendor for k in ("espressif", "tuya", "tapo", "shelly", "meross", "gosund")):
         return "iot"
-    # Access points / routers
     if any(k in hostname for k in ("ap.", "access", "router", "gateway", "ubnt", "unifi", "openwrt", "airos")):
         return "access_point"
     if any(k in vendor for k in ("ubiquiti", "tp-link", "netgear", "asus", "linksys", "openwrt")):
         if {80, 443, 22} & ports:
             return "router"
-    # NAS / servers
     if any(k in hostname for k in ("nas", "synology", "qnap", "server", "truenas", "plex", "jellyfin")):
         return "nas"
     if {445, 139, 2049} & ports:
         return "nas"
-    # Printers
     if any(k in hostname for k in ("printer", "print", "hp", "epson", "canon", "brother")):
         return "printer"
     if {9100, 515, 631} & ports:
         return "printer"
-    # Smart TV / streaming
     if any(k in hostname for k in ("tv", "roku", "firetv", "appletv", "chromecast", "shield", "androidtv")):
         return "tv"
-    if any(k in vendor for k in ("roku", "amazon", "chromecast", "nvidia", "samsung")):
-        if not {22, 80, 443} - ports:
-            return "tv"
-    # Game consoles
     if any(k in vendor for k in ("sony interactive", "microsoft xbox", "nintendo")):
         return "console"
-    # Smart home hubs
     if any(k in vendor for k in ("tado", "philips", "ikea", "meross", "bouffalo")):
         return "smart_home"
-    # Windows PCs
     if "windows" in os_guess or {3389, 445} & ports:
         return "computer"
-    # Linux servers
     if "linux" in os_guess and {22} & ports and len(ports) > 3:
         return "server"
-
     return None
 
 
@@ -283,11 +277,13 @@ def _to_dict(d: Device) -> dict:
         "last_seen":            d.last_seen.isoformat()   if d.last_seen   else None,
         "scan_results":         d.scan_results,
         "display_name":         d.custom_name or d.hostname or d.ip_address,
-        # Phase 2
         "identity_score":       id_score["score"],
         "identity_reasons":     id_score["reasons"],
         "device_type":          getattr(d, 'device_type_override', None) or inferred,
         "device_type_inferred": inferred,
+        # Phase 3
+        "vuln_last_scanned":    getattr(d, 'vuln_last_scanned', None) and d.vuln_last_scanned.isoformat(),
+        "vuln_severity":        getattr(d, 'vuln_severity', None),
     }
 
 
@@ -303,10 +299,8 @@ def _match_fingerprints(device: Device, fingerprints: list[FingerprintEntry]) ->
     device_ports = set()
     if device.scan_results:
         device_ports = {p.get('port') for p in (device.scan_results.get('open_ports') or []) if p.get('port')}
-
     best_score = 0
     best_fp    = None
-
     for fp in fingerprints:
         score = 0
         if fp.oui_prefix and fp.oui_prefix.lower() == device_oui:
@@ -320,7 +314,6 @@ def _match_fingerprints(device: Device, fingerprints: list[FingerprintEntry]) ->
             if score > 0:
                 best_score = score
                 best_fp    = fp
-
     return best_fp
 
 
@@ -330,10 +323,8 @@ def _upsert_manual_fingerprint(db: Session, device: Device, vendor_name: Optiona
     if device.scan_results:
         ports = [p.get('port') for p in (device.scan_results.get('open_ports') or []) if p.get('port')]
         open_ports = ports if ports else None
-
     effective_type   = (device_type   or "").strip() or None
     effective_vendor = (vendor_name   or "").strip() or None
-
     existing = None
     if oui:
         q = db.query(FingerprintEntry).filter(
@@ -343,26 +334,17 @@ def _upsert_manual_fingerprint(db: Session, device: Device, vendor_name: Optiona
         if effective_type:
             q = q.filter(FingerprintEntry.device_type == effective_type)
         existing = q.first()
-
     if existing:
-        if effective_vendor:
-            existing.vendor_name = effective_vendor
-        if effective_type:
-            existing.device_type = effective_type
-        if open_ports:
-            existing.open_ports = open_ports
+        if effective_vendor: existing.vendor_name = effective_vendor
+        if effective_type:   existing.device_type = effective_type
+        if open_ports:       existing.open_ports  = open_ports
         existing.hit_count        += 1
         existing.confidence_score  = 1.0
     else:
         db.add(FingerprintEntry(
-            oui_prefix       = oui,
-            hostname_pattern = None,
-            open_ports       = open_ports,
-            device_type      = effective_type or "unknown",
-            vendor_name      = effective_vendor,
-            confidence_score = 1.0,
-            hit_count        = 1,
-            source           = 'manual',
+            oui_prefix=oui, hostname_pattern=None, open_ports=open_ports,
+            device_type=effective_type or "unknown", vendor_name=effective_vendor,
+            confidence_score=1.0, hit_count=1, source='manual',
         ))
 
 
@@ -415,8 +397,7 @@ def update_device(mac: str, payload: DeviceUpdate, db: Session = Depends(get_db)
         d.hostname = payload.hostname
     if payload.custom_name is not None and payload.custom_name != old_name:
         _add_event(db, mac.lower(), 'renamed', {'old': old_name, 'new': payload.custom_name})
-    db.commit()
-    db.refresh(d)
+    db.commit(); db.refresh(d)
     return _to_dict(d)
 
 
@@ -430,8 +411,7 @@ def update_identity(mac: str, payload: IdentityUpdate, db: Session = Depends(get
     if payload.device_type_override is not None:
         d.device_type_override = payload.device_type_override or None
     _upsert_manual_fingerprint(db, device=d, vendor_name=d.vendor_override, device_type=d.device_type_override)
-    db.commit()
-    db.refresh(d)
+    db.commit(); db.refresh(d)
     return _to_dict(d)
 
 
@@ -440,12 +420,9 @@ def update_metadata(mac: str, payload: MetadataUpdate, db: Session = Depends(get
     d = db.get(Device, mac.lower())
     if not d:
         raise HTTPException(404, "Device not found")
-    if payload.notes is not None:
-        d.notes = payload.notes or None
-    if payload.tags is not None:
-        d.tags = payload.tags or None
-    if payload.location is not None:
-        d.location = payload.location or None
+    if payload.notes    is not None: d.notes    = payload.notes    or None
+    if payload.tags     is not None: d.tags     = payload.tags     or None
+    if payload.location is not None: d.location = payload.location or None
     if payload.is_important is not None:
         old_imp = bool(getattr(d, 'is_important', False))
         d.is_important = payload.is_important
@@ -453,8 +430,7 @@ def update_metadata(mac: str, payload: MetadataUpdate, db: Session = Depends(get
             _add_event(db, mac.lower(), 'marked_important', {'important': payload.is_important})
     if payload.tags is not None:
         _add_event(db, mac.lower(), 'tagged', {'tags': payload.tags})
-    db.commit()
-    db.refresh(d)
+    db.commit(); db.refresh(d)
     return _to_dict(d)
 
 
@@ -466,8 +442,7 @@ def resolve_name(mac: str, db: Session = Depends(get_db)):
     name = _resolve_hostname(d.ip_address)
     if name:
         d.hostname = name
-        db.commit()
-        db.refresh(d)
+        db.commit(); db.refresh(d)
     return {"mac": mac, "resolved": name, "device": _to_dict(d)}
 
 
@@ -526,6 +501,167 @@ def get_identity_score(mac: str, db: Session = Depends(get_db)):
     return {"mac": mac, "score": _identity_score(d), "device_type": _infer_device_type(d)}
 
 
+# ---------------------------------------------------------------------------
+# Phase 3 — Vulnerability scanning
+# ---------------------------------------------------------------------------
+@app.get("/devices/{mac}/vuln-scan")
+async def stream_vuln_scan(mac: str, db: Session = Depends(get_db)):
+    """
+    SSE endpoint — streams live Nmap vuln-script output.
+    Final SSE line is RESULT:{...json...} which the frontend parses to
+    persist the report and update the device badge.
+    """
+    import json as _json
+    from datetime import datetime, timezone
+    from vuln_scanner import run_vuln_scan
+
+    d = db.get(Device, mac.lower())
+    if not d:
+        raise HTTPException(404, "Device not found")
+    if not d.ip_address:
+        raise HTTPException(400, "Device has no IP address")
+
+    # Fetch configured scripts from settings (fall back to default)
+    scripts_setting = db.get(Setting, "vuln_scan_scripts")
+    scripts = scripts_setting.value if scripts_setting else None
+
+    ip  = d.ip_address
+    mac_lower = mac.lower()
+
+    async def _event_stream():
+        result_saved = False
+        async for line in run_vuln_scan(ip, scripts=scripts or None):
+            if line.startswith("RESULT:"):
+                # Parse and persist the report
+                try:
+                    data = _json.loads(line[7:])
+                    db2  = SessionLocal()
+                    try:
+                        dev = db2.get(Device, mac_lower)
+                        if dev:
+                            report = VulnReport(
+                                mac_address=mac_lower,
+                                ip_address=ip,
+                                duration_s=data.get("duration_s"),
+                                severity=data.get("severity", "clean"),
+                                vuln_count=data.get("vuln_count", 0),
+                                findings=data.get("findings"),
+                                raw_output=data.get("raw_output"),
+                                nmap_args=scripts,
+                            )
+                            db2.add(report)
+                            dev.vuln_last_scanned = datetime.now(timezone.utc)
+                            dev.vuln_severity     = data.get("severity", "clean")
+                            db2.commit()
+                            _add_event(db2, mac_lower, 'vuln_scan_complete', {
+                                'severity':   data.get('severity'),
+                                'vuln_count': data.get('vuln_count', 0),
+                            })
+                            db2.commit()
+                            result_saved = True
+                    finally:
+                        db2.close()
+                except Exception as exc:
+                    yield f"data: [WARN] Could not save report: {exc}\n\n"
+            yield f"data: {line}\n\n"
+        if not result_saved:
+            yield "data: [WARN] No RESULT line received from scanner\n\n"
+
+    return StreamingResponse(_event_stream(), media_type="text/event-stream",
+                             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+
+@app.get("/devices/{mac}/vuln-reports")
+def get_vuln_reports(mac: str, limit: int = Query(10, ge=1, le=100), db: Session = Depends(get_db)):
+    """Return the N most recent vuln scan reports for a device."""
+    d = db.get(Device, mac.lower())
+    if not d:
+        raise HTTPException(404, "Device not found")
+    reports = (
+        db.query(VulnReport)
+        .filter(VulnReport.mac_address == mac.lower())
+        .order_by(VulnReport.scanned_at.desc())
+        .limit(limit)
+        .all()
+    )
+    return [
+        {
+            "id":           r.id,
+            "ip_address":   r.ip_address,
+            "scanned_at":   r.scanned_at.isoformat() if r.scanned_at else None,
+            "duration_s":   r.duration_s,
+            "severity":     r.severity,
+            "vuln_count":   r.vuln_count,
+            "findings":     r.findings or [],
+            "nmap_args":    r.nmap_args,
+        }
+        for r in reports
+    ]
+
+
+@app.get("/devices/{mac}/vuln-reports/{report_id}")
+def get_vuln_report_detail(mac: str, report_id: int, db: Session = Depends(get_db)):
+    """Return a single vuln report including raw_output."""
+    r = db.query(VulnReport).filter(
+        VulnReport.id == report_id,
+        VulnReport.mac_address == mac.lower()
+    ).first()
+    if not r:
+        raise HTTPException(404, "Report not found")
+    return {
+        "id":           r.id,
+        "ip_address":   r.ip_address,
+        "scanned_at":   r.scanned_at.isoformat() if r.scanned_at else None,
+        "duration_s":   r.duration_s,
+        "severity":     r.severity,
+        "vuln_count":   r.vuln_count,
+        "findings":     r.findings or [],
+        "raw_output":   r.raw_output,
+        "nmap_args":    r.nmap_args,
+    }
+
+
+@app.delete("/devices/{mac}/vuln-reports/{report_id}")
+def delete_vuln_report(mac: str, report_id: int, db: Session = Depends(get_db)):
+    r = db.query(VulnReport).filter(
+        VulnReport.id == report_id,
+        VulnReport.mac_address == mac.lower()
+    ).first()
+    if not r:
+        raise HTTPException(404, "Report not found")
+    db.delete(r)
+    db.commit()
+    return {"deleted": report_id}
+
+
+@app.get("/vuln-reports")
+def list_all_vuln_reports(
+    severity: Optional[str] = None,
+    limit: int = Query(50, ge=1, le=500),
+    db: Session = Depends(get_db)
+):
+    """Global vuln report list, optionally filtered by severity."""
+    q = db.query(VulnReport)
+    if severity:
+        q = q.filter(VulnReport.severity == severity)
+    reports = q.order_by(VulnReport.scanned_at.desc()).limit(limit).all()
+    return [
+        {
+            "id":           r.id,
+            "mac_address":  r.mac_address,
+            "ip_address":   r.ip_address,
+            "scanned_at":   r.scanned_at.isoformat() if r.scanned_at else None,
+            "severity":     r.severity,
+            "vuln_count":   r.vuln_count,
+            "findings":     r.findings or [],
+        }
+        for r in reports
+    ]
+
+
+# ---------------------------------------------------------------------------
+# Events
+# ---------------------------------------------------------------------------
 @app.get("/events")
 def get_all_events(limit: int = Query(100, ge=1, le=1000), event_type: Optional[str] = None, db: Session = Depends(get_db)):
     try:
@@ -553,9 +689,9 @@ def get_all_events(limit: int = Query(100, ge=1, le=1000), event_type: Optional[
 
 @app.get("/changes")
 def get_change_feed(limit: int = Query(100, ge=1, le=500), db: Session = Depends(get_db)):
-    """Dedicated change feed — joined, online, offline, ip_change, scan_complete, renamed, etc."""
     CHANGE_TYPES = ["joined", "online", "offline", "ip_change", "scan_complete",
-                    "renamed", "tagged", "marked_important", "port_change", "hostname_change"]
+                    "renamed", "tagged", "marked_important", "port_change", "hostname_change",
+                    "vuln_scan_complete"]
     try:
         rows = db.execute(text("""
             SELECT de.id, de.mac_address, de.type, de.detail, de.created_at,
@@ -576,25 +712,22 @@ def get_change_feed(limit: int = Query(100, ge=1, le=500), db: Session = Depends
 
 @app.get("/dashboard/summary")
 def dashboard_summary(db: Session = Depends(get_db)):
-    """Aggregated dashboard data — recent changes and needs-attention counts."""
     try:
         recent_rows = db.execute(text("""
             SELECT de.type, de.detail, de.created_at,
-                   COALESCE(d.custom_name, d.hostname, d.ip_address, de.mac_address) AS display_name,
+                   COALESCE(d.custom_name, d.hostname, d.ip_address, de.mac_address),
                    de.mac_address, d.ip_address
             FROM device_events de
             JOIN devices d ON d.mac_address = de.mac_address
-            ORDER BY de.created_at DESC
-            LIMIT 20
+            ORDER BY de.created_at DESC LIMIT 20
         """)).fetchall()
         recent = [{"type": r[0], "detail": r[1], "created_at": r[2].isoformat() if r[2] else None,
                    "display_name": r[3], "mac_address": r[4], "ip_address": r[5]} for r in recent_rows]
-
         unnamed   = db.execute(text("SELECT COUNT(*) FROM devices WHERE custom_name IS NULL AND hostname IS NULL")).scalar()
         unknown_v = db.execute(text("SELECT COUNT(*) FROM devices WHERE (vendor IS NULL OR vendor='Unknown') AND vendor_override IS NULL")).scalar()
         unscanned = db.execute(text("SELECT COUNT(*) FROM devices WHERE deep_scanned = FALSE AND is_online = TRUE")).scalar()
         low_conf  = db.execute(text("SELECT COUNT(*) FROM devices WHERE hostname IS NULL AND (vendor IS NULL OR vendor='Unknown') AND scan_results IS NULL")).scalar()
-
+        vuln_devices = db.execute(text("SELECT COUNT(DISTINCT mac_address) FROM vuln_reports WHERE severity NOT IN ('clean','info')")).scalar()
         return {
             "recent_changes": recent,
             "attention": {
@@ -602,6 +735,7 @@ def dashboard_summary(db: Session = Depends(get_db)):
                 "unknown_vendor":   unknown_v,
                 "not_deep_scanned": unscanned,
                 "low_confidence":   low_conf,
+                "vuln_devices":     vuln_devices,
             }
         }
     except Exception:
@@ -635,8 +769,11 @@ def stats(db: Session = Depends(get_db)):
     offline   = db.query(Device).filter(Device.is_online == False).count()
     scanned   = db.query(Device).filter(Device.deep_scanned == True).count()
     important = db.query(Device).filter(Device.is_important == True).count()
+    vuln_high = db.execute(text(
+        "SELECT COUNT(DISTINCT mac_address) FROM vuln_reports WHERE severity IN ('critical','high')"
+    )).scalar()
     return {"total_devices": total, "online": online, "offline": offline,
-            "deep_scanned": scanned, "important": important}
+            "deep_scanned": scanned, "important": important, "vuln_high": int(vuln_high or 0)}
 
 
 # ---------------------------------------------------------------------------
@@ -699,8 +836,7 @@ def delete_fingerprint(fid: int, db: Session = Depends(get_db)):
     fp = db.get(FingerprintEntry, fid)
     if not fp:
         raise HTTPException(404, "Fingerprint not found")
-    db.delete(fp)
-    db.commit()
+    db.delete(fp); db.commit()
     return {"deleted": fid}
 
 
@@ -713,13 +849,15 @@ def export_devices_csv(db: Session = Depends(get_db)):
     writer = csv.writer(buf)
     writer.writerow(["mac_address", "ip_address", "hostname", "vendor", "vendor_override",
                      "device_type_override", "custom_name", "is_online", "is_important",
-                     "location", "tags", "notes", "first_seen", "last_seen"])
+                     "location", "tags", "notes", "first_seen", "last_seen",
+                     "vuln_severity", "vuln_last_scanned"])
     for d in db.query(Device).all():
         writer.writerow([d.mac_address, d.ip_address, d.hostname, d.vendor,
                          getattr(d, 'vendor_override', None), getattr(d, 'device_type_override', None),
                          d.custom_name, d.is_online, getattr(d, 'is_important', False),
                          getattr(d, 'location', None), getattr(d, 'tags', None),
-                         getattr(d, 'notes', None), d.first_seen, d.last_seen])
+                         getattr(d, 'notes', None), d.first_seen, d.last_seen,
+                         getattr(d, 'vuln_severity', None), getattr(d, 'vuln_last_scanned', None)])
     buf.seek(0)
     return StreamingResponse(buf, media_type="text/csv",
                              headers={"Content-Disposition": "attachment; filename=inspectre-devices.csv"})
@@ -732,7 +870,8 @@ def export_inventory(db: Session = Depends(get_db)):
     w = csv.writer(buf)
     w.writerow(["MAC", "IP", "Hostname", "Custom Name", "Vendor", "Device Type",
                 "Online", "First Seen", "Last Seen", "Deep Scanned",
-                "Important", "Tags", "Location", "Notes", "Identity Score"])
+                "Important", "Tags", "Location", "Notes", "Identity Score",
+                "Vuln Severity", "Vuln Last Scanned"])
     for d in devices:
         score = _identity_score(d)["score"]
         dtype = getattr(d, 'device_type_override', None) or _infer_device_type(d) or ""
@@ -740,9 +879,10 @@ def export_inventory(db: Session = Depends(get_db)):
                     d.custom_name or "", d.vendor or "", dtype,
                     d.is_online, d.first_seen, d.last_seen, d.deep_scanned,
                     bool(getattr(d, 'is_important', False)),
-                    getattr(d, 'tags', None) or "",
-                    getattr(d, 'location', None) or "",
-                    getattr(d, 'notes', None) or "", score])
+                    getattr(d, 'tags', None) or "", getattr(d, 'location', None) or "",
+                    getattr(d, 'notes', None) or "", score,
+                    getattr(d, 'vuln_severity', None) or "",
+                    getattr(d, 'vuln_last_scanned', None) or ""])
     buf.seek(0)
     return StreamingResponse(
         iter([buf.getvalue()]), media_type="text/csv",
@@ -793,14 +933,10 @@ async def import_fingerprints_json(file: UploadFile = File(...), db: Session = D
             raise ValueError("Expected a JSON array")
     except Exception as exc:
         raise HTTPException(400, f"Invalid JSON: {exc}")
-
-    inserted = 0
-    merged   = 0
-
+    inserted = merged = 0
     for entry in entries:
         device_type = entry.get("device_type", "").strip()
-        if not device_type:
-            continue
+        if not device_type: continue
         oui_prefix       = (entry.get("oui_prefix") or "").strip().lower() or None
         vendor_name      = (entry.get("vendor_name") or "").strip() or None
         open_ports       = entry.get("open_ports") or None
@@ -808,7 +944,6 @@ async def import_fingerprints_json(file: UploadFile = File(...), db: Session = D
         confidence       = float(entry.get("confidence_score", 1.0))
         hit_count        = int(entry.get("hit_count", 1))
         source           = entry.get("source", "community")
-
         existing = None
         if oui_prefix:
             existing = (
@@ -817,7 +952,6 @@ async def import_fingerprints_json(file: UploadFile = File(...), db: Session = D
                         FingerprintEntry.device_type == device_type)
                 .first()
             )
-
         if existing:
             existing.hit_count        += hit_count
             existing.confidence_score  = max(existing.confidence_score, confidence)
@@ -833,9 +967,7 @@ async def import_fingerprints_json(file: UploadFile = File(...), db: Session = D
                 source=source if source in ('manual', 'community', 'auto') else 'community',
             ))
             inserted += 1
-
     db.commit()
-
     all_fps = db.query(FingerprintEntry).all()
     devices = db.query(Device).filter(
         (Device.device_type_override == None) | (Device.device_type_override == "")
