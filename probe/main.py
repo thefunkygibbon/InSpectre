@@ -74,6 +74,7 @@ class Device(Base):
     scan_results = Column(JSON,    nullable=True)
     deep_scanned = Column(Boolean, default=False)
     miss_count   = Column(Integer, default=0)
+    is_important = Column(Boolean, default=False, nullable=False)
 
 class IPHistory(Base):
     __tablename__ = "ip_history"
@@ -121,6 +122,8 @@ def init_db() -> None:
         try:
             conn.execute(text("ALTER TABLE devices ADD COLUMN IF NOT EXISTS deep_scanned BOOLEAN DEFAULT FALSE"))
             conn.execute(text("ALTER TABLE devices ADD COLUMN IF NOT EXISTS miss_count INTEGER DEFAULT 0"))
+            conn.execute(text("ALTER TABLE devices ADD COLUMN IF NOT EXISTS is_important BOOLEAN NOT NULL DEFAULT FALSE"))
+            conn.execute(text("ALTER TABLE devices ALTER COLUMN is_important SET DEFAULT FALSE"))
             conn.commit()
         except Exception as e:
             print(f"[DB] Column migration note: {e}", flush=True)
@@ -496,6 +499,7 @@ def upsert_seen_device(mac: str, ip: str, source: str) -> None:
                     last_seen    = now,
                     deep_scanned = False,   # only used for brand-new INSERT rows
                     miss_count   = 0,
+                    is_important = False,   # only used for brand-new INSERT rows
                 )
                 .on_conflict_do_update(
                     index_elements=["mac_address"],
@@ -504,7 +508,7 @@ def upsert_seen_device(mac: str, ip: str, source: str) -> None:
                         is_online  = True,
                         last_seen  = now,
                         miss_count = 0,
-                        # deep_scanned and scan_results intentionally NOT here
+                        # deep_scanned, scan_results, is_important intentionally NOT here
                         # — they must never be overwritten by a routine upsert.
                         hostname   = text(
                             "CASE WHEN devices.hostname IS NOT NULL AND devices.hostname != '' "
