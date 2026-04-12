@@ -6,22 +6,24 @@ cd "$ROOT_DIR"
 
 PROJECT_NAME="inspectre"
 
-echo "[inspectre] Stopping stack..."
+echo "[inspectre] Stopping existing stack..."
 docker compose -p "$PROJECT_NAME" down --remove-orphans --volumes || true
 
-echo "[inspectre] Removing leftover project containers..."
+echo "[inspectre] Removing project containers..."
 docker ps -aq --filter "label=com.docker.compose.project=$PROJECT_NAME" | xargs -r docker rm -f
 
-echo "[inspectre] Removing leftover project volumes..."
+echo "[inspectre] Removing project volumes..."
 docker volume ls -q --filter "label=com.docker.compose.project=$PROJECT_NAME" | xargs -r docker volume rm -f
 
-echo "[inspectre] Removing leftover project network..."
+echo "[inspectre] Removing project network..."
 docker network ls -q --filter "label=com.docker.compose.project=$PROJECT_NAME" | xargs -r docker network rm
 
-echo "[inspectre] Removing leftover project images..."
+echo "[inspectre] Removing project images..."
 docker images -q --filter "label=com.docker.compose.project=$PROJECT_NAME" | xargs -r docker rmi -f
 
-echo "[inspectre] Rebuilding fresh..."
-docker compose -p "$PROJECT_NAME" up -d --build
+echo "[inspectre] Pulling and rebuilding..."
+docker compose -p "$PROJECT_NAME" pull
+docker compose -p "$PROJECT_NAME" build --no-cache
+docker compose -p "$PROJECT_NAME" up -d
 
-echo "[inspectre] Done."
+echo "[inspectre] Complete."
