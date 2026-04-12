@@ -27,9 +27,9 @@ const SORT_OPTIONS = [
   { value: 'last_seen_asc',  label: 'Last seen (oldest)' },
   { value: 'ip_asc',         label: 'IP address (asc)'   },
   { value: 'ip_desc',        label: 'IP address (desc)'  },
-  { value: 'name_asc',       label: 'Name (A\u2013Z)'    },
-  { value: 'name_desc',      label: 'Name (Z\u2013A)'    },
-  { value: 'vendor_asc',     label: 'Vendor (A\u2013Z)'  },
+  { value: 'name_asc',       label: 'Name (A–Z)'    },
+  { value: 'name_desc',      label: 'Name (Z–A)'    },
+  { value: 'vendor_asc',     label: 'Vendor (A–Z)'  },
   { value: 'status',         label: 'Status (online first)' },
   { value: 'important',      label: 'Watched first' },
 ]
@@ -66,7 +66,7 @@ function useClock() {
   return time
 }
 
-// ── Toast ──────────────────────────────────────────────────────────────────
+// ── Toast ─────────────────────────────────────────────────────────────────────────────
 function Toast({ alert, kind, onDismiss, onDeviceClick }) {
   const timerRef = useRef(null)
 
@@ -164,7 +164,7 @@ function NotificationToasts({ newAlerts, offlineAlerts, onDismissNew, onDismissO
   )
 }
 
-// ── Main App ──────────────────────────────────────────────────────────────
+// ── Main App ────────────────────────────────────────────────────────────────────────────
 export default function App() {
   const {
     devices, stats, loading, error, refresh, lastRefresh,
@@ -401,7 +401,7 @@ export default function App() {
             <div className="relative flex-1">
               <Search size={15} className="absolute left-3 top-1/2 -translate-y-1/2 pointer-events-none"
                 style={{ color: 'var(--color-text-muted)' }} />
-              <input className="input pl-9" placeholder="Search IP, MAC, hostname, vendor, tags\u2026"
+              <input className="input pl-9" placeholder="Search IP, MAC, hostname, vendor, tags…"
                 value={search} onChange={e => setSearch(e.target.value)} />
             </div>
 

@@ -175,7 +175,7 @@ function IdentityForm({ device, onSaved }) {
           <select className="input w-full appearance-none pr-8" value={typeKey} onChange={e => setTypeKey(e.target.value)}>
             {OVERRIDE_OPTIONS.map(opt => (
               <option key={opt.value} value={opt.value}>
-                {opt.value && CATEGORIES[opt.value] ? `${CATEGORIES[opt.value].label} \u2014 ${opt.label}` : opt.label}
+                {opt.value && CATEGORIES[opt.value] ? `${CATEGORIES[opt.value].label} — ${opt.label}` : opt.label}
               </option>
             ))}
           </select>
@@ -188,7 +188,7 @@ function IdentityForm({ device, onSaved }) {
       {error && <p className="text-xs text-red-400">{error}</p>}
       <div className="flex gap-2">
         <button type="submit" disabled={saving} className="btn-primary flex items-center gap-1.5 shrink-0">
-          {saved ? <><CheckCircle2 size={13} /> Saved!</> : saving ? 'Saving\u2026' : 'Save Identity'}
+          {saved ? <><CheckCircle2 size={13} /> Saved!</> : saving ? 'Saving…' : 'Save Identity'}
         </button>
         <button type="button" onClick={() => { setVendor(''); setTypeKey('') }}
           className="btn-ghost text-xs text-text-faint hover:text-text">Reset to auto</button>
@@ -226,7 +226,7 @@ export function DeviceDrawer({ device, onClose, onRename, onResolveName, onRefre
     setRescanning(true); setActiveAction('rescan'); stream.stop(); setStaticLines([])
     try {
       await api.rescanDevice(mac)
-      setStaticLines(['[RESCAN] Deep scan queued -- results will update shortly.'])
+      setStaticLines(['[RESCAN] Deep scan queued — results will update shortly.'])
     } catch (e) { setStaticLines([`[RESCAN] Error: ${e.message}`]) }
     finally { setRescanning(false); if (onRefresh) onRefresh() }
   }
@@ -330,7 +330,7 @@ export function DeviceDrawer({ device, onClose, onRename, onResolveName, onRefre
                     ? <StopBtn label="Stop Trace" onClick={handleTraceroute} />
                     : <ActionBtn icon={GitBranch} label="Traceroute" active={activeAction === 'traceroute'} onClick={handleTraceroute} />}
                   <ActionBtn icon={RotateCcw} label="Re-scan ports" active={activeAction === 'rescan'} loading={rescanning} onClick={handleRescan} />
-                  <ActionBtn icon={Bug}       label="Vuln scan"     active={activeAction === 'vuln'} onClick={() => handlePlaceholder('vuln', 'Vulnerability scan -- coming in Phase 3.')} />
+                  <ActionBtn icon={Bug}       label="Vuln scan"     active={activeAction === 'vuln'} onClick={() => handlePlaceholder('vuln', 'Vulnerability scan — coming in Phase 3.')} />
                 </div>
                 <button disabled
                   className="mt-2 w-full flex items-center justify-center gap-2 py-2 rounded-lg
@@ -538,9 +538,9 @@ function RenameForm({ device, onRename }) {
   return (
     <form onSubmit={handleSave} className="flex gap-2">
       <input className="input" value={val} onChange={e => setVal(e.target.value)}
-        placeholder={device.hostname || device.ip_address || 'Custom name...'} />
+        placeholder={device.hostname || device.ip_address || 'Custom name…'} />
       <button type="submit" disabled={saving} className="btn-primary shrink-0">
-        {saving ? '...' : 'Save'}
+        {saving ? '…' : 'Save'}
       </button>
     </form>
   )

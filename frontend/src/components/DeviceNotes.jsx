@@ -72,7 +72,7 @@ export function DeviceNotes({ device, onSaved }) {
           rows={3}
           value={notes}
           onChange={e => setNotes(e.target.value)}
-          placeholder="Add notes about this device\u2026"
+          placeholder="Add notes about this device…"
           style={{ fontFamily: 'inherit', fontSize: 'var(--text-sm)' }}
         />
       </div>
@@ -127,7 +127,7 @@ export function DeviceNotes({ device, onSaved }) {
             value={tagInput}
             onChange={e => setTagInput(e.target.value)}
             onKeyDown={addTag}
-            placeholder={tags.length === 0 ? 'Type a tag, press Enter\u2026' : 'Add another\u2026'}
+            placeholder={tags.length === 0 ? 'Type a tag, press Enter…' : 'Add another…'}
             style={{ color: 'var(--color-text)' }}
           />
         </div>
@@ -142,9 +142,9 @@ export function DeviceNotes({ device, onSaved }) {
         className="btn-primary flex items-center gap-1.5"
       >
         {saved ? (
-          <><span>\u2713</span> Saved!</>
+          <><span>&#x2713;</span> Saved!</>
         ) : saving ? (
-          'Saving\u2026'
+          'Saving…'
         ) : (
           <><Save size={13} /> Save notes</>  
         )}
