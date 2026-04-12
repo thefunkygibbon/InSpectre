@@ -1,11 +1,14 @@
 from fastapi import FastAPI, HTTPException, Depends, UploadFile, File, Query
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse, Response
 from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker, Session
 from pydantic import BaseModel
 from typing import Optional, List
 import os
 import json
+import csv
+import io
 import socket
 import subprocess
 
@@ -17,7 +20,7 @@ SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base.metadata.create_all(bind=engine)
 
 # ---------------------------------------------------------------------------
-# DB migration: add new columns if they don't exist (safe for existing installs)
+# DB migration
 # ---------------------------------------------------------------------------
 def _migrate(db: Session):
     migrations = [
@@ -67,7 +70,7 @@ def _seed_settings(db: Session):
     db.commit()
 
 
-app = FastAPI(title="InSpectre API", version="0.6.0")
+app = FastAPI(title="InSpectre API", version="0.7.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -108,9 +111,8 @@ class IdentityUpdate(BaseModel):
 
 
 class MetadataUpdate(BaseModel):
-    """Phase 1: notes, tags, location, is_important."""
     notes:        Optional[str]  = None
-    tags:         Optional[str]  = None   # comma-separated string
+    tags:         Optional[str]  = None
     location:     Optional[str]  = None
     is_important: Optional[bool] = None
 
@@ -152,6 +154,141 @@ def _resolve_hostname(ip: str) -> str | None:
     except Exception:
         pass
     return None
+
+
+# ---------------------------------------------------------------------------
+# Identity scoring & device type inference
+# ---------------------------------------------------------------------------
+def _identity_score(d: Device) -> dict:
+    """Return a 0-100 score + reasons explaining how well we know this device."""
+    score   = 0
+    reasons = []
+
+    vendor = getattr(d, 'vendor_override', None) or d.vendor
+    if vendor and vendor.lower() not in ("unknown", ""):
+        score += 20
+        reasons.append("vendor_known")
+
+    if d.hostname:
+        score += 20
+        reasons.append("hostname_known")
+
+    if d.custom_name:
+        score += 10
+        reasons.append("named_by_user")
+
+    if d.deep_scanned:
+        score += 20
+        reasons.append("deep_scanned")
+
+    scan  = d.scan_results or {}
+    ports = scan.get("open_ports") or []
+    if ports:
+        score += 15
+        reasons.append("ports_identified")
+
+    if scan.get("os_matches"):
+        score += 15
+        reasons.append("os_identified")
+
+    return {"score": min(score, 100), "reasons": reasons}
+
+
+def _infer_device_type(d: Device) -> str | None:
+    """Rule-based device type inference from hostname, vendor, ports, OS."""
+    if getattr(d, 'device_type_override', None):
+        return d.device_type_override
+
+    hostname = (d.hostname or d.custom_name or "").lower()
+    vendor   = (getattr(d, 'vendor_override', None) or d.vendor or "").lower()
+    scan     = d.scan_results or {}
+    ports    = {p.get("port") for p in (scan.get("open_ports") or []) if p.get("port")}
+    os_guess = (scan.get("os_matches") or [{}])[0].get("name", "").lower() if scan.get("os_matches") else ""
+
+    # Cameras / NVR
+    if any(k in hostname for k in ("cam", "camera", "nvr", "reolink", "dahua", "hikvision", "arlo", "ring", "nest")):
+        return "camera"
+    if any(k in vendor for k in ("reolink", "hikvision", "dahua", "axis", "hanwha")):
+        return "camera"
+    # Phones / tablets
+    if any(k in hostname for k in ("iphone", "android", "phone", "pixel", "galaxy", "ipad", "tablet", "redmi", "oneplus")):
+        return "phone"
+    if "android" in os_guess or "ios" in os_guess:
+        return "phone"
+    # Smart plugs / IoT
+    if any(k in hostname for k in ("shelly", "plug", "switch", "tasmota", "sonoff", "gosund", "kasa", "tapo")):
+        return "smart_plug"
+    if any(k in vendor for k in ("espressif", "tuya", "tapo", "shelly", "meross", "gosund")):
+        return "iot"
+    # Access points / routers
+    if any(k in hostname for k in ("ap.", "access", "router", "gateway", "ubnt", "unifi", "openwrt", "airos")):
+        return "access_point"
+    if any(k in vendor for k in ("ubiquiti", "tp-link", "netgear", "asus", "linksys", "openwrt")):
+        if {80, 443, 22} & ports:
+            return "router"
+    # NAS / servers
+    if any(k in hostname for k in ("nas", "synology", "qnap", "server", "truenas", "plex", "jellyfin")):
+        return "nas"
+    if {445, 139, 2049} & ports:
+        return "nas"
+    # Printers
+    if any(k in hostname for k in ("printer", "print", "hp", "epson", "canon", "brother")):
+        return "printer"
+    if {9100, 515, 631} & ports:
+        return "printer"
+    # Smart TV / streaming
+    if any(k in hostname for k in ("tv", "roku", "firetv", "appletv", "chromecast", "shield", "androidtv")):
+        return "tv"
+    if any(k in vendor for k in ("roku", "amazon", "chromecast", "nvidia", "samsung")):
+        if not {22, 80, 443} - ports:
+            return "tv"
+    # Game consoles
+    if any(k in vendor for k in ("sony interactive", "microsoft xbox", "nintendo")):
+        return "console"
+    # Smart home hubs
+    if any(k in vendor for k in ("tado", "philips", "ikea", "meross", "bouffalo")):
+        return "smart_home"
+    # Windows PCs
+    if "windows" in os_guess or {3389, 445} & ports:
+        return "computer"
+    # Linux servers
+    if "linux" in os_guess and {22} & ports and len(ports) > 3:
+        return "server"
+
+    return None
+
+
+# ---------------------------------------------------------------------------
+# _to_dict
+# ---------------------------------------------------------------------------
+def _to_dict(d: Device) -> dict:
+    id_score = _identity_score(d)
+    inferred = _infer_device_type(d)
+    return {
+        "mac_address":          d.mac_address,
+        "ip_address":           d.ip_address,
+        "hostname":             d.hostname,
+        "vendor":               d.vendor,
+        "vendor_override":      getattr(d, 'vendor_override', None),
+        "device_type_override": getattr(d, 'device_type_override', None),
+        "custom_name":          d.custom_name,
+        "is_online":            d.is_online,
+        "deep_scanned":         d.deep_scanned,
+        "miss_count":           getattr(d, 'miss_count', 0),
+        "is_important":         bool(getattr(d, 'is_important', False)),
+        "notes":                getattr(d, 'notes', None),
+        "tags":                 getattr(d, 'tags', None),
+        "location":             getattr(d, 'location', None),
+        "first_seen":           d.first_seen.isoformat()  if d.first_seen  else None,
+        "last_seen":            d.last_seen.isoformat()   if d.last_seen   else None,
+        "scan_results":         d.scan_results,
+        "display_name":         d.custom_name or d.hostname or d.ip_address,
+        # Phase 2
+        "identity_score":       id_score["score"],
+        "identity_reasons":     id_score["reasons"],
+        "device_type":          getattr(d, 'device_type_override', None) or inferred,
+        "device_type_inferred": inferred,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -233,10 +370,8 @@ def _upsert_manual_fingerprint(db: Session, device: Device, vendor_name: Optiona
 # Event helper
 # ---------------------------------------------------------------------------
 def _add_event(db: Session, mac: str, event_type: str, detail: dict = None):
-    """Write a DeviceEvent row. Never raises — silently swallows errors."""
     try:
         db.add(DeviceEvent(mac_address=mac, type=event_type, detail=detail))
-        # no commit here — caller commits
     except Exception:
         pass
 
@@ -246,7 +381,7 @@ def _add_event(db: Session, mac: str, event_type: str, detail: dict = None):
 # ---------------------------------------------------------------------------
 @app.get("/")
 def root():
-    return {"message": "InSpectre API", "version": "0.6.0"}
+    return {"message": "InSpectre API", "version": "0.7.0"}
 
 
 # ---------------------------------------------------------------------------
@@ -279,10 +414,7 @@ def update_device(mac: str, payload: DeviceUpdate, db: Session = Depends(get_db)
     if payload.hostname is not None:
         d.hostname = payload.hostname
     if payload.custom_name is not None and payload.custom_name != old_name:
-        _add_event(db, mac.lower(), 'renamed', {
-            'old': old_name,
-            'new': payload.custom_name,
-        })
+        _add_event(db, mac.lower(), 'renamed', {'old': old_name, 'new': payload.custom_name})
     db.commit()
     db.refresh(d)
     return _to_dict(d)
@@ -293,18 +425,11 @@ def update_identity(mac: str, payload: IdentityUpdate, db: Session = Depends(get
     d = db.get(Device, mac.lower())
     if not d:
         raise HTTPException(404, "Device not found")
-
     if payload.vendor_override is not None:
         d.vendor_override = payload.vendor_override or None
     if payload.device_type_override is not None:
         d.device_type_override = payload.device_type_override or None
-
-    _upsert_manual_fingerprint(
-        db,
-        device      = d,
-        vendor_name = d.vendor_override,
-        device_type = d.device_type_override,
-    )
+    _upsert_manual_fingerprint(db, device=d, vendor_name=d.vendor_override, device_type=d.device_type_override)
     db.commit()
     db.refresh(d)
     return _to_dict(d)
@@ -312,11 +437,9 @@ def update_identity(mac: str, payload: IdentityUpdate, db: Session = Depends(get
 
 @app.patch("/devices/{mac}/metadata")
 def update_metadata(mac: str, payload: MetadataUpdate, db: Session = Depends(get_db)):
-    """Phase 1: update notes, tags, location, is_important."""
     d = db.get(Device, mac.lower())
     if not d:
         raise HTTPException(404, "Device not found")
-
     if payload.notes is not None:
         d.notes = payload.notes or None
     if payload.tags is not None:
@@ -327,12 +450,9 @@ def update_metadata(mac: str, payload: MetadataUpdate, db: Session = Depends(get
         old_imp = bool(getattr(d, 'is_important', False))
         d.is_important = payload.is_important
         if payload.is_important != old_imp:
-            _add_event(db, mac.lower(), 'marked_important', {
-                'important': payload.is_important,
-            })
+            _add_event(db, mac.lower(), 'marked_important', {'important': payload.is_important})
     if payload.tags is not None:
         _add_event(db, mac.lower(), 'tagged', {'tags': payload.tags})
-
     db.commit()
     db.refresh(d)
     return _to_dict(d)
@@ -384,79 +504,108 @@ def get_ip_history(mac: str, db: Session = Depends(get_db)):
 
 
 @app.get("/devices/{mac}/events")
-def get_device_events(
-    mac: str,
-    limit: int = Query(50, ge=1, le=500),
-    db: Session = Depends(get_db)
-):
-    """Phase 1: return timeline events for a device, newest first."""
+def get_device_events(mac: str, limit: int = Query(50, ge=1, le=500), db: Session = Depends(get_db)):
     d = db.get(Device, mac.lower())
     if not d:
         raise HTTPException(404, "Device not found")
     try:
         rows = db.execute(
-            text("""
-                SELECT id, type, detail, created_at
-                FROM device_events
-                WHERE mac_address = :mac
-                ORDER BY created_at DESC
-                LIMIT :limit
-            """),
+            text("SELECT id, type, detail, created_at FROM device_events WHERE mac_address = :mac ORDER BY created_at DESC LIMIT :limit"),
             {"mac": mac.lower(), "limit": limit}
         ).fetchall()
-        return [
-            {
-                "id":         r[0],
-                "type":       r[1],
-                "detail":     r[2],
-                "created_at": r[3].isoformat() if r[3] else None,
-            }
-            for r in rows
-        ]
-    except Exception as e:
+        return [{"id": r[0], "type": r[1], "detail": r[2], "created_at": r[3].isoformat() if r[3] else None} for r in rows]
+    except Exception:
         return []
+
+
+@app.get("/devices/{mac}/identity-score")
+def get_identity_score(mac: str, db: Session = Depends(get_db)):
+    d = db.get(Device, mac.lower())
+    if not d:
+        raise HTTPException(404, "Device not found")
+    return {"mac": mac, "score": _identity_score(d), "device_type": _infer_device_type(d)}
 
 
 @app.get("/events")
-def get_all_events(
-    limit: int = Query(100, ge=1, le=1000),
-    event_type: Optional[str] = None,
-    db: Session = Depends(get_db)
-):
-    """Phase 1: global event feed, newest first. Optionally filter by type."""
+def get_all_events(limit: int = Query(100, ge=1, le=1000), event_type: Optional[str] = None, db: Session = Depends(get_db)):
     try:
-        where = "WHERE de.mac_address = d.mac_address"
         params: dict = {"limit": limit}
+        extra = ""
         if event_type:
-            where += " AND de.type = :event_type"
+            extra = " AND de.type = :event_type"
             params["event_type"] = event_type
-        rows = db.execute(
-            text(f"""
-                SELECT de.id, de.mac_address, de.type, de.detail, de.created_at,
-                       COALESCE(d.custom_name, d.hostname, d.ip_address, de.mac_address) AS display_name,
-                       d.ip_address, d.vendor
-                FROM device_events de
-                JOIN devices d ON d.mac_address = de.mac_address
-                ORDER BY de.created_at DESC
-                LIMIT :limit
-            """),
-            params
-        ).fetchall()
-        return [
-            {
-                "id":           r[0],
-                "mac_address":  r[1],
-                "type":         r[2],
-                "detail":       r[3],
-                "created_at":   r[4].isoformat() if r[4] else None,
-                "display_name": r[5],
-                "ip_address":   r[6],
-                "vendor":       r[7],
-            }
-            for r in rows
-        ]
+        rows = db.execute(text(f"""
+            SELECT de.id, de.mac_address, de.type, de.detail, de.created_at,
+                   COALESCE(d.custom_name, d.hostname, d.ip_address, de.mac_address) AS display_name,
+                   d.ip_address, d.vendor
+            FROM device_events de
+            JOIN devices d ON d.mac_address = de.mac_address
+            WHERE 1=1{extra}
+            ORDER BY de.created_at DESC
+            LIMIT :limit
+        """), params).fetchall()
+        return [{"id": r[0], "mac_address": r[1], "type": r[2], "detail": r[3],
+                 "created_at": r[4].isoformat() if r[4] else None, "display_name": r[5],
+                 "ip_address": r[6], "vendor": r[7]} for r in rows]
     except Exception:
         return []
+
+
+@app.get("/changes")
+def get_change_feed(limit: int = Query(100, ge=1, le=500), db: Session = Depends(get_db)):
+    """Dedicated change feed — joined, online, offline, ip_change, scan_complete, renamed, etc."""
+    CHANGE_TYPES = ["joined", "online", "offline", "ip_change", "scan_complete",
+                    "renamed", "tagged", "marked_important", "port_change", "hostname_change"]
+    try:
+        rows = db.execute(text("""
+            SELECT de.id, de.mac_address, de.type, de.detail, de.created_at,
+                   COALESCE(d.custom_name, d.hostname, d.ip_address, de.mac_address) AS display_name,
+                   d.ip_address, d.vendor, d.is_online, d.device_type_override
+            FROM device_events de
+            JOIN devices d ON d.mac_address = de.mac_address
+            WHERE de.type = ANY(:types)
+            ORDER BY de.created_at DESC
+            LIMIT :limit
+        """), {"types": CHANGE_TYPES, "limit": limit}).fetchall()
+        return [{"id": r[0], "mac_address": r[1], "type": r[2], "detail": r[3],
+                 "created_at": r[4].isoformat() if r[4] else None, "display_name": r[5],
+                 "ip_address": r[6], "vendor": r[7], "is_online": r[8], "device_type": r[9]} for r in rows]
+    except Exception:
+        return []
+
+
+@app.get("/dashboard/summary")
+def dashboard_summary(db: Session = Depends(get_db)):
+    """Aggregated dashboard data — recent changes and needs-attention counts."""
+    try:
+        recent_rows = db.execute(text("""
+            SELECT de.type, de.detail, de.created_at,
+                   COALESCE(d.custom_name, d.hostname, d.ip_address, de.mac_address) AS display_name,
+                   de.mac_address, d.ip_address
+            FROM device_events de
+            JOIN devices d ON d.mac_address = de.mac_address
+            ORDER BY de.created_at DESC
+            LIMIT 20
+        """)).fetchall()
+        recent = [{"type": r[0], "detail": r[1], "created_at": r[2].isoformat() if r[2] else None,
+                   "display_name": r[3], "mac_address": r[4], "ip_address": r[5]} for r in recent_rows]
+
+        unnamed   = db.execute(text("SELECT COUNT(*) FROM devices WHERE custom_name IS NULL AND hostname IS NULL")).scalar()
+        unknown_v = db.execute(text("SELECT COUNT(*) FROM devices WHERE (vendor IS NULL OR vendor='Unknown') AND vendor_override IS NULL")).scalar()
+        unscanned = db.execute(text("SELECT COUNT(*) FROM devices WHERE deep_scanned = FALSE AND is_online = TRUE")).scalar()
+        low_conf  = db.execute(text("SELECT COUNT(*) FROM devices WHERE hostname IS NULL AND (vendor IS NULL OR vendor='Unknown') AND scan_results IS NULL")).scalar()
+
+        return {
+            "recent_changes": recent,
+            "attention": {
+                "unnamed_devices":  unnamed,
+                "unknown_vendor":   unknown_v,
+                "not_deep_scanned": unscanned,
+                "low_confidence":   low_conf,
+            }
+        }
+    except Exception:
+        return {"recent_changes": [], "attention": {}}
 
 
 # ---------------------------------------------------------------------------
@@ -486,13 +635,8 @@ def stats(db: Session = Depends(get_db)):
     offline   = db.query(Device).filter(Device.is_online == False).count()
     scanned   = db.query(Device).filter(Device.deep_scanned == True).count()
     important = db.query(Device).filter(Device.is_important == True).count()
-    return {
-        "total_devices": total,
-        "online":        online,
-        "offline":       offline,
-        "deep_scanned":  scanned,
-        "important":     important,
-    }
+    return {"total_devices": total, "online": online, "offline": offline,
+            "deep_scanned": scanned, "important": important}
 
 
 # ---------------------------------------------------------------------------
@@ -532,19 +676,11 @@ def reset_settings(db: Session = Depends(get_db)):
 def get_fingerprints(db: Session = Depends(get_db)):
     fps = db.query(FingerprintEntry).order_by(FingerprintEntry.updated_at.desc()).all()
     return [
-        {
-            "id":               fp.id,
-            "oui_prefix":       fp.oui_prefix,
-            "hostname_pattern": fp.hostname_pattern,
-            "open_ports":       fp.open_ports,
-            "device_type":      fp.device_type,
-            "vendor_name":      fp.vendor_name,
-            "confidence_score": fp.confidence_score,
-            "hit_count":        fp.hit_count,
-            "source":           fp.source,
-            "created_at":       fp.created_at.isoformat() if fp.created_at else None,
-            "updated_at":       fp.updated_at.isoformat() if fp.updated_at else None,
-        }
+        {"id": fp.id, "oui_prefix": fp.oui_prefix, "hostname_pattern": fp.hostname_pattern,
+         "open_ports": fp.open_ports, "device_type": fp.device_type, "vendor_name": fp.vendor_name,
+         "confidence_score": fp.confidence_score, "hit_count": fp.hit_count, "source": fp.source,
+         "created_at": fp.created_at.isoformat() if fp.created_at else None,
+         "updated_at": fp.updated_at.isoformat() if fp.updated_at else None}
         for fp in fps
     ]
 
@@ -568,48 +704,84 @@ def delete_fingerprint(fid: int, db: Session = Depends(get_db)):
     return {"deleted": fid}
 
 
+# ---------------------------------------------------------------------------
+# Export / Import
+# ---------------------------------------------------------------------------
 @app.get("/export/devices")
 def export_devices_csv(db: Session = Depends(get_db)):
-    from fastapi.responses import StreamingResponse
-    import csv, io
     buf = io.StringIO()
     writer = csv.writer(buf)
-    writer.writerow(["mac_address","ip_address","hostname","vendor","vendor_override","device_type_override",
-                     "custom_name","is_online","is_important","location","tags","notes","first_seen","last_seen"])
+    writer.writerow(["mac_address", "ip_address", "hostname", "vendor", "vendor_override",
+                     "device_type_override", "custom_name", "is_online", "is_important",
+                     "location", "tags", "notes", "first_seen", "last_seen"])
     for d in db.query(Device).all():
         writer.writerow([d.mac_address, d.ip_address, d.hostname, d.vendor,
-                         getattr(d,'vendor_override',None), getattr(d,'device_type_override',None),
-                         d.custom_name, d.is_online,
-                         getattr(d,'is_important',False), getattr(d,'location',None),
-                         getattr(d,'tags',None), getattr(d,'notes',None),
-                         d.first_seen, d.last_seen])
+                         getattr(d, 'vendor_override', None), getattr(d, 'device_type_override', None),
+                         d.custom_name, d.is_online, getattr(d, 'is_important', False),
+                         getattr(d, 'location', None), getattr(d, 'tags', None),
+                         getattr(d, 'notes', None), d.first_seen, d.last_seen])
     buf.seek(0)
     return StreamingResponse(buf, media_type="text/csv",
                              headers={"Content-Disposition": "attachment; filename=inspectre-devices.csv"})
 
 
+@app.get("/reports/inventory.csv")
+def export_inventory(db: Session = Depends(get_db)):
+    devices = db.query(Device).order_by(Device.last_seen.desc()).all()
+    buf = io.StringIO()
+    w = csv.writer(buf)
+    w.writerow(["MAC", "IP", "Hostname", "Custom Name", "Vendor", "Device Type",
+                "Online", "First Seen", "Last Seen", "Deep Scanned",
+                "Important", "Tags", "Location", "Notes", "Identity Score"])
+    for d in devices:
+        score = _identity_score(d)["score"]
+        dtype = getattr(d, 'device_type_override', None) or _infer_device_type(d) or ""
+        w.writerow([d.mac_address, d.ip_address or "", d.hostname or "",
+                    d.custom_name or "", d.vendor or "", dtype,
+                    d.is_online, d.first_seen, d.last_seen, d.deep_scanned,
+                    bool(getattr(d, 'is_important', False)),
+                    getattr(d, 'tags', None) or "",
+                    getattr(d, 'location', None) or "",
+                    getattr(d, 'notes', None) or "", score])
+    buf.seek(0)
+    return StreamingResponse(
+        iter([buf.getvalue()]), media_type="text/csv",
+        headers={"Content-Disposition": "attachment; filename=inspectre-inventory.csv"})
+
+
+@app.get("/reports/events.csv")
+def export_events_csv(limit: int = Query(1000, ge=1, le=10000), db: Session = Depends(get_db)):
+    rows = db.execute(text("""
+        SELECT de.created_at, de.type, de.mac_address,
+               COALESCE(d.custom_name, d.hostname, d.ip_address, de.mac_address),
+               d.ip_address, d.vendor, de.detail::text
+        FROM device_events de
+        JOIN devices d ON d.mac_address = de.mac_address
+        ORDER BY de.created_at DESC LIMIT :limit
+    """), {"limit": limit}).fetchall()
+    buf = io.StringIO()
+    w = csv.writer(buf)
+    w.writerow(["Timestamp", "Event", "MAC", "Device Name", "IP", "Vendor", "Detail"])
+    for r in rows:
+        w.writerow([r[0], r[1], r[2], r[3], r[4], r[5], r[6]])
+    buf.seek(0)
+    return StreamingResponse(
+        iter([buf.getvalue()]), media_type="text/csv",
+        headers={"Content-Disposition": "attachment; filename=inspectre-events.csv"})
+
+
 @app.get("/export/fingerprints")
 def export_fingerprints_json(db: Session = Depends(get_db)):
-    from fastapi.responses import Response
     fps = db.query(FingerprintEntry).all()
     data = [
-        {
-            "oui_prefix":       fp.oui_prefix,
-            "hostname_pattern": fp.hostname_pattern,
-            "open_ports":       fp.open_ports,
-            "device_type":      fp.device_type,
-            "vendor_name":      fp.vendor_name,
-            "confidence_score": fp.confidence_score,
-            "hit_count":        fp.hit_count,
-            "source":           fp.source,
-        }
+        {"oui_prefix": fp.oui_prefix, "hostname_pattern": fp.hostname_pattern,
+         "open_ports": fp.open_ports, "device_type": fp.device_type,
+         "vendor_name": fp.vendor_name, "confidence_score": fp.confidence_score,
+         "hit_count": fp.hit_count, "source": fp.source}
         for fp in fps
     ]
-    return Response(
-        content=json.dumps(data, indent=2),
-        media_type="application/json",
-        headers={"Content-Disposition": "attachment; filename=inspectre-fingerprints.json"},
-    )
+    return Response(content=json.dumps(data, indent=2), media_type="application/json",
+                    headers={"Content-Disposition": "attachment; filename=inspectre-fingerprints.json"})
 
 
 @app.post("/import/fingerprints")
@@ -629,7 +801,6 @@ async def import_fingerprints_json(file: UploadFile = File(...), db: Session = D
         device_type = entry.get("device_type", "").strip()
         if not device_type:
             continue
-
         oui_prefix       = (entry.get("oui_prefix") or "").strip().lower() or None
         vendor_name      = (entry.get("vendor_name") or "").strip() or None
         open_ports       = entry.get("open_ports") or None
@@ -642,10 +813,8 @@ async def import_fingerprints_json(file: UploadFile = File(...), db: Session = D
         if oui_prefix:
             existing = (
                 db.query(FingerprintEntry)
-                .filter(
-                    FingerprintEntry.oui_prefix  == oui_prefix,
-                    FingerprintEntry.device_type == device_type,
-                )
+                .filter(FingerprintEntry.oui_prefix == oui_prefix,
+                        FingerprintEntry.device_type == device_type)
                 .first()
             )
 
@@ -657,14 +826,11 @@ async def import_fingerprints_json(file: UploadFile = File(...), db: Session = D
             merged += 1
         else:
             db.add(FingerprintEntry(
-                oui_prefix       = oui_prefix,
-                hostname_pattern = hostname_pattern,
-                open_ports       = open_ports,
-                device_type      = device_type,
-                vendor_name      = vendor_name,
-                confidence_score = confidence,
-                hit_count        = hit_count,
-                source           = source if source in ('manual', 'community', 'auto') else 'community',
+                oui_prefix=oui_prefix, hostname_pattern=hostname_pattern,
+                open_ports=open_ports, device_type=device_type,
+                vendor_name=vendor_name, confidence_score=confidence,
+                hit_count=hit_count,
+                source=source if source in ('manual', 'community', 'auto') else 'community',
             ))
             inserted += 1
 
@@ -674,7 +840,6 @@ async def import_fingerprints_json(file: UploadFile = File(...), db: Session = D
     devices = db.query(Device).filter(
         (Device.device_type_override == None) | (Device.device_type_override == "")
     ).all()
-
     corrected = 0
     for device in devices:
         best = _match_fingerprints(device, all_fps)
@@ -684,7 +849,6 @@ async def import_fingerprints_json(file: UploadFile = File(...), db: Session = D
                 device.vendor_override = best.vendor_name
             corrected += 1
             best.hit_count += 1
-
     db.commit()
     return {"inserted": inserted, "merged": merged, "corrected": corrected}
 
@@ -694,7 +858,6 @@ async def import_fingerprints_json(file: UploadFile = File(...), db: Session = D
 # ---------------------------------------------------------------------------
 @app.get("/devices/{mac}/ping")
 async def stream_ping(mac: str, db: Session = Depends(get_db)):
-    from fastapi.responses import StreamingResponse
     import asyncio
     d = db.get(Device, mac.lower())
     if not d:
@@ -704,8 +867,7 @@ async def stream_ping(mac: str, db: Session = Depends(get_db)):
         try:
             proc = await asyncio.create_subprocess_exec(
                 "ping", "-c", "10", d.ip_address,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.STDOUT,
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
             )
             async for line in proc.stdout:
                 yield f"data: {line.decode().rstrip()}\n\n"
@@ -718,7 +880,6 @@ async def stream_ping(mac: str, db: Session = Depends(get_db)):
 
 @app.get("/devices/{mac}/traceroute")
 async def stream_traceroute(mac: str, db: Session = Depends(get_db)):
-    from fastapi.responses import StreamingResponse
     import asyncio
     d = db.get(Device, mac.lower())
     if not d:
@@ -728,8 +889,7 @@ async def stream_traceroute(mac: str, db: Session = Depends(get_db)):
         try:
             proc = await asyncio.create_subprocess_exec(
                 "traceroute", "-n", "-m", "20", d.ip_address,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.STDOUT,
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
             )
             async for line in proc.stdout:
                 yield f"data: {line.decode().rstrip()}\n\n"
@@ -738,29 +898,3 @@ async def stream_traceroute(mac: str, db: Session = Depends(get_db)):
             yield f"data: [ERROR] {e}\n\n"
 
     return StreamingResponse(_gen(), media_type="text/event-stream")
-
-
-# ---------------------------------------------------------------------------
-# _to_dict
-# ---------------------------------------------------------------------------
-def _to_dict(d: Device) -> dict:
-    return {
-        "mac_address":          d.mac_address,
-        "ip_address":           d.ip_address,
-        "hostname":             d.hostname,
-        "vendor":               d.vendor,
-        "vendor_override":      getattr(d, 'vendor_override', None),
-        "device_type_override": getattr(d, 'device_type_override', None),
-        "custom_name":          d.custom_name,
-        "is_online":            d.is_online,
-        "deep_scanned":         d.deep_scanned,
-        "miss_count":           getattr(d, 'miss_count', 0),
-        "is_important":         bool(getattr(d, 'is_important', False)),
-        "notes":                getattr(d, 'notes', None),
-        "tags":                 getattr(d, 'tags', None),
-        "location":             getattr(d, 'location', None),
-        "first_seen":           d.first_seen.isoformat()  if d.first_seen  else None,
-        "last_seen":            d.last_seen.isoformat()   if d.last_seen   else None,
-        "scan_results":         d.scan_results,
-        "display_name":         d.custom_name or d.hostname or d.ip_address,
-    }
