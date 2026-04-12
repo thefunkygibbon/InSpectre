@@ -27,10 +27,12 @@ class Device(Base):
     tags                 = Column(String, nullable=True)   # comma-separated
     location             = Column(String, nullable=True)   # free-text room/zone
 
-    ip_history           = relationship("IPHistory", back_populates="device",
-                                         order_by="IPHistory.first_seen.desc()")
-    events               = relationship("DeviceEvent", back_populates="device",
-                                         order_by="DeviceEvent.created_at.desc()")
+    ip_history   = relationship("IPHistory",    back_populates="device",
+                                order_by="IPHistory.first_seen.desc()")
+    events       = relationship("DeviceEvent",  back_populates="device",
+                                order_by="DeviceEvent.created_at.desc()")
+    vuln_reports = relationship("VulnReport",   back_populates="device",
+                                order_by="VulnReport.scanned_at.desc()")
 
 
 class IPHistory(Base):
@@ -48,21 +50,41 @@ class DeviceEvent(Base):
     """
     Timeline of significant events per device.
     type: 'joined' | 'online' | 'offline' | 'ip_change' | 'scan_complete'
-          | 'renamed' | 'tagged' | 'marked_important' | 'port_change'
+          | 'renamed' | 'tagged' | 'marked_important' | 'port_change' | 'vuln_scan_complete'
     """
     __tablename__ = "device_events"
     id          = Column(Integer, primary_key=True, autoincrement=True)
     mac_address = Column(String, ForeignKey("devices.mac_address", ondelete="CASCADE"),
                          nullable=False, index=True)
     type        = Column(String, nullable=False, index=True)
-    detail      = Column(JSON, nullable=True)   # e.g. {"old_ip": "x", "new_ip": "y"}
+    detail      = Column(JSON, nullable=True)
     created_at  = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), index=True)
     device      = relationship("Device", back_populates="events")
 
 
+class VulnReport(Base):
+    """
+    Stores the result of a vulnerability scan (Nmap NSE vuln scripts) for a device.
+    severity: 'critical' | 'high' | 'medium' | 'low' | 'info' | 'clean'
+    """
+    __tablename__ = "vuln_reports"
+    id           = Column(Integer, primary_key=True, autoincrement=True)
+    mac_address  = Column(String, ForeignKey("devices.mac_address", ondelete="CASCADE"),
+                          nullable=False, index=True)
+    ip_address   = Column(String, nullable=True)
+    scanned_at   = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), index=True)
+    duration_s   = Column(Float,   nullable=True)   # seconds the scan took
+    severity     = Column(String,  nullable=False, default="clean")  # highest severity found
+    vuln_count   = Column(Integer, nullable=False, default=0)
+    findings     = Column(JSON,    nullable=True)   # list of finding dicts
+    raw_output   = Column(Text,    nullable=True)   # full nmap stdout
+    nmap_args    = Column(String,  nullable=True)   # args used
+    device       = relationship("Device", back_populates="vuln_reports")
+
+
 class Alert(Base):
     """
-    type: 'new_device' | 'device_offline' | 'device_online' | 'ip_change'
+    type: 'new_device' | 'device_offline' | 'device_online' | 'ip_change' | 'vuln_found'
     """
     __tablename__ = "alerts"
     id          = Column(Integer, primary_key=True, autoincrement=True)
