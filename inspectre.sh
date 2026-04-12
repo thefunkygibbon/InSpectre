@@ -1,29 +1,73 @@
 #!/usr/bin/env bash
-set -euo pipefail
-
-ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-cd "$ROOT_DIR"
+set -Eeuo pipefail
 
 PROJECT_NAME="inspectre"
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+cd "$SCRIPT_DIR"
 
-echo "[inspectre] Stopping existing stack..."
+echo "[InSpectre] Starting full reset..."
+
+if ! command -v docker >/dev/null 2>&1; then
+  echo "[InSpectre] ERROR: docker is not installed"
+  exit 1
+fi
+
+if ! docker info >/dev/null 2>&1; then
+  echo "[InSpectre] ERROR: docker daemon is not running or not accessible"
+  exit 1
+fi
+
+echo "[InSpectre] Stopping and removing compose stack..."
 docker compose -p "$PROJECT_NAME" down --remove-orphans --volumes || true
 
-echo "[inspectre] Removing project containers..."
-docker ps -aq --filter "label=com.docker.compose.project=$PROJECT_NAME" | xargs -r docker rm -f
+echo "[InSpectre] Removing any leftover containers for this project..."
+docker ps -aq --filter "label=com.docker.compose.project=$PROJECT_NAME" | xargs -r docker rm -f || true
 
-echo "[inspectre] Removing project volumes..."
-docker volume ls -q --filter "label=com.docker.compose.project=$PROJECT_NAME" | xargs -r docker volume rm -f
+echo "[InSpectre] Removing any leftover networks for this project..."
+docker network ls -q --filter "label=com.docker.compose.project=$PROJECT_NAME" | xargs -r docker network rm || true
 
-echo "[inspectre] Removing project network..."
-docker network ls -q --filter "label=com.docker.compose.project=$PROJECT_NAME" | xargs -r docker network rm
+echo "[InSpectre] Removing any leftover volumes for this project..."
+docker volume ls -q --filter "label=com.docker.compose.project=$PROJECT_NAME" | xargs -r docker volume rm -f || true
 
-echo "[inspectre] Removing project images..."
-docker images -q --filter "label=com.docker.compose.project=$PROJECT_NAME" | xargs -r docker rmi -f
+echo "[InSpectre] Removing likely InSpectre images..."
+docker images --format '{{.Repository}}:{{.Tag}} {{.ID}}' \
+  | awk '/inspectre|InSpectre/ {print $2}' \
+  | sort -u \
+  | xargs -r docker rmi -f || true
 
-echo "[inspectre] Pulling and rebuilding..."
-docker compose -p "$PROJECT_NAME" pull
-docker compose -p "$PROJECT_NAME" build --no-cache
-docker compose -p "$PROJECT_NAME" up -d
+echo "[InSpectre] Removing build cache..."
+docker builder prune -af >/dev/null 2>&1 || true
 
-echo "[inspectre] Complete."
+echo "[InSpectre] Removing local data folders..."
+rm -rf \
+  "$SCRIPT_DIR/data" \
+  "$SCRIPT_DIR/db" \
+  "$SCRIPT_DIR/postgres-data" \
+  "$SCRIPT_DIR/postgres" \
+  "$SCRIPT_DIR/.inspectre" \
+  "$SCRIPT_DIR/backend/data" \
+  "$SCRIPT_DIR/backend/db" \
+  "$SCRIPT_DIR/backend/postgres-data" \
+  "$SCRIPT_DIR/probe/data" \
+  "$SCRIPT_DIR/frontend/dist"
+
+echo "[InSpectre] Resetting git checkout to latest main..."
+git fetch origin
+git reset --hard origin/main
+git clean -fd
+
+echo "[InSpectre] Pulling any referenced base images..."
+docker compose -p "$PROJECT_NAME" pull || true
+
+echo "[InSpectre] Rebuilding with no cache..."
+docker compose -p "$PROJECT_NAME" build --no-cache --pull
+
+echo "[InSpectre] Starting fresh stack..."
+docker compose -p "$PROJECT_NAME" up -d --force-recreate
+
+echo "[InSpectre] Current containers:"
+docker compose -p "$PROJECT_NAME" ps
+
+echo "[InSpectre] Done."
+echo "[InSpectre] If it still fails, immediately run:"
+echo "docker compose -p $PROJECT_NAME logs --tail=200"
