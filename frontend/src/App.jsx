@@ -3,31 +3,24 @@ import {
   Wifi, WifiOff, Monitor, ScanSearch, Settings,
   RefreshCw, Search, Filter, AlertCircle, Activity,
   LayoutGrid, List, Sun, Moon, ChevronDown,
-  Bell, X, Layers,
+  Bell, X, Layers, Star,
 } from 'lucide-react'
-import { useDevices } from './hooks/useDevices'
-import { useTheme }   from './hooks/useTheme'
-import { api }        from './api'
-import { Logo }           from './components/Logo'
-import { StatCard }       from './components/StatCard'
-import { DeviceCard }     from './components/DeviceCard'
-import { DeviceRow }      from './components/DeviceRow'
-import { DeviceDrawer }   from './components/DeviceDrawer'
-import { SettingsPanel }  from './components/SettingsPanel'
-import { CategoryView }   from './components/CategoryView'
+import { useDevices }       from './hooks/useDevices'
+import { useTheme }         from './hooks/useTheme'
+import { useSmartFilters }  from './hooks/useSmartFilters'
+import { api }              from './api'
+import { Logo }             from './components/Logo'
+import { StatCard }         from './components/StatCard'
+import { DeviceCard }       from './components/DeviceCard'
+import { DeviceRow }        from './components/DeviceRow'
+import { DeviceDrawer }     from './components/DeviceDrawer'
+import { SettingsPanel }    from './components/SettingsPanel'
+import { CategoryView }     from './components/CategoryView'
+import { SmartFilterBar }   from './components/SmartFilterBar'
 
-const APP_VERSION = '0.5.0'
+const APP_VERSION = '0.6.0'
 
-// filter values — 'scanned' is new, maps to deep_scanned=true
 const FILTERS = ['all', 'online', 'offline']
-
-// Map stat card colour key -> filter value
-const CARD_FILTER_MAP = {
-  all:     'all',
-  online:  'online',
-  offline: 'offline',
-  scanned: 'scanned',
-}
 
 const SORT_OPTIONS = [
   { value: 'last_seen_desc', label: 'Last seen (newest)' },
@@ -38,6 +31,7 @@ const SORT_OPTIONS = [
   { value: 'name_desc',      label: 'Name (Z\u2013A)'    },
   { value: 'vendor_asc',     label: 'Vendor (A\u2013Z)'  },
   { value: 'status',         label: 'Status (online first)' },
+  { value: 'important',      label: 'Watched first' },
 ]
 
 const TOAST_DURATION = 7000
@@ -58,6 +52,7 @@ function sortDevices(list, sort) {
     case 'name_desc':      return copy.sort((a, b) => (b.display_name||'').localeCompare(a.display_name||''))
     case 'vendor_asc':     return copy.sort((a, b) => (a.vendor||'').localeCompare(b.vendor||''))
     case 'status':         return copy.sort((a, b) => (b.is_online ? 1 : 0) - (a.is_online ? 1 : 0))
+    case 'important':      return copy.sort((a, b) => (b.is_important ? 1 : 0) - (a.is_important ? 1 : 0))
     default:               return copy
   }
 }
@@ -71,7 +66,7 @@ function useClock() {
   return time
 }
 
-// ── Single toast item ────────────────────────────────────────────────────
+// ── Toast ──────────────────────────────────────────────────────────────────
 function Toast({ alert, kind, onDismiss, onDeviceClick }) {
   const timerRef = useRef(null)
 
@@ -86,6 +81,8 @@ function Toast({ alert, kind, onDismiss, onDeviceClick }) {
     onDismiss(alert.id)
   }
 
+  const isImportant = kind === 'offline' && alert.is_important
+
   return (
     <div
       onClick={handleClick}
@@ -97,13 +94,13 @@ function Toast({ alert, kind, onDismiss, onDeviceClick }) {
           background: 'var(--toast-new-bg)',
           border: '1px solid var(--toast-new-border)',
         } : {
-          background: 'var(--toast-offline-bg)',
-          border: '1px solid var(--toast-offline-border)',
+          background: isImportant ? 'rgba(239,68,68,0.15)' : 'var(--toast-offline-bg)',
+          border: `1px solid ${isImportant ? 'rgba(239,68,68,0.4)' : 'var(--toast-offline-border)'}`,
         }),
       }}
     >
       {kind === 'new'
-        ? <Bell   size={14} style={{ color: 'var(--color-brand)', flexShrink: 0, marginTop: 2 }} />
+        ? <Bell    size={14} style={{ color: 'var(--color-brand)', flexShrink: 0, marginTop: 2 }} />
         : <WifiOff size={14} style={{ color: '#ef4444',            flexShrink: 0, marginTop: 2 }} />
       }
       <div className="flex-1 min-w-0">
@@ -118,7 +115,10 @@ function Toast({ alert, kind, onDismiss, onDeviceClick }) {
           </>
         ) : (
           <>
-            <p className="font-semibold" style={{ color: '#ef4444' }}>Device went offline</p>
+            <p className="font-semibold flex items-center gap-1.5" style={{ color: '#ef4444' }}>
+              {isImportant && <Star size={11} fill="currentColor" />}
+              {isImportant ? 'Watched device offline' : 'Device went offline'}
+            </p>
             <p className="text-xs mt-0.5" style={{ color: 'var(--color-text)' }}>
               <span className="font-medium">{alert.name}</span>
               <span className="ml-1.5" style={{ color: 'var(--color-text-muted)' }}>{alert.ip}</span>
@@ -140,7 +140,6 @@ function Toast({ alert, kind, onDismiss, onDeviceClick }) {
   )
 }
 
-// ── Toast stack ───────────────────────────────────────────────────────────
 function NotificationToasts({ newAlerts, offlineAlerts, onDismissNew, onDismissOffline, onDeviceClick }) {
   const all = [
     ...newAlerts.map(a     => ({ ...a, kind: 'new'     })),
@@ -165,24 +164,26 @@ function NotificationToasts({ newAlerts, offlineAlerts, onDismissNew, onDismissO
   )
 }
 
-// ── Main App ─────────────────────────────────────────────────────────────
+// ── Main App ──────────────────────────────────────────────────────────────
 export default function App() {
   const {
     devices, stats, loading, error, refresh, lastRefresh,
     newDeviceAlerts, offlineAlerts,
     dismissNewDevice, dismissOffline,
     dismissAllNew, dismissAllOffline,
+    optimisticUpdate,
   } = useDevices(10000)
   const { theme, toggle: toggleTheme } = useTheme()
   const clock = useClock()
+  const { activeFilters, toggleFilter, clearFilters, applyFilters } = useSmartFilters()
 
-  const [search,       setSearch]       = useState('')
-  const [filter,       setFilter]       = useState('all')
-  const [sort,         setSort]         = useState('last_seen_desc')
-  const [layout,       setLayout]       = useState('grid')
-  const [selected,     setSelected]     = useState(null)
-  const [showSettings, setShowSettings] = useState(false)
-  const [refreshing,   setRefreshing]   = useState(false)
+  const [search,        setSearch]        = useState('')
+  const [filter,        setFilter]        = useState('all')
+  const [sort,          setSort]          = useState('last_seen_desc')
+  const [layout,        setLayout]        = useState('grid')
+  const [selected,      setSelected]      = useState(null)
+  const [showSettings,  setShowSettings]  = useState(false)
+  const [refreshing,    setRefreshing]    = useState(false)
   const [showAlertDrop, setShowAlertDrop] = useState(false)
   const [notificationsEnabled, setNotificationsEnabled] = useState(true)
 
@@ -195,7 +196,6 @@ export default function App() {
 
   const totalAlerts = newDeviceAlerts.length
 
-  // Toggle a stat-card filter: clicking the active card resets to 'all'
   function handleCardFilter(cardKey) {
     setFilter(prev => prev === cardKey ? 'all' : cardKey)
   }
@@ -207,11 +207,25 @@ export default function App() {
     if (device) setSelected(device)
   }
 
+  // Star toggle — optimistic update then persist
+  async function handleStarToggle(mac, value) {
+    optimisticUpdate(mac, { is_important: value })
+    try {
+      const updated = await api.updateMetadata(mac, { is_important: value })
+      // sync selected drawer if open
+      setSelected(prev => prev?.mac_address === mac ? { ...prev, ...updated } : prev)
+    } catch (e) {
+      // revert on failure
+      optimisticUpdate(mac, { is_important: !value })
+    }
+  }
+
   const filtered = useMemo(() => {
     let list = devices
     if (filter === 'online')  list = list.filter(d => d.is_online)
     if (filter === 'offline') list = list.filter(d => !d.is_online)
     if (filter === 'scanned') list = list.filter(d => d.deep_scanned)
+    if (filter === 'important') list = list.filter(d => d.is_important)
     if (search.trim()) {
       const q = search.toLowerCase()
       list = list.filter(d =>
@@ -220,11 +234,15 @@ export default function App() {
         (d.hostname     || '').toLowerCase().includes(q) ||
         (d.custom_name  || '').toLowerCase().includes(q) ||
         (d.vendor       || '').toLowerCase().includes(q) ||
-        (d.display_name || '').toLowerCase().includes(q)
+        (d.display_name || '').toLowerCase().includes(q) ||
+        (d.tags         || '').toLowerCase().includes(q) ||
+        (d.location     || '').toLowerCase().includes(q)
       )
     }
+    // Apply smart filters (AND logic)
+    list = applyFilters(list)
     return sortDevices(list, sort)
-  }, [devices, filter, search, sort])
+  }, [devices, filter, search, sort, applyFilters])
 
   async function handleRefresh() {
     setRefreshing(true)
@@ -248,10 +266,8 @@ export default function App() {
 
   const isDark = theme === 'dark'
   const isCategoryMode = layout === 'category'
-
-  // The filter buttons only show all/online/offline (not scanned — that comes from the card)
-  // but we keep them in sync: if filter is 'scanned' the pill buttons show nothing highlighted
   const pillFilter = FILTERS.includes(filter) ? filter : 'all'
+  const hasActiveSmartFilters = activeFilters.length > 0
 
   return (
     <div className="min-h-screen bg-bg flex flex-col transition-colors duration-200">
@@ -267,22 +283,17 @@ export default function App() {
               <Logo size={30} />
               <div>
                 <span className="font-bold tracking-tight" style={{ color: 'var(--color-text)' }}>InSpectre</span>
-                <span className="hidden sm:inline text-xs ml-2" style={{ color: 'var(--color-text-faint)' }}>
-                  Network Security Suite
-                </span>
+                <span className="hidden sm:inline text-xs ml-2" style={{ color: 'var(--color-text-faint)' }}>Network Security Suite</span>
               </div>
             </div>
 
             <div className="flex items-center gap-1">
               <div className="hidden md:flex items-center gap-2 mr-3">
-                <span className="live-ping" aria-hidden>
-                  <span className="live-ping-dot" />
-                </span>
-                <span className="text-xs font-mono" style={{ color: 'var(--color-text-faint)' }}>
-                  live &middot; {clock}
-                </span>
+                <span className="live-ping" aria-hidden><span className="live-ping-dot" /></span>
+                <span className="text-xs font-mono" style={{ color: 'var(--color-text-faint)' }}>live &middot; {clock}</span>
               </div>
 
+              {/* Bell / alerts */}
               <div className="relative">
                 <button
                   onClick={() => setShowAlertDrop(v => !v)}
@@ -324,11 +335,7 @@ export default function App() {
                           <div key={a.id}
                             className="flex items-start gap-2 p-2.5 rounded-lg cursor-pointer hover:opacity-80 transition-opacity"
                             style={{ background: 'var(--color-surface-offset)' }}
-                            onClick={() => {
-                              handleToastDeviceClick(a)
-                              dismissNewDevice(a.id)
-                              setShowAlertDrop(false)
-                            }}
+                            onClick={() => { handleToastDeviceClick(a); dismissNewDevice(a.id); setShowAlertDrop(false) }}
                           >
                             <Bell size={12} className="mt-0.5 shrink-0" style={{ color: 'var(--color-brand)' }} />
                             <div className="flex-1 min-w-0">
@@ -354,18 +361,11 @@ export default function App() {
               <button onClick={handleRefresh} className="btn-ghost p-2" aria-label="Refresh">
                 <RefreshCw size={16} className={refreshing ? 'animate-spin' : ''} />
               </button>
-              <button
-                onClick={toggleTheme}
-                className="btn-ghost p-2"
-                aria-label={isDark ? 'Switch to light mode' : 'Switch to dark mode'}
-              >
+              <button onClick={toggleTheme} className="btn-ghost p-2"
+                aria-label={isDark ? 'Switch to light mode' : 'Switch to dark mode'}>
                 {isDark ? <Sun size={16} /> : <Moon size={16} />}
               </button>
-              <button
-                onClick={() => setShowSettings(true)}
-                className="btn-ghost p-2"
-                aria-label="Settings"
-              >
+              <button onClick={() => setShowSettings(true)} className="btn-ghost p-2" aria-label="Settings">
                 <Settings size={16} />
               </button>
             </div>
@@ -375,67 +375,45 @@ export default function App() {
         <main className="flex-1 max-w-[1400px] mx-auto w-full px-4 sm:px-6 py-8 space-y-8">
 
           {error && (
-            <div
-              className="flex items-center gap-3 px-4 py-3 rounded-xl text-sm"
-              style={{
-                background: 'rgb(239 68 68 / 0.1)',
-                border: '1px solid rgb(239 68 68 / 0.2)',
-                color: '#ef4444',
-              }}
-            >
+            <div className="flex items-center gap-3 px-4 py-3 rounded-xl text-sm"
+              style={{ background: 'rgb(239 68 68 / 0.1)', border: '1px solid rgb(239 68 68 / 0.2)', color: '#ef4444' }}>
               <AlertCircle size={16} className="shrink-0" />
               {error}
             </div>
           )}
 
-          {/* ── Stat cards — each one is a filter shortcut ── */}
+          {/* Stat cards */}
           <section>
             <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
-              <StatCard
-                label="Total Devices" value={stats?.total_devices} icon={Monitor}   color="brand"
-                onClick={() => handleCardFilter('all')}
-                active={filter === 'all'}
-              />
-              <StatCard
-                label="Online"        value={stats?.online}        icon={Wifi}       color="emerald"
-                onClick={() => handleCardFilter('online')}
-                active={filter === 'online'}
-              />
-              <StatCard
-                label="Offline"       value={stats?.offline}       icon={WifiOff}    color="red"
-                onClick={() => handleCardFilter('offline')}
-                active={filter === 'offline'}
-              />
-              <StatCard
-                label="Deep Scanned"  value={stats?.deep_scanned}  icon={ScanSearch} color="amber"
-                onClick={() => handleCardFilter('scanned')}
-                active={filter === 'scanned'}
-              />
+              <StatCard label="Total Devices" value={stats?.total_devices} icon={Monitor}   color="brand"
+                onClick={() => handleCardFilter('all')}    active={filter === 'all'} />
+              <StatCard label="Online"        value={stats?.online}        icon={Wifi}       color="emerald"
+                onClick={() => handleCardFilter('online')}  active={filter === 'online'} />
+              <StatCard label="Offline"       value={stats?.offline}       icon={WifiOff}    color="red"
+                onClick={() => handleCardFilter('offline')} active={filter === 'offline'} />
+              <StatCard label="Watched"       value={stats?.important}     icon={Star}       color="amber"
+                onClick={() => handleCardFilter('important')} active={filter === 'important'} />
             </div>
           </section>
 
+          {/* Search / filter / sort / layout row */}
           <section className="flex flex-col sm:flex-row gap-3 items-stretch sm:items-center">
             <div className="relative flex-1">
-              <Search size={15} className="absolute left-3 top-1/2 -translate-y-1/2 pointer-events-none" style={{ color: 'var(--color-text-muted)' }} />
-              <input
-                className="input pl-9"
-                placeholder="Search IP, MAC, hostname, vendor\u2026"
-                value={search}
-                onChange={e => setSearch(e.target.value)}
-              />
+              <Search size={15} className="absolute left-3 top-1/2 -translate-y-1/2 pointer-events-none"
+                style={{ color: 'var(--color-text-muted)' }} />
+              <input className="input pl-9" placeholder="Search IP, MAC, hostname, vendor, tags\u2026"
+                value={search} onChange={e => setSearch(e.target.value)} />
             </div>
 
             <div className="flex items-center gap-1 glass rounded-xl p-1">
               <Filter size={13} className="ml-2" style={{ color: 'var(--color-text-muted)' }} />
               {FILTERS.map(f => (
-                <button
-                  key={f}
+                <button key={f}
                   onClick={() => setFilter(prev => prev === f ? 'all' : f)}
                   className="px-3 py-1.5 rounded-lg text-xs font-medium capitalize transition-all duration-150"
                   style={filter === f
                     ? { background: 'var(--color-brand)', color: 'white' }
-                    : { color: 'var(--color-text-muted)' }
-                  }
+                    : { color: 'var(--color-text-muted)' }}
                 >
                   {f}
                 </button>
@@ -444,47 +422,50 @@ export default function App() {
 
             {!isCategoryMode && (
               <div className="relative">
-                <select
-                  value={sort}
-                  onChange={e => setSort(e.target.value)}
-                  className="input pr-8 appearance-none cursor-pointer"
-                  aria-label="Sort devices"
-                >
-                  {SORT_OPTIONS.map(o => (
-                    <option key={o.value} value={o.value}>{o.label}</option>
-                  ))}
+                <select value={sort} onChange={e => setSort(e.target.value)}
+                  className="input pr-8 appearance-none cursor-pointer" aria-label="Sort devices">
+                  {SORT_OPTIONS.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
                 </select>
-                <ChevronDown size={14} className="absolute right-3 top-1/2 -translate-y-1/2 pointer-events-none" style={{ color: 'var(--color-text-muted)' }} />
+                <ChevronDown size={14} className="absolute right-3 top-1/2 -translate-y-1/2 pointer-events-none"
+                  style={{ color: 'var(--color-text-muted)' }} />
               </div>
             )}
 
             <div className="flex items-center gap-1 glass rounded-xl p-1">
-              <button
-                onClick={() => setLayout('grid')}
+              <button onClick={() => setLayout('grid')}
                 className="p-2 rounded-lg transition-all duration-150"
                 style={layout === 'grid' ? { background: 'var(--color-brand)', color: 'white' } : { color: 'var(--color-text-muted)' }}
-                aria-label="Grid layout" title="Grid view"
-              ><LayoutGrid size={15} /></button>
-              <button
-                onClick={() => setLayout('list')}
+                aria-label="Grid layout">
+                <LayoutGrid size={15} /></button>
+              <button onClick={() => setLayout('list')}
                 className="p-2 rounded-lg transition-all duration-150"
                 style={layout === 'list' ? { background: 'var(--color-brand)', color: 'white' } : { color: 'var(--color-text-muted)' }}
-                aria-label="List layout" title="List view"
-              ><List size={15} /></button>
-              <button
-                onClick={() => setLayout('category')}
+                aria-label="List layout">
+                <List size={15} /></button>
+              <button onClick={() => setLayout('category')}
                 className="p-2 rounded-lg transition-all duration-150"
                 style={layout === 'category' ? { background: 'var(--color-brand)', color: 'white' } : { color: 'var(--color-text-muted)' }}
-                aria-label="Category view" title="Category view"
-              ><Layers size={15} /></button>
+                aria-label="Category view">
+                <Layers size={15} /></button>
             </div>
           </section>
 
+          {/* Smart filter bar */}
+          <section>
+            <SmartFilterBar
+              devices={devices}
+              activeFilters={activeFilters}
+              onToggle={toggleFilter}
+              onClear={clearFilters}
+            />
+          </section>
+
+          {/* Device list */}
           <section>
             {loading ? (
               <SkeletonGrid layout={layout === 'category' ? 'grid' : layout} />
             ) : filtered.length === 0 ? (
-              <EmptyState search={search} filter={filter} />
+              <EmptyState search={search} filter={filter} hasSmartFilters={hasActiveSmartFilters} onClearSmartFilters={clearFilters} />
             ) : isCategoryMode ? (
               <>
                 <p className="text-xs mb-4" style={{ color: 'var(--color-text-faint)' }}>
@@ -497,30 +478,38 @@ export default function App() {
                 <p className="text-xs mb-4" style={{ color: 'var(--color-text-faint)' }}>
                   Showing {filtered.length} of {devices.length} device{devices.length !== 1 ? 's' : ''}
                   {filter !== 'all' && (
-                    <span
-                      className="ml-2 px-2 py-0.5 rounded-full text-[10px] font-semibold uppercase"
-                      style={{ background: 'var(--color-brand)', color: 'white' }}
-                    >
-                      {filter}
+                    <span className="ml-2 px-2 py-0.5 rounded-full text-[10px] font-semibold uppercase"
+                      style={{ background: 'var(--color-brand)', color: 'white' }}>{filter}</span>
+                  )}
+                  {hasActiveSmartFilters && (
+                    <span className="ml-2 px-2 py-0.5 rounded-full text-[10px] font-semibold"
+                      style={{ background: 'var(--color-surface-offset)', color: 'var(--color-text-muted)' }}>
+                      + smart filters
                     </span>
                   )}
                 </p>
                 {layout === 'grid' ? (
                   <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-4">
                     {filtered.map(d => (
-                      <DeviceCard key={d.mac_address} device={d} onClick={() => setSelected(d)} />
+                      <DeviceCard key={d.mac_address} device={d}
+                        onClick={() => setSelected(d)}
+                        onStarToggle={handleStarToggle}
+                      />
                     ))}
                   </div>
                 ) : (
                   <div className="card overflow-hidden">
                     <div
-                      className="grid grid-cols-[1.5rem_2fr_1fr_1fr_1fr_6rem] gap-4 px-4 py-2.5 border-b text-xs font-semibold uppercase tracking-wider"
+                      className="grid grid-cols-[1.5rem_2fr_1fr_1fr_1fr_6rem_2rem] gap-4 px-4 py-2.5 border-b
+                                 text-xs font-semibold uppercase tracking-wider"
                       style={{ borderColor: 'var(--color-border)', color: 'var(--color-text-muted)' }}
                     >
-                      <span /><span>Name / IP</span><span>MAC</span><span>Vendor</span><span>Last Seen</span><span>Status</span>
+                      <span /><span>Name / IP</span><span>MAC</span><span>Vendor</span>
+                      <span>Last Seen</span><span>Status</span><span />
                     </div>
                     {filtered.map((d, i) => (
-                      <DeviceRow key={d.mac_address} device={d} onClick={() => setSelected(d)} striped={i % 2 === 1} />
+                      <DeviceRow key={d.mac_address} device={d} onClick={() => setSelected(d)}
+                        striped={i % 2 === 1} onStarToggle={handleStarToggle} />
                     ))}
                   </div>
                 )}
@@ -530,7 +519,6 @@ export default function App() {
 
         </main>
 
-        {/* Footer */}
         <footer className="border-t py-4" style={{ borderColor: 'var(--color-border)' }}>
           <div className="max-w-[1400px] mx-auto px-4 sm:px-6 flex flex-wrap items-center justify-between gap-2">
             <div className="flex items-center gap-3 text-xs" style={{ color: 'var(--color-text-faint)' }}>
@@ -538,15 +526,9 @@ export default function App() {
               <span style={{ color: 'var(--color-border)' }}>|</span>
               <span>v{APP_VERSION}</span>
               <span style={{ color: 'var(--color-border)' }}>|</span>
-              <span>
-                Developed by{' '}
-                <a
-                  href="mailto:inspectre@thefunkygibbon.net"
-                  style={{ color: 'var(--color-brand)' }}
-                  className="hover:underline"
-                >
-                  thefunkygibbon
-                </a>
+              <span>Developed by{' '}
+                <a href="mailto:inspectre@thefunkygibbon.net" style={{ color: 'var(--color-brand)' }}
+                  className="hover:underline">thefunkygibbon</a>
               </span>
             </div>
             <div className="flex items-center gap-1.5 text-xs" style={{ color: '#10b981' }}>
@@ -573,13 +555,16 @@ export default function App() {
           onClose={() => setSelected(null)}
           onRename={handleRename}
           onResolveName={handleResolveName}
+          onStarToggle={handleStarToggle}
+          onMetadataUpdate={async (mac, patch) => {
+            const updated = await api.updateMetadata(mac, patch)
+            setSelected(prev => prev?.mac_address === mac ? { ...prev, ...updated } : prev)
+            await refresh()
+          }}
         />
       )}
       {showSettings && (
-        <SettingsPanel
-          onClose={() => setShowSettings(false)}
-          onNotificationsChange={setNotificationsEnabled}
-        />
+        <SettingsPanel onClose={() => setShowSettings(false)} onNotificationsChange={setNotificationsEnabled} />
       )}
     </div>
   )
@@ -612,10 +597,7 @@ function SkeletonGrid({ layout }) {
             <div className="skeleton h-4 w-28 rounded" />
           </div>
           <div className="grid grid-cols-2 gap-2">
-            <div className="skeleton h-3 rounded" />
-            <div className="skeleton h-3 rounded" />
-            <div className="skeleton h-3 rounded" />
-            <div className="skeleton h-3 rounded" />
+            {[...Array(4)].map((_, j) => <div key={j} className="skeleton h-3 rounded" />)}
           </div>
           <div className="skeleton h-px w-full" />
           <div className="skeleton h-3 w-20 rounded" />
@@ -625,13 +607,11 @@ function SkeletonGrid({ layout }) {
   )
 }
 
-function EmptyState({ search, filter }) {
+function EmptyState({ search, filter, hasSmartFilters, onClearSmartFilters }) {
   return (
     <div className="flex flex-col items-center text-center py-24 gap-4">
-      <div
-        className="w-16 h-16 rounded-2xl flex items-center justify-center"
-        style={{ background: 'var(--color-surface)', border: '1px solid var(--color-border)' }}
-      >
+      <div className="w-16 h-16 rounded-2xl flex items-center justify-center"
+        style={{ background: 'var(--color-surface)', border: '1px solid var(--color-border)' }}>
         <Monitor size={28} style={{ color: 'var(--color-text-muted)' }} />
       </div>
       <div>
@@ -639,10 +619,15 @@ function EmptyState({ search, filter }) {
           {search ? 'No matches found' : filter !== 'all' ? `No ${filter} devices` : 'No devices yet'}
         </h3>
         <p className="text-sm mt-1 max-w-xs" style={{ color: 'var(--color-text-muted)' }}>
-          {search
-            ? 'Try a different search term'
-            : 'The probe will discover devices on the next ARP sweep'}
+          {search ? 'Try a different search term' : 'The probe will discover devices on the next ARP sweep'}
         </p>
+        {hasSmartFilters && (
+          <button onClick={onClearSmartFilters}
+            className="mt-3 text-xs px-3 py-1.5 rounded-full border transition-colors"
+            style={{ borderColor: 'var(--color-border)', color: 'var(--color-text-muted)' }}>
+            Clear smart filters
+          </button>
+        )}
       </div>
     </div>
   )

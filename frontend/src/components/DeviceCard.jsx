@@ -4,6 +4,7 @@ import {
   MonitorSpeaker, Tablet, Radio, Network, Shield, Monitor
 } from 'lucide-react'
 import { OnlineDot } from './OnlineDot'
+import { StarButton } from './StarButton'
 import { classifyDevice, getDeviceCategory } from '../deviceCategories'
 
 function relativeTime(iso) {
@@ -17,7 +18,6 @@ function relativeTime(iso) {
   return `${Math.floor(hrs / 24)}d ago`
 }
 
-/** Map category type key → Lucide icon component */
 const TYPE_ICON_MAP = {
   router:   Router,
   switch:   Network,
@@ -43,10 +43,6 @@ function getDeviceIcon(device) {
   return TYPE_ICON_MAP[type] || HelpCircle
 }
 
-/**
- * Clean up vendor name — strip trailing noise so it reads nicely as a subtitle.
- * e.g. "Reolink Security Technologies Co., Ltd." → "Reolink"
- */
 function cleanVendor(vendor) {
   if (!vendor) return null
   return vendor
@@ -54,10 +50,6 @@ function cleanVendor(vendor) {
     .trim()
 }
 
-/**
- * Best display name with fallback chain:
- * 1. custom_name  2. hostname  3. cleaned vendor  4. "Device .{last_octet}"  5. MAC prefix
- */
 function deviceDisplayName(device) {
   if (device.custom_name) return device.custom_name
   if (device.hostname)    return device.hostname
@@ -77,50 +69,45 @@ function openPortCount(device) {
   return null
 }
 
-export function DeviceCard({ device, onClick }) {
-  const name      = deviceDisplayName(device)
-  const vendor    = cleanVendor(device.vendor_override || device.vendor)
-  const DevIcon   = getDeviceIcon(device)
-  const category  = getDeviceCategory(device)
-  const ports     = openPortCount(device)
-  const scanning  = !device.deep_scanned
+export function DeviceCard({ device, onClick, onStarToggle }) {
+  const name     = deviceDisplayName(device)
+  const vendor   = cleanVendor(device.vendor_override || device.vendor)
+  const DevIcon  = getDeviceIcon(device)
+  const category = getDeviceCategory(device)
+  const ports    = openPortCount(device)
+  const scanning = !device.deep_scanned
 
-  // Show vendor as subtitle only when it differs from the main name
   const showVendorSubtitle = vendor && vendor !== name
 
   return (
     <button
       onClick={onClick}
-      className={`device-card${scanning ? ' device-card-scanning' : ''} p-5 text-left w-full flex flex-col gap-3 group`}
+      className={`device-card${scanning ? ' device-card-scanning' : ''}${device.is_important ? ' ring-1 ring-amber-400/30' : ''} p-5 text-left w-full flex flex-col gap-3 group relative`}
     >
-      {/* ── Header: icon + name + vendor subtitle ── */}
-      <div className="flex items-start justify-between gap-2">
+      {/* Star button — top right corner */}
+      {onStarToggle && (
+        <div className="absolute top-3 right-3 z-10">
+          <StarButton device={device} onToggle={onStarToggle} size={14} />
+        </div>
+      )}
+
+      {/* Header */}
+      <div className="flex items-start justify-between gap-2 pr-6">
         <div className="flex items-center gap-2.5 min-w-0">
-          {/* Device type icon — colour driven by category */}
-          <span
-            className="w-8 h-8 rounded-lg flex items-center justify-center shrink-0 transition-colors duration-200"
-            style={{ background: category.bgColor }}
-          >
+          <span className="w-8 h-8 rounded-lg flex items-center justify-center shrink-0 transition-colors duration-200"
+            style={{ background: category.bgColor }}>
             <DevIcon size={15} style={{ color: category.color }} />
           </span>
-
           <div className="min-w-0">
-            {/* 1 — Device name */}
             <div className="flex items-center gap-1.5">
               <OnlineDot online={device.is_online} size="sm" />
-              <span className="font-semibold text-sm truncate" style={{ color: 'var(--color-text)' }}>
-                {name}
-              </span>
+              <span className="font-semibold text-sm truncate" style={{ color: 'var(--color-text)' }}>{name}</span>
             </div>
-            {/* 2 — Vendor subtitle */}
             {showVendorSubtitle && (
-              <span className="text-[11px] truncate block" style={{ color: 'var(--color-text-muted)' }}>
-                {vendor}
-              </span>
+              <span className="text-[11px] truncate block" style={{ color: 'var(--color-text-muted)' }}>{vendor}</span>
             )}
           </div>
         </div>
-
         {scanning && (
           <span className="shrink-0 text-[10px] font-medium text-amber-400 bg-amber-400/10
                            border border-amber-400/20 rounded-full px-2 py-0.5 mt-0.5">
@@ -129,43 +116,50 @@ export function DeviceCard({ device, onClick }) {
         )}
       </div>
 
-      {/* ── Details grid ── */}
+      {/* Details grid */}
       <div className="grid grid-cols-2 gap-x-3 gap-y-1.5 text-xs">
-        {/* 3 — IP */}
         <span style={{ color: 'var(--color-text-muted)' }}>IP</span>
-        <span className="font-mono truncate" style={{ color: 'var(--color-text)' }}>
-          {device.ip_address}
-        </span>
-
-        {/* 4 — MAC */}
+        <span className="font-mono truncate" style={{ color: 'var(--color-text)' }}>{device.ip_address}</span>
         <span style={{ color: 'var(--color-text-muted)' }}>MAC</span>
-        <span className="font-mono truncate text-[11px]" style={{ color: 'var(--color-text)' }}>
-          {device.mac_address}
-        </span>
-
-        {/* 5 — Device type */}
+        <span className="font-mono truncate text-[11px]" style={{ color: 'var(--color-text)' }}>{device.mac_address}</span>
         <span style={{ color: 'var(--color-text-muted)' }}>Type</span>
-        <span className="truncate capitalize" style={{ color: 'var(--color-text)' }}>
-          {category.label}
-        </span>
-
-        {/* 6 — Open ports (only once scanned) */}
+        <span className="truncate capitalize" style={{ color: 'var(--color-text)' }}>{category.label}</span>
         {ports !== null && (
           <>
             <span style={{ color: 'var(--color-text-muted)' }}>Ports</span>
             <span style={{ color: 'var(--color-text)' }}>{ports} open</span>
           </>
         )}
+        {device.location && (
+          <>
+            <span style={{ color: 'var(--color-text-muted)' }}>Location</span>
+            <span className="truncate" style={{ color: 'var(--color-text)' }}>{device.location}</span>
+          </>
+        )}
       </div>
 
-      {/* ── Footer: last seen ── */}
-      <div
-        className="flex items-center justify-end pt-1 border-t"
-        style={{ borderColor: 'var(--color-border)' }}
-      >
-        <span className="text-xs" style={{ color: 'var(--color-text-faint)' }}>
-          {relativeTime(device.last_seen)}
-        </span>
+      {/* Tags */}
+      {device.tags_array?.length > 0 && (
+        <div className="flex flex-wrap gap-1">
+          {device.tags_array.slice(0, 3).map(tag => (
+            <span key={tag}
+              className="px-1.5 py-0.5 rounded-full text-[10px] font-medium"
+              style={{ background: 'var(--color-brand)', color: '#fff', opacity: 0.85 }}>
+              {tag}
+            </span>
+          ))}
+          {device.tags_array.length > 3 && (
+            <span className="px-1.5 py-0.5 rounded-full text-[10px]"
+              style={{ background: 'var(--color-surface-offset)', color: 'var(--color-text-faint)' }}>
+              +{device.tags_array.length - 3}
+            </span>
+          )}
+        </div>
+      )}
+
+      {/* Footer */}
+      <div className="flex items-center justify-end pt-1 border-t" style={{ borderColor: 'var(--color-border)' }}>
+        <span className="text-xs" style={{ color: 'var(--color-text-faint)' }}>{relativeTime(device.last_seen)}</span>
       </div>
     </button>
   )

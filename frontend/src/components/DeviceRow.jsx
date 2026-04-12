@@ -1,4 +1,5 @@
 import { OnlineDot } from './OnlineDot'
+import { StarButton } from './StarButton'
 
 function relativeTime(iso) {
   if (!iso) return ''
@@ -11,41 +12,55 @@ function relativeTime(iso) {
   return `${Math.floor(hrs / 24)}d ago`
 }
 
-export function DeviceRow({ device, onClick, striped }) {
-  const name = device.display_name || device.ip_address
+function cleanVendor(vendor) {
+  if (!vendor) return '--'
+  return vendor
+    .replace(/\s+(Inc\.?|LLC\.?|Ltd\.?|Co\.,?\s*Ltd\.?|Technologies|Technology|International|Electronics|Systems|Networks|Communications|Corp\.?|Group|Holdings)(\s+|$)/gi, '')
+    .trim()
+}
+
+export function DeviceRow({ device, onClick, striped, onStarToggle }) {
+  const name = device.custom_name || device.hostname || device.ip_address || device.mac_address
 
   return (
-    <button
+    <div
       onClick={onClick}
-      className={`grid grid-cols-[1.5rem_2fr_1fr_1fr_1fr_6rem] gap-4 px-4 py-3 w-full text-left
-                  border-b border-border last:border-0 transition-colors duration-100
-                  hover:bg-surface-hover active:bg-surface-active
-                  ${ striped ? 'bg-surface-offset/30' : '' }`}
+      className={`grid grid-cols-[1.5rem_2fr_1fr_1fr_1fr_6rem_2rem] gap-4 px-4 py-3 border-b last:border-0
+                  items-center cursor-pointer hover:bg-surface-offset transition-colors
+                  ${striped ? 'bg-surface-offset/40' : ''}`}
+      style={{ borderColor: 'var(--color-border)' }}
     >
-      <div className="flex items-center">
-        <OnlineDot online={device.is_online} />
-      </div>
+      <OnlineDot online={device.is_online} size="sm" />
+
       <div className="min-w-0">
-        <p className="text-sm font-medium text-text truncate">{name}</p>
-        {device.hostname && device.custom_name && (
-          <p className="text-xs text-text-muted font-mono truncate">{device.hostname}</p>
-        )}
-        <p className="text-xs text-text-muted font-mono">{device.ip_address}</p>
+        <p className="text-sm font-medium truncate" style={{ color: 'var(--color-text)' }}>{name}</p>
+        <p className="text-xs font-mono truncate" style={{ color: 'var(--color-text-faint)' }}>{device.ip_address}</p>
       </div>
-      <div className="flex items-center">
-        <span className="text-xs font-mono text-text-muted truncate">{device.mac_address}</span>
+
+      <span className="font-mono text-xs truncate" style={{ color: 'var(--color-text-muted)' }}>
+        {device.mac_address}
+      </span>
+
+      <span className="text-xs truncate" style={{ color: 'var(--color-text-muted)' }}>
+        {cleanVendor(device.vendor_override || device.vendor)}
+      </span>
+
+      <span className="text-xs" style={{ color: 'var(--color-text-faint)' }}>
+        {relativeTime(device.last_seen)}
+      </span>
+
+      <div>
+        <span
+          className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[11px] font-medium
+                      ${device.is_online ? 'badge-online' : 'badge-offline'}`}
+        >
+          {device.is_online ? 'Online' : 'Offline'}
+        </span>
       </div>
-      <div className="flex items-center">
-        <span className="text-sm text-text truncate">{device.vendor || '—'}</span>
+
+      <div onClick={e => e.stopPropagation()}>
+        {onStarToggle && <StarButton device={device} onToggle={onStarToggle} size={13} />}
       </div>
-      <div className="flex items-center">
-        <span className="text-xs text-text-muted">{relativeTime(device.last_seen)}</span>
-      </div>
-      <div className="flex items-center">
-        {device.is_online
-          ? <span className="badge-online">Online</span>
-          : <span className="badge-offline">Offline</span>}
-      </div>
-    </button>
+    </div>
   )
 }
