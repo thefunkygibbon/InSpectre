@@ -4,12 +4,13 @@ import {
   ShieldCheck, ScanLine, RefreshCw, ExternalLink,
   Activity, GitBranch, Bug, RotateCcw, Ban, History,
   ChevronDown, ChevronRight, Square, Tag, CheckCircle2,
-  FileText, Star as StarIcon,
+  FileText, Star as StarIcon, ShieldAlert,
 } from 'lucide-react'
 import { OnlineDot }    from './OnlineDot'
 import { StarButton }   from './StarButton'
 import { DeviceNotes }  from './DeviceNotes'
 import { DeviceTimeline } from './DeviceTimeline'
+import { VulnPanel }    from './VulnPanel'
 import { api }          from '../api'
 import { useStreamAction } from '../hooks/useStreamAction'
 import { CATEGORIES, OVERRIDE_OPTIONS } from '../deviceCategories'
@@ -28,11 +29,12 @@ const HTTPS_PORTS = new Set([443, 8443, 4443, 9443])
 function isWebPort(port)   { return HTTP_PORTS.has(port) || HTTPS_PORTS.has(port) }
 function portUrl(ip, port) { return `${HTTPS_PORTS.has(port) ? 'https' : 'http'}://${ip}:${port}` }
 
-// Tab definitions
+// Tab definitions — Phase 3 adds the Vulnerabilities tab
 const TABS = [
-  { id: 'overview', label: 'Overview' },
-  { id: 'timeline', label: 'Timeline' },
-  { id: 'notes',    label: 'Notes & Tags' },
+  { id: 'overview',  label: 'Overview' },
+  { id: 'vulns',     label: 'Vulnerabilities' },
+  { id: 'timeline',  label: 'Timeline' },
+  { id: 'notes',     label: 'Notes & Tags' },
 ]
 
 function TerminalBox({ lines, running, onStop }) {
@@ -216,6 +218,12 @@ export function DeviceDrawer({ device, onClose, onRename, onResolveName, onRefre
   const scan = localDevice.scan_results
   const mac  = localDevice.mac_address
 
+  // Severity badge colour for the Vulnerabilities tab label
+  const vulnSev     = localDevice.vuln_severity
+  const vulnSevCfg  = vulnSev && vulnSev !== 'clean' ? {
+    critical: '#ef4444', high: '#f97316', medium: '#f59e0b', low: '#3b82f6', info: '#8b5cf6'
+  }[vulnSev] : null
+
   async function handleResolve() {
     setResolving(true)
     await onResolveName(mac)
@@ -241,11 +249,6 @@ export function DeviceDrawer({ device, onClose, onRename, onResolveName, onRefre
     if (activeAction === 'traceroute' && stream.running) { stream.stop(); return }
     setActiveAction('traceroute'); setStaticLines([])
     stream.start(`/devices/${mac}/traceroute`)
-  }
-
-  function handlePlaceholder(label, note) {
-    setActiveAction(label); stream.stop()
-    setStaticLines([`[${label.toUpperCase()}] ${note}`])
   }
 
   async function handleStarClick(mac, value) {
@@ -281,18 +284,27 @@ export function DeviceDrawer({ device, onClose, onRename, onResolveName, onRefre
 
         {/* Tab bar */}
         <div className="flex border-b border-border px-6 gap-1" style={{ background: 'var(--color-surface)' }}>
-          {TABS.map(tab => (
-            <button
-              key={tab.id}
-              onClick={() => setActiveTab(tab.id)}
-              className="px-3 py-3 text-xs font-medium border-b-2 transition-colors"
-              style={activeTab === tab.id
-                ? { borderColor: 'var(--color-brand)', color: 'var(--color-brand)' }
-                : { borderColor: 'transparent', color: 'var(--color-text-muted)' }}
-            >
-              {tab.label}
-            </button>
-          ))}
+          {TABS.map(tab => {
+            const isVuln   = tab.id === 'vulns'
+            const isActive = activeTab === tab.id
+            return (
+              <button
+                key={tab.id}
+                onClick={() => setActiveTab(tab.id)}
+                className="px-3 py-3 text-xs font-medium border-b-2 transition-colors flex items-center gap-1.5"
+                style={isActive
+                  ? { borderColor: 'var(--color-brand)', color: 'var(--color-brand)' }
+                  : { borderColor: 'transparent', color: 'var(--color-text-muted)' }}
+              >
+                {tab.label}
+                {/* Dot indicator on Vulnerabilities tab if scan found issues */}
+                {isVuln && vulnSevCfg && (
+                  <span className="w-1.5 h-1.5 rounded-full shrink-0"
+                    style={{ background: vulnSevCfg }} />
+                )}
+              </button>
+            )
+          })}
         </div>
 
         {/* Body */}
@@ -318,6 +330,11 @@ export function DeviceDrawer({ device, onClose, onRename, onResolveName, onRefre
                     <StarIcon size={11} />Watched
                   </span>
                 )}
+                {vulnSev && vulnSev !== 'clean' && (
+                  <span className="badge-online" style={{ background: `rgba(239,68,68,0.12)`, color: vulnSevCfg, border: `1px solid rgba(239,68,68,0.3)` }}>
+                    <ShieldAlert size={11} />{vulnSev.charAt(0).toUpperCase() + vulnSev.slice(1)} vuln
+                  </span>
+                )}
               </div>
 
               {/* Actions */}
@@ -325,12 +342,13 @@ export function DeviceDrawer({ device, onClose, onRename, onResolveName, onRefre
                 <div className="grid grid-cols-2 gap-2 pt-1">
                   {pingRunning
                     ? <StopBtn label="Stop Ping"  onClick={handlePing} />
-                    : <ActionBtn icon={Activity}  label="Ping"       active={activeAction === 'ping'}       onClick={handlePing} />}
+                    : <ActionBtn icon={Activity}    label="Ping"         active={activeAction === 'ping'}       onClick={handlePing} />}
                   {traceRunning
                     ? <StopBtn label="Stop Trace" onClick={handleTraceroute} />
-                    : <ActionBtn icon={GitBranch} label="Traceroute" active={activeAction === 'traceroute'} onClick={handleTraceroute} />}
-                  <ActionBtn icon={RotateCcw} label="Re-scan ports" active={activeAction === 'rescan'} loading={rescanning} onClick={handleRescan} />
-                  <ActionBtn icon={Bug}       label="Vuln scan"     active={activeAction === 'vuln'} onClick={() => handlePlaceholder('vuln', 'Vulnerability scan — coming in Phase 3.')} />
+                    : <ActionBtn icon={GitBranch}   label="Traceroute"   active={activeAction === 'traceroute'} onClick={handleTraceroute} />}
+                  <ActionBtn icon={RotateCcw}   label="Re-scan ports" active={activeAction === 'rescan'}     loading={rescanning} onClick={handleRescan} />
+                  <ActionBtn icon={ShieldAlert} label="Vuln scan"     active={activeTab   === 'vulns'}
+                    onClick={() => setActiveTab('vulns')} />
                 </div>
                 <button disabled
                   className="mt-2 w-full flex items-center justify-center gap-2 py-2 rounded-lg
@@ -438,6 +456,19 @@ export function DeviceDrawer({ device, onClose, onRename, onResolveName, onRefre
                 <RenameForm device={localDevice} onRename={onRename} />
               </Section>
             </>
+          )}
+
+          {activeTab === 'vulns' && (
+            <VulnPanel
+              device={localDevice}
+              onScanComplete={() => {
+                // Refresh device data so vuln_severity badge updates
+                api.getDevice(mac).then(updated => {
+                  setLocalDevice(updated)
+                  if (onRefresh) onRefresh()
+                }).catch(() => {})
+              }}
+            />
           )}
 
           {activeTab === 'timeline' && (
