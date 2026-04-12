@@ -1,4 +1,5 @@
 import asyncio
+import json
 import os
 import queue
 import socket
@@ -24,7 +25,7 @@ from sqlalchemy.orm import declarative_base, sessionmaker
 # ---------------------------------------------------------------------------
 # Version
 # ---------------------------------------------------------------------------
-VERSION = "0.5.3"
+VERSION = "0.6.0"
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -152,6 +153,21 @@ def init_db() -> None:
         except Exception:
             conn.rollback()
 
+        # Ensure device_events table exists (probe also needs it for event writing)
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS device_events (
+                id          SERIAL PRIMARY KEY,
+                mac_address VARCHAR NOT NULL REFERENCES devices(mac_address) ON DELETE CASCADE,
+                type        VARCHAR NOT NULL,
+                detail      JSONB,
+                created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )
+        """))
+        conn.execute(text("CREATE INDEX IF NOT EXISTS ix_device_events_mac     ON device_events(mac_address)"))
+        conn.execute(text("CREATE INDEX IF NOT EXISTS ix_device_events_type    ON device_events(type)"))
+        conn.execute(text("CREATE INDEX IF NOT EXISTS ix_device_events_created ON device_events(created_at)"))
+        conn.commit()
+
     print("[DB] Migrations complete.", flush=True)
 
 # ---------------------------------------------------------------------------
@@ -160,8 +176,7 @@ def init_db() -> None:
 def record_ip(mac: str, ip: str) -> bool:
     """
     Upserts the IP into ip_history. Returns True only if this is a BRAND NEW
-    mac+ip combination (first_seen == last_seen within 2s), i.e. a genuine
-    new IP assignment rather than a repeat seen-again update.
+    mac+ip combination (first_seen == last_seen within 2s).
     """
     if not _is_valid_ip(ip):
         return False
@@ -188,6 +203,24 @@ def record_ip(mac: str, ip: str) -> bool:
         session.rollback()
         print(f"[ip_history] record error {mac}/{ip}: {e}", flush=True)
         return False
+    finally:
+        session.close()
+
+# ---------------------------------------------------------------------------
+# Event writing
+# ---------------------------------------------------------------------------
+def _write_event(mac: str, event_type: str, detail: dict) -> None:
+    """Write a device_events row. Silently swallows errors."""
+    session = Session()
+    try:
+        session.execute(text("""
+            INSERT INTO device_events (mac_address, type, detail, created_at)
+            VALUES (:mac, :type, :detail::jsonb, NOW())
+        """), {"mac": mac, "type": event_type, "detail": json.dumps(detail)})
+        session.commit()
+    except Exception as e:
+        session.rollback()
+        print(f"[events] write error {mac}/{event_type}: {e}", flush=True)
     finally:
         session.close()
 
@@ -434,6 +467,11 @@ def _run_deep_scan_thread(ip: str, mac: str) -> None:
             if not device.hostname and results.get("hostnames"):
                 device.hostname = _strip_fqdn(results["hostnames"][0])
             session.commit()
+            # Emit scan_complete event
+            _write_event(mac, "scan_complete", {
+                "ports": len(results.get("open_ports") or []),
+                "os":    results["os_matches"][0]["name"] if results.get("os_matches") else None,
+            })
     except Exception as e:
         session.rollback()
         print(f"[DB] Scan save error {mac}: {e}", flush=True)
@@ -468,6 +506,7 @@ def upsert_seen_device(mac: str, ip: str, source: str) -> None:
             existing   = session.get(Device, mac)
             is_new     = existing is None
             old_ip     = None if is_new else (existing.ip_address or "")
+            was_online = None if is_new else existing.is_online
             ip_changed = (not is_new) and (old_ip != ip)
 
             if is_new:
@@ -479,13 +518,6 @@ def upsert_seen_device(mac: str, ip: str, source: str) -> None:
 
             safe_hostname = (hostname or '').replace("'", "''")
 
-            # ----------------------------------------------------------------
-            # The on_conflict SET clause deliberately omits deep_scanned and
-            # scan_results — those columns are ONLY written by the nmap thread
-            # (_run_deep_scan_thread) or the explicit rescan endpoint.
-            # Preserving them here stops routine ARP upserts from ever
-            # resetting the deep-scan state.
-            # ----------------------------------------------------------------
             stmt = (
                 pg_insert(Device)
                 .values(
@@ -497,9 +529,9 @@ def upsert_seen_device(mac: str, ip: str, source: str) -> None:
                     is_online    = True,
                     first_seen   = now,
                     last_seen    = now,
-                    deep_scanned = False,   # only used for brand-new INSERT rows
+                    deep_scanned = False,
                     miss_count   = 0,
-                    is_important = False,   # only used for brand-new INSERT rows
+                    is_important = False,   # only applied on brand-new INSERT rows
                 )
                 .on_conflict_do_update(
                     index_elements=["mac_address"],
@@ -509,7 +541,6 @@ def upsert_seen_device(mac: str, ip: str, source: str) -> None:
                         last_seen  = now,
                         miss_count = 0,
                         # deep_scanned, scan_results, is_important intentionally NOT here
-                        # — they must never be overwritten by a routine upsert.
                         hostname   = text(
                             "CASE WHEN devices.hostname IS NOT NULL AND devices.hostname != '' "
                             f"THEN devices.hostname ELSE '{safe_hostname}' END"
@@ -520,32 +551,18 @@ def upsert_seen_device(mac: str, ip: str, source: str) -> None:
             session.execute(stmt)
             session.commit()
 
+            # Emit events
             if is_new:
                 print(f"[+] New device via {source}: {ip} ({mac}) hostname={hostname} vendor={vendor}", flush=True)
+                _write_event(mac, "joined", {"ip": ip, "vendor": vendor or "Unknown"})
                 trigger_deep_scan(ip, mac)
-            elif not existing.is_online:
-                print(f"[~] Back online via {source}: {ip} ({mac})", flush=True)
-
-            # ----------------------------------------------------------------
-            # IP-change handling.
-            #
-            # We only want to treat this as a real IP change (and thus
-            # invalidate the existing deep-scan) if the NEW ip is genuinely
-            # stable, not just a transient gratuitous ARP or a brief
-            # multi-interface flap.
-            #
-            # Strategy: record_ip() returns True only when the mac+ip combo
-            # has JUST been inserted for the first time (first_seen ≈ now).
-            # We check that AND that the device was previously deep-scanned
-            # before wiping anything.  This means:
-            #   - same IP seen again -> record_ip returns False -> no rescan
-            #   - new IP first appearance -> record_ip returns True -> rescan
-            #     only if the device was already deep-scanned (otherwise
-            #     there's nothing to invalidate; the pending scan will pick
-            #     up the correct IP anyway)
-            # ----------------------------------------------------------------
-            if ip_changed:
-                print(f"[~] IP change detected {old_ip} -> {ip} for {mac} (source={source})", flush=True)
+            else:
+                if not was_online:
+                    print(f"[~] Back online via {source}: {ip} ({mac})", flush=True)
+                    _write_event(mac, "online", {"ip": ip})
+                if ip_changed:
+                    print(f"[~] IP change detected {old_ip} -> {ip} for {mac} (source={source})", flush=True)
+                    _write_event(mac, "ip_change", {"old_ip": old_ip, "new_ip": ip})
 
         except Exception as e:
             session.rollback()
@@ -555,11 +572,9 @@ def upsert_seen_device(mac: str, ip: str, source: str) -> None:
             session.close()
 
     # record_ip is called OUTSIDE the session so the upsert is committed first.
-    # It returns True only for a genuinely new mac+ip combo.
     is_brand_new_ip = record_ip(mac, ip)
 
     if ip_changed and is_brand_new_ip:
-        # Confirmed stable IP change — invalidate scan only if one existed.
         session2 = Session()
         try:
             dev2 = session2.get(Device, mac)
@@ -570,8 +585,6 @@ def upsert_seen_device(mac: str, ip: str, source: str) -> None:
                 session2.commit()
                 trigger_deep_scan(ip, mac)
             elif dev2 and not dev2.deep_scanned:
-                # Not yet scanned — the in-flight or pending scan will use
-                # whatever IP is current; no action needed.
                 print(f"[~] IP change for unscanned device {mac} — scan will use new IP {ip}", flush=True)
         except Exception as e:
             session2.rollback()
@@ -682,6 +695,7 @@ def update_presence_from_sweep(session, active_macs: set) -> None:
             if dev.miss_count >= OFFLINE_MISS_THRESHOLD and dev.is_online:
                 dev.is_online = False
                 print(f"[-] Offline: {dev.ip_address} ({dev.mac_address}) after {dev.miss_count} missed sweeps", flush=True)
+                _write_event(dev.mac_address, "offline", {"ip": dev.ip_address})
 
 # ---------------------------------------------------------------------------
 # Probe HTTP API (port 8001)
