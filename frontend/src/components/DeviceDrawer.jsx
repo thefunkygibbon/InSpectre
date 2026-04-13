@@ -6,12 +6,13 @@ import {
   ChevronDown, ChevronRight, Square, Tag, CheckCircle2,
   FileText, Star as StarIcon, ShieldAlert,
 } from 'lucide-react'
-import { OnlineDot }    from './OnlineDot'
-import { StarButton }   from './StarButton'
-import { DeviceNotes }  from './DeviceNotes'
+import { OnlineDot }      from './OnlineDot'
+import { StarButton }     from './StarButton'
+import { DeviceNotes }    from './DeviceNotes'
 import { DeviceTimeline } from './DeviceTimeline'
-import { VulnPanel }    from './VulnPanel'
-import { api }          from '../api'
+import { VulnPanel }      from './VulnPanel'
+import { StreamOutput }   from './StreamOutput'
+import { api }            from '../api'
 import { useStreamAction } from '../hooks/useStreamAction'
 import { CATEGORIES, OVERRIDE_OPTIONS } from '../deviceCategories'
 
@@ -29,38 +30,12 @@ const HTTPS_PORTS = new Set([443, 8443, 4443, 9443])
 function isWebPort(port)   { return HTTP_PORTS.has(port) || HTTPS_PORTS.has(port) }
 function portUrl(ip, port) { return `${HTTPS_PORTS.has(port) ? 'https' : 'http'}://${ip}:${port}` }
 
-// Tab definitions — Phase 3 adds the Vulnerabilities tab
 const TABS = [
   { id: 'overview',  label: 'Overview' },
   { id: 'vulns',     label: 'Vulnerabilities' },
   { id: 'timeline',  label: 'Timeline' },
   { id: 'notes',     label: 'Notes & Tags' },
 ]
-
-function TerminalBox({ lines, running, onStop }) {
-  const containerRef = useRef(null)
-  useEffect(() => {
-    const el = containerRef.current
-    if (el) el.scrollTop = el.scrollHeight
-  }, [lines])
-  if (!lines.length && !running) return null
-  return (
-    <div ref={containerRef}
-      className="mt-3 rounded-lg bg-[#0d1117] border border-[#30363d] p-3 font-mono
-                 text-green-400 max-h-56 overflow-y-auto relative"
-      style={{ fontSize: '11px', lineHeight: '1.5' }}
-    >
-      {running && (
-        <button onClick={onStop} className="absolute top-2 right-2 text-[#30363d] hover:text-red-400 transition-colors" title="Stop">
-          <X size={12} />
-        </button>
-      )}
-      {lines.map((l, i) => <div key={i} className="whitespace-pre overflow-x-auto">{l}</div>)}
-      {running  && <div className="inline-block animate-pulse">&#9608;</div>}
-      {!running && lines.length > 0 && <div className="text-green-600 mt-1">--- done ---</div>}
-    </div>
-  )
-}
 
 function Collapsible({ title, icon: Icon, defaultOpen = false, children }) {
   const [open, setOpen] = useState(defaultOpen)
@@ -199,14 +174,16 @@ function IdentityForm({ device, onSaved }) {
   )
 }
 
-// -- Main component -----------------------------------------------------------
+// ---------------------------------------------------------------------------
+// Main component
+// ---------------------------------------------------------------------------
 export function DeviceDrawer({ device, onClose, onRename, onResolveName, onRefresh, onStarToggle, onMetadataUpdate }) {
   if (!device) return null
 
   const [localDevice,  setLocalDevice]  = useState(device)
   const [resolving,    setResolving]    = useState(false)
   const [rescanning,   setRescanning]   = useState(false)
-  const [activeAction, setActiveAction] = useState(null)
+  const [activeAction, setActiveAction] = useState(null)  // 'ping' | 'traceroute' | 'rescan'
   const [staticLines,  setStaticLines]  = useState([])
   const [activeTab,    setActiveTab]    = useState('overview')
 
@@ -218,9 +195,8 @@ export function DeviceDrawer({ device, onClose, onRename, onResolveName, onRefre
   const scan = localDevice.scan_results
   const mac  = localDevice.mac_address
 
-  // Severity badge colour for the Vulnerabilities tab label
-  const vulnSev     = localDevice.vuln_severity
-  const vulnSevCfg  = vulnSev && vulnSev !== 'clean' ? {
+  const vulnSev    = localDevice.vuln_severity
+  const vulnSevCfg = vulnSev && vulnSev !== 'clean' ? {
     critical: '#ef4444', high: '#f97316', medium: '#f59e0b', low: '#3b82f6', info: '#8b5cf6'
   }[vulnSev] : null
 
@@ -234,8 +210,8 @@ export function DeviceDrawer({ device, onClose, onRename, onResolveName, onRefre
     setRescanning(true); setActiveAction('rescan'); stream.stop(); setStaticLines([])
     try {
       await api.rescanDevice(mac)
-      setStaticLines(['[RESCAN] Deep scan queued — results will update shortly.'])
-    } catch (e) { setStaticLines([`[RESCAN] Error: ${e.message}`]) }
+      setStaticLines(['[INFO] Deep scan queued — results will update shortly.'])
+    } catch (e) { setStaticLines([`[ERROR] ${e.message}`]) }
     finally { setRescanning(false); if (onRefresh) onRefresh() }
   }
 
@@ -256,10 +232,15 @@ export function DeviceDrawer({ device, onClose, onRename, onResolveName, onRefre
     if (onStarToggle) onStarToggle(mac, value)
   }
 
-  const termLines    = stream.lines.length ? stream.lines : staticLines
-  const termRunning  = stream.running
+  const termLines   = stream.lines.length ? stream.lines : staticLines
+  const termRunning = stream.running
   const pingRunning  = activeAction === 'ping'       && stream.running
   const traceRunning = activeAction === 'traceroute' && stream.running
+
+  // Derive stream mode so StreamOutput knows how to render
+  const streamMode = activeAction === 'ping'       ? 'ping'
+                   : activeAction === 'traceroute' ? 'traceroute'
+                   : 'generic'
 
   return (
     <>
@@ -297,10 +278,8 @@ export function DeviceDrawer({ device, onClose, onRename, onResolveName, onRefre
                   : { borderColor: 'transparent', color: 'var(--color-text-muted)' }}
               >
                 {tab.label}
-                {/* Dot indicator on Vulnerabilities tab if scan found issues */}
                 {isVuln && vulnSevCfg && (
-                  <span className="w-1.5 h-1.5 rounded-full shrink-0"
-                    style={{ background: vulnSevCfg }} />
+                  <span className="w-1.5 h-1.5 rounded-full shrink-0" style={{ background: vulnSevCfg }} />
                 )}
               </button>
             )
@@ -358,7 +337,13 @@ export function DeviceDrawer({ device, onClose, onRename, onResolveName, onRefre
                   Block internet access
                   <span className="ml-auto text-[10px] bg-surface-offset px-1.5 py-0.5 rounded">Phase 4</span>
                 </button>
-                <TerminalBox lines={termLines} running={termRunning} onStop={stream.stop} />
+                {/* Structured stream output */}
+                <StreamOutput
+                  lines={termLines}
+                  running={termRunning}
+                  onStop={stream.stop}
+                  mode={streamMode}
+                />
               </Section>
 
               {/* Network */}
@@ -462,7 +447,6 @@ export function DeviceDrawer({ device, onClose, onRename, onResolveName, onRefre
             <VulnPanel
               device={localDevice}
               onScanComplete={() => {
-                // Refresh device data so vuln_severity badge updates
                 api.getDevice(mac).then(updated => {
                   setLocalDevice(updated)
                   if (onRefresh) onRefresh()

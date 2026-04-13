@@ -1,10 +1,11 @@
 import { useState, useEffect, useRef } from 'react'
 import {
   ShieldAlert, ShieldCheck, ShieldQuestion, AlertTriangle,
-  Info, ChevronDown, ChevronRight, Trash2, RefreshCw,
+  Info, ChevronDown, ChevronRight, Trash2,
   Clock, X, Square,
 } from 'lucide-react'
 import { api, streamSSE } from '../api'
+import { StreamOutput }   from './StreamOutput'
 
 // ---------------------------------------------------------------------------
 // Severity helpers
@@ -157,32 +158,6 @@ function ReportDetail({ mac, report, onDelete }) {
 }
 
 // ---------------------------------------------------------------------------
-// TerminalBox (scan progress)
-// ---------------------------------------------------------------------------
-function TerminalBox({ lines, running, onStop }) {
-  const ref = useRef(null)
-  useEffect(() => {
-    if (ref.current) ref.current.scrollTop = ref.current.scrollHeight
-  }, [lines])
-  if (!lines.length && !running) return null
-  return (
-    <div ref={ref}
-      className="mt-3 rounded-lg bg-[#0d1117] border border-[#30363d] p-3 font-mono
-                 text-green-400 max-h-56 overflow-y-auto relative"
-      style={{ fontSize: '11px', lineHeight: '1.5' }}>
-      {running && (
-        <button onClick={onStop} className="absolute top-2 right-2 text-[#30363d] hover:text-red-400" title="Stop">
-          <X size={12} />
-        </button>
-      )}
-      {lines.map((l, i) => <div key={i} className="whitespace-pre overflow-x-auto">{l}</div>)}
-      {running  && <div className="inline-block animate-pulse">&#9608;</div>}
-      {!running && lines.length > 0 && <div className="text-green-600 mt-1">--- done ---</div>}
-    </div>
-  )
-}
-
-// ---------------------------------------------------------------------------
 // VulnPanel — main export
 // ---------------------------------------------------------------------------
 export function VulnPanel({ device, onScanComplete }) {
@@ -195,7 +170,6 @@ export function VulnPanel({ device, onScanComplete }) {
   const [lines,    setLines]    = useState([])
   const abortRef = useRef(null)
 
-  // Load historical reports on mount
   useEffect(() => {
     if (!mac) return
     setLoading(true)
@@ -226,7 +200,6 @@ export function VulnPanel({ device, onScanComplete }) {
         `/devices/${mac}/vuln-scan`,
         (line) => {
           if (line.startsWith('RESULT:')) {
-            // Scan done — reload reports
             api.getVulnReports(mac, 5)
               .then(setReports)
               .catch(() => {})
@@ -295,8 +268,13 @@ export function VulnPanel({ device, onScanComplete }) {
         </button>
       )}
 
-      {/* Live scan output */}
-      <TerminalBox lines={lines} running={scanning} onStop={stopScan} />
+      {/* Structured scan progress — uses vuln mode */}
+      <StreamOutput
+        lines={lines}
+        running={scanning}
+        onStop={stopScan}
+        mode="vuln"
+      />
 
       {/* Historical reports */}
       {loading && (
