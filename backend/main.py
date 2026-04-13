@@ -17,7 +17,12 @@ import httpx
 from models import Base, Device, DeviceEvent, FingerprintEntry, Setting, VulnReport
 
 DATABASE_URL = os.environ.get("DATABASE_URL", "postgresql://admin:password123@db:5432/inspectre")
-PROBE_URL    = os.environ.get("PROBE_URL",    "http://probe:8001")
+# PROBE_API_URL is the name used in docker-compose; PROBE_URL is the legacy fallback.
+PROBE_URL    = (
+    os.environ.get("PROBE_API_URL")
+    or os.environ.get("PROBE_URL")
+    or "http://host-gateway:8001"
+)
 
 engine       = create_engine(DATABASE_URL, pool_pre_ping=True)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
