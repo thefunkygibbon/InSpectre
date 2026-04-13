@@ -17,15 +17,15 @@ from fastapi.responses import StreamingResponse
 from scapy.all import ARP, Ether, sniff, srp
 from sqlalchemy import (
     Boolean, Column, DateTime, Integer, JSON, String, UniqueConstraint,
-    create_engine, text,
+    cast, create_engine, text,
 )
-from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy.dialects.postgresql import JSONB, insert as pg_insert
 from sqlalchemy.orm import declarative_base, sessionmaker
 
 # ---------------------------------------------------------------------------
 # Version
 # ---------------------------------------------------------------------------
-VERSION = "0.6.1"
+VERSION = "0.6.2"
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -220,10 +220,16 @@ def _write_event(mac: str, event_type: str, detail: dict) -> None:
     """Write a device_events row.  Silently swallows errors."""
     session = Session()
     try:
-        session.execute(text("""
-            INSERT INTO device_events (mac_address, type, detail, created_at)
-            VALUES (:mac, :type, :detail::jsonb, NOW())
-        """), {"mac": mac, "type": event_type, "detail": json.dumps(detail)})
+        # Use cast() so SQLAlchemy handles the JSONB type conversion correctly.
+        # The previous :detail::jsonb syntax mixed SQLAlchemy bind-param notation
+        # (:name) with PostgreSQL cast syntax (::type) which psycopg2 rejects.
+        session.execute(
+            text("""
+                INSERT INTO device_events (mac_address, type, detail, created_at)
+                VALUES (:mac, :type, cast(:detail AS jsonb), NOW())
+            """),
+            {"mac": mac, "type": event_type, "detail": json.dumps(detail)},
+        )
         session.commit()
     except Exception as e:
         session.rollback()
