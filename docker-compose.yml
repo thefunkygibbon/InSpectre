@@ -29,7 +29,7 @@ services:
       # Probe runs with network_mode:host so it binds directly to the host.
       # host.docker.internal resolves to the Docker host bridge IP automatically
       # on any Docker Engine >= 20.10 — no manual config required.
-      PROBE_API_URL: http://host.docker.internal:8001
+      PROBE_API_URL: http://host.docker.internal:8082
     extra_hosts:
       # Makes host.docker.internal resolve to the host's bridge gateway IP.
       # Works on Linux with Docker Engine >= 20.10 (released Oct 2020).
@@ -51,7 +51,7 @@ services:
       INTERFACE: "eno1"
       SCAN_INTERVAL: "60"
       NMAP_ARGS: "-O --osscan-guess -sV --version-intensity 5 -T4"
-      PROBE_API_PORT: "8001"
+      PROBE_API_PORT: "8082"
       PYTHONUNBUFFERED: "1"
       # ── DNS / Hostname resolution ──────────────────────────────────────────
       # Set this to your router/DNS server IP so the probe can resolve LAN

@@ -21,7 +21,7 @@ DATABASE_URL = os.environ.get("DATABASE_URL", "postgresql://admin:password123@db
 PROBE_URL    = (
     os.environ.get("PROBE_API_URL")
     or os.environ.get("PROBE_URL")
-    or "http://host-gateway:8001"
+    or "http://host.docker.internal:8082"
 )
 
 engine       = create_engine(DATABASE_URL, pool_pre_ping=True)
