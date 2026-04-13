@@ -25,7 +25,7 @@ from sqlalchemy.orm import declarative_base, sessionmaker
 # ---------------------------------------------------------------------------
 # Version
 # ---------------------------------------------------------------------------
-VERSION = "0.6.0"
+VERSION = "0.6.1"
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -65,7 +65,8 @@ Base = declarative_base()
 class Device(Base):
     __tablename__ = "devices"
     mac_address  = Column(String,  primary_key=True, index=True)
-    ip_address   = Column(String)
+    ip_address   = Column(String)   # most-recently-seen IP (may be shim)
+    primary_ip   = Column(String,  nullable=True)  # first/canonical IP — never displaced by shim
     hostname     = Column(String,  nullable=True)
     vendor       = Column(String,  nullable=True)
     custom_name  = Column(String,  nullable=True)
@@ -125,6 +126,13 @@ def init_db() -> None:
             conn.execute(text("ALTER TABLE devices ADD COLUMN IF NOT EXISTS miss_count INTEGER DEFAULT 0"))
             conn.execute(text("ALTER TABLE devices ADD COLUMN IF NOT EXISTS is_important BOOLEAN NOT NULL DEFAULT FALSE"))
             conn.execute(text("ALTER TABLE devices ALTER COLUMN is_important SET DEFAULT FALSE"))
+            # primary_ip: the first/canonical IP for this MAC — never displaced by a shim/secondary address
+            conn.execute(text("ALTER TABLE devices ADD COLUMN IF NOT EXISTS primary_ip VARCHAR"))
+            # Back-fill primary_ip from ip_address for existing rows
+            conn.execute(text("""
+                UPDATE devices SET primary_ip = ip_address
+                WHERE primary_ip IS NULL AND ip_address IS NOT NULL
+            """))
             conn.commit()
         except Exception as e:
             print(f"[DB] Column migration note: {e}", flush=True)
@@ -153,7 +161,6 @@ def init_db() -> None:
         except Exception:
             conn.rollback()
 
-        # Ensure device_events table exists (probe also needs it for event writing)
         conn.execute(text("""
             CREATE TABLE IF NOT EXISTS device_events (
                 id          SERIAL PRIMARY KEY,
@@ -175,7 +182,7 @@ def init_db() -> None:
 # ---------------------------------------------------------------------------
 def record_ip(mac: str, ip: str) -> bool:
     """
-    Upserts the IP into ip_history. Returns True only if this is a BRAND NEW
+    Upserts the IP into ip_history.  Returns True only if this is a BRAND NEW
     mac+ip combination (first_seen == last_seen within 2s).
     """
     if not _is_valid_ip(ip):
@@ -210,7 +217,7 @@ def record_ip(mac: str, ip: str) -> bool:
 # Event writing
 # ---------------------------------------------------------------------------
 def _write_event(mac: str, event_type: str, detail: dict) -> None:
-    """Write a device_events row. Silently swallows errors."""
+    """Write a device_events row.  Silently swallows errors."""
     session = Session()
     try:
         session.execute(text("""
@@ -467,7 +474,6 @@ def _run_deep_scan_thread(ip: str, mac: str) -> None:
             if not device.hostname and results.get("hostnames"):
                 device.hostname = _strip_fqdn(results["hostnames"][0])
             session.commit()
-            # Emit scan_complete event
             _write_event(mac, "scan_complete", {
                 "ports": len(results.get("open_ports") or []),
                 "os":    results["os_matches"][0]["name"] if results.get("os_matches") else None,
@@ -493,6 +499,20 @@ def trigger_deep_scan(ip: str, mac: str) -> None:
 # Device upsert
 # ---------------------------------------------------------------------------
 def upsert_seen_device(mac: str, ip: str, source: str) -> None:
+    """
+    Insert-or-update a device row.
+
+    primary_ip semantics
+    --------------------
+    The first IP ever seen for a MAC becomes its `primary_ip` and is never
+    replaced by a later, different IP.  This prevents a shim/Docker bridge
+    address (which appears on a different NIC with a different MAC but resolves
+    to the same host) from displacing the real LAN IP.
+
+    `ip_address` continues to hold the most-recently-seen IP for informational
+    purposes and is shown alongside `primary_ip` in ip_history.  All scans
+    (deep scan, vuln scan) target `primary_ip`.
+    """
     if not mac or mac == "00:00:00:00:00:00":
         return
     if not _is_valid_ip(ip):
@@ -518,40 +538,86 @@ def upsert_seen_device(mac: str, ip: str, source: str) -> None:
 
             safe_hostname = (hostname or '').replace("'", "''")
 
-            stmt = (
-                pg_insert(Device)
-                .values(
-                    mac_address  = mac,
-                    ip_address   = ip,
-                    hostname     = hostname,
-                    vendor       = vendor,
-                    custom_name  = None,
-                    is_online    = True,
-                    first_seen   = now,
-                    last_seen    = now,
-                    deep_scanned = False,
-                    miss_count   = 0,
-                    is_important = False,   # only applied on brand-new INSERT rows
-                )
-                .on_conflict_do_update(
-                    index_elements=["mac_address"],
-                    set_=dict(
-                        ip_address = ip,
-                        is_online  = True,
-                        last_seen  = now,
-                        miss_count = 0,
-                        # deep_scanned, scan_results, is_important intentionally NOT here
-                        hostname   = text(
-                            "CASE WHEN devices.hostname IS NOT NULL AND devices.hostname != '' "
-                            f"THEN devices.hostname ELSE '{safe_hostname}' END"
+            if is_new:
+                # Brand-new device: ip_address and primary_ip are both set to ip.
+                stmt = (
+                    pg_insert(Device)
+                    .values(
+                        mac_address  = mac,
+                        ip_address   = ip,
+                        primary_ip   = ip,
+                        hostname     = hostname,
+                        vendor       = vendor,
+                        custom_name  = None,
+                        is_online    = True,
+                        first_seen   = now,
+                        last_seen    = now,
+                        deep_scanned = False,
+                        miss_count   = 0,
+                        is_important = False,
+                    )
+                    .on_conflict_do_update(
+                        index_elements=["mac_address"],
+                        set_=dict(
+                            ip_address = ip,
+                            # primary_ip: set only if not already populated
+                            primary_ip = text(
+                                "CASE WHEN devices.primary_ip IS NOT NULL "
+                                "THEN devices.primary_ip ELSE EXCLUDED.primary_ip END"
+                            ),
+                            is_online  = True,
+                            last_seen  = now,
+                            miss_count = 0,
+                            hostname   = text(
+                                "CASE WHEN devices.hostname IS NOT NULL AND devices.hostname != '' "
+                                f"THEN devices.hostname ELSE '{safe_hostname}' END"
+                            ),
                         ),
-                    ),
+                    )
                 )
-            )
+            else:
+                # Existing device: always update last_seen / online status.
+                # ip_address gets the latest seen IP (informational).
+                # primary_ip is NEVER overwritten — it stays as the first IP.
+                stmt = (
+                    pg_insert(Device)
+                    .values(
+                        mac_address  = mac,
+                        ip_address   = ip,
+                        primary_ip   = existing.primary_ip or ip,
+                        hostname     = hostname,
+                        vendor       = vendor,
+                        custom_name  = existing.custom_name,
+                        is_online    = True,
+                        first_seen   = existing.first_seen or now,
+                        last_seen    = now,
+                        deep_scanned = existing.deep_scanned,
+                        miss_count   = 0,
+                        is_important = existing.is_important,
+                    )
+                    .on_conflict_do_update(
+                        index_elements=["mac_address"],
+                        set_=dict(
+                            ip_address = ip,
+                            # primary_ip frozen: keep whatever is already stored
+                            primary_ip = text(
+                                "CASE WHEN devices.primary_ip IS NOT NULL "
+                                "THEN devices.primary_ip ELSE EXCLUDED.primary_ip END"
+                            ),
+                            is_online  = True,
+                            last_seen  = now,
+                            miss_count = 0,
+                            hostname   = text(
+                                "CASE WHEN devices.hostname IS NOT NULL AND devices.hostname != '' "
+                                f"THEN devices.hostname ELSE '{safe_hostname}' END"
+                            ),
+                        ),
+                    )
+                )
+
             session.execute(stmt)
             session.commit()
 
-            # Emit events
             if is_new:
                 print(f"[+] New device via {source}: {ip} ({mac}) hostname={hostname} vendor={vendor}", flush=True)
                 _write_event(mac, "joined", {"ip": ip, "vendor": vendor or "Unknown"})
@@ -561,8 +627,13 @@ def upsert_seen_device(mac: str, ip: str, source: str) -> None:
                     print(f"[~] Back online via {source}: {ip} ({mac})", flush=True)
                     _write_event(mac, "online", {"ip": ip})
                 if ip_changed:
-                    print(f"[~] IP change detected {old_ip} -> {ip} for {mac} (source={source})", flush=True)
-                    _write_event(mac, "ip_change", {"old_ip": old_ip, "new_ip": ip})
+                    primary = existing.primary_ip or old_ip
+                    if ip == primary:
+                        print(f"[~] IP reverted to primary {ip} for {mac}", flush=True)
+                    else:
+                        print(f"[~] Secondary IP seen {ip} for {mac} (primary={primary}, source={source})", flush=True)
+                    _write_event(mac, "ip_change", {"old_ip": old_ip, "new_ip": ip,
+                                                     "primary_ip": primary})
 
         except Exception as e:
             session.rollback()
@@ -571,21 +642,27 @@ def upsert_seen_device(mac: str, ip: str, source: str) -> None:
         finally:
             session.close()
 
-    # record_ip is called OUTSIDE the session so the upsert is committed first.
     is_brand_new_ip = record_ip(mac, ip)
 
+    # Only invalidate the deep scan when the PRIMARY IP changes to something new,
+    # not when we merely observe a secondary/shim address.
     if ip_changed and is_brand_new_ip:
         session2 = Session()
         try:
             dev2 = session2.get(Device, mac)
-            if dev2 and dev2.deep_scanned:
-                print(f"[~] Stable IP change {old_ip} -> {ip} for {mac} — invalidating deep scan", flush=True)
-                dev2.deep_scanned = False
-                dev2.scan_results = None
-                session2.commit()
-                trigger_deep_scan(ip, mac)
-            elif dev2 and not dev2.deep_scanned:
-                print(f"[~] IP change for unscanned device {mac} — scan will use new IP {ip}", flush=True)
+            if dev2:
+                scan_ip = dev2.primary_ip or ip
+                if ip == scan_ip:  # primary IP genuinely changed
+                    if dev2.deep_scanned:
+                        print(f"[~] Primary IP changed {old_ip} -> {ip} for {mac} — invalidating deep scan", flush=True)
+                        dev2.deep_scanned = False
+                        dev2.scan_results = None
+                        session2.commit()
+                        trigger_deep_scan(scan_ip, mac)
+                    else:
+                        print(f"[~] Primary IP change for unscanned device {mac} — scan will use {scan_ip}", flush=True)
+                else:
+                    print(f"[~] Secondary IP {ip} recorded for {mac} — deep scan target remains {scan_ip}", flush=True)
         except Exception as e:
             session2.rollback()
             print(f"[DB] IP-change rescan error {mac}: {e}", flush=True)
@@ -602,13 +679,14 @@ def refresh_missing_hostnames() -> None:
         ).all()
         updated = 0
         for dev in unnamed:
-            if not _is_valid_ip(dev.ip_address):
+            scan_ip = dev.primary_ip or dev.ip_address
+            if not _is_valid_ip(scan_ip):
                 continue
-            name = resolve_hostname(dev.ip_address)
+            name = resolve_hostname(scan_ip)
             if name:
                 dev.hostname = name
                 updated += 1
-                print(f"[hostname] Resolved: {dev.ip_address} -> {name}", flush=True)
+                print(f"[hostname] Resolved: {scan_ip} -> {name}", flush=True)
         if updated:
             session.commit()
             print(f"[hostname] Resolved {updated} new hostnames this pass.", flush=True)
@@ -621,14 +699,15 @@ def refresh_missing_hostnames() -> None:
 def bulk_reresolve_all() -> None:
     session = Session()
     try:
-        all_devs = session.query(Device).filter(Device.ip_address != None).all()
+        all_devs = session.query(Device).all()
         updated = 0
         for dev in all_devs:
-            if not _is_valid_ip(dev.ip_address):
+            scan_ip = dev.primary_ip or dev.ip_address
+            if not _is_valid_ip(scan_ip):
                 continue
-            name = resolve_hostname(dev.ip_address)
+            name = resolve_hostname(scan_ip)
             if name and name != dev.hostname:
-                print(f"[hostname] Re-resolved: {dev.ip_address} -> {name}", flush=True)
+                print(f"[hostname] Re-resolved: {scan_ip} -> {name}", flush=True)
                 dev.hostname = name
                 updated += 1
         if updated:
@@ -764,13 +843,14 @@ def probe_rescan(mac: str):
         device = session.get(Device, mac.lower())
         if not device:
             raise HTTPException(404, "Device not found")
-        if not device.ip_address:
+        scan_ip = device.primary_ip or device.ip_address
+        if not scan_ip:
             raise HTTPException(422, "Device has no IP address")
         device.deep_scanned = False
         device.scan_results = None
         session.commit()
-        trigger_deep_scan(device.ip_address, device.mac_address)
-        return {"queued": True, "mac": mac, "ip": device.ip_address}
+        trigger_deep_scan(scan_ip, device.mac_address)
+        return {"queued": True, "mac": mac, "ip": scan_ip}
     finally:
         session.close()
 

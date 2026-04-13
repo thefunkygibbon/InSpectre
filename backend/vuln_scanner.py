@@ -15,16 +15,15 @@ from typing import AsyncGenerator
 # NSE script set
 #
 # Only scripts that ship with the nmap package in Debian bookworm (apt install
-# nmap) are listed here. Scripts added in later upstream releases or via
+# nmap) are listed here.  Scripts added in later upstream releases or via
 # nmap-update are intentionally omitted to avoid the
 # "did not match a category, filename, or directory" fatal error.
 #
 # Removed:
-#   smb-vuln-cve-2020-0796  – not in Debian nmap package (only upstream 7.80+)
+#   smb-vuln-cve-2020-0796    – not in Debian nmap package (only upstream 7.80+)
 #   http-vuln-cve2017-1001000 – absent from many distro builds
 #   telnet-encryption         – absent from slim builds
-#   http-csrf / http-dombased-xss / http-stored-xss – very slow; minimal value
-#                                                      in a LAN context
+#   http-csrf / http-dombased-xss / http-stored-xss – very slow, minimal LAN value
 # ---------------------------------------------------------------------------
 DEFAULT_VULN_SCRIPTS = (
     "vulners,"
@@ -37,6 +36,10 @@ DEFAULT_VULN_SCRIPTS = (
     "ftp-vsftpd-backdoor,"
     "ftp-anon"
 )
+
+# -sV is required for the `vulners` script to cross-reference CVEs.
+# --version-intensity 5 keeps it reasonably fast.
+DEFAULT_EXTRA_ARGS = "-T4 --open -sV --version-intensity 5"
 
 # Severity ordering for comparison
 _SEV_RANK = {"critical": 5, "high": 4, "medium": 3, "low": 2, "info": 1, "clean": 0}
@@ -51,7 +54,7 @@ def _bump_severity(current: str, candidate: str) -> str:
 async def _validate_scripts(scripts: str) -> tuple[str, list[str]]:
     """
     Run `nmap --script-help <scripts>` to check which script names nmap
-    actually recognises. Returns (valid_csv, rejected_list).
+    actually recognises.  Returns (valid_csv, rejected_list).
 
     Falls back to returning the original string unchanged if nmap is not
     available (the caller will surface the error anyway).
@@ -68,8 +71,6 @@ async def _validate_scripts(scripts: str) -> tuple[str, list[str]]:
         _, stderr_bytes = await proc.communicate()
         stderr_text = stderr_bytes.decode(errors="replace")
 
-        # nmap prints one line per bad script:
-        # "'smb-vuln-cve-2020-0796' did not match a category, filename, or directory"
         bad_re = re.compile(r"'([^']+)'\s+did not match")
         rejected = bad_re.findall(stderr_text)
 
@@ -77,14 +78,14 @@ async def _validate_scripts(scripts: str) -> tuple[str, list[str]]:
             valid = [n for n in names if n not in rejected]
             return ",".join(valid), rejected
     except FileNotFoundError:
-        pass  # nmap not installed — let the main path surface the error
+        pass
 
     return scripts, []
 
 
 def _parse_nmap_output(raw: str) -> tuple[list[dict], str]:
     """
-    Very lightweight parser — looks for NSE script output blocks that contain
+    Lightweight parser — looks for NSE script output blocks that contain
     vulnerability indicators and extracts them as structured findings.
     Returns (findings_list, highest_severity).
     """
@@ -155,7 +156,7 @@ def _parse_nmap_output(raw: str) -> tuple[list[dict], str]:
 async def run_vuln_scan(
     ip: str,
     scripts: str = DEFAULT_VULN_SCRIPTS,
-    extra_args: str = "-T4 --open",
+    extra_args: str = DEFAULT_EXTRA_ARGS,
 ) -> AsyncGenerator[str, None]:
     """
     Async generator — yields log lines suitable for SSE `data:` fields.
@@ -165,7 +166,6 @@ async def run_vuln_scan(
 
     yield f"[INFO] Starting vulnerability scan against {ip}…"
 
-    # Validate scripts against the installed nmap version before running
     scripts, rejected = await _validate_scripts(scripts)
     if rejected:
         yield f"[WARN] Skipping unsupported script(s): {', '.join(rejected)}"
