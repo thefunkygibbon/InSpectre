@@ -12,9 +12,13 @@ import io
 import socket
 import subprocess
 
+import httpx
+
 from models import Base, Device, DeviceEvent, FingerprintEntry, Setting, VulnReport
 
 DATABASE_URL = os.environ.get("DATABASE_URL", "postgresql://admin:password123@db:5432/inspectre")
+PROBE_URL    = os.environ.get("PROBE_URL",    "http://probe:8001")
+
 engine       = create_engine(DATABASE_URL, pool_pre_ping=True)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base.metadata.create_all(bind=engine)
@@ -58,7 +62,7 @@ def _migrate(db: Session):
         "CREATE INDEX IF NOT EXISTS ix_vuln_reports_mac       ON vuln_reports(mac_address)",
         "CREATE INDEX IF NOT EXISTS ix_vuln_reports_scanned   ON vuln_reports(scanned_at)",
         "CREATE INDEX IF NOT EXISTS ix_vuln_reports_severity  ON vuln_reports(severity)",
-        # vuln_last_scanned column on devices
+        # vuln_last_scanned / vuln_severity columns on devices
         "ALTER TABLE devices ADD COLUMN IF NOT EXISTS vuln_last_scanned TIMESTAMPTZ",
         "ALTER TABLE devices ADD COLUMN IF NOT EXISTS vuln_severity VARCHAR",
     ]
@@ -96,7 +100,7 @@ def _seed_settings(db: Session):
     db.commit()
 
 
-app = FastAPI(title="InSpectre API", version="0.7.0")
+app = FastAPI(title="InSpectre API", version="0.7.1")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -363,7 +367,7 @@ def _add_event(db: Session, mac: str, event_type: str, detail: dict = None):
 # ---------------------------------------------------------------------------
 @app.get("/")
 def root():
-    return {"message": "InSpectre API", "version": "0.7.0"}
+    return {"message": "InSpectre API", "version": "0.7.1"}
 
 
 # ---------------------------------------------------------------------------
@@ -502,18 +506,22 @@ def get_identity_score(mac: str, db: Session = Depends(get_db)):
 
 
 # ---------------------------------------------------------------------------
-# Phase 3 — Vulnerability scanning
+# Phase 3 — Vulnerability scanning (proxied through the probe container)
+#
+# The probe runs on --network=host so nmap can actually reach LAN devices.
+# The backend cannot (Docker bridge network), so we proxy the SSE stream
+# from probe's  GET /stream/vuln-scan/{ip}  endpoint, intercept the final
+# RESULT line to persist it in the DB, then forward every line on to the
+# browser unchanged.
 # ---------------------------------------------------------------------------
 @app.get("/devices/{mac}/vuln-scan")
 async def stream_vuln_scan(mac: str, db: Session = Depends(get_db)):
     """
-    SSE endpoint — streams live Nmap vuln-script output.
-    Final SSE line is RESULT:{...json...} which the frontend parses to
-    persist the report and update the device badge.
+    SSE — streams live nmap vuln-script output sourced from the probe.
+    The final data line is  RESULT:{...json...}  which we persist before
+    forwarding; the browser uses it to update the device's severity badge.
     """
-    import json as _json
     from datetime import datetime, timezone
-    from vuln_scanner import run_vuln_scan
 
     d = db.get(Device, mac.lower())
     if not d:
@@ -521,54 +529,75 @@ async def stream_vuln_scan(mac: str, db: Session = Depends(get_db)):
     if not d.ip_address:
         raise HTTPException(400, "Device has no IP address")
 
-    # Fetch configured scripts from settings (fall back to default)
     scripts_setting = db.get(Setting, "vuln_scan_scripts")
-    scripts = scripts_setting.value if scripts_setting else None
+    scripts = (scripts_setting.value or "").strip() if scripts_setting else ""
 
-    ip  = d.ip_address
+    ip        = d.ip_address
     mac_lower = mac.lower()
+    probe_url = f"{PROBE_URL}/stream/vuln-scan/{ip}"
+    params    = {"scripts": scripts} if scripts else {}
 
     async def _event_stream():
         result_saved = False
-        async for line in run_vuln_scan(ip, scripts=scripts or None):
-            if line.startswith("RESULT:"):
-                # Parse and persist the report
-                try:
-                    data = _json.loads(line[7:])
-                    db2  = SessionLocal()
-                    try:
-                        dev = db2.get(Device, mac_lower)
-                        if dev:
-                            report = VulnReport(
-                                mac_address=mac_lower,
-                                ip_address=ip,
-                                duration_s=data.get("duration_s"),
-                                severity=data.get("severity", "clean"),
-                                vuln_count=data.get("vuln_count", 0),
-                                findings=data.get("findings"),
-                                raw_output=data.get("raw_output"),
-                                nmap_args=scripts,
-                            )
-                            db2.add(report)
-                            dev.vuln_last_scanned = datetime.now(timezone.utc)
-                            dev.vuln_severity     = data.get("severity", "clean")
-                            db2.commit()
-                            _add_event(db2, mac_lower, 'vuln_scan_complete', {
-                                'severity':   data.get('severity'),
-                                'vuln_count': data.get('vuln_count', 0),
-                            })
-                            db2.commit()
-                            result_saved = True
-                    finally:
-                        db2.close()
-                except Exception as exc:
-                    yield f"data: [WARN] Could not save report: {exc}\n\n"
-            yield f"data: {line}\n\n"
-        if not result_saved:
-            yield "data: [WARN] No RESULT line received from scanner\n\n"
+        try:
+            async with httpx.AsyncClient(timeout=None) as client:
+                async with client.stream("GET", probe_url, params=params) as resp:
+                    if resp.status_code != 200:
+                        body = await resp.aread()
+                        yield f"data: [ERROR] Probe returned HTTP {resp.status_code}: {body.decode()[:200]}\n\n"
+                        return
 
-    return StreamingResponse(_event_stream(), media_type="text/event-stream",
-                             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+                    async for raw_line in resp.aiter_lines():
+                        # raw_line is the full SSE line including the "data: " prefix
+                        yield f"{raw_line}\n"
+
+                        # Intercept RESULT line to persist to DB
+                        if raw_line.startswith("data: RESULT:"):
+                            payload_str = raw_line[len("data: RESULT:"):]
+                            try:
+                                data = json.loads(payload_str)
+                                db2  = SessionLocal()
+                                try:
+                                    dev = db2.get(Device, mac_lower)
+                                    if dev:
+                                        report = VulnReport(
+                                            mac_address = mac_lower,
+                                            ip_address  = ip,
+                                            duration_s  = data.get("duration_s"),
+                                            severity    = data.get("severity", "clean"),
+                                            vuln_count  = data.get("vuln_count", 0),
+                                            findings    = data.get("findings"),
+                                            raw_output  = data.get("raw_output"),
+                                            nmap_args   = scripts or None,
+                                        )
+                                        db2.add(report)
+                                        dev.vuln_last_scanned = datetime.now(timezone.utc)
+                                        dev.vuln_severity     = data.get("severity", "clean")
+                                        db2.commit()
+                                        _add_event(db2, mac_lower, "vuln_scan_complete", {
+                                            "severity":   data.get("severity"),
+                                            "vuln_count": data.get("vuln_count", 0),
+                                        })
+                                        db2.commit()
+                                        result_saved = True
+                                finally:
+                                    db2.close()
+                            except Exception as exc:
+                                yield f"data: [WARN] Could not save report: {exc}\n\n"
+
+        except httpx.ConnectError:
+            yield f"data: [ERROR] Cannot reach probe at {PROBE_URL} — is it running?\n\n"
+        except Exception as exc:
+            yield f"data: [ERROR] Proxy error: {exc}\n\n"
+
+        if not result_saved:
+            yield "data: [WARN] No RESULT line received from probe\n\n"
+
+    return StreamingResponse(
+        _event_stream(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
 
 
 @app.get("/devices/{mac}/vuln-reports")
@@ -586,14 +615,14 @@ def get_vuln_reports(mac: str, limit: int = Query(10, ge=1, le=100), db: Session
     )
     return [
         {
-            "id":           r.id,
-            "ip_address":   r.ip_address,
-            "scanned_at":   r.scanned_at.isoformat() if r.scanned_at else None,
-            "duration_s":   r.duration_s,
-            "severity":     r.severity,
-            "vuln_count":   r.vuln_count,
-            "findings":     r.findings or [],
-            "nmap_args":    r.nmap_args,
+            "id":         r.id,
+            "ip_address": r.ip_address,
+            "scanned_at": r.scanned_at.isoformat() if r.scanned_at else None,
+            "duration_s": r.duration_s,
+            "severity":   r.severity,
+            "vuln_count": r.vuln_count,
+            "findings":   r.findings or [],
+            "nmap_args":  r.nmap_args,
         }
         for r in reports
     ]
@@ -647,13 +676,13 @@ def list_all_vuln_reports(
     reports = q.order_by(VulnReport.scanned_at.desc()).limit(limit).all()
     return [
         {
-            "id":           r.id,
-            "mac_address":  r.mac_address,
-            "ip_address":   r.ip_address,
-            "scanned_at":   r.scanned_at.isoformat() if r.scanned_at else None,
-            "severity":     r.severity,
-            "vuln_count":   r.vuln_count,
-            "findings":     r.findings or [],
+            "id":          r.id,
+            "mac_address": r.mac_address,
+            "ip_address":  r.ip_address,
+            "scanned_at":  r.scanned_at.isoformat() if r.scanned_at else None,
+            "severity":    r.severity,
+            "vuln_count":  r.vuln_count,
+            "findings":    r.findings or [],
         }
         for r in reports
     ]
@@ -986,47 +1015,45 @@ async def import_fingerprints_json(file: UploadFile = File(...), db: Session = D
 
 
 # ---------------------------------------------------------------------------
-# SSE streaming (ping / traceroute)
+# SSE streaming (ping / traceroute) — proxied through probe
 # ---------------------------------------------------------------------------
 @app.get("/devices/{mac}/ping")
 async def stream_ping(mac: str, db: Session = Depends(get_db)):
-    import asyncio
     d = db.get(Device, mac.lower())
     if not d:
         raise HTTPException(404, "Device not found")
 
     async def _gen():
         try:
-            proc = await asyncio.create_subprocess_exec(
-                "ping", "-c", "10", d.ip_address,
-                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
-            )
-            async for line in proc.stdout:
-                yield f"data: {line.decode().rstrip()}\n\n"
-            await proc.wait()
+            async with httpx.AsyncClient(timeout=None) as client:
+                async with client.stream("GET", f"{PROBE_URL}/stream/ping/{d.ip_address}") as resp:
+                    async for line in resp.aiter_lines():
+                        yield f"{line}\n"
+        except httpx.ConnectError:
+            yield f"data: [ERROR] Cannot reach probe at {PROBE_URL}\n\n"
         except Exception as e:
             yield f"data: [ERROR] {e}\n\n"
 
-    return StreamingResponse(_gen(), media_type="text/event-stream")
+    return StreamingResponse(_gen(), media_type="text/event-stream",
+                             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
 
 @app.get("/devices/{mac}/traceroute")
 async def stream_traceroute(mac: str, db: Session = Depends(get_db)):
-    import asyncio
     d = db.get(Device, mac.lower())
     if not d:
         raise HTTPException(404, "Device not found")
 
     async def _gen():
         try:
-            proc = await asyncio.create_subprocess_exec(
-                "traceroute", "-n", "-m", "20", d.ip_address,
-                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
-            )
-            async for line in proc.stdout:
-                yield f"data: {line.decode().rstrip()}\n\n"
-            await proc.wait()
+            async with httpx.AsyncClient(timeout=None) as client:
+                async with client.stream("GET", f"{PROBE_URL}/stream/traceroute/{d.ip_address}") as resp:
+                    async for line in resp.aiter_lines():
+                        yield f"{line}\n"
+        except httpx.ConnectError:
+            yield f"data: [ERROR] Cannot reach probe at {PROBE_URL}\n\n"
         except Exception as e:
             yield f"data: [ERROR] {e}\n\n"
 
-    return StreamingResponse(_gen(), media_type="text/event-stream")
+    return StreamingResponse(_gen(), media_type="text/event-stream",
+                             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
