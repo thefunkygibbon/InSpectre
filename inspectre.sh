@@ -55,7 +55,7 @@ echo "[InSpectre] Resetting git checkout to latest main..."
 git fetch origin
 git reset --hard origin/main
 git clean -fd
-
+chmod 777 inspectre.sh
 echo "[InSpectre] Pulling any referenced base images..."
 docker compose -p "$PROJECT_NAME" pull || true
 
