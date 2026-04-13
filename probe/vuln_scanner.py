@@ -34,7 +34,9 @@ DEFAULT_VULN_SCRIPTS = (
 # -oN - writes normal-format results to stdout so we can capture them directly.
 DEFAULT_EXTRA_ARGS = "-T4 --open -sV --version-intensity 5 -v -oN -"
 
-# Lines from nmap stderr (or stdout noise) that are pure noise — suppress them
+# Lines from nmap stderr (or stdout noise) that are pure noise — suppress them.
+# NOTE: "Error in input stream" is an nmap cosmetic message when stdin is
+# /dev/null; it is harmless and should be silently dropped, not surfaced.
 _NOISE_RE = re.compile(
     r"(Error in input stream"
     r"|NSE: Loaded"
@@ -165,6 +167,12 @@ async def run_vuln_scan(
 ) -> AsyncGenerator[str, None]:
     """
     Async generator — yields log lines for SSE streaming.
+
+    stderr lines are yielded in real-time as nmap produces them so that the
+    SSE connection stays alive through nginx and the UI shows live progress.
+    stdout (the -oN report) is collected in the background and only parsed
+    after the process exits.
+
     Final line is always ``RESULT:<json>``.
     """
     import json
@@ -204,33 +212,33 @@ async def run_vuln_scan(
             stderr=asyncio.subprocess.PIPE,
         )
 
+        # --- Collect stdout quietly in the background ---
+        # We MUST drain stdout concurrently otherwise the OS pipe buffer fills
+        # and nmap deadlocks waiting for the reader.
         async def _collect_stdout() -> None:
+            assert proc.stdout is not None
             async for chunk in proc.stdout:
                 stdout_chunks.append(chunk.decode(errors="replace"))
 
-        async def _stream_stderr():
-            async for raw in proc.stderr:
-                line = raw.decode(errors="replace").rstrip()
-                if not line:
-                    continue
-                if _NOISE_RE.search(line):
-                    continue
-                yield f"[NMAP] {line}"
+        stdout_task = asyncio.create_task(_collect_stdout())
 
-        stderr_lines: list[str] = []
+        # --- Stream stderr in real-time so SSE stays alive ---
+        # This is the key fix: previously we gathered both coroutines and only
+        # yielded after both finished, which meant nginx saw silence for the
+        # entire scan duration and killed the connection at 60 s.
+        assert proc.stderr is not None
+        async for raw in proc.stderr:
+            line = raw.decode(errors="replace").rstrip()
+            if not line:
+                continue
+            if _NOISE_RE.search(line):
+                # Silently drop cosmetic noise (incl. "Error in input stream")
+                continue
+            yield f"[NMAP] {line}"
 
-        async def _collect_stderr() -> None:
-            async for line in _stream_stderr():
-                stderr_lines.append(line)
-
-        await asyncio.gather(
-            _collect_stdout(),
-            _collect_stderr(),
-        )
+        # Wait for stdout collection and process exit
+        await stdout_task
         await proc.wait()
-
-        for line in stderr_lines:
-            yield line
 
         rc = proc.returncode
         if rc not in (0, 1):
