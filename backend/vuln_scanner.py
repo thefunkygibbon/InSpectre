@@ -5,27 +5,21 @@ Runs Nmap NSE vulnerability scripts against a target IP and parses the output
 into structured findings.  Designed to be called from an async SSE endpoint so
 progress lines stream back to the browser in real time.
 
-Why a temp file + stdout=DEVNULL
----------------------------------
-nmap writes scan results to -oN <file>.  We do NOT need nmap's stdout at all.
-With -oN <file>, nmap's stdout is just a duplicate of the file content PLUS
-progress/timing lines.  On nmap 7.95 with stdout connected to a pipe and
-stdin=/dev/null it also unconditionally prints "Error in input stream" to
-stdout before the scan starts (a known quirk of 7.95's target-list reader).
+Architecture
+------------
+nmap is invoked with ``-oN -`` which writes its normal-format output directly
+to stdout.  We capture stdout in full after the process exits, then parse it.
 
-Solution: redirect nmap stdout to /dev/null entirely.  We capture real-time
-progress from stderr (nmap -v writes timing info there) and read the completed
-results from the temp file afterwards.
+stderr is read line-by-line while the scan runs so progress/timing lines
+(emitted by ``-v``) can be streamed to the UI in real time.  Pure noise lines
+(e.g. "Error in input stream", NSE pre/post scan chatter) are suppressed.
 
-Why stdin=/dev/null (kept open)
--------------------------------
-nmap checks stdin on startup.  Keeping /dev/null open on the fd for the full
-subprocess lifetime avoids a race on some kernel versions.
+stdin is /dev/null for the full lifetime of the subprocess to prevent nmap
+from trying to read a target list from the terminal on some kernel versions.
 """
 import asyncio
 import os
 import re
-import tempfile
 import time
 from datetime import datetime, timezone
 from typing import AsyncGenerator
@@ -46,10 +40,11 @@ DEFAULT_VULN_SCRIPTS = (
 )
 
 # -sV is required for vulners to cross-reference CVEs.
-# -v makes nmap write timing progress to stderr so the UI isn't silent.
-DEFAULT_EXTRA_ARGS = "-T4 --open -sV --version-intensity 5 -v"
+# -v makes nmap write timing/progress to stderr so the UI isn't silent.
+# -oN - writes normal-format results to stdout so we can capture them directly.
+DEFAULT_EXTRA_ARGS = "-T4 --open -sV --version-intensity 5 -v -oN -"
 
-# Lines from nmap stderr that are pure noise — suppress them in the UI
+# Lines from nmap stderr (or stdout noise) that are pure noise — suppress them
 _NOISE_RE = re.compile(
     r"(Error in input stream"
     r"|NSE: Loaded"
@@ -74,7 +69,7 @@ def _bump_severity(current: str, candidate: str) -> str:
 
 async def _validate_scripts(scripts: str) -> tuple[str, list[str]]:
     """
-    Run `nmap --script-help <scripts>` to check which script names nmap
+    Run ``nmap --script-help <scripts>`` to check which script names nmap
     recognises.  Returns (valid_csv, rejected_list).
     """
     rejected: list[str] = []
@@ -106,7 +101,7 @@ async def _validate_scripts(scripts: str) -> tuple[str, list[str]]:
 
 def _parse_nmap_output(raw: str) -> tuple[list[dict], str]:
     """
-    Parse NSE script output blocks from the nmap normal-format file.
+    Parse NSE script output blocks from nmap normal-format output.
     Returns (findings_list, highest_severity).
     """
     findings: list[dict] = []
@@ -180,7 +175,7 @@ async def run_vuln_scan(
 ) -> AsyncGenerator[str, None]:
     """
     Async generator — yields log lines for SSE streaming.
-    Final line is always `RESULT:<json>`.
+    Final line is always ``RESULT:<json>``.
     """
     import json
 
@@ -197,17 +192,10 @@ async def run_vuln_scan(
     script_names = [s.strip() for s in scripts.split(",") if s.strip()]
     yield f"[INFO] Scripts: {len(script_names)} script(s) — {', '.join(script_names)}"
 
-    tmp = tempfile.NamedTemporaryFile(
-        prefix="inspectre_vuln_", suffix=".nmap", delete=False, mode="w"
-    )
-    tmp.close()
-    outfile = tmp.name
-
     cmd = [
         "nmap",
         "--script", scripts,
         *extra_args.split(),
-        "-oN", outfile,
         ip,
     ]
 
@@ -215,29 +203,46 @@ async def run_vuln_scan(
 
     t0 = time.monotonic()
 
-    # stdout → DEVNULL: nmap 7.95 unconditionally writes "Error in input stream"
-    # to stdout when stdout is a pipe and stdin is /dev/null.  Since we capture
-    # results via -oN <file> we don't need stdout at all.
-    # stderr → PIPE: nmap -v writes timing/progress to stderr; we stream those.
-    devnull_in  = open(os.devnull, "rb")
-    devnull_out = open(os.devnull, "wb")
+    devnull_in = open(os.devnull, "rb")
+    stdout_chunks: list[str] = []
+
     try:
         proc = await asyncio.create_subprocess_exec(
             *cmd,
             stdin=devnull_in,
-            stdout=devnull_out,
+            stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
 
-        async for raw in proc.stderr:
-            line = raw.decode(errors="replace").rstrip()
-            if not line:
-                continue
-            if _NOISE_RE.search(line):
-                continue
-            yield f"[NMAP] {line}"
+        # Stream stderr live for progress; collect stdout silently for parsing.
+        async def _collect_stdout() -> None:
+            async for chunk in proc.stdout:
+                stdout_chunks.append(chunk.decode(errors="replace"))
 
+        async def _stream_stderr() -> None:
+            async for raw in proc.stderr:
+                line = raw.decode(errors="replace").rstrip()
+                if not line:
+                    continue
+                if _NOISE_RE.search(line):
+                    continue
+                yield f"[NMAP] {line}"
+
+        # Run both coroutines concurrently while waiting for the process.
+        stderr_lines: list[str] = []
+        async def _collect_stderr() -> None:
+            async for line in _stream_stderr():
+                stderr_lines.append(line)
+
+        await asyncio.gather(
+            _collect_stdout(),
+            _collect_stderr(),
+        )
         await proc.wait()
+
+        for line in stderr_lines:
+            yield line
+
         rc = proc.returncode
         if rc not in (0, 1):
             yield f"[WARN] nmap exited with code {rc}"
@@ -245,28 +250,15 @@ async def run_vuln_scan(
     except FileNotFoundError:
         yield "[ERROR] nmap not found — is it installed in the backend container?"
         yield 'RESULT:{"severity":"clean","vuln_count":0,"findings":[],"error":"nmap_not_found"}'
-        try: os.unlink(outfile)
-        except OSError: pass
         return
     except Exception as exc:
         yield f"[ERROR] Scan failed: {exc}"
         yield f'RESULT:{{"severity":"clean","vuln_count":0,"findings":[],"error":"{exc}"}}'
-        try: os.unlink(outfile)
-        except OSError: pass
         return
     finally:
         devnull_in.close()
-        devnull_out.close()
 
-    try:
-        with open(outfile, "r", errors="replace") as f:
-            raw_text = f.read()
-    except Exception as exc:
-        yield f"[ERROR] Could not read scan output file: {exc}"
-        raw_text = ""
-    finally:
-        try: os.unlink(outfile)
-        except OSError: pass
+    raw_text = "".join(stdout_chunks)
 
     duration = round(time.monotonic() - t0, 1)
     findings, severity = _parse_nmap_output(raw_text)
