@@ -21,7 +21,7 @@ DATABASE_URL = os.environ.get("DATABASE_URL", "postgresql://admin:password123@db
 PROBE_URL    = (
     os.environ.get("PROBE_API_URL")
     or os.environ.get("PROBE_URL")
-    or "http://host.docker.internal:8082"
+    or "http://host.docker.internal:8666"
 )
 
 engine       = create_engine(DATABASE_URL, pool_pre_ping=True)
@@ -512,20 +512,9 @@ def get_identity_score(mac: str, db: Session = Depends(get_db)):
 
 # ---------------------------------------------------------------------------
 # Phase 3 — Vulnerability scanning (proxied through the probe container)
-#
-# The probe runs on --network=host so nmap can actually reach LAN devices.
-# The backend cannot (Docker bridge network), so we proxy the SSE stream
-# from probe's  GET /stream/vuln-scan/{ip}  endpoint, intercept the final
-# RESULT line to persist it in the DB, then forward every line on to the
-# browser unchanged.
 # ---------------------------------------------------------------------------
 @app.get("/devices/{mac}/vuln-scan")
 async def stream_vuln_scan(mac: str, db: Session = Depends(get_db)):
-    """
-    SSE — streams live nmap vuln-script output sourced from the probe.
-    The final data line is  RESULT:{...json...}  which we persist before
-    forwarding; the browser uses it to update the device's severity badge.
-    """
     from datetime import datetime, timezone
 
     d = db.get(Device, mac.lower())
@@ -553,10 +542,8 @@ async def stream_vuln_scan(mac: str, db: Session = Depends(get_db)):
                         return
 
                     async for raw_line in resp.aiter_lines():
-                        # raw_line is the full SSE line including the "data: " prefix
                         yield f"{raw_line}\n"
 
-                        # Intercept RESULT line to persist to DB
                         if raw_line.startswith("data: RESULT:"):
                             payload_str = raw_line[len("data: RESULT:"):]
                             try:
@@ -607,7 +594,6 @@ async def stream_vuln_scan(mac: str, db: Session = Depends(get_db)):
 
 @app.get("/devices/{mac}/vuln-reports")
 def get_vuln_reports(mac: str, limit: int = Query(10, ge=1, le=100), db: Session = Depends(get_db)):
-    """Return the N most recent vuln scan reports for a device."""
     d = db.get(Device, mac.lower())
     if not d:
         raise HTTPException(404, "Device not found")
@@ -635,7 +621,6 @@ def get_vuln_reports(mac: str, limit: int = Query(10, ge=1, le=100), db: Session
 
 @app.get("/devices/{mac}/vuln-reports/{report_id}")
 def get_vuln_report_detail(mac: str, report_id: int, db: Session = Depends(get_db)):
-    """Return a single vuln report including raw_output."""
     r = db.query(VulnReport).filter(
         VulnReport.id == report_id,
         VulnReport.mac_address == mac.lower()
@@ -674,7 +659,6 @@ def list_all_vuln_reports(
     limit: int = Query(50, ge=1, le=500),
     db: Session = Depends(get_db)
 ):
-    """Global vuln report list, optionally filtered by severity."""
     q = db.query(VulnReport)
     if severity:
         q = q.filter(VulnReport.severity == severity)
