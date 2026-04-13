@@ -13,10 +13,13 @@ the SSE connection can buffer or be closed before nmap finishes, producing a
 SIGPIPE that nmap reports as "Error in input stream".  Writing to a temp file
 sidesteps the pipe entirely.
 
-Why stdin=/dev/null
--------------------
+Why stdin=/dev/null (kept open)
+-------------------------------
 Nmap 7.80+ checks stdin on startup and logs "Error in input stream" if stdin
-is a closed/empty pipe.  Redirecting stdin from /dev/null suppresses this.
+is a closed/empty pipe.  We open /dev/null and keep it open for the entire
+lifetime of the subprocess — closing it early (even after create_subprocess_exec
+returns) races with nmap's startup check on some kernel versions and still
+triggers the message.  The fd is closed in a finally block after proc.wait().
 """
 import asyncio
 import os
@@ -207,43 +210,56 @@ async def run_vuln_scan(
 
     t0 = time.monotonic()
 
+    # Keep devnull_in open for the entire subprocess lifetime.
+    # Closing it immediately after create_subprocess_exec races with nmap's
+    # stdin check on startup and causes "Error in input stream" on stdout.
+    devnull_in = open(os.devnull, "rb")
     try:
-        # stdin=/dev/null prevents nmap 7.80+ from printing
-        # "Error in input stream" when it checks whether stdin has targets
-        devnull_in = open(os.devnull, "rb")
         proc = await asyncio.create_subprocess_exec(
             *cmd,
             stdin=devnull_in,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
-        devnull_in.close()
 
-        # Read stdout and stderr concurrently, interleaving lines
-        stdout_task = asyncio.ensure_future(proc.stdout.readline())
-        stderr_task = asyncio.ensure_future(proc.stderr.readline())
-        pending = {stdout_task, stderr_task}
+        # Drain stdout and stderr concurrently, tagging stderr lines with [NMAP].
+        async def _drain_stdout():
+            async for raw in proc.stdout:
+                line = raw.decode(errors="replace").rstrip()
+                if line:
+                    yield line
 
-        while pending:
-            done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
-            for task in done:
-                raw = task.result()
-                if task is stdout_task:
-                    if raw:
-                        line = raw.decode(errors="replace").rstrip()
-                        if line:
-                            yield line
-                        if not proc.stdout.at_eof():
-                            stdout_task = asyncio.ensure_future(proc.stdout.readline())
-                            pending.add(stdout_task)
-                else:  # stderr
-                    if raw:
-                        line = raw.decode(errors="replace").rstrip()
-                        if line:
-                            yield f"[NMAP] {line}"
-                        if not proc.stderr.at_eof():
-                            stderr_task = asyncio.ensure_future(proc.stderr.readline())
-                            pending.add(stderr_task)
+        async def _drain_stderr():
+            async for raw in proc.stderr:
+                line = raw.decode(errors="replace").rstrip()
+                if line:
+                    yield f"[NMAP] {line}"
+
+        # Interleave both streams via asyncio queues so neither blocks the other.
+        queue: asyncio.Queue[str | None] = asyncio.Queue()
+
+        async def _enqueue(gen):
+            async for item in gen:
+                await queue.put(item)
+
+        stdout_task = asyncio.ensure_future(_enqueue(_drain_stdout()))
+        stderr_task = asyncio.ensure_future(_enqueue(_drain_stderr()))
+
+        watcher = asyncio.ensure_future(
+            asyncio.gather(stdout_task, stderr_task)
+        )
+
+        async def _sentinel():
+            await watcher
+            await queue.put(None)  # signal done
+
+        asyncio.ensure_future(_sentinel())
+
+        while True:
+            item = await queue.get()
+            if item is None:
+                break
+            yield item
 
         await proc.wait()
         rc = proc.returncode
@@ -266,6 +282,8 @@ async def run_vuln_scan(
         except OSError:
             pass
         return
+    finally:
+        devnull_in.close()
 
     # Read the completed output file for parsing
     try:
