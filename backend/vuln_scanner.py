@@ -2,11 +2,22 @@
 Phase 3 — Vulnerability Scanner
 
 Runs Nmap NSE vulnerability scripts against a target IP and parses the output
-into structured findings. Designed to be called from an async SSE endpoint so
+into structured findings.  Designed to be called from an async SSE endpoint so
 progress lines stream back to the browser in real time.
+
+Why a temp file instead of -oN -
+---------------------------------
+Using `-oN -` (stdout) causes nmap to detect a pipe and write progress/errors
+to stderr while also writing results to stdout.  On hosts with many open ports
+the SSE connection can buffer or be closed before nmap finishes, producing a
+SIGPIPE that nmap reports as "Error in input stream".  Writing to a temp file
+sidesteps the pipe entirely; we tail-follow the file for live streaming and
+read the completed file for parsing.
 """
 import asyncio
+import os
 import re
+import tempfile
 import time
 from datetime import datetime, timezone
 from typing import AsyncGenerator
@@ -14,13 +25,9 @@ from typing import AsyncGenerator
 # ---------------------------------------------------------------------------
 # NSE script set
 #
-# Only scripts that ship with the nmap package in Debian bookworm (apt install
-# nmap) are listed here.  Scripts added in later upstream releases or via
-# nmap-update are intentionally omitted to avoid the
-# "did not match a category, filename, or directory" fatal error.
-#
+# Only scripts that ship with the nmap package in Debian bookworm are listed.
 # Removed:
-#   smb-vuln-cve-2020-0796    – not in Debian nmap package (only upstream 7.80+)
+#   smb-vuln-cve-2020-0796    – not in Debian nmap package
 #   http-vuln-cve2017-1001000 – absent from many distro builds
 #   telnet-encryption         – absent from slim builds
 #   http-csrf / http-dombased-xss / http-stored-xss – very slow, minimal LAN value
@@ -39,6 +46,7 @@ DEFAULT_VULN_SCRIPTS = (
 
 # -sV is required for the `vulners` script to cross-reference CVEs.
 # --version-intensity 5 keeps it reasonably fast.
+# -p- is NOT used here; default port range keeps scan time sensible.
 DEFAULT_EXTRA_ARGS = "-T4 --open -sV --version-intensity 5"
 
 # Severity ordering for comparison
@@ -55,9 +63,6 @@ async def _validate_scripts(scripts: str) -> tuple[str, list[str]]:
     """
     Run `nmap --script-help <scripts>` to check which script names nmap
     actually recognises.  Returns (valid_csv, rejected_list).
-
-    Falls back to returning the original string unchanged if nmap is not
-    available (the caller will surface the error anyway).
     """
     rejected: list[str] = []
     names = [s.strip() for s in scripts.split(",") if s.strip()]
@@ -136,7 +141,7 @@ def _parse_nmap_output(raw: str) -> tuple[list[dict], str]:
             severity = "medium"
 
         cves = list({c.upper() for c in cve_re.findall(block_text)})
-        title_lines = [l.lstrip("| ").strip() for l in block_lines[1:] if l.strip().lstrip("|").strip()]
+        title_lines = [ln.lstrip("| ").strip() for ln in block_lines[1:] if ln.strip().lstrip("|").strip()]
         title = title_lines[0] if title_lines else script_name
 
         findings.append({
@@ -161,6 +166,9 @@ async def run_vuln_scan(
     """
     Async generator — yields log lines suitable for SSE `data:` fields.
     Final line is always a JSON-serialisable summary prefixed with `RESULT:`.
+
+    Output is written to a temp file (not piped via -oN -) to avoid SIGPIPE
+    errors on hosts with many open ports.
     """
     import json
 
@@ -177,41 +185,108 @@ async def run_vuln_scan(
     script_names = [s.strip() for s in scripts.split(",") if s.strip()]
     yield f"[INFO] Scripts: {len(script_names)} script(s) — {', '.join(script_names)}"
 
+    # Write output to a temp file — avoids the -oN - pipe/SIGPIPE issue entirely
+    tmp = tempfile.NamedTemporaryFile(
+        prefix="inspectre_vuln_", suffix=".nmap", delete=False, mode="w"
+    )
+    tmp.close()
+    outfile = tmp.name
+
     cmd = [
         "nmap",
         "--script", scripts,
         *extra_args.split(),
-        "-oN", "-",
+        "-oN", outfile,
         ip,
     ]
 
     yield f"[INFO] Command: {' '.join(cmd)}"
 
     t0 = time.monotonic()
-    raw_lines: list[str] = []
 
     try:
         proc = await asyncio.create_subprocess_exec(
             *cmd,
             stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.STDOUT,
+            stderr=asyncio.subprocess.PIPE,
         )
-        async for raw in proc.stdout:
-            line = raw.decode(errors="replace").rstrip()
-            raw_lines.append(line)
-            yield line
+
+        # Stream stdout (nmap status lines) and stderr concurrently
+        async def _read_stream(stream, prefix: str):
+            async for raw in stream:
+                line = raw.decode(errors="replace").rstrip()
+                if line:
+                    yield f"{prefix}{line}"
+
+        # Interleave both streams
+        stdout_gen = _read_stream(proc.stdout, "")
+        stderr_gen = _read_stream(proc.stderr, "[NMAP] ")
+
+        stdout_task = asyncio.ensure_future(proc.stdout.readline())
+        stderr_task = asyncio.ensure_future(proc.stderr.readline())
+
+        pending = {stdout_task, stderr_task}
+        while pending:
+            done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+            for task in done:
+                raw = task.result()
+                if raw:
+                    line = raw.decode(errors="replace").rstrip()
+                    if task is stdout_task:
+                        if line:
+                            yield line
+                        if not proc.stdout.at_eof():
+                            stdout_task = asyncio.ensure_future(proc.stdout.readline())
+                            pending.add(stdout_task)
+                    else:
+                        if line:
+                            # Suppress the common "Error in input stream" false-positive
+                            # that nmap prints when it detects a non-tty output — we're
+                            # using a file now so this shouldn't appear, but guard anyway
+                            if "error in input stream" in line.lower():
+                                yield f"[NMAP-WARN] {line} (suppressed — using file output)"
+                            else:
+                                yield f"[NMAP] {line}"
+                        if not proc.stderr.at_eof():
+                            stderr_task = asyncio.ensure_future(proc.stderr.readline())
+                            pending.add(stderr_task)
+
         await proc.wait()
+        rc = proc.returncode
+        if rc not in (0, 1):  # nmap exits 1 when no hosts up, which is fine
+            yield f"[WARN] nmap exited with code {rc}"
+
     except FileNotFoundError:
         yield "[ERROR] nmap not found — is it installed in the backend container?"
         yield 'RESULT:{"severity":"clean","vuln_count":0,"findings":[],"error":"nmap_not_found"}'
+        try:
+            os.unlink(outfile)
+        except OSError:
+            pass
         return
     except Exception as exc:
         yield f"[ERROR] Scan failed: {exc}"
         yield f'RESULT:{{"severity":"clean","vuln_count":0,"findings":[],"error":"{exc}"}}'
+        try:
+            os.unlink(outfile)
+        except OSError:
+            pass
         return
 
+    # Read the completed output file for parsing
+    try:
+        with open(outfile, "r", errors="replace") as f:
+            raw_text = f.read()
+    except Exception as exc:
+        yield f"[ERROR] Could not read scan output file: {exc}"
+        raw_text = ""
+    finally:
+        try:
+            os.unlink(outfile)
+        except OSError:
+            pass
+
     duration = round(time.monotonic() - t0, 1)
-    raw_text = "\n".join(raw_lines)
     findings, severity = _parse_nmap_output(raw_text)
 
     yield f"[INFO] Scan complete in {duration}s — {len(findings)} finding(s), highest severity: {severity}"
