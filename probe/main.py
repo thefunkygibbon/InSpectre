@@ -25,7 +25,7 @@ from sqlalchemy.orm import declarative_base, sessionmaker
 # ---------------------------------------------------------------------------
 # Version
 # ---------------------------------------------------------------------------
-VERSION = "0.6.2"
+VERSION = "0.6.3"
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -133,6 +133,9 @@ def init_db() -> None:
                 UPDATE devices SET primary_ip = ip_address
                 WHERE primary_ip IS NULL AND ip_address IS NOT NULL
             """))
+            # Phase 3 vuln columns on devices table
+            conn.execute(text("ALTER TABLE devices ADD COLUMN IF NOT EXISTS vuln_last_scanned TIMESTAMPTZ"))
+            conn.execute(text("ALTER TABLE devices ADD COLUMN IF NOT EXISTS vuln_severity VARCHAR"))
             conn.commit()
         except Exception as e:
             print(f"[DB] Column migration note: {e}", flush=True)
@@ -173,6 +176,26 @@ def init_db() -> None:
         conn.execute(text("CREATE INDEX IF NOT EXISTS ix_device_events_mac     ON device_events(mac_address)"))
         conn.execute(text("CREATE INDEX IF NOT EXISTS ix_device_events_type    ON device_events(type)"))
         conn.execute(text("CREATE INDEX IF NOT EXISTS ix_device_events_created ON device_events(created_at)"))
+        conn.commit()
+
+        # Phase 3: vuln_reports table (probe also needs to write vuln results)
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS vuln_reports (
+                id          SERIAL PRIMARY KEY,
+                mac_address VARCHAR NOT NULL REFERENCES devices(mac_address) ON DELETE CASCADE,
+                ip_address  VARCHAR,
+                scanned_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                duration_s  FLOAT,
+                severity    VARCHAR NOT NULL DEFAULT 'clean',
+                vuln_count  INTEGER NOT NULL DEFAULT 0,
+                findings    JSONB,
+                raw_output  TEXT,
+                nmap_args   VARCHAR
+            )
+        """))
+        conn.execute(text("CREATE INDEX IF NOT EXISTS ix_vuln_reports_mac      ON vuln_reports(mac_address)"))
+        conn.execute(text("CREATE INDEX IF NOT EXISTS ix_vuln_reports_scanned  ON vuln_reports(scanned_at)"))
+        conn.execute(text("CREATE INDEX IF NOT EXISTS ix_vuln_reports_severity ON vuln_reports(severity)"))
         conn.commit()
 
     print("[DB] Migrations complete.", flush=True)
@@ -220,9 +243,6 @@ def _write_event(mac: str, event_type: str, detail: dict) -> None:
     """Write a device_events row.  Silently swallows errors."""
     session = Session()
     try:
-        # Use cast() so SQLAlchemy handles the JSONB type conversion correctly.
-        # The previous :detail::jsonb syntax mixed SQLAlchemy bind-param notation
-        # (:name) with PostgreSQL cast syntax (::type) which psycopg2 rejects.
         session.execute(
             text("""
                 INSERT INTO device_events (mac_address, type, detail, created_at)
@@ -886,6 +906,42 @@ def stream_traceroute(ip: str):
     cmd = ["traceroute", "-m", str(TRACE_MAX_HOP), "-w", "2", ip]
     return StreamingResponse(
         _stream_subprocess(cmd),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+@probe_api.get("/stream/vuln-scan/{ip}")
+async def stream_vuln_scan(ip: str, scripts: str = ""):
+    """
+    SSE endpoint — runs nmap vuln scripts against <ip> (which the probe can
+    reach because it is on the host network) and streams progress lines.
+
+    The final SSE data line is  RESULT:<json>  which the backend picks up,
+    saves to vuln_reports, and forwards on to the browser.
+
+    Query param  ?scripts=  overrides the default script set.
+    """
+    import ipaddress
+    from vuln_scanner import run_vuln_scan, DEFAULT_VULN_SCRIPTS
+
+    try:
+        ipaddress.ip_address(ip)
+    except ValueError:
+        raise HTTPException(400, "Invalid IP address")
+
+    effective_scripts = scripts.strip() if scripts.strip() else DEFAULT_VULN_SCRIPTS
+
+    async def _gen():
+        yield f"data: [INFO] Initiating vulnerability scan…\n\n"
+        async for line in run_vuln_scan(ip, scripts=effective_scripts):
+            safe = line.replace("\n", " ").replace("\r", "")
+            yield f"data: {safe}\n\n"
+        yield "data: --- done ---\n\n"
+        yield "event: done\ndata: {}\n\n"
+
+    return StreamingResponse(
+        _gen(),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
