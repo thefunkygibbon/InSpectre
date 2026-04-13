@@ -11,8 +11,12 @@ Using `-oN -` (stdout) causes nmap to detect a pipe and write progress/errors
 to stderr while also writing results to stdout.  On hosts with many open ports
 the SSE connection can buffer or be closed before nmap finishes, producing a
 SIGPIPE that nmap reports as "Error in input stream".  Writing to a temp file
-sidesteps the pipe entirely; we tail-follow the file for live streaming and
-read the completed file for parsing.
+sidesteps the pipe entirely.
+
+Why stdin=/dev/null
+-------------------
+Nmap 7.80+ checks stdin on startup and logs "Error in input stream" if stdin
+is a closed/empty pipe.  Redirecting stdin from /dev/null suppresses this.
 """
 import asyncio
 import os
@@ -46,7 +50,6 @@ DEFAULT_VULN_SCRIPTS = (
 
 # -sV is required for the `vulners` script to cross-reference CVEs.
 # --version-intensity 5 keeps it reasonably fast.
-# -p- is NOT used here; default port range keeps scan time sensible.
 DEFAULT_EXTRA_ARGS = "-T4 --open -sV --version-intensity 5"
 
 # Severity ordering for comparison
@@ -68,12 +71,15 @@ async def _validate_scripts(scripts: str) -> tuple[str, list[str]]:
     names = [s.strip() for s in scripts.split(",") if s.strip()]
 
     try:
+        devnull = open(os.devnull, "rb")
         proc = await asyncio.create_subprocess_exec(
             "nmap", "--script-help", ",".join(names),
+            stdin=devnull,
             stdout=asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.PIPE,
         )
         _, stderr_bytes = await proc.communicate()
+        devnull.close()
         stderr_text = stderr_bytes.decode(errors="replace")
 
         bad_re = re.compile(r"'([^']+)'\s+did not match")
@@ -166,9 +172,6 @@ async def run_vuln_scan(
     """
     Async generator — yields log lines suitable for SSE `data:` fields.
     Final line is always a JSON-serialisable summary prefixed with `RESULT:`.
-
-    Output is written to a temp file (not piped via -oN -) to avoid SIGPIPE
-    errors on hosts with many open ports.
     """
     import json
 
@@ -185,7 +188,7 @@ async def run_vuln_scan(
     script_names = [s.strip() for s in scripts.split(",") if s.strip()]
     yield f"[INFO] Scripts: {len(script_names)} script(s) — {', '.join(script_names)}"
 
-    # Write output to a temp file — avoids the -oN - pipe/SIGPIPE issue entirely
+    # Write to a temp file — avoids -oN - pipe issues
     tmp = tempfile.NamedTemporaryFile(
         prefix="inspectre_vuln_", suffix=".nmap", delete=False, mode="w"
     )
@@ -205,55 +208,46 @@ async def run_vuln_scan(
     t0 = time.monotonic()
 
     try:
+        # stdin=/dev/null prevents nmap 7.80+ from printing
+        # "Error in input stream" when it checks whether stdin has targets
+        devnull_in = open(os.devnull, "rb")
         proc = await asyncio.create_subprocess_exec(
             *cmd,
+            stdin=devnull_in,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
+        devnull_in.close()
 
-        # Stream stdout (nmap status lines) and stderr concurrently
-        async def _read_stream(stream, prefix: str):
-            async for raw in stream:
-                line = raw.decode(errors="replace").rstrip()
-                if line:
-                    yield f"{prefix}{line}"
-
-        # Interleave both streams
-        stdout_gen = _read_stream(proc.stdout, "")
-        stderr_gen = _read_stream(proc.stderr, "[NMAP] ")
-
+        # Read stdout and stderr concurrently, interleaving lines
         stdout_task = asyncio.ensure_future(proc.stdout.readline())
         stderr_task = asyncio.ensure_future(proc.stderr.readline())
-
         pending = {stdout_task, stderr_task}
+
         while pending:
             done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
             for task in done:
                 raw = task.result()
-                if raw:
-                    line = raw.decode(errors="replace").rstrip()
-                    if task is stdout_task:
+                if task is stdout_task:
+                    if raw:
+                        line = raw.decode(errors="replace").rstrip()
                         if line:
                             yield line
                         if not proc.stdout.at_eof():
                             stdout_task = asyncio.ensure_future(proc.stdout.readline())
                             pending.add(stdout_task)
-                    else:
+                else:  # stderr
+                    if raw:
+                        line = raw.decode(errors="replace").rstrip()
                         if line:
-                            # Suppress the common "Error in input stream" false-positive
-                            # that nmap prints when it detects a non-tty output — we're
-                            # using a file now so this shouldn't appear, but guard anyway
-                            if "error in input stream" in line.lower():
-                                yield f"[NMAP-WARN] {line} (suppressed — using file output)"
-                            else:
-                                yield f"[NMAP] {line}"
+                            yield f"[NMAP] {line}"
                         if not proc.stderr.at_eof():
                             stderr_task = asyncio.ensure_future(proc.stderr.readline())
                             pending.add(stderr_task)
 
         await proc.wait()
         rc = proc.returncode
-        if rc not in (0, 1):  # nmap exits 1 when no hosts up, which is fine
+        if rc not in (0, 1):  # nmap exits 1 when no hosts up — that's fine
             yield f"[WARN] nmap exited with code {rc}"
 
     except FileNotFoundError:
