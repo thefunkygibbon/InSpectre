@@ -27,12 +27,14 @@ services:
     environment:
       DATABASE_URL: postgresql://admin:password123@db:5432/inspectre
       # Probe runs with network_mode:host so it binds directly to the host.
-      # From this bridge-network container we reach the host via host-gateway.
-      PROBE_API_URL: http://host-gateway:8001
+      # host.docker.internal resolves to the Docker host bridge IP automatically
+      # on any Docker Engine >= 20.10 — no manual config required.
+      PROBE_API_URL: http://host.docker.internal:8001
     extra_hosts:
-      # Resolves 'host-gateway' to the Docker host's bridge IP (typically 172.17.0.1)
-      # This lets the backend reach the probe's host-bound port 8001.
-      - "host-gateway:host-gateway"
+      # Makes host.docker.internal resolve to the host's bridge gateway IP.
+      # Works on Linux with Docker Engine >= 20.10 (released Oct 2020).
+      # No changes to Docker config or the host network are needed.
+      - "host.docker.internal:host-gateway"
     depends_on:
       db:
         condition: service_healthy
