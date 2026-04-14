@@ -18,7 +18,7 @@ import { SettingsPanel }    from './components/SettingsPanel'
 import { CategoryView }     from './components/CategoryView'
 import { SmartFilterBar }   from './components/SmartFilterBar'
 
-const APP_VERSION = '0.6.0'
+const APP_VERSION = '0.7.0'
 
 const FILTERS = ['all', 'online', 'offline']
 
