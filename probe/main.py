@@ -25,7 +25,7 @@ from sqlalchemy.orm import declarative_base, sessionmaker
 # ---------------------------------------------------------------------------
 # Version
 # ---------------------------------------------------------------------------
-VERSION = "0.7.0"
+VERSION = "0.6.3"
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -36,7 +36,7 @@ IP_RANGE                = os.environ.get("IP_RANGE",                "192.168.0.0
 INTERFACE               = os.environ.get("INTERFACE",               "eth0")
 NMAP_ARGS               = os.environ.get("NMAP_ARGS",               "-O --osscan-limit -sV --version-intensity 5 -T4")
 OS_CONFIDENCE_THRESHOLD = int(os.environ.get("OS_CONFIDENCE_THRESHOLD", 85))
-OFFLINE_MISS_THRESHOLD  = int(os.environ.get("OFFLINE_MISS_THRESHOLD",   3))
+OFFLINE_MISS_THRESHOLD  = int(os.environ.get("OFFLINE_MISS_THRESHOLD",   5))
 SNIFFER_WORKERS         = int(os.environ.get("SNIFFER_WORKERS",          4))
 PROBE_API_PORT          = int(os.environ.get("PROBE_API_PORT",         8001))
 LAN_DNS_SERVER_ENV      = os.environ.get("LAN_DNS_SERVER", "").strip()
@@ -126,11 +126,14 @@ def init_db() -> None:
             conn.execute(text("ALTER TABLE devices ADD COLUMN IF NOT EXISTS miss_count INTEGER DEFAULT 0"))
             conn.execute(text("ALTER TABLE devices ADD COLUMN IF NOT EXISTS is_important BOOLEAN NOT NULL DEFAULT FALSE"))
             conn.execute(text("ALTER TABLE devices ALTER COLUMN is_important SET DEFAULT FALSE"))
+            # primary_ip: the first/canonical IP for this MAC — never displaced by a shim/secondary address
             conn.execute(text("ALTER TABLE devices ADD COLUMN IF NOT EXISTS primary_ip VARCHAR"))
+            # Back-fill primary_ip from ip_address for existing rows
             conn.execute(text("""
                 UPDATE devices SET primary_ip = ip_address
                 WHERE primary_ip IS NULL AND ip_address IS NOT NULL
             """))
+            # Phase 3 vuln columns on devices table
             conn.execute(text("ALTER TABLE devices ADD COLUMN IF NOT EXISTS vuln_last_scanned TIMESTAMPTZ"))
             conn.execute(text("ALTER TABLE devices ADD COLUMN IF NOT EXISTS vuln_severity VARCHAR"))
             conn.commit()
@@ -175,6 +178,7 @@ def init_db() -> None:
         conn.execute(text("CREATE INDEX IF NOT EXISTS ix_device_events_created ON device_events(created_at)"))
         conn.commit()
 
+        # Phase 3: vuln_reports table (probe also needs to write vuln results)
         conn.execute(text("""
             CREATE TABLE IF NOT EXISTS vuln_reports (
                 id          SERIAL PRIMARY KEY,
@@ -200,6 +204,10 @@ def init_db() -> None:
 # IP History
 # ---------------------------------------------------------------------------
 def record_ip(mac: str, ip: str) -> bool:
+    """
+    Upserts the IP into ip_history.  Returns True only if this is a BRAND NEW
+    mac+ip combination (first_seen == last_seen within 2s).
+    """
     if not _is_valid_ip(ip):
         return False
     now     = datetime.now(timezone.utc)
@@ -232,6 +240,7 @@ def record_ip(mac: str, ip: str) -> bool:
 # Event writing
 # ---------------------------------------------------------------------------
 def _write_event(mac: str, event_type: str, detail: dict) -> None:
+    """Write a device_events row.  Silently swallows errors."""
     session = Session()
     try:
         session.execute(
@@ -425,26 +434,6 @@ def arp_scan(interface: str, ip_range: str) -> list[dict]:
     return [{"ip": rcv.psrc, "mac": rcv.hwsrc.lower()} for _, rcv in result]
 
 # ---------------------------------------------------------------------------
-# One-shot ping helper (used for offline confirmation)
-# ---------------------------------------------------------------------------
-def _ping_once(ip: str, timeout: int = 2) -> bool:
-    """
-    Returns True if the host responds to a single ICMP ping within `timeout` seconds.
-    Uses the system ping binary so no extra privileges are required beyond what
-    the probe container already has.
-    """
-    try:
-        result = subprocess.run(
-            ["ping", "-c", "1", "-W", str(timeout), ip],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            timeout=timeout + 1,
-        )
-        return result.returncode == 0
-    except Exception:
-        return False
-
-# ---------------------------------------------------------------------------
 # Nmap deep scan
 # ---------------------------------------------------------------------------
 def deep_scan(ip: str, mac: str) -> dict:
@@ -536,6 +525,20 @@ def trigger_deep_scan(ip: str, mac: str) -> None:
 # Device upsert
 # ---------------------------------------------------------------------------
 def upsert_seen_device(mac: str, ip: str, source: str) -> None:
+    """
+    Insert-or-update a device row.
+
+    primary_ip semantics
+    --------------------
+    The first IP ever seen for a MAC becomes its `primary_ip` and is never
+    replaced by a later, different IP.  This prevents a shim/Docker bridge
+    address (which appears on a different NIC with a different MAC but resolves
+    to the same host) from displacing the real LAN IP.
+
+    `ip_address` continues to hold the most-recently-seen IP for informational
+    purposes and is shown alongside `primary_ip` in ip_history.  All scans
+    (deep scan, vuln scan) target `primary_ip`.
+    """
     if not mac or mac == "00:00:00:00:00:00":
         return
     if not _is_valid_ip(ip):
@@ -562,6 +565,7 @@ def upsert_seen_device(mac: str, ip: str, source: str) -> None:
             safe_hostname = (hostname or '').replace("'", "''")
 
             if is_new:
+                # Brand-new device: ip_address and primary_ip are both set to ip.
                 stmt = (
                     pg_insert(Device)
                     .values(
@@ -582,6 +586,7 @@ def upsert_seen_device(mac: str, ip: str, source: str) -> None:
                         index_elements=["mac_address"],
                         set_=dict(
                             ip_address = ip,
+                            # primary_ip: set only if not already populated
                             primary_ip = text(
                                 "CASE WHEN devices.primary_ip IS NOT NULL "
                                 "THEN devices.primary_ip ELSE EXCLUDED.primary_ip END"
@@ -597,6 +602,9 @@ def upsert_seen_device(mac: str, ip: str, source: str) -> None:
                     )
                 )
             else:
+                # Existing device: always update last_seen / online status.
+                # ip_address gets the latest seen IP (informational).
+                # primary_ip is NEVER overwritten — it stays as the first IP.
                 stmt = (
                     pg_insert(Device)
                     .values(
@@ -617,6 +625,7 @@ def upsert_seen_device(mac: str, ip: str, source: str) -> None:
                         index_elements=["mac_address"],
                         set_=dict(
                             ip_address = ip,
+                            # primary_ip frozen: keep whatever is already stored
                             primary_ip = text(
                                 "CASE WHEN devices.primary_ip IS NOT NULL "
                                 "THEN devices.primary_ip ELSE EXCLUDED.primary_ip END"
@@ -661,13 +670,15 @@ def upsert_seen_device(mac: str, ip: str, source: str) -> None:
 
     is_brand_new_ip = record_ip(mac, ip)
 
+    # Only invalidate the deep scan when the PRIMARY IP changes to something new,
+    # not when we merely observe a secondary/shim address.
     if ip_changed and is_brand_new_ip:
         session2 = Session()
         try:
             dev2 = session2.get(Device, mac)
             if dev2:
                 scan_ip = dev2.primary_ip or ip
-                if ip == scan_ip:
+                if ip == scan_ip:  # primary IP genuinely changed
                     if dev2.deep_scanned:
                         print(f"[~] Primary IP changed {old_ip} -> {ip} for {mac} — invalidating deep scan", flush=True)
                         dev2.deep_scanned = False
@@ -770,7 +781,7 @@ def start_arp_sniffer() -> None:
     sniff(iface=INTERFACE, filter="arp", store=False, prn=process_arp_packet)
 
 # ---------------------------------------------------------------------------
-# Presence sweep  ← CHANGED: ping confirmation before marking offline
+# Presence sweep
 # ---------------------------------------------------------------------------
 def update_presence_from_sweep(session, active_macs: set) -> None:
     now = datetime.now(timezone.utc)
@@ -786,29 +797,9 @@ def update_presence_from_sweep(session, active_macs: set) -> None:
                     continue
 
             dev.miss_count = (dev.miss_count or 0) + 1
-
             if dev.miss_count >= OFFLINE_MISS_THRESHOLD and dev.is_online:
-                # Double-confirmation: ping the device before declaring it offline.
-                # If it responds, it is ARP-quiet (common with iOS/IoT) — reset
-                # the miss counter and keep it marked online.
-                ping_ip = dev.primary_ip or dev.ip_address
-                if ping_ip and _is_valid_ip(ping_ip):
-                    alive = _ping_once(ping_ip)
-                    if alive:
-                        print(
-                            f"[~] ARP miss but ping OK for {ping_ip} ({dev.mac_address}) "
-                            f"— device is ARP-quiet, keeping online",
-                            flush=True,
-                        )
-                        dev.miss_count = 0
-                        continue
-
                 dev.is_online = False
-                print(
-                    f"[-] Offline: {dev.ip_address} ({dev.mac_address}) "
-                    f"after {dev.miss_count} missed sweeps + ping confirm",
-                    flush=True,
-                )
+                print(f"[-] Offline: {dev.ip_address} ({dev.mac_address}) after {dev.miss_count} missed sweeps", flush=True)
                 _write_event(dev.mac_address, "offline", {"ip": dev.ip_address})
 
 # ---------------------------------------------------------------------------
@@ -890,49 +881,6 @@ def probe_rescan(mac: str):
         session.close()
 
 
-# ---------------------------------------------------------------------------
-# NEW: /config/reload — lets the backend push updated settings at runtime
-# ---------------------------------------------------------------------------
-@probe_api.post("/config/reload")
-def config_reload(payload: dict):
-    """
-    Accepts a JSON body with any of the probe's runtime config keys and
-    updates the module-level globals immediately — no restart required.
-
-    Supported keys (all optional, types are coerced automatically):
-        scan_interval, offline_miss_threshold, os_confidence_threshold,
-        ip_range, nmap_args, sniffer_workers
-    """
-    global SCAN_INTERVAL, OFFLINE_MISS_THRESHOLD, OS_CONFIDENCE_THRESHOLD
-    global IP_RANGE, NMAP_ARGS, SNIFFER_WORKERS
-
-    updated = {}
-    try:
-        if "scan_interval" in payload:
-            SCAN_INTERVAL = int(payload["scan_interval"])
-            updated["scan_interval"] = SCAN_INTERVAL
-        if "offline_miss_threshold" in payload:
-            OFFLINE_MISS_THRESHOLD = int(payload["offline_miss_threshold"])
-            updated["offline_miss_threshold"] = OFFLINE_MISS_THRESHOLD
-        if "os_confidence_threshold" in payload:
-            OS_CONFIDENCE_THRESHOLD = int(payload["os_confidence_threshold"])
-            updated["os_confidence_threshold"] = OS_CONFIDENCE_THRESHOLD
-        if "ip_range" in payload:
-            IP_RANGE = str(payload["ip_range"])
-            updated["ip_range"] = IP_RANGE
-        if "nmap_args" in payload:
-            NMAP_ARGS = str(payload["nmap_args"])
-            updated["nmap_args"] = NMAP_ARGS
-        if "sniffer_workers" in payload:
-            SNIFFER_WORKERS = int(payload["sniffer_workers"])
-            updated["sniffer_workers"] = SNIFFER_WORKERS
-    except (ValueError, TypeError) as e:
-        raise HTTPException(400, f"Invalid value: {e}")
-
-    print(f"[config] Runtime reload applied: {updated}", flush=True)
-    return {"reloaded": True, "applied": updated}
-
-
 @probe_api.get("/stream/ping/{ip}")
 def stream_ping(ip: str):
     import ipaddress
@@ -965,6 +913,15 @@ def stream_traceroute(ip: str):
 
 @probe_api.get("/stream/vuln-scan/{ip}")
 async def stream_vuln_scan(ip: str, scripts: str = ""):
+    """
+    SSE endpoint — runs nmap vuln scripts against <ip> (which the probe can
+    reach because it is on the host network) and streams progress lines.
+
+    The final SSE data line is  RESULT:<json>  which the backend picks up,
+    saves to vuln_reports, and forwards on to the browser.
+
+    Query param  ?scripts=  overrides the default script set.
+    """
     import ipaddress
     from vuln_scanner import run_vuln_scan, DEFAULT_VULN_SCRIPTS
 
