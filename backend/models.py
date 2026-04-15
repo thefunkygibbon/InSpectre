@@ -9,6 +9,7 @@ class Device(Base):
     __tablename__ = "devices"
     mac_address          = Column(String, primary_key=True, index=True)
     ip_address           = Column(String, nullable=True)
+    primary_ip           = Column(String, nullable=True)   # ← ADDED: canonical/first IP, never overwritten
     hostname             = Column(String, nullable=True)
     vendor               = Column(String, nullable=True)
     custom_name          = Column(String, nullable=True)
@@ -24,8 +25,12 @@ class Device(Base):
     # Phase 1: user metadata
     is_important         = Column(Boolean, default=False, nullable=False)
     notes                = Column(Text, nullable=True)
-    tags                 = Column(String, nullable=True)   # comma-separated
-    location             = Column(String, nullable=True)   # free-text room/zone
+    tags                 = Column(String, nullable=True)
+    location             = Column(String, nullable=True)
+
+    # Phase 3: vuln scan
+    vuln_last_scanned    = Column(DateTime(timezone=True), nullable=True)
+    vuln_severity        = Column(String, nullable=True)
 
     ip_history   = relationship("IPHistory",    back_populates="device",
                                 order_by="IPHistory.first_seen.desc()")
@@ -47,11 +52,6 @@ class IPHistory(Base):
 
 
 class DeviceEvent(Base):
-    """
-    Timeline of significant events per device.
-    type: 'joined' | 'online' | 'offline' | 'ip_change' | 'scan_complete'
-          | 'renamed' | 'tagged' | 'marked_important' | 'port_change' | 'vuln_scan_complete'
-    """
     __tablename__ = "device_events"
     id          = Column(Integer, primary_key=True, autoincrement=True)
     mac_address = Column(String, ForeignKey("devices.mac_address", ondelete="CASCADE"),
@@ -63,29 +63,22 @@ class DeviceEvent(Base):
 
 
 class VulnReport(Base):
-    """
-    Stores the result of a vulnerability scan (Nmap NSE vuln scripts) for a device.
-    severity: 'critical' | 'high' | 'medium' | 'low' | 'info' | 'clean'
-    """
     __tablename__ = "vuln_reports"
     id           = Column(Integer, primary_key=True, autoincrement=True)
     mac_address  = Column(String, ForeignKey("devices.mac_address", ondelete="CASCADE"),
                           nullable=False, index=True)
     ip_address   = Column(String, nullable=True)
     scanned_at   = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), index=True)
-    duration_s   = Column(Float,   nullable=True)   # seconds the scan took
-    severity     = Column(String,  nullable=False, default="clean")  # highest severity found
+    duration_s   = Column(Float,   nullable=True)
+    severity     = Column(String,  nullable=False, default="clean")
     vuln_count   = Column(Integer, nullable=False, default=0)
-    findings     = Column(JSON,    nullable=True)   # list of finding dicts
-    raw_output   = Column(Text,    nullable=True)   # full nmap stdout
-    nmap_args    = Column(String,  nullable=True)   # args used
+    findings     = Column(JSON,    nullable=True)
+    raw_output   = Column(Text,    nullable=True)
+    nmap_args    = Column(String,  nullable=True)
     device       = relationship("Device", back_populates="vuln_reports")
 
 
 class Alert(Base):
-    """
-    type: 'new_device' | 'device_offline' | 'device_online' | 'ip_change' | 'vuln_found'
-    """
     __tablename__ = "alerts"
     id          = Column(Integer, primary_key=True, autoincrement=True)
     type        = Column(String, nullable=False, index=True)
@@ -111,7 +104,6 @@ class Setting(Base):
 
 class FingerprintEntry(Base):
     __tablename__ = "fingerprints"
-
     id               = Column(Integer, primary_key=True, autoincrement=True)
     oui_prefix       = Column(String(6),  nullable=True,  index=True)
     hostname_pattern = Column(String,     nullable=True)
