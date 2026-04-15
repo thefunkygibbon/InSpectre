@@ -50,14 +50,27 @@ function cleanVendor(vendor) {
     .trim()
 }
 
+/**
+ * Derive the best display name for a device.
+ *
+ * Priority order:
+ *   1. custom_name  — explicitly set by the user
+ *   2. hostname     — resolved from DNS / mDNS / NetBIOS
+ *   3. IP address   — always available, unambiguous
+ *   4. MAC prefix   — last resort if somehow IP is missing too
+ *
+ * NOTE: vendor is intentionally NOT used as a display name.
+ * Vendor strings like "Samsung Electronics" or "Espressif Inc." make terrible
+ * card titles when you have multiple devices from the same manufacturer.
+ * The vendor is shown as a subtitle line instead (see showVendorSubtitle below).
+ */
 function deviceDisplayName(device) {
   if (device.custom_name) return device.custom_name
   if (device.hostname)    return device.hostname
-  const v = cleanVendor(device.vendor_override || device.vendor)
-  if (v) return v
   if (device.ip_address) {
     const parts = device.ip_address.split('.')
     if (parts.length === 4) return `Device .${parts[3]}`
+    return device.ip_address
   }
   if (device.mac_address) return device.mac_address.slice(0, 8).toUpperCase()
   return 'Unknown'
@@ -77,6 +90,9 @@ export function DeviceCard({ device, onClick, onStarToggle }) {
   const ports    = openPortCount(device)
   const scanning = !device.deep_scanned
 
+  // Show vendor as a subtitle only when it adds information beyond what the
+  // display name already tells the user (e.g. don't show vendor if the
+  // hostname already contains it, or if it IS the display name).
   const showVendorSubtitle = vendor && vendor !== name
 
   return (
