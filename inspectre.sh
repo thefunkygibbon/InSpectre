@@ -98,8 +98,19 @@ cmd_update() {
   git pull --ff-only origin main || {
     _warn "Fast-forward pull failed — you may have local changes. Skipping git pull."
   }
-  _info "Rebuilding and restarting..."
-  _compose up -d --build
+  _info "Rebuilding and restarting (no cache)..."
+  _compose down --remove-orphans
+
+  _info "Removing InSpectre images so layers are not reused..."
+  docker images --format '{{.Repository}}:{{.Tag}} {{.ID}}' \
+    | awk '/inspectre|InSpectre/ {print $2}' \
+    | sort -u \
+    | xargs -r docker rmi -f || true
+
+  _info "Clearing build cache..."
+  docker builder prune -af >/dev/null 2>&1 || true
+
+  _compose up -d --build --no-cache 2>/dev/null || _compose up -d --build
   _success "Update complete."
   local port; port=$(_frontend_port)
   _info "Dashboard: http://$(hostname -I | awk '{print $1}'):${port}"
@@ -115,47 +126,91 @@ cmd_rebuild() {
   read -rp "[InSpectre] Are you sure? This deletes the database and all scan history. [y/N] " confirm
   [[ "${confirm,,}" == "y" ]] || { _info "Aborted."; exit 0; }
 
+  # ── 1. Pull latest code first ──────────────────────────────────────────────
+  _info "Pulling latest code from git..."
+  git fetch origin
+  git pull --ff-only origin main || {
+    _warn "Fast-forward pull failed — you may have local changes. Continuing with current code."
+  }
+
+  # ── 2. Tear down compose stack (removes named volumes too) ─────────────────
   _info "Stopping and removing compose stack..."
   _compose down --remove-orphans --volumes || true
 
+  # ── 3. Remove any leftover containers ──────────────────────────────────────
   _info "Removing any leftover containers..."
   docker ps -aq --filter "label=com.docker.compose.project=$PROJECT_NAME" \
     | xargs -r docker rm -f || true
 
+  # ── 4. Remove any leftover networks ────────────────────────────────────────
   _info "Removing any leftover networks..."
   docker network ls -q --filter "label=com.docker.compose.project=$PROJECT_NAME" \
     | xargs -r docker network rm || true
 
-  _info "Removing any leftover volumes..."
+  # ── 5. Remove any leftover named volumes ───────────────────────────────────
+  _info "Removing any leftover named volumes..."
   docker volume ls -q --filter "label=com.docker.compose.project=$PROJECT_NAME" \
     | xargs -r docker volume rm -f || true
 
+  # ── 6. Remove InSpectre images ─────────────────────────────────────────────
   _info "Removing InSpectre images..."
   docker images --format '{{.Repository}}:{{.Tag}} {{.ID}}' \
     | awk '/inspectre|InSpectre/ {print $2}' \
     | sort -u \
     | xargs -r docker rmi -f || true
 
+  # ── 7. Prune dangling images left behind ───────────────────────────────────
+  _info "Pruning dangling images..."
+  docker image prune -f >/dev/null 2>&1 || true
+
+  # ── 8. Clear all build cache ───────────────────────────────────────────────
   _info "Clearing build cache..."
   docker builder prune -af >/dev/null 2>&1 || true
 
-  _info "Removing local data folders..."
+  # ── 9. Wipe local data / bind-mount directories ────────────────────────────
+  _info "Removing local data folders (postgres bind-mount, caches, build artefacts)..."
+
+  # postgres bind-mount (as defined in docker-compose.yml)
   rm -rf \
-    "$SCRIPT_DIR/data" \
-    "$SCRIPT_DIR/db" \
     "$SCRIPT_DIR/postgres_data" \
     "$SCRIPT_DIR/postgres-data" \
     "$SCRIPT_DIR/postgres" \
+    "$SCRIPT_DIR/data" \
+    "$SCRIPT_DIR/db" \
     "$SCRIPT_DIR/.inspectre" \
     "$SCRIPT_DIR/backend/data" \
     "$SCRIPT_DIR/backend/db" \
-    "$SCRIPT_DIR/backend/postgres-data" \
-    "$SCRIPT_DIR/probe/data" \
-    "$SCRIPT_DIR/frontend/dist"
+    "$SCRIPT_DIR/backend/postgres-data"
 
+  # Python bytecode caches (probe + backend)
+  find "$SCRIPT_DIR/probe"   -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null || true
+  find "$SCRIPT_DIR/probe"   -type f -name "*.pyc"       -delete               2>/dev/null || true
+  find "$SCRIPT_DIR/probe"   -type f -name "*.pyo"       -delete               2>/dev/null || true
+  find "$SCRIPT_DIR/backend" -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null || true
+  find "$SCRIPT_DIR/backend" -type f -name "*.pyc"       -delete               2>/dev/null || true
+  find "$SCRIPT_DIR/backend" -type f -name "*.pyo"       -delete               2>/dev/null || true
+
+  # Python dist/egg-info artefacts
+  find "$SCRIPT_DIR/probe"   -type d \( -name "*.egg-info" -o -name "dist" -o -name "build" \) \
+    -exec rm -rf {} + 2>/dev/null || true
+  find "$SCRIPT_DIR/backend" -type d \( -name "*.egg-info" -o -name "dist" -o -name "build" \) \
+    -exec rm -rf {} + 2>/dev/null || true
+
+  # Frontend build artefacts + dependency cache
+  rm -rf \
+    "$SCRIPT_DIR/frontend/dist" \
+    "$SCRIPT_DIR/frontend/build" \
+    "$SCRIPT_DIR/frontend/.next" \
+    "$SCRIPT_DIR/frontend/.nuxt" \
+    "$SCRIPT_DIR/frontend/node_modules" \
+    "$SCRIPT_DIR/frontend/.vite" \
+    "$SCRIPT_DIR/frontend/.cache"
+
+  # ── 10. Pull latest base images ────────────────────────────────────────────
   _info "Pulling latest base images..."
   _compose pull || true
 
+  # ── 11. Rebuild and start ──────────────────────────────────────────────────
   _info "Rebuilding with no cache..."
   _compose build --no-cache --pull
 
