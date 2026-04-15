@@ -25,7 +25,7 @@ from sqlalchemy.orm import declarative_base, sessionmaker
 # ---------------------------------------------------------------------------
 # Version
 # ---------------------------------------------------------------------------
-VERSION = "0.6.3"
+VERSION = "0.6.4"
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -65,8 +65,8 @@ Base = declarative_base()
 class Device(Base):
     __tablename__ = "devices"
     mac_address  = Column(String,  primary_key=True, index=True)
-    ip_address   = Column(String)   # most-recently-seen IP (may be shim)
-    primary_ip   = Column(String,  nullable=True)  # first/canonical IP — never displaced by shim
+    ip_address   = Column(String)
+    primary_ip   = Column(String,  nullable=True)
     hostname     = Column(String,  nullable=True)
     vendor       = Column(String,  nullable=True)
     custom_name  = Column(String,  nullable=True)
@@ -93,6 +93,11 @@ Session = sessionmaker(bind=engine)
 _sniffer_queue: queue.Queue = queue.Queue()
 _upsert_locks: dict[str, threading.Lock] = {}
 _upsert_locks_lock = threading.Lock()
+
+# Track the last time each MAC was seen by the sniffer within the current sweep
+# window, so we don't falsely increment miss counts for devices the sniffer saw.
+_sniffer_seen_this_interval: set[str] = set()
+_sniffer_seen_lock = threading.Lock()
 
 def _get_mac_lock(mac: str) -> threading.Lock:
     with _upsert_locks_lock:
@@ -126,14 +131,11 @@ def init_db() -> None:
             conn.execute(text("ALTER TABLE devices ADD COLUMN IF NOT EXISTS miss_count INTEGER DEFAULT 0"))
             conn.execute(text("ALTER TABLE devices ADD COLUMN IF NOT EXISTS is_important BOOLEAN NOT NULL DEFAULT FALSE"))
             conn.execute(text("ALTER TABLE devices ALTER COLUMN is_important SET DEFAULT FALSE"))
-            # primary_ip: the first/canonical IP for this MAC — never displaced by a shim/secondary address
             conn.execute(text("ALTER TABLE devices ADD COLUMN IF NOT EXISTS primary_ip VARCHAR"))
-            # Back-fill primary_ip from ip_address for existing rows
             conn.execute(text("""
                 UPDATE devices SET primary_ip = ip_address
                 WHERE primary_ip IS NULL AND ip_address IS NOT NULL
             """))
-            # Phase 3 vuln columns on devices table
             conn.execute(text("ALTER TABLE devices ADD COLUMN IF NOT EXISTS vuln_last_scanned TIMESTAMPTZ"))
             conn.execute(text("ALTER TABLE devices ADD COLUMN IF NOT EXISTS vuln_severity VARCHAR"))
             conn.commit()
@@ -178,7 +180,6 @@ def init_db() -> None:
         conn.execute(text("CREATE INDEX IF NOT EXISTS ix_device_events_created ON device_events(created_at)"))
         conn.commit()
 
-        # Phase 3: vuln_reports table (probe also needs to write vuln results)
         conn.execute(text("""
             CREATE TABLE IF NOT EXISTS vuln_reports (
                 id          SERIAL PRIMARY KEY,
@@ -528,21 +529,18 @@ def upsert_seen_device(mac: str, ip: str, source: str) -> None:
     """
     Insert-or-update a device row.
 
-    primary_ip semantics
-    --------------------
-    The first IP ever seen for a MAC becomes its `primary_ip` and is never
-    replaced by a later, different IP.  This prevents a shim/Docker bridge
-    address (which appears on a different NIC with a different MAC but resolves
-    to the same host) from displacing the real LAN IP.
-
-    `ip_address` continues to hold the most-recently-seen IP for informational
-    purposes and is shown alongside `primary_ip` in ip_history.  All scans
-    (deep scan, vuln scan) target `primary_ip`.
+    Also records the MAC as seen this interval so that update_presence_from_sweep
+    does not falsely increment the miss count for devices the sniffer caught
+    but the ARP sweep missed.
     """
     if not mac or mac == "00:00:00:00:00:00":
         return
     if not _is_valid_ip(ip):
         return
+
+    # Mark this MAC as seen in the current sweep interval regardless of source
+    with _sniffer_seen_lock:
+        _sniffer_seen_this_interval.add(mac)
 
     mac_lock = _get_mac_lock(mac)
     with mac_lock:
@@ -559,13 +557,18 @@ def upsert_seen_device(mac: str, ip: str, source: str) -> None:
                 hostname = resolve_hostname(ip)
                 vendor   = lookup_vendor(mac)
             else:
-                hostname = existing.hostname or resolve_hostname(ip)
+                # FIX: always attempt resolution for existing devices with no hostname.
+                # Previously this path only called resolve_hostname for new devices,
+                # so existing devices were permanently stuck showing the vendor name.
+                if existing.hostname:
+                    hostname = existing.hostname
+                else:
+                    hostname = resolve_hostname(ip)
                 vendor   = existing.vendor
 
             safe_hostname = (hostname or '').replace("'", "''")
 
             if is_new:
-                # Brand-new device: ip_address and primary_ip are both set to ip.
                 stmt = (
                     pg_insert(Device)
                     .values(
@@ -586,7 +589,6 @@ def upsert_seen_device(mac: str, ip: str, source: str) -> None:
                         index_elements=["mac_address"],
                         set_=dict(
                             ip_address = ip,
-                            # primary_ip: set only if not already populated
                             primary_ip = text(
                                 "CASE WHEN devices.primary_ip IS NOT NULL "
                                 "THEN devices.primary_ip ELSE EXCLUDED.primary_ip END"
@@ -602,9 +604,6 @@ def upsert_seen_device(mac: str, ip: str, source: str) -> None:
                     )
                 )
             else:
-                # Existing device: always update last_seen / online status.
-                # ip_address gets the latest seen IP (informational).
-                # primary_ip is NEVER overwritten — it stays as the first IP.
                 stmt = (
                     pg_insert(Device)
                     .values(
@@ -625,7 +624,6 @@ def upsert_seen_device(mac: str, ip: str, source: str) -> None:
                         index_elements=["mac_address"],
                         set_=dict(
                             ip_address = ip,
-                            # primary_ip frozen: keep whatever is already stored
                             primary_ip = text(
                                 "CASE WHEN devices.primary_ip IS NOT NULL "
                                 "THEN devices.primary_ip ELSE EXCLUDED.primary_ip END"
@@ -633,6 +631,7 @@ def upsert_seen_device(mac: str, ip: str, source: str) -> None:
                             is_online  = True,
                             last_seen  = now,
                             miss_count = 0,
+                            # FIX: update hostname if we resolved one and device had none
                             hostname   = text(
                                 "CASE WHEN devices.hostname IS NOT NULL AND devices.hostname != '' "
                                 f"THEN devices.hostname ELSE '{safe_hostname}' END"
@@ -670,15 +669,13 @@ def upsert_seen_device(mac: str, ip: str, source: str) -> None:
 
     is_brand_new_ip = record_ip(mac, ip)
 
-    # Only invalidate the deep scan when the PRIMARY IP changes to something new,
-    # not when we merely observe a secondary/shim address.
     if ip_changed and is_brand_new_ip:
         session2 = Session()
         try:
             dev2 = session2.get(Device, mac)
             if dev2:
                 scan_ip = dev2.primary_ip or ip
-                if ip == scan_ip:  # primary IP genuinely changed
+                if ip == scan_ip:
                     if dev2.deep_scanned:
                         print(f"[~] Primary IP changed {old_ip} -> {ip} for {mac} — invalidating deep scan", flush=True)
                         dev2.deep_scanned = False
@@ -697,6 +694,10 @@ def upsert_seen_device(mac: str, ip: str, source: str) -> None:
 
 
 def refresh_missing_hostnames() -> None:
+    """
+    After each sweep, attempt to resolve hostnames for any online device
+    that still has none.  This is a best-effort background pass.
+    """
     session = Session()
     try:
         unnamed = session.query(Device).filter(
@@ -784,22 +785,37 @@ def start_arp_sniffer() -> None:
 # Presence sweep
 # ---------------------------------------------------------------------------
 def update_presence_from_sweep(session, active_macs: set) -> None:
+    """
+    Mark devices online/offline based on the current ARP sweep results,
+    combined with anything the passive sniffer saw since the last sweep.
+
+    FIX: The previous logic used `last_seen` timestamp as a proxy for sniffer
+    activity, but that was unreliable — last_seen is updated for many reasons.
+    We now use a dedicated `_sniffer_seen_this_interval` set that is populated
+    by upsert_seen_device (for both sweep and sniffer sources) and cleared at
+    the end of each sweep cycle.  A device is considered "seen" this cycle if
+    it appears in either the sweep results OR the sniffer set.
+    """
     now = datetime.now(timezone.utc)
+
+    # Combine sweep results with anything the sniffer caught this cycle
+    with _sniffer_seen_lock:
+        seen_this_cycle = active_macs | _sniffer_seen_this_interval.copy()
+
     for dev in session.query(Device).all():
-        if dev.mac_address in active_macs:
+        if dev.mac_address in seen_this_cycle:
             dev.is_online  = True
             dev.miss_count = 0
         else:
-            if dev.last_seen:
-                seconds_since_seen = (now - dev.last_seen).total_seconds()
-                if seconds_since_seen <= SCAN_INTERVAL:
-                    dev.miss_count = 0
-                    continue
-
+            # Device was not seen at all this cycle — increment miss count
             dev.miss_count = (dev.miss_count or 0) + 1
             if dev.miss_count >= OFFLINE_MISS_THRESHOLD and dev.is_online:
                 dev.is_online = False
-                print(f"[-] Offline: {dev.ip_address} ({dev.mac_address}) after {dev.miss_count} missed sweeps", flush=True)
+                print(
+                    f"[-] Offline: {dev.ip_address} ({dev.mac_address}) "
+                    f"after {dev.miss_count} missed sweeps",
+                    flush=True,
+                )
                 _write_event(dev.mac_address, "offline", {"ip": dev.ip_address})
 
 # ---------------------------------------------------------------------------
@@ -913,15 +929,6 @@ def stream_traceroute(ip: str):
 
 @probe_api.get("/stream/vuln-scan/{ip}")
 async def stream_vuln_scan(ip: str, scripts: str = ""):
-    """
-    SSE endpoint — runs nmap vuln scripts against <ip> (which the probe can
-    reach because it is on the host network) and streams progress lines.
-
-    The final SSE data line is  RESULT:<json>  which the backend picks up,
-    saves to vuln_reports, and forwards on to the browser.
-
-    Query param  ?scripts=  overrides the default script set.
-    """
     import ipaddress
     from vuln_scanner import run_vuln_scan, DEFAULT_VULN_SCRIPTS
 
@@ -985,6 +992,11 @@ def main() -> None:
     threading.Thread(target=start_arp_sniffer, daemon=True, name="arp-sniffer").start()
 
     while True:
+        # Reset the sniffer-seen set at the start of each sweep cycle so that
+        # only activity from THIS interval counts toward online presence.
+        with _sniffer_seen_lock:
+            _sniffer_seen_this_interval.clear()
+
         session = Session()
         try:
             found        = arp_scan(INTERFACE, IP_RANGE)
