@@ -17,7 +17,6 @@ import httpx
 from models import Base, Device, DeviceEvent, FingerprintEntry, Setting, VulnReport
 
 DATABASE_URL = os.environ.get("DATABASE_URL", "postgresql://admin:password123@db:5432/inspectre")
-# PROBE_API_URL is the name used in docker-compose; PROBE_URL is the legacy fallback.
 PROBE_URL    = (
     os.environ.get("PROBE_API_URL")
     or os.environ.get("PROBE_URL")
@@ -37,6 +36,13 @@ def _migrate(db: Session):
         "ALTER TABLE devices ADD COLUMN IF NOT EXISTS notes TEXT",
         "ALTER TABLE devices ADD COLUMN IF NOT EXISTS tags VARCHAR",
         "ALTER TABLE devices ADD COLUMN IF NOT EXISTS location VARCHAR",
+        # primary_ip — canonical first IP, never overwritten by shim/secondary addresses
+        "ALTER TABLE devices ADD COLUMN IF NOT EXISTS primary_ip VARCHAR",
+        # Back-fill primary_ip from ip_address for any existing rows
+        """
+        UPDATE devices SET primary_ip = ip_address
+        WHERE primary_ip IS NULL AND ip_address IS NOT NULL
+        """,
         """
         CREATE TABLE IF NOT EXISTS device_events (
             id SERIAL PRIMARY KEY,
@@ -67,7 +73,6 @@ def _migrate(db: Session):
         "CREATE INDEX IF NOT EXISTS ix_vuln_reports_mac       ON vuln_reports(mac_address)",
         "CREATE INDEX IF NOT EXISTS ix_vuln_reports_scanned   ON vuln_reports(scanned_at)",
         "CREATE INDEX IF NOT EXISTS ix_vuln_reports_severity  ON vuln_reports(severity)",
-        # vuln_last_scanned / vuln_severity columns on devices
         "ALTER TABLE devices ADD COLUMN IF NOT EXISTS vuln_last_scanned TIMESTAMPTZ",
         "ALTER TABLE devices ADD COLUMN IF NOT EXISTS vuln_severity VARCHAR",
     ]
@@ -105,7 +110,7 @@ def _seed_settings(db: Session):
     db.commit()
 
 
-app = FastAPI(title="InSpectre API", version="0.7.1")
+app = FastAPI(title="InSpectre API", version="0.7.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -150,6 +155,10 @@ class MetadataUpdate(BaseModel):
     tags:         Optional[str]  = None
     location:     Optional[str]  = None
     is_important: Optional[bool] = None
+
+
+class SetPrimaryIPRequest(BaseModel):
+    ip: str
 
 
 # ---------------------------------------------------------------------------
@@ -262,7 +271,7 @@ def _infer_device_type(d: Device) -> str | None:
 
 
 # ---------------------------------------------------------------------------
-# _to_dict
+# _to_dict  ← CHANGED: now includes primary_ip
 # ---------------------------------------------------------------------------
 def _to_dict(d: Device) -> dict:
     id_score = _identity_score(d)
@@ -270,6 +279,7 @@ def _to_dict(d: Device) -> dict:
     return {
         "mac_address":          d.mac_address,
         "ip_address":           d.ip_address,
+        "primary_ip":           getattr(d, 'primary_ip', None),   # ← ADDED
         "hostname":             d.hostname,
         "vendor":               d.vendor,
         "vendor_override":      getattr(d, 'vendor_override', None),
@@ -290,7 +300,6 @@ def _to_dict(d: Device) -> dict:
         "identity_reasons":     id_score["reasons"],
         "device_type":          getattr(d, 'device_type_override', None) or inferred,
         "device_type_inferred": inferred,
-        # Phase 3
         "vuln_last_scanned":    getattr(d, 'vuln_last_scanned', None) and d.vuln_last_scanned.isoformat(),
         "vuln_severity":        getattr(d, 'vuln_severity', None),
     }
@@ -372,7 +381,7 @@ def _add_event(db: Session, mac: str, event_type: str, detail: dict = None):
 # ---------------------------------------------------------------------------
 @app.get("/")
 def root():
-    return {"message": "InSpectre API", "version": "0.7.1"}
+    return {"message": "InSpectre API", "version": "0.7.0"}
 
 
 # ---------------------------------------------------------------------------
@@ -465,6 +474,45 @@ def rescan_device(mac: str, db: Session = Depends(get_db)):
     return {"mac": mac, "queued": True}
 
 
+# ---------------------------------------------------------------------------
+# NEW: promote a historical IP to primary_ip
+# ---------------------------------------------------------------------------
+@app.post("/devices/{mac}/set-primary-ip")
+def set_primary_ip(mac: str, payload: SetPrimaryIPRequest, db: Session = Depends(get_db)):
+    """
+    Promotes the given IP address to be the device's primary_ip.
+    The IP must already exist in ip_history for this MAC.
+    Also updates ip_address to match, and invalidates the deep scan so it
+    re-runs against the new primary IP.
+    """
+    d = db.get(Device, mac.lower())
+    if not d:
+        raise HTTPException(404, "Device not found")
+
+    # Verify the IP is in history for this device
+    row = db.execute(
+        text("SELECT ip_address FROM ip_history WHERE mac_address = :mac AND ip_address = :ip"),
+        {"mac": mac.lower(), "ip": payload.ip}
+    ).fetchone()
+    if not row:
+        raise HTTPException(400, f"IP {payload.ip} is not in the history for this device")
+
+    old_primary = d.primary_ip
+    d.primary_ip   = payload.ip
+    d.ip_address   = payload.ip
+    d.deep_scanned = False
+    d.scan_results = None
+    db.commit()
+
+    _add_event(db, mac.lower(), "primary_ip_changed", {
+        "old_primary": old_primary,
+        "new_primary": payload.ip,
+    })
+    db.commit()
+
+    return {"mac": mac.lower(), "primary_ip": payload.ip, "device": _to_dict(d)}
+
+
 @app.get("/devices/{mac}/scan")
 def get_scan_results(mac: str, db: Session = Depends(get_db)):
     d = db.get(Device, mac.lower())
@@ -482,7 +530,17 @@ def get_ip_history(mac: str, db: Session = Depends(get_db)):
             text("SELECT ip_address, first_seen, last_seen FROM ip_history WHERE mac_address = :mac ORDER BY last_seen DESC"),
             {"mac": mac.lower()}
         ).fetchall()
-        return [{"ip": r[0], "first_seen": r[1].isoformat() if r[1] else None, "last_seen": r[2].isoformat() if r[2] else None} for r in rows]
+        d = db.get(Device, mac.lower())
+        primary = getattr(d, 'primary_ip', None) if d else None
+        return [
+            {
+                "ip": r[0],
+                "first_seen": r[1].isoformat() if r[1] else None,
+                "last_seen":  r[2].isoformat() if r[2] else None,
+                "is_primary": r[0] == primary,
+            }
+            for r in rows
+        ]
     except Exception:
         return []
 
@@ -511,7 +569,7 @@ def get_identity_score(mac: str, db: Session = Depends(get_db)):
 
 
 # ---------------------------------------------------------------------------
-# Phase 3 — Vulnerability scanning (proxied through the probe container)
+# Phase 3 — Vulnerability scanning
 # ---------------------------------------------------------------------------
 @app.get("/devices/{mac}/vuln-scan")
 async def stream_vuln_scan(mac: str, db: Session = Depends(get_db)):
@@ -709,7 +767,7 @@ def get_all_events(limit: int = Query(100, ge=1, le=1000), event_type: Optional[
 def get_change_feed(limit: int = Query(100, ge=1, le=500), db: Session = Depends(get_db)):
     CHANGE_TYPES = ["joined", "online", "offline", "ip_change", "scan_complete",
                     "renamed", "tagged", "marked_important", "port_change", "hostname_change",
-                    "vuln_scan_complete"]
+                    "vuln_scan_complete", "primary_ip_changed"]
     try:
         rows = db.execute(text("""
             SELECT de.id, de.mac_address, de.type, de.detail, de.created_at,
@@ -825,6 +883,43 @@ def reset_settings(db: Session = Depends(get_db)):
 
 
 # ---------------------------------------------------------------------------
+# NEW: /settings/apply — push DB settings to the probe's runtime config
+# ---------------------------------------------------------------------------
+@app.post("/settings/apply")
+async def apply_settings(db: Session = Depends(get_db)):
+    """
+    Reads the probe-relevant settings from the DB and POSTs them to the
+    probe's /config/reload endpoint so they take effect immediately without
+    restarting any container.
+    """
+    PROBE_KEYS = {
+        "scan_interval":           "scan_interval",
+        "offline_miss_threshold":  "offline_miss_threshold",
+        "os_confidence_threshold": "os_confidence_threshold",
+        "ip_range":                "ip_range",
+        "nmap_args":               "nmap_args",
+        "sniffer_workers":         "sniffer_workers",
+    }
+    payload = {}
+    for db_key, probe_key in PROBE_KEYS.items():
+        s = db.get(Setting, db_key)
+        if s and s.value:
+            payload[probe_key] = s.value
+
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.post(f"{PROBE_URL}/config/reload", json=payload)
+            resp.raise_for_status()
+            return {"applied": True, "probe_response": resp.json()}
+    except httpx.ConnectError:
+        raise HTTPException(502, f"Cannot reach probe at {PROBE_URL}")
+    except httpx.HTTPStatusError as e:
+        raise HTTPException(502, f"Probe returned error: {e.response.text}")
+    except Exception as e:
+        raise HTTPException(500, f"Unexpected error: {e}")
+
+
+# ---------------------------------------------------------------------------
 # Fingerprints
 # ---------------------------------------------------------------------------
 @app.get("/fingerprints")
@@ -865,12 +960,13 @@ def delete_fingerprint(fid: int, db: Session = Depends(get_db)):
 def export_devices_csv(db: Session = Depends(get_db)):
     buf = io.StringIO()
     writer = csv.writer(buf)
-    writer.writerow(["mac_address", "ip_address", "hostname", "vendor", "vendor_override",
+    writer.writerow(["mac_address", "ip_address", "primary_ip", "hostname", "vendor", "vendor_override",
                      "device_type_override", "custom_name", "is_online", "is_important",
                      "location", "tags", "notes", "first_seen", "last_seen",
                      "vuln_severity", "vuln_last_scanned"])
     for d in db.query(Device).all():
-        writer.writerow([d.mac_address, d.ip_address, d.hostname, d.vendor,
+        writer.writerow([d.mac_address, d.ip_address, getattr(d, 'primary_ip', None),
+                         d.hostname, d.vendor,
                          getattr(d, 'vendor_override', None), getattr(d, 'device_type_override', None),
                          d.custom_name, d.is_online, getattr(d, 'is_important', False),
                          getattr(d, 'location', None), getattr(d, 'tags', None),
@@ -886,15 +982,15 @@ def export_inventory(db: Session = Depends(get_db)):
     devices = db.query(Device).order_by(Device.last_seen.desc()).all()
     buf = io.StringIO()
     w = csv.writer(buf)
-    w.writerow(["MAC", "IP", "Hostname", "Custom Name", "Vendor", "Device Type",
+    w.writerow(["MAC", "IP", "Primary IP", "Hostname", "Custom Name", "Vendor", "Device Type",
                 "Online", "First Seen", "Last Seen", "Deep Scanned",
                 "Important", "Tags", "Location", "Notes", "Identity Score",
                 "Vuln Severity", "Vuln Last Scanned"])
     for d in devices:
         score = _identity_score(d)["score"]
         dtype = getattr(d, 'device_type_override', None) or _infer_device_type(d) or ""
-        w.writerow([d.mac_address, d.ip_address or "", d.hostname or "",
-                    d.custom_name or "", d.vendor or "", dtype,
+        w.writerow([d.mac_address, d.ip_address or "", getattr(d, 'primary_ip', None) or "",
+                    d.hostname or "", d.custom_name or "", d.vendor or "", dtype,
                     d.is_online, d.first_seen, d.last_seen, d.deep_scanned,
                     bool(getattr(d, 'is_important', False)),
                     getattr(d, 'tags', None) or "", getattr(d, 'location', None) or "",
@@ -1008,41 +1104,4 @@ async def import_fingerprints_json(file: UploadFile = File(...), db: Session = D
 # ---------------------------------------------------------------------------
 @app.get("/devices/{mac}/ping")
 async def stream_ping(mac: str, db: Session = Depends(get_db)):
-    d = db.get(Device, mac.lower())
-    if not d:
-        raise HTTPException(404, "Device not found")
-
-    async def _gen():
-        try:
-            async with httpx.AsyncClient(timeout=None) as client:
-                async with client.stream("GET", f"{PROBE_URL}/stream/ping/{d.ip_address}") as resp:
-                    async for line in resp.aiter_lines():
-                        yield f"{line}\n"
-        except httpx.ConnectError:
-            yield f"data: [ERROR] Cannot reach probe at {PROBE_URL}\n\n"
-        except Exception as e:
-            yield f"data: [ERROR] {e}\n\n"
-
-    return StreamingResponse(_gen(), media_type="text/event-stream",
-                             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
-
-
-@app.get("/devices/{mac}/traceroute")
-async def stream_traceroute(mac: str, db: Session = Depends(get_db)):
-    d = db.get(Device, mac.lower())
-    if not d:
-        raise HTTPException(404, "Device not found")
-
-    async def _gen():
-        try:
-            async with httpx.AsyncClient(timeout=None) as client:
-                async with client.stream("GET", f"{PROBE_URL}/stream/traceroute/{d.ip_address}") as resp:
-                    async for line in resp.aiter_lines():
-                        yield f"{line}\n"
-        except httpx.ConnectError:
-            yield f"data: [ERROR] Cannot reach probe at {PROBE_URL}\n\n"
-        except Exception as e:
-            yield f"data: [ERROR] {e}\n\n"
-
-    return StreamingResponse(_gen(), media_type="text/event-stream",
-                             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+    d = db.get(Device, mac.
