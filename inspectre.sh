@@ -94,10 +94,14 @@ cmd_status() {
 cmd_update() {
   _info "Pulling latest changes from git..."
   _check_deps
+
+  # Fetch and hard-reset to origin/main so local files always match remote.
+  # A plain git pull won't overwrite locally modified files, which means Docker
+  # could still build from stale source code.
   git fetch origin
-  git pull --ff-only origin main || {
-    _warn "Fast-forward pull failed — you may have local changes. Skipping git pull."
-  }
+  git reset --hard origin/main
+  _success "Source code reset to origin/main."
+
   _info "Rebuilding and restarting (no cache)..."
   _compose down --remove-orphans
 
@@ -108,9 +112,11 @@ cmd_update() {
     | xargs -r docker rmi -f || true
 
   _info "Clearing build cache..."
-  docker builder prune -af >/dev/null 2>&1 || true
+  docker builder prune -af
 
-  _compose up -d --build --no-cache 2>/dev/null || _compose up -d --build
+  # Do NOT use the "|| fallback" pattern here — if --no-cache fails we want to
+  # know about it, not silently fall back to a cached build with old code.
+  _compose up -d --build --no-cache
   _success "Update complete."
   local port; port=$(_frontend_port)
   _info "Dashboard: http://$(hostname -I | awk '{print $1}'):${port}"
@@ -211,11 +217,11 @@ cmd_rebuild() {
   _compose pull || true
 
   # ── 11. Rebuild and start ──────────────────────────────────────────────────
-  _info "Rebuilding with no cache..."
-  _compose build --no-cache --pull
-
-  _info "Starting fresh stack..."
-  _compose up -d --force-recreate
+  # Use a single 'up --build --no-cache --force-recreate' rather than a separate
+  # 'build' + 'up', so Docker cannot silently reuse a cached image from the
+  # separate build step when bringing containers up.
+  _info "Rebuilding with no cache and starting fresh stack..."
+  _compose up -d --build --no-cache --force-recreate
 
   _success "Rebuild complete."
   local port; port=$(_frontend_port)
