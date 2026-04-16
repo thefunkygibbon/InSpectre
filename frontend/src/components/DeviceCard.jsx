@@ -67,13 +67,9 @@ function cleanVendor(vendor) {
 function deviceDisplayName(device) {
   if (device.custom_name) return device.custom_name
   if (device.hostname)    return device.hostname
-  if (device.ip_address) {
-    const parts = device.ip_address.split('.')
-    if (parts.length === 4) return `Device .${parts[3]}`
-    return device.ip_address
-  }
+  if (device.ip_address)  return device.ip_address
   if (device.mac_address) return device.mac_address.slice(0, 8).toUpperCase()
-  return 'Unknown'
+  return 'Unknown Device'
 }
 
 function openPortCount(device) {
@@ -90,10 +86,8 @@ export function DeviceCard({ device, onClick, onStarToggle }) {
   const ports    = openPortCount(device)
   const scanning = !device.deep_scanned
 
-  // Show vendor as a subtitle only when it adds information beyond what the
-  // display name already tells the user (e.g. don't show vendor if the
-  // hostname already contains it, or if it IS the display name).
-  const showVendorSubtitle = vendor && vendor !== name
+// Show vendor only when it adds info the title doesn't already give
+  const showVendorSubtitle = vendor && vendor !== name && !device.ip_address?.startsWith(name)
 
   return (
     <button
