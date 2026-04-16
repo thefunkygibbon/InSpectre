@@ -139,7 +139,9 @@ class DeviceUpdate(BaseModel):
     custom_name: Optional[str] = None
     hostname:    Optional[str] = None
 
-
+class SettingUpdate(BaseModel):
+    value: str
+    
 class IdentityUpdate(BaseModel):
     vendor_override:      Optional[str] = None
     device_type_override: Optional[str] = None
