@@ -431,7 +431,9 @@ def lookup_vendor(mac: str) -> str:
 # ---------------------------------------------------------------------------
 def arp_scan(interface: str, ip_range: str) -> list[dict]:
     pkt    = Ether(dst="ff:ff:ff:ff:ff:ff") / ARP(pdst=ip_range)
-    result = srp(pkt, iface=interface, timeout=3, verbose=0)[0]
+    # Increased timeout from 3s → 5s and added retry=2 so slow/sleeping
+    # devices (IoT, phones, printers) have more time to respond.
+    result = srp(pkt, iface=interface, timeout=5, retry=2, verbose=0)[0]
     return [{"ip": rcv.psrc, "mac": rcv.hwsrc.lower()} for _, rcv in result]
 
 # ---------------------------------------------------------------------------
