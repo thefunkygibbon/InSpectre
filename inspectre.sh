@@ -116,7 +116,8 @@ cmd_update() {
 
   # Do NOT use the "|| fallback" pattern here — if --no-cache fails we want to
   # know about it, not silently fall back to a cached build with old code.
-  _compose up -d --build --no-cache
+  _compose build --no-cache
+  _compose up -d --force-recreate
   _success "Update complete."
   local port; port=$(_frontend_port)
   _info "Dashboard: http://$(hostname -I | awk '{print $1}'):${port}"
@@ -221,7 +222,8 @@ cmd_rebuild() {
   # 'build' + 'up', so Docker cannot silently reuse a cached image from the
   # separate build step when bringing containers up.
   _info "Rebuilding with no cache and starting fresh stack..."
-  _compose up -d --build --no-cache --force-recreate
+  _compose build --no-cache --pull
+  _compose up -d --force-recreate
 
   _success "Rebuild complete."
   local port; port=$(_frontend_port)
