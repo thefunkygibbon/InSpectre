@@ -291,8 +291,8 @@ def _to_dict(d: Device) -> dict:
         "device_type":          getattr(d, 'device_type_override', None) or inferred,
         "device_type_inferred": inferred,
         # Phase 3
-        "vuln_last_scanned":    getattr(d, 'vuln_last_scanned', None) and d.vuln_last_scanned.isoformat(),
-        "vuln_severity":        getattr(d, 'vuln_severity', None),
+        "vuln_last_scanned": d.vuln_last_scanned.isoformat() if d.vuln_last_scanned else None,
+        "vuln_severity":     d.vuln_severity,
     }
 
 
@@ -802,13 +802,12 @@ def get_settings(db: Session = Depends(get_db)):
     _seed_settings(db)
     return [{"key": s.key, "value": s.value, "description": s.description} for s in db.query(Setting).all()]
 
-
 @app.put("/settings/{key}")
-def update_setting(key: str, payload: dict, db: Session = Depends(get_db)):
+def update_setting(key: str, payload: SettingUpdate, db: Session = Depends(get_db)):
     s = db.get(Setting, key)
     if not s:
         raise HTTPException(404, "Setting not found")
-    s.value = str(payload.get("value", s.value))
+    s.value = payload.value
     db.commit()
     return {"key": key, "value": s.value}
 
