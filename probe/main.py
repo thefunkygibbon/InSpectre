@@ -12,6 +12,7 @@ import nmap
 import requests
 import uvicorn
 from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from scapy.all import ARP, Ether, sniff, srp
@@ -25,7 +26,7 @@ from sqlalchemy.orm import declarative_base, sessionmaker
 # ---------------------------------------------------------------------------
 # Version
 # ---------------------------------------------------------------------------
-VERSION = "0.6.4"
+VERSION = "0.6.5"
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -36,13 +37,69 @@ IP_RANGE                = os.environ.get("IP_RANGE",                "192.168.0.0
 INTERFACE               = os.environ.get("INTERFACE",               "eth0")
 NMAP_ARGS               = os.environ.get("NMAP_ARGS",               "-O --osscan-limit -sV --version-intensity 5 -T4")
 OS_CONFIDENCE_THRESHOLD = int(os.environ.get("OS_CONFIDENCE_THRESHOLD", 85))
-OFFLINE_MISS_THRESHOLD  = int(os.environ.get("OFFLINE_MISS_THRESHOLD",   5))
+OFFLINE_MISS_THRESHOLD  = int(os.environ.get("OFFLINE_MISS_THRESHOLD",   3))
 SNIFFER_WORKERS         = int(os.environ.get("SNIFFER_WORKERS",          4))
 PROBE_API_PORT          = int(os.environ.get("PROBE_API_PORT",         8001))
 LAN_DNS_SERVER_ENV      = os.environ.get("LAN_DNS_SERVER", "").strip()
 
 PING_COUNT    = 10
 TRACE_MAX_HOP = 30
+
+
+def ping_once(ip: str, timeout_s: int = 2) -> bool:
+    if not _is_valid_ip(ip):
+        return False
+    try:
+        result = subprocess.run(
+            ["ping", "-c", "1", "-W", str(timeout_s), ip],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=timeout_s + 1,
+        )
+        return result.returncode == 0
+    except Exception:
+        return False
+
+
+def apply_runtime_config(payload: dict) -> dict:
+    global SCAN_INTERVAL, IP_RANGE, NMAP_ARGS, OS_CONFIDENCE_THRESHOLD, OFFLINE_MISS_THRESHOLD, SNIFFER_WORKERS
+
+    changes = {}
+
+    if "scan_interval" in payload:
+        SCAN_INTERVAL = int(payload["scan_interval"])
+        changes["scan_interval"] = SCAN_INTERVAL
+    if "ip_range" in payload:
+        IP_RANGE = str(payload["ip_range"]).strip()
+        changes["ip_range"] = IP_RANGE
+    if "nmap_args" in payload:
+        NMAP_ARGS = str(payload["nmap_args"]).strip()
+        changes["nmap_args"] = NMAP_ARGS
+    if "os_confidence_threshold" in payload:
+        OS_CONFIDENCE_THRESHOLD = int(payload["os_confidence_threshold"])
+        changes["os_confidence_threshold"] = OS_CONFIDENCE_THRESHOLD
+    if "offline_miss_threshold" in payload:
+        OFFLINE_MISS_THRESHOLD = int(payload["offline_miss_threshold"])
+        changes["offline_miss_threshold"] = OFFLINE_MISS_THRESHOLD
+    if "sniffer_workers" in payload:
+        changes["sniffer_workers"] = {
+            "requested": int(payload["sniffer_workers"]),
+            "applied": SNIFFER_WORKERS,
+            "note": "worker count changes require probe restart",
+        }
+
+    return {
+        "applied": True,
+        "changes": changes,
+        "effective": {
+            "scan_interval": SCAN_INTERVAL,
+            "ip_range": IP_RANGE,
+            "nmap_args": NMAP_ARGS,
+            "os_confidence_threshold": OS_CONFIDENCE_THRESHOLD,
+            "offline_miss_threshold": OFFLINE_MISS_THRESHOLD,
+            "sniffer_workers": SNIFFER_WORKERS,
+        },
+    }
 
 # IPs that should never be stored, resolved, or rescanned
 _INVALID_IPS = {"0.0.0.0", "", "255.255.255.255"}
@@ -559,9 +616,6 @@ def upsert_seen_device(mac: str, ip: str, source: str) -> None:
                 hostname = resolve_hostname(ip)
                 vendor   = lookup_vendor(mac)
             else:
-                # FIX: always attempt resolution for existing devices with no hostname.
-                # Previously this path only called resolve_hostname for new devices,
-                # so existing devices were permanently stuck showing the vendor name.
                 if existing.hostname:
                     hostname = existing.hostname
                 else:
@@ -633,7 +687,6 @@ def upsert_seen_device(mac: str, ip: str, source: str) -> None:
                             is_online  = True,
                             last_seen  = now,
                             miss_count = 0,
-                            # FIX: update hostname if we resolved one and device had none
                             hostname   = text(
                                 "CASE WHEN devices.hostname IS NOT NULL AND devices.hostname != '' "
                                 f"THEN devices.hostname ELSE '{safe_hostname}' END"
@@ -696,10 +749,6 @@ def upsert_seen_device(mac: str, ip: str, source: str) -> None:
 
 
 def refresh_missing_hostnames() -> None:
-    """
-    After each sweep, attempt to resolve hostnames for any online device
-    that still has none.  This is a best-effort background pass.
-    """
     session = Session()
     try:
         unnamed = session.query(Device).filter(
@@ -791,34 +840,43 @@ def update_presence_from_sweep(session, active_macs: set) -> None:
     Mark devices online/offline based on the current ARP sweep results,
     combined with anything the passive sniffer saw since the last sweep.
 
-    FIX: The previous logic used `last_seen` timestamp as a proxy for sniffer
-    activity, but that was unreliable — last_seen is updated for many reasons.
-    We now use a dedicated `_sniffer_seen_this_interval` set that is populated
-    by upsert_seen_device (for both sweep and sniffer sources) and cleared at
-    the end of each sweep cycle.  A device is considered "seen" this cycle if
-    it appears in either the sweep results OR the sniffer set.
+    When a device first hits the offline miss threshold, do a one-shot ICMP
+    confirmation against its current scan IP before marking it offline. This
+    avoids false offline events for devices that go ARP-quiet temporarily.
     """
     now = datetime.now(timezone.utc)
 
-    # Combine sweep results with anything the sniffer caught this cycle
     with _sniffer_seen_lock:
         seen_this_cycle = active_macs | _sniffer_seen_this_interval.copy()
 
     for dev in session.query(Device).all():
         if dev.mac_address in seen_this_cycle:
-            dev.is_online  = True
+            dev.is_online = True
             dev.miss_count = 0
-        else:
-            # Device was not seen at all this cycle — increment miss count
-            dev.miss_count = (dev.miss_count or 0) + 1
-            if dev.miss_count >= OFFLINE_MISS_THRESHOLD and dev.is_online:
-                dev.is_online = False
-                print(
-                    f"[-] Offline: {dev.ip_address} ({dev.mac_address}) "
-                    f"after {dev.miss_count} missed sweeps",
-                    flush=True,
-                )
-                _write_event(dev.mac_address, "offline", {"ip": dev.ip_address})
+            continue
+
+        dev.miss_count = (dev.miss_count or 0) + 1
+
+        if not dev.is_online:
+            continue
+
+        if dev.miss_count < OFFLINE_MISS_THRESHOLD:
+            continue
+
+        confirm_ip = dev.primary_ip or dev.ip_address
+        if confirm_ip and ping_once(confirm_ip, timeout_s=2):
+            dev.is_online = True
+            dev.miss_count = 0
+            print(f"[~] Offline check rescued by ping: {confirm_ip} ({dev.mac_address})", flush=True)
+            continue
+
+        dev.is_online = False
+        print(
+            f"[-] Offline: {confirm_ip or dev.ip_address} ({dev.mac_address}) "
+            f"after {dev.miss_count} missed sweeps + ping confirm",
+            flush=True,
+        )
+        _write_event(dev.mac_address, "offline", {"ip": confirm_ip or dev.ip_address})
 
 # ---------------------------------------------------------------------------
 # Probe HTTP API (port 8001)
@@ -866,7 +924,33 @@ def _stream_subprocess(cmd: list[str]):
 
 @probe_api.get("/health")
 def probe_health():
-    return {"status": "ok", "version": VERSION, "dns_server": _DNS_SERVER}
+    return {
+        "status": "ok",
+        "version": VERSION,
+        "dns_server": _DNS_SERVER,
+        "config": {
+            "scan_interval": SCAN_INTERVAL,
+            "ip_range": IP_RANGE,
+            "nmap_args": NMAP_ARGS,
+            "os_confidence_threshold": OS_CONFIDENCE_THRESHOLD,
+            "offline_miss_threshold": OFFLINE_MISS_THRESHOLD,
+            "sniffer_workers": SNIFFER_WORKERS,
+        },
+    }
+
+
+class ConfigReloadRequest(BaseModel):
+    scan_interval: int | None = None
+    ip_range: str | None = None
+    nmap_args: str | None = None
+    os_confidence_threshold: int | None = None
+    offline_miss_threshold: int | None = None
+    sniffer_workers: int | None = None
+
+
+@probe_api.post("/config/reload")
+def probe_config_reload(payload: ConfigReloadRequest):
+    return apply_runtime_config(payload.model_dump(exclude_none=True))
 
 
 @probe_api.get("/resolve/{ip}")
@@ -994,8 +1078,6 @@ def main() -> None:
     threading.Thread(target=start_arp_sniffer, daemon=True, name="arp-sniffer").start()
 
     while True:
-        # Reset the sniffer-seen set at the start of each sweep cycle so that
-        # only activity from THIS interval counts toward online presence.
         with _sniffer_seen_lock:
             _sniffer_seen_this_interval.clear()
 
