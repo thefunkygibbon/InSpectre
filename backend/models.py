@@ -24,8 +24,12 @@ class Device(Base):
     # Phase 1: user metadata
     is_important         = Column(Boolean, default=False, nullable=False)
     notes                = Column(Text, nullable=True)
-    tags                 = Column(String, nullable=True)   # comma-separated
-    location             = Column(String, nullable=True)   # free-text room/zone
+    tags                 = Column(String, nullable=True)
+    location             = Column(String, nullable=True)
+
+    # Phase 3: vulnerability scanning  ← THESE WERE MISSING
+    vuln_last_scanned    = Column(DateTime(timezone=True), nullable=True)
+    vuln_severity        = Column(String, nullable=True)
 
     ip_history   = relationship("IPHistory",    back_populates="device",
                                 order_by="IPHistory.first_seen.desc()")
@@ -33,8 +37,7 @@ class Device(Base):
                                 order_by="DeviceEvent.created_at.desc()")
     vuln_reports = relationship("VulnReport",   back_populates="device",
                                 order_by="VulnReport.scanned_at.desc()")
-
-
+    
 class IPHistory(Base):
     __tablename__ = "ip_history"
     id          = Column(Integer, primary_key=True, autoincrement=True)
