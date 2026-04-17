@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# InSpectre helper script for managing multiple checkouts and docker stacks. v1
+# InSpectre helper script for managing multiple checkouts and docker stacks. v1.1
 set -Eeuo pipefail
 
 APP_NAME="InSpectre"
