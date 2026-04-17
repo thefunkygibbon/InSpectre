@@ -1,272 +1,247 @@
 #!/usr/bin/env bash
-# =============================================================================
-#  inspectre.sh  —  InSpectre management script
-#
-#  Usage:
-#    ./inspectre.sh start      Build (if needed) and start all containers
-#    ./inspectre.sh stop       Stop and remove containers
-#    ./inspectre.sh restart    Stop then start
-#    ./inspectre.sh rebuild    Full nuclear reset — wipe images/cache/data, rebuild from scratch
-#    ./inspectre.sh update     Pull latest git changes and restart
-#    ./inspectre.sh logs       Tail logs from all containers (Ctrl-C to exit)
-#    ./inspectre.sh status     Show running container status
-# =============================================================================
 set -Eeuo pipefail
 
-PROJECT_NAME="inspectre"
-SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-cd "$SCRIPT_DIR"
+APP_NAME="InSpectre"
 
-# ---------------------------------------------------------------------------
+# ------------------------------------------------------------------
+# Paths
+# ------------------------------------------------------------------
+# Recommended layout:
+#   ~/InSpectre-main   -> stable checkout on main
+#   ~/InSpectre-test   -> test checkout / worktree for test branches
+#
+# You can override any of these with env vars before running the script.
+MAIN_REPO_DIR="${MAIN_REPO_DIR:-$HOME/InSpectre-main}"
+TEST_REPO_DIR="${TEST_REPO_DIR:-$HOME/InSpectre-test}"
+
+# Default branch aliases
+MAIN_BRANCH="${MAIN_BRANCH:-main}"
+TEST_BRANCH="${TEST_BRANCH:-test}"
+
+COMPOSE_BIN="${COMPOSE_BIN:-docker compose}"
+
+# ------------------------------------------------------------------
 # Helpers
-# ---------------------------------------------------------------------------
-_banner()  { echo ""; echo "  ██╗███╗   ██╗███████╗██████╗ ███████╗ ██████╗████████╗██████╗ ███████╗"; \
-                      echo "  ██║████╗  ██║██╔════╝██╔══██╗██╔════╝██╔════╝╚══██╔══╝██╔══██╗██╔════╝"; \
-                      echo "  ██║██╔██╗ ██║███████╗██████╔╝█████╗  ██║        ██║   ██████╔╝█████╗  "; \
-                      echo "  ██║██║╚██╗██║╚════██║██╔═══╝ ██╔══╝  ██║        ██║   ██╔══██╗██╔══╝  "; \
-                      echo "  ██║██║ ╚████║███████║██║     ███████╗╚██████╗   ██║   ██║  ██║███████╗"; \
-                      echo "  ╚═╝╚═╝  ╚═══╝╚══════╝╚═╝     ╚══════╝ ╚═════╝   ╚═╝   ╚═╝  ╚═╝╚══════╝"; \
-                      echo ""; }
-_info()    { echo "[InSpectre] $*"; }
-_success() { echo "[InSpectre] ✓ $*"; }
-_warn()    { echo "[InSpectre] ⚠  $*"; }
-_error()   { echo "[InSpectre] ✗  ERROR: $*" >&2; }
-_die()     { _error "$*"; exit 1; }
+# ------------------------------------------------------------------
+info()  { echo "[$APP_NAME] $*"; }
+warn()  { echo "[$APP_NAME] WARNING: $*" >&2; }
+error() { echo "[$APP_NAME] ERROR: $*" >&2; exit 1; }
 
-_check_deps() {
-  command -v docker >/dev/null 2>&1 || _die "docker is not installed"
-  docker info >/dev/null 2>&1       || _die "docker daemon is not running or not accessible"
-}
+usage() {
+  cat <<'EOF'
+Usage:
+  ./inspectre.sh rebuild main
+  ./inspectre.sh rebuild test
+  ./inspectre.sh rebuild <branch-name>
+  ./inspectre.sh status [main|test|branch-name]
+  ./inspectre.sh logs [main|test|branch-name]
+  ./inspectre.sh branch [main|test|branch-name]
+  ./inspectre.sh pull [main|test|branch-name]
+  ./inspectre.sh help
 
-_compose() {
-  docker compose -p "$PROJECT_NAME" "$@"
-}
+Examples:
+  ./inspectre.sh rebuild main
+  ./inspectre.sh rebuild test
+  ./inspectre.sh rebuild fix/offline-ping
+  ./inspectre.sh logs test
 
-_frontend_port() {
-  # Read the host port for the frontend service from docker-compose.yml
-  grep -A3 'container_name: inspectre-frontend' docker-compose.yml \
-    | grep -oP '"\K[0-9]+(?=:80")' | head -1 || echo "3000"
-}
-
-# ---------------------------------------------------------------------------
-# Commands
-# ---------------------------------------------------------------------------
-cmd_start() {
-  _info "Starting InSpectre..."
-  _check_deps
-  _compose up -d --build
-  _success "All containers started."
-  local port; port=$(_frontend_port)
-  _info "Dashboard: http://$(hostname -I | awk '{print $1}'):${port}"
-  _info "API:       http://$(hostname -I | awk '{print $1}'):8000"
-  echo ""
-  _compose ps
-}
-
-cmd_stop() {
-  _info "Stopping InSpectre..."
-  _check_deps
-  _compose down --remove-orphans
-  _success "All containers stopped."
-}
-
-cmd_restart() {
-  _info "Restarting InSpectre..."
-  _check_deps
-  _compose down --remove-orphans
-  _compose up -d --build
-  _success "All containers restarted."
-  local port; port=$(_frontend_port)
-  _info "Dashboard: http://$(hostname -I | awk '{print $1}'):${port}"
-}
-
-cmd_logs() {
-  _check_deps
-  _info "Tailing logs (Ctrl-C to stop)..."
-  _compose logs -f --tail=100
-}
-
-cmd_status() {
-  _check_deps
-  _compose ps
-}
-
-cmd_update() {
-  _info "Pulling latest changes from git..."
-  _check_deps
-
-  # Fetch and hard-reset to origin/main so local files always match remote.
-  # A plain git pull won't overwrite locally modified files, which means Docker
-  # could still build from stale source code.
-  git fetch origin
-  git reset --hard origin/main
-  _success "Source code reset to origin/main."
-
-  _info "Rebuilding and restarting (no cache)..."
-  _compose down --remove-orphans
-
-  _info "Removing InSpectre images so layers are not reused..."
-  docker images --format '{{.Repository}}:{{.Tag}} {{.ID}}' \
-    | awk '/inspectre|InSpectre/ {print $2}' \
-    | sort -u \
-    | xargs -r docker rmi -f || true
-
-  _info "Clearing build cache..."
-  docker builder prune -af
-
-  # Do NOT use the "|| fallback" pattern here — if --no-cache fails we want to
-  # know about it, not silently fall back to a cached build with old code.
-  _compose build --no-cache
-  _compose up -d --force-recreate
-  _success "Update complete."
-  local port; port=$(_frontend_port)
-  _info "Dashboard: http://$(hostname -I | awk '{print $1}'):${port}"
-  echo ""
-  _compose ps
-}
-
-cmd_rebuild() {
-  _info "Starting full rebuild (this will wipe all containers, images, cache, and data)..."
-  _check_deps
-
-  local confirm
-  read -rp "[InSpectre] Are you sure? This deletes the database and all scan history. [y/N] " confirm
-  [[ "${confirm,,}" == "y" ]] || { _info "Aborted."; exit 0; }
-
-  # ── 1. Pull latest code first ──────────────────────────────────────────────
-  _info "Pulling latest code from git..."
-  git fetch origin
-  git pull --ff-only origin main || {
-    _warn "Fast-forward pull failed — you may have local changes. Continuing with current code."
-  }
-
-  # ── 2. Tear down compose stack (removes named volumes too) ─────────────────
-  _info "Stopping and removing compose stack..."
-  _compose down --remove-orphans --volumes || true
-
-  # ── 3. Remove any leftover containers ──────────────────────────────────────
-  _info "Removing any leftover containers..."
-  docker ps -aq --filter "label=com.docker.compose.project=$PROJECT_NAME" \
-    | xargs -r docker rm -f || true
-
-  # ── 4. Remove any leftover networks ────────────────────────────────────────
-  _info "Removing any leftover networks..."
-  docker network ls -q --filter "label=com.docker.compose.project=$PROJECT_NAME" \
-    | xargs -r docker network rm || true
-
-  # ── 5. Remove any leftover named volumes ───────────────────────────────────
-  _info "Removing any leftover named volumes..."
-  docker volume ls -q --filter "label=com.docker.compose.project=$PROJECT_NAME" \
-    | xargs -r docker volume rm -f || true
-
-  # ── 6. Remove InSpectre images ─────────────────────────────────────────────
-  _info "Removing InSpectre images..."
-  docker images --format '{{.Repository}}:{{.Tag}} {{.ID}}' \
-    | awk '/inspectre|InSpectre/ {print $2}' \
-    | sort -u \
-    | xargs -r docker rmi -f || true
-
-  # ── 7. Prune dangling images left behind ───────────────────────────────────
-  _info "Pruning dangling images..."
-  docker image prune -f >/dev/null 2>&1 || true
-
-  # ── 8. Clear all build cache ───────────────────────────────────────────────
-  _info "Clearing build cache..."
-  docker builder prune -af >/dev/null 2>&1 || true
-
-  # ── 9. Wipe local data / bind-mount directories ────────────────────────────
-  _info "Removing local data folders (postgres bind-mount, caches, build artefacts)..."
-
-  # postgres bind-mount (as defined in docker-compose.yml)
-  rm -rf \
-    "$SCRIPT_DIR/postgres_data" \
-    "$SCRIPT_DIR/postgres-data" \
-    "$SCRIPT_DIR/postgres" \
-    "$SCRIPT_DIR/data" \
-    "$SCRIPT_DIR/db" \
-    "$SCRIPT_DIR/.inspectre" \
-    "$SCRIPT_DIR/backend/data" \
-    "$SCRIPT_DIR/backend/db" \
-    "$SCRIPT_DIR/backend/postgres-data"
-
-  # Python bytecode caches (probe + backend)
-  find "$SCRIPT_DIR/probe"   -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null || true
-  find "$SCRIPT_DIR/probe"   -type f -name "*.pyc"       -delete               2>/dev/null || true
-  find "$SCRIPT_DIR/probe"   -type f -name "*.pyo"       -delete               2>/dev/null || true
-  find "$SCRIPT_DIR/backend" -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null || true
-  find "$SCRIPT_DIR/backend" -type f -name "*.pyc"       -delete               2>/dev/null || true
-  find "$SCRIPT_DIR/backend" -type f -name "*.pyo"       -delete               2>/dev/null || true
-
-  # Python dist/egg-info artefacts
-  find "$SCRIPT_DIR/probe"   -type d \( -name "*.egg-info" -o -name "dist" -o -name "build" \) \
-    -exec rm -rf {} + 2>/dev/null || true
-  find "$SCRIPT_DIR/backend" -type d \( -name "*.egg-info" -o -name "dist" -o -name "build" \) \
-    -exec rm -rf {} + 2>/dev/null || true
-
-  # Frontend build artefacts + dependency cache
-  rm -rf \
-    "$SCRIPT_DIR/frontend/dist" \
-    "$SCRIPT_DIR/frontend/build" \
-    "$SCRIPT_DIR/frontend/.next" \
-    "$SCRIPT_DIR/frontend/.nuxt" \
-    "$SCRIPT_DIR/frontend/node_modules" \
-    "$SCRIPT_DIR/frontend/.vite" \
-    "$SCRIPT_DIR/frontend/.cache"
-
-  # ── 10. Pull latest base images ────────────────────────────────────────────
-  _info "Pulling latest base images..."
-  _compose pull || true
-
-  # ── 11. Rebuild and start ──────────────────────────────────────────────────
-  # Use a single 'up --build --no-cache --force-recreate' rather than a separate
-  # 'build' + 'up', so Docker cannot silently reuse a cached image from the
-  # separate build step when bringing containers up.
-  _info "Rebuilding with no cache and starting fresh stack..."
-  _compose build --no-cache --pull
-  _compose up -d --force-recreate
-
-  _success "Rebuild complete."
-  local port; port=$(_frontend_port)
-  _info "Dashboard: http://$(hostname -I | awk '{print $1}'):${port}"
-  echo ""
-  _compose ps
-}
-
-cmd_help() {
-  _banner
-  cat <<EOF
-  Usage: ./inspectre.sh <command>
-
-  Commands:
-    start     Build (if needed) and start all containers
-    stop      Stop and remove containers
-    restart   Stop then start
-    rebuild   Full wipe and rebuild from scratch (destructive — prompts for confirmation)
-    update    Pull latest git changes and restart
-    logs      Tail logs from all containers (Ctrl-C to exit)
-    status    Show running container status
-    help      Show this help message
-
+Notes:
+- "main" uses MAIN_REPO_DIR and MAIN_BRANCH.
+- "test" uses TEST_REPO_DIR and TEST_BRANCH.
+- Any other branch name uses TEST_REPO_DIR by default.
+- rebuild is destructive to the selected working tree:
+  it does git reset --hard origin/<branch> and git clean -fd
 EOF
+  exit 1
 }
 
-# ---------------------------------------------------------------------------
-# Entry point
-# ---------------------------------------------------------------------------
-COMMAND="${1:-help}"
+require_repo() {
+  local repo_dir="$1"
+  [ -d "$repo_dir/.git" ] || error "Git repo not found at $repo_dir"
+}
 
-case "$COMMAND" in
-  start)   cmd_start   ;;
-  stop)    cmd_stop    ;;
-  restart) cmd_restart ;;
-  rebuild) cmd_rebuild ;;
-  update)  cmd_update  ;;
-  logs)    cmd_logs    ;;
-  status)  cmd_status  ;;
-  help|--help|-h) cmd_help ;;
+resolve_target() {
+  local target="${1:-main}"
+
+  case "$target" in
+    main)
+      RESOLVED_REPO_DIR="$MAIN_REPO_DIR"
+      RESOLVED_BRANCH="$MAIN_BRANCH"
+      ;;
+    test)
+      RESOLVED_REPO_DIR="$TEST_REPO_DIR"
+      RESOLVED_BRANCH="$TEST_BRANCH"
+      ;;
+    *)
+      RESOLVED_REPO_DIR="$TEST_REPO_DIR"
+      RESOLVED_BRANCH="$target"
+      ;;
+  esac
+}
+
+run_compose() {
+  local repo_dir="$1"
+  shift
+  (cd "$repo_dir" && $COMPOSE_BIN "$@")
+}
+
+confirm_destructive() {
+  local repo_dir="$1"
+  local branch="$2"
+
+  info "About to fully reset repo:"
+  info "  Repo:   $repo_dir"
+  info "  Branch: $branch"
+  info "This will discard ALL local changes in that working tree."
+  read -r -p "Continue? [y/N]: " reply
+  case "$reply" in
+    y|Y|yes|YES) ;;
+    *) error "Cancelled." ;;
+  esac
+}
+
+ensure_local_branch_tracks_remote() {
+  local repo_dir="$1"
+  local branch="$2"
+
+  cd "$repo_dir"
+
+  info "Fetching latest refs from origin..."
+  git fetch origin --prune
+
+  if git show-ref --verify --quiet "refs/remotes/origin/$branch"; then
+    if git show-ref --verify --quiet "refs/heads/$branch"; then
+      info "Checking out existing local branch: $branch"
+      git checkout "$branch"
+    else
+      info "Creating local branch $branch tracking origin/$branch"
+      git checkout -b "$branch" "origin/$branch"
+    fi
+  else
+    error "Remote branch origin/$branch does not exist."
+  fi
+}
+
+hard_sync_branch() {
+  local repo_dir="$1"
+  local branch="$2"
+
+  require_repo "$repo_dir"
+  ensure_local_branch_tracks_remote "$repo_dir" "$branch"
+
+  cd "$repo_dir"
+
+  info "Resetting working tree to origin/$branch"
+  git reset --hard "origin/$branch"
+  git clean -fd
+
+  info "Now on branch: $(git branch --show-current)"
+  info "Commit: $(git rev-parse --short HEAD)"
+}
+
+pull_branch_only() {
+  local repo_dir="$1"
+  local branch="$2"
+
+  require_repo "$repo_dir"
+  ensure_local_branch_tracks_remote "$repo_dir" "$branch"
+
+  cd "$repo_dir"
+
+  info "Hard syncing from GitHub..."
+  git reset --hard "origin/$branch"
+  git clean -fd
+
+  info "Repo updated to:"
+  info "  Branch: $(git branch --show-current)"
+  info "  Commit: $(git rev-parse --short HEAD)"
+}
+
+docker_rebuild_stack() {
+  local repo_dir="$1"
+
+  require_repo "$repo_dir"
+
+  info "Stopping containers and removing orphans..."
+  run_compose "$repo_dir" down --remove-orphans || true
+
+  info "Building fresh images with no cache..."
+  run_compose "$repo_dir" build --no-cache
+
+  info "Starting fresh stack..."
+  run_compose "$repo_dir" up -d --force-recreate
+
+  info "Stack status:"
+  run_compose "$repo_dir" ps
+}
+
+show_status() {
+  local repo_dir="$1"
+
+  require_repo "$repo_dir"
+  cd "$repo_dir"
+
+  info "Repo:   $repo_dir"
+  info "Branch: $(git branch --show-current)"
+  info "Commit: $(git rev-parse --short HEAD)"
+  info "Remote: $(git remote get-url origin)"
+  echo
+  run_compose "$repo_dir" ps || true
+}
+
+show_logs() {
+  local repo_dir="$1"
+
+  require_repo "$repo_dir"
+  info "Streaming docker logs from $repo_dir"
+  run_compose "$repo_dir" logs -f
+}
+
+show_branch() {
+  local repo_dir="$1"
+
+  require_repo "$repo_dir"
+  cd "$repo_dir"
+
+  echo "Repo:   $repo_dir"
+  echo "Branch: $(git branch --show-current)"
+  echo "Commit: $(git rev-parse --short HEAD)"
+}
+
+# ------------------------------------------------------------------
+# Main
+# ------------------------------------------------------------------
+ACTION="${1:-help}"
+TARGET="${2:-main}"
+
+case "$ACTION" in
+  rebuild)
+    resolve_target "$TARGET"
+    confirm_destructive "$RESOLVED_REPO_DIR" "$RESOLVED_BRANCH"
+    hard_sync_branch "$RESOLVED_REPO_DIR" "$RESOLVED_BRANCH"
+    docker_rebuild_stack "$RESOLVED_REPO_DIR"
+    ;;
+  pull)
+    resolve_target "$TARGET"
+    confirm_destructive "$RESOLVED_REPO_DIR" "$RESOLVED_BRANCH"
+    pull_branch_only "$RESOLVED_REPO_DIR" "$RESOLVED_BRANCH"
+    ;;
+  status)
+    resolve_target "$TARGET"
+    show_status "$RESOLVED_REPO_DIR"
+    ;;
+  logs)
+    resolve_target "$TARGET"
+    show_logs "$RESOLVED_REPO_DIR"
+    ;;
+  branch)
+    resolve_target "$TARGET"
+    show_branch "$RESOLVED_REPO_DIR"
+    ;;
+  help|-h|--help)
+    usage
+    ;;
   *)
-    _error "Unknown command: '$COMMAND'"
-    cmd_help
-    exit 1
+    usage
     ;;
 esac
