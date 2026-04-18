@@ -2,7 +2,7 @@
 
 InSpectre already has a solid foundation across probe, backend, and frontend components, with support for device discovery, metadata, event history, IP history, alert records, vulnerability reporting, fingerprinting, and user-maintained device context. This roadmap breaks the next stage of work into smaller batches so features can be delivered incrementally without losing product direction.
 
-## Now
+## Upcoming
 
 ### Alert delivery
 Add outbound notification delivery for important alert types including new devices, devices going offline, devices returning online, IP changes, and vulnerability findings. The existing `Alert` model already provides the event foundation, so this phase should focus on dispatch integrations such as webhooks, ntfy, Gotify, Pushover, or email targets.
