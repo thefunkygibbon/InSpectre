@@ -18,7 +18,7 @@ import { SettingsPanel }    from './components/SettingsPanel'
 import { CategoryView }     from './components/CategoryView'
 import { SmartFilterBar }   from './components/SmartFilterBar'
 
-const APP_VERSION = '0.7.0'
+const APP_VERSION = '1.0.0'
 
 const SORT_OPTIONS = [
   { value: 'last_seen_desc', label: 'Last seen (newest)' },

@@ -83,6 +83,10 @@ export const api = {
   streamPing:       (mac, signal) => streamSSE(`/devices/${mac}/ping`,       (l) => l, signal),
   streamTraceroute: (mac, signal) => streamSSE(`/devices/${mac}/traceroute`, (l) => l, signal),
 
+  // Phase 4 — ARP block
+  blockDevice:   (mac) => request('POST', `/devices/${mac}/block`),
+  unblockDevice: (mac) => request('POST', `/devices/${mac}/unblock`),
+
   // Phase 3 — Vuln scanning
   getVulnReports:       (mac, limit) => request('GET',    `/devices/${mac}/vuln-reports${limit ? `?limit=${limit}` : ''}`),
   getVulnReportDetail:  (mac, id)    => request('GET',    `/devices/${mac}/vuln-reports/${id}`),

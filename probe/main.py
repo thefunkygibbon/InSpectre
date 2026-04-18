@@ -15,7 +15,7 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
-from scapy.all import ARP, Ether, sniff, srp
+from scapy.all import ARP, Ether, sniff, srp, sendp
 from sqlalchemy import (
     Boolean, Column, DateTime, Integer, JSON, String, UniqueConstraint,
     cast, create_engine, text,
@@ -26,7 +26,7 @@ from sqlalchemy.orm import declarative_base, sessionmaker
 # ---------------------------------------------------------------------------
 # Version
 # ---------------------------------------------------------------------------
-VERSION = "0.6.5"
+VERSION = "1.0.0"
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -917,6 +917,146 @@ def update_presence_from_sweep(session, active_macs: set) -> None:
         _write_event(dev.mac_address, "offline", {"ip": confirm_ip or dev.ip_address})
 
 # ---------------------------------------------------------------------------
+# ARP blocking (internet cut-off via ARP spoofing)
+# ---------------------------------------------------------------------------
+_blocked_devices: dict[str, dict] = {}
+_blocked_lock = threading.Lock()
+
+
+def _get_mac_for_ip(ip: str) -> str | None:
+    """Send a unicast ARP request and return the MAC, or None if unreachable."""
+    try:
+        pkt = Ether(dst="ff:ff:ff:ff:ff:ff") / ARP(pdst=ip)
+        result = srp(pkt, iface=INTERFACE, timeout=3, retry=1, verbose=0)[0]
+        if result:
+            return result[0][1].hwsrc.lower()
+    except Exception as e:
+        print(f"[block] MAC lookup failed for {ip}: {e}", flush=True)
+    return None
+
+
+def _block_table_id(target_ip: str) -> int:
+    import ipaddress
+    return 10000 + (int(ipaddress.ip_address(target_ip)) % 50000)
+
+
+def _ip_rule_block(target_ip: str) -> None:
+    """
+    Policy-routing blackhole: packets forwarded from target_ip are sent to a
+    dedicated routing table that has only a blackhole default route.
+    Works with iproute2 alone — no iptables required.
+    """
+    table = _block_table_id(target_ip)
+    steps = [
+        ["ip", "route", "replace", "blackhole", "default", "table", str(table)],
+        ["ip", "rule",  "add", "from", target_ip, "table", str(table), "priority", "100"],
+    ]
+    for cmd in steps:
+        try:
+            r = subprocess.run(cmd, capture_output=True, timeout=5)
+            print(f"[block] {' '.join(cmd)}: {'OK' if r.returncode == 0 else r.stderr.decode().strip()}", flush=True)
+        except Exception as e:
+            print(f"[block] ip rule error: {e}", flush=True)
+
+
+def _ip_rule_unblock(target_ip: str) -> None:
+    table = _block_table_id(target_ip)
+    for cmd in [
+        ["ip", "rule",  "del", "from", target_ip, "table", str(table), "priority", "100"],
+        ["ip", "route", "del", "blackhole", "default", "table", str(table)],
+    ]:
+        try:
+            subprocess.run(cmd, capture_output=True, timeout=5)
+        except Exception:
+            pass
+
+
+def _iptables(action: str, target_ip: str) -> None:
+    """
+    iptables FORWARD DROP as defence-in-depth alongside the ip-rule blackhole.
+    Uses -I (insert at top) to block, -D to remove.  -D errors are silenced
+    because the rule may already be gone after a container restart.
+    """
+    for direction in ["-s", "-d"]:
+        cmd = ["iptables", action, "FORWARD", direction, target_ip, "-j", "DROP"]
+        try:
+            r = subprocess.run(cmd, capture_output=True, timeout=5)
+            if r.returncode == 0:
+                print(f"[block] {' '.join(cmd)}: OK", flush=True)
+            elif action != "-D":
+                print(f"[block] {' '.join(cmd)}: {r.stderr.decode().strip()}", flush=True)
+        except FileNotFoundError:
+            if action == "-I":
+                print("[block] iptables not found — skipping (ip rule is primary)", flush=True)
+        except Exception as e:
+            if action == "-I":
+                print(f"[block] iptables error: {e}", flush=True)
+
+
+def _arp_spoof_loop(
+    target_ip: str, target_mac: str,
+    gateway_ip: str, gateway_mac: str,
+    iface: str, stop_event: threading.Event,
+) -> None:
+    """
+    Blocks internet access for target_ip using two complementary mechanisms:
+    1. ARP spoofing — continuously tells both the target and the gateway that
+       the other party lives at the probe's MAC, so all traffic is redirected
+       through this host.
+    2. iptables FORWARD DROP — since Docker hosts have IP forwarding enabled,
+       the redirected packets would otherwise be forwarded to the real gateway.
+       The iptables rules ensure they are dropped instead.
+    Both are reversed cleanly when the stop_event is set.
+    """
+    print(
+        f"[block] Starting block: {target_ip} ({target_mac}), "
+        f"gateway {gateway_ip} ({gateway_mac})",
+        flush=True,
+    )
+
+    # Install drop rules before spoofing starts so no packets slip through
+    _ip_rule_block(target_ip)
+    _iptables("-I", target_ip)
+
+    # Poison packets (hwsrc left unset → Scapy uses the interface's own MAC)
+    poison_target = Ether(dst=target_mac) / ARP(
+        op=2, pdst=target_ip, hwdst=target_mac, psrc=gateway_ip,
+    )
+    poison_gateway = Ether(dst=gateway_mac) / ARP(
+        op=2, pdst=gateway_ip, hwdst=gateway_mac, psrc=target_ip,
+    )
+
+    while not stop_event.is_set():
+        try:
+            sendp(poison_target,  iface=iface, verbose=0)
+            sendp(poison_gateway, iface=iface, verbose=0)
+        except Exception as e:
+            print(f"[block] send error: {e}", flush=True)
+        stop_event.wait(timeout=2)
+
+    # Remove drop rules before restoring ARP so connectivity comes back cleanly
+    _ip_rule_unblock(target_ip)
+    _iptables("-D", target_ip)
+
+    # Restore correct ARP entries so both devices update their caches
+    print(f"[block] Restoring ARP for {target_ip}", flush=True)
+    restore_target = Ether(dst=target_mac) / ARP(
+        op=2, pdst=target_ip, hwdst=target_mac, psrc=gateway_ip, hwsrc=gateway_mac,
+    )
+    restore_gateway = Ether(dst=gateway_mac) / ARP(
+        op=2, pdst=gateway_ip, hwdst=gateway_mac, psrc=target_ip, hwsrc=target_mac,
+    )
+    for _ in range(5):
+        try:
+            sendp(restore_target,  iface=iface, verbose=0)
+            sendp(restore_gateway, iface=iface, verbose=0)
+        except Exception:
+            pass
+        time.sleep(0.5)
+    print(f"[block] Block lifted for {target_ip}", flush=True)
+
+
+# ---------------------------------------------------------------------------
 # Probe HTTP API (port 8001)
 # ---------------------------------------------------------------------------
 probe_api = FastAPI(
@@ -1076,6 +1216,77 @@ async def stream_vuln_scan(ip: str, scripts: str = ""):
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
+
+
+@probe_api.post("/block/{mac}")
+def probe_block_device(mac: str):
+    mac = mac.lower()
+    session = Session()
+    try:
+        device = session.get(Device, mac)
+        if not device:
+            raise HTTPException(404, "Device not found")
+        target_ip = device.primary_ip or device.ip_address
+        if not target_ip or not _is_valid_ip(target_ip):
+            raise HTTPException(422, "Device has no valid IP address")
+        target_mac = mac
+    finally:
+        session.close()
+
+    with _blocked_lock:
+        if mac in _blocked_devices:
+            return {"ok": True, "already_blocked": True, "target_ip": target_ip}
+
+    gateway_ip = _get_default_gateway()
+    if not gateway_ip:
+        raise HTTPException(500, "Could not detect default gateway")
+
+    gateway_mac = _get_mac_for_ip(gateway_ip)
+    if not gateway_mac:
+        raise HTTPException(500, f"Could not resolve gateway MAC for {gateway_ip}")
+
+    stop_event = threading.Event()
+    t = threading.Thread(
+        target=_arp_spoof_loop,
+        args=(target_ip, target_mac, gateway_ip, gateway_mac, INTERFACE, stop_event),
+        daemon=True,
+        name=f"arp-block-{mac}",
+    )
+
+    with _blocked_lock:
+        _blocked_devices[mac] = {
+            "target_ip":   target_ip,
+            "target_mac":  target_mac,
+            "gateway_ip":  gateway_ip,
+            "gateway_mac": gateway_mac,
+            "stop_event":  stop_event,
+            "thread":      t,
+        }
+
+    t.start()
+    return {"ok": True, "blocked": True, "target_ip": target_ip, "gateway_ip": gateway_ip}
+
+
+@probe_api.delete("/block/{mac}")
+def probe_unblock_device(mac: str):
+    mac = mac.lower()
+    with _blocked_lock:
+        entry = _blocked_devices.pop(mac, None)
+    if not entry:
+        return {"ok": True, "was_blocked": False}
+    entry["stop_event"].set()
+    return {"ok": True, "was_blocked": True}
+
+
+@probe_api.get("/blocked")
+def probe_list_blocked():
+    with _blocked_lock:
+        return {
+            "blocked": [
+                {"mac": m, "target_ip": e["target_ip"], "gateway_ip": e["gateway_ip"]}
+                for m, e in _blocked_devices.items()
+            ]
+        }
 
 
 def start_probe_api() -> None:

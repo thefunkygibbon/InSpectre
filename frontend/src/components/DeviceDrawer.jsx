@@ -186,6 +186,7 @@ export function DeviceDrawer({ device, onClose, onRename, onResolveName, onRefre
   const [activeAction, setActiveAction] = useState(null)  // 'ping' | 'traceroute' | 'rescan'
   const [staticLines,  setStaticLines]  = useState([])
   const [activeTab,    setActiveTab]    = useState('overview')
+  const [blocking,     setBlocking]     = useState(false)
 
   useEffect(() => { setLocalDevice(device) }, [device])
 
@@ -225,6 +226,29 @@ export function DeviceDrawer({ device, onClose, onRename, onResolveName, onRefre
     if (activeAction === 'traceroute' && stream.running) { stream.stop(); return }
     setActiveAction('traceroute'); setStaticLines([])
     stream.start(`/devices/${mac}/traceroute`)
+  }
+
+  async function handleBlockToggle() {
+    setBlocking(true)
+    setActiveAction('block')
+    setStaticLines([])
+    try {
+      const action = localDevice.is_blocked ? 'unblock' : 'block'
+      const updated = localDevice.is_blocked
+        ? await api.unblockDevice(mac)
+        : await api.blockDevice(mac)
+      setLocalDevice(updated)
+      if (onRefresh) onRefresh()
+      setStaticLines([
+        action === 'block'
+          ? `[OK] Device ${updated.ip_address} is now blocked from the internet via ARP spoofing.`
+          : `[OK] Device ${updated.ip_address} has been unblocked — internet access restored.`,
+      ])
+    } catch (e) {
+      setStaticLines([`[ERROR] ${e.message}`])
+    } finally {
+      setBlocking(false)
+    }
   }
 
   async function handleStarClick(mac, value) {
@@ -314,6 +338,11 @@ export function DeviceDrawer({ device, onClose, onRename, onResolveName, onRefre
                     <ShieldAlert size={11} />{vulnSev.charAt(0).toUpperCase() + vulnSev.slice(1)} vuln
                   </span>
                 )}
+                {localDevice.is_blocked && (
+                  <span className="badge-online" style={{ background: 'rgba(239,68,68,0.15)', color: '#f87171', border: '1px solid rgba(239,68,68,0.4)' }}>
+                    <Ban size={11} />Blocked
+                  </span>
+                )}
               </div>
 
               {/* Actions */}
@@ -329,13 +358,20 @@ export function DeviceDrawer({ device, onClose, onRename, onResolveName, onRefre
                   <ActionBtn icon={ShieldAlert} label="Vuln scan"     active={activeTab   === 'vulns'}
                     onClick={() => setActiveTab('vulns')} />
                 </div>
-                <button disabled
-                  className="mt-2 w-full flex items-center justify-center gap-2 py-2 rounded-lg
-                             border border-dashed border-border text-xs text-text-faint
-                             cursor-not-allowed opacity-60">
-                  <Ban size={12} />
-                  Block internet access
-                  <span className="ml-auto text-[10px] bg-surface-offset px-1.5 py-0.5 rounded">Phase 4</span>
+                <button
+                  onClick={handleBlockToggle}
+                  disabled={blocking}
+                  className={`mt-2 w-full flex items-center justify-center gap-2 py-2 rounded-lg
+                             border text-xs font-medium transition-colors duration-150
+                             ${localDevice.is_blocked
+                               ? 'border-red-500/60 bg-red-500/15 text-red-400 hover:bg-red-500/25'
+                               : 'border-orange-500/40 bg-orange-500/10 text-orange-400 hover:bg-orange-500/20'
+                             }
+                             ${blocking ? 'opacity-60 cursor-wait' : ''}`}>
+                  <Ban size={12} className={blocking ? 'animate-pulse' : ''} />
+                  {blocking
+                    ? (localDevice.is_blocked ? 'Unblocking…' : 'Blocking…')
+                    : (localDevice.is_blocked ? 'Unblock device' : 'Block internet access')}
                 </button>
                 {/* Structured stream output */}
                 <StreamOutput

@@ -70,6 +70,8 @@ def _migrate(db: Session):
         # vuln_last_scanned / vuln_severity columns on devices
         "ALTER TABLE devices ADD COLUMN IF NOT EXISTS vuln_last_scanned TIMESTAMPTZ",
         "ALTER TABLE devices ADD COLUMN IF NOT EXISTS vuln_severity VARCHAR",
+        "ALTER TABLE devices ADD COLUMN IF NOT EXISTS is_blocked BOOLEAN NOT NULL DEFAULT FALSE",
+        "ALTER TABLE devices ALTER COLUMN is_blocked SET DEFAULT FALSE",
     ]
     for sql in migrations:
         try:
@@ -105,7 +107,7 @@ def _seed_settings(db: Session):
     db.commit()
 
 
-app = FastAPI(title="InSpectre API", version="0.7.2")
+app = FastAPI(title="InSpectre API", version="1.0.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -299,6 +301,7 @@ def _to_dict(d: Device) -> dict:
         "device_type_inferred": inferred,
         "vuln_last_scanned": d.vuln_last_scanned.isoformat() if d.vuln_last_scanned else None,
         "vuln_severity":     d.vuln_severity,
+        "is_blocked":        bool(getattr(d, 'is_blocked', False)),
     }
 
 
@@ -378,7 +381,7 @@ def _add_event(db: Session, mac: str, event_type: str, detail: dict = None):
 # ---------------------------------------------------------------------------
 @app.get("/")
 def root():
-    return {"message": "InSpectre API", "version": "0.7.2"}
+    return {"message": "InSpectre API", "version": "1.0.0"}
 
 
 # ---------------------------------------------------------------------------
@@ -1094,6 +1097,44 @@ async def stream_ping(mac: str, db: Session = Depends(get_db)):
 
     return StreamingResponse(_gen(), media_type="text/event-stream",
                              headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+
+@app.post("/devices/{mac}/block")
+async def block_device(mac: str, db: Session = Depends(get_db)):
+    d = db.get(Device, mac.lower())
+    if not d:
+        raise HTTPException(404, "Device not found")
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            resp = await client.post(f"{PROBE_URL}/block/{mac.lower()}")
+            if resp.status_code >= 400:
+                body = resp.text
+                raise HTTPException(502, f"Probe error: {body[:200]}")
+    except httpx.ConnectError:
+        raise HTTPException(502, f"Cannot reach probe at {PROBE_URL}")
+    d.is_blocked = True
+    _add_event(db, mac.lower(), "blocked", {"ip": d.ip_address})
+    db.commit(); db.refresh(d)
+    return _to_dict(d)
+
+
+@app.post("/devices/{mac}/unblock")
+async def unblock_device(mac: str, db: Session = Depends(get_db)):
+    d = db.get(Device, mac.lower())
+    if not d:
+        raise HTTPException(404, "Device not found")
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            resp = await client.delete(f"{PROBE_URL}/block/{mac.lower()}")
+            if resp.status_code >= 400:
+                body = resp.text
+                raise HTTPException(502, f"Probe error: {body[:200]}")
+    except httpx.ConnectError:
+        raise HTTPException(502, f"Cannot reach probe at {PROBE_URL}")
+    d.is_blocked = False
+    _add_event(db, mac.lower(), "unblocked", {"ip": d.ip_address})
+    db.commit(); db.refresh(d)
+    return _to_dict(d)
 
 
 @app.get("/devices/{mac}/traceroute")

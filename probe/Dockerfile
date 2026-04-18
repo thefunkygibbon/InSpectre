@@ -9,6 +9,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     iputils-ping \
     traceroute \
     iproute2 \
+    iptables \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
