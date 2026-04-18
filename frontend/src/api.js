@@ -34,7 +34,7 @@ async function streamSSE(path, onLine, signal) {
 
 export const api = {
   // Devices
-  getDevices:      ()           => request('GET',   '/devices'),
+  getDevices:      (includeIgnored = true) => request('GET', `/devices${includeIgnored ? '' : '?include_ignored=false'}`),
   getDevice:       (mac)        => request('GET',   `/devices/${mac}`),
   updateDevice:    (mac, body)  => request('PATCH', `/devices/${mac}`, body),
   updateIdentity:  (mac, body)  => request('PATCH', `/devices/${mac}/identity`, body),
@@ -97,6 +97,7 @@ export const api = {
   getVulnReportDetail:  (mac, id)    => request('GET',    `/devices/${mac}/vuln-reports/${id}`),
   deleteVulnReport:     (mac, id)    => request('DELETE', `/devices/${mac}/vuln-reports/${id}`),
   getAllVulnReports:     (severity)   => request('GET',    `/vuln-reports${severity ? `?severity=${severity}` : ''}`),
+  getVulnSummary:       ()           => request('GET',    '/vulns/summary'),
 }
 
 export { streamSSE }

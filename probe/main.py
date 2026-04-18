@@ -498,6 +498,109 @@ def lookup_vendor(mac: str) -> str:
     return "Unknown"
 
 # ---------------------------------------------------------------------------
+# mDNS enrichment
+# ---------------------------------------------------------------------------
+def _mdns_browse() -> dict[str, dict]:
+    """
+    Run avahi-browse -a -t -r to discover mDNS services on the LAN.
+    Returns a dict keyed by IP address:
+        { "mdns_name": str|None, "services": [str, ...] }
+    Silently returns {} if avahi-browse is not available.
+    """
+    result: dict[str, dict] = {}
+    try:
+        out = subprocess.run(
+            ["avahi-browse", "-a", "-t", "-r", "--no-fail"],
+            capture_output=True, text=True, timeout=20,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired, Exception) as e:
+        print(f"[mdns] avahi-browse unavailable: {e}", flush=True)
+        return result
+
+    # Parse output: blocks separated by blank lines.
+    # A resolved entry looks like:
+    #   = eth0 IPv4 DeviceName  _service._tcp  local
+    #      hostname = [name.local]
+    #      address = [192.168.x.y]
+    #      port = [N]
+    #      txt = [...]
+    current_service: str | None = None
+    current_hostname: str | None = None
+
+    for line in out.stdout.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            current_service = None
+            current_hostname = None
+            continue
+
+        if stripped.startswith("="):
+            # Resolved entry header
+            parts = stripped.split(None, 6)
+            # parts: ['=', iface, 'IPv4', name, service_type, 'local']
+            if len(parts) >= 5:
+                current_service = parts[4]  # e.g. _apple-mobdev2._tcp
+            current_hostname = None
+            continue
+
+        if current_service is None:
+            continue  # skip '+' (found but not resolved) lines
+
+        if stripped.startswith("hostname = ["):
+            h = stripped[len("hostname = ["):].rstrip("]").strip()
+            current_hostname = _strip_fqdn(h) if h else None
+
+        elif stripped.startswith("address = ["):
+            ip = stripped[len("address = ["):].rstrip("]").strip()
+            if ip and _is_valid_ip(ip):
+                if ip not in result:
+                    result[ip] = {"mdns_name": None, "services": []}
+                if current_hostname and not result[ip]["mdns_name"]:
+                    result[ip]["mdns_name"] = current_hostname
+                if current_service and current_service not in result[ip]["services"]:
+                    result[ip]["services"].append(current_service)
+
+    if result:
+        print(f"[mdns] Discovered {len(result)} device(s) via mDNS", flush=True)
+    return result
+
+
+def _apply_mdns_enrichment(mdns_data: dict[str, dict]) -> None:
+    """Update device records with mDNS name and service list."""
+    if not mdns_data:
+        return
+    session = Session()
+    try:
+        updated = 0
+        for ip, info in mdns_data.items():
+            dev = session.query(Device).filter(Device.ip_address == ip).first()
+            if not dev:
+                continue
+            changed = False
+            if info.get("mdns_name") and not dev.hostname:
+                dev.hostname = info["mdns_name"]
+                changed = True
+            if info.get("services"):
+                scan = dict(dev.scan_results) if dev.scan_results else {}
+                existing = scan.get("mdns_services", [])
+                merged = list(dict.fromkeys(existing + info["services"]))  # dedup, preserve order
+                if merged != existing:
+                    scan["mdns_services"] = merged
+                    dev.scan_results = scan
+                    changed = True
+            if changed:
+                updated += 1
+        if updated:
+            session.commit()
+            print(f"[mdns] Enriched {updated} device(s)", flush=True)
+    except Exception as e:
+        session.rollback()
+        print(f"[mdns] Enrichment error: {e}", flush=True)
+    finally:
+        session.close()
+
+
+# ---------------------------------------------------------------------------
 # ARP sweep
 # ---------------------------------------------------------------------------
 def arp_scan(interface: str, ip_range: str) -> list[dict]:
@@ -676,7 +779,7 @@ def upsert_seen_device(mac: str, ip: str, source: str) -> None:
                                 "THEN devices.primary_ip ELSE EXCLUDED.primary_ip END"
                             ),
                             is_online  = True,
-                            last_seen  = now,
+                            last_seen  = text("CASE WHEN devices.is_online = false THEN NOW() ELSE devices.last_seen END"),
                             miss_count = 0,
                             hostname   = text(
                                 "CASE WHEN devices.hostname IS NOT NULL AND devices.hostname != '' "
@@ -711,7 +814,7 @@ def upsert_seen_device(mac: str, ip: str, source: str) -> None:
                                 "THEN devices.primary_ip ELSE EXCLUDED.primary_ip END"
                             ),
                             is_online  = True,
-                            last_seen  = now,
+                            last_seen  = text("CASE WHEN devices.is_online = false THEN NOW() ELSE devices.last_seen END"),
                             miss_count = 0,
                             hostname   = text(
                                 "CASE WHEN devices.hostname IS NOT NULL AND devices.hostname != '' "
@@ -1355,6 +1458,9 @@ def main() -> None:
             session.commit()
             print(f"[*] Sweep done -- {len(active_macs)} online", flush=True)
             threading.Thread(target=refresh_missing_hostnames, daemon=True).start()
+            mdns_data = _mdns_browse()
+            if mdns_data:
+                _apply_mdns_enrichment(mdns_data)
         except Exception as e:
             session.rollback()
             print(f"[!] Sweep error: {e}", flush=True)

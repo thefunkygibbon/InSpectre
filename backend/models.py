@@ -34,6 +34,10 @@ class Device(Base):
     # Phase 4: ARP-based internet block
     is_blocked           = Column(Boolean, server_default='false', nullable=False)
 
+    # Phase 5: zones and suppression
+    zone                 = Column(String, nullable=True)
+    is_ignored           = Column(Boolean, server_default='false', nullable=False)
+
     ip_history   = relationship("IPHistory",    back_populates="device",
                                 order_by="IPHistory.first_seen.desc()")
     events       = relationship("DeviceEvent",  back_populates="device",

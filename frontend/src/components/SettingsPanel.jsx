@@ -31,6 +31,8 @@ const SETTING_META = {
       { value: 'important', label: 'Watched devices only' },
     ],
   },
+  vuln_scan_on_new_device: { label: 'Auto-scan New Devices', type: 'toggle', tab: 'scanner',
+    description: 'Automatically run a vulnerability scan when a new device is first discovered.' },
 
   // Notifications tab — in-app
   notifications_enabled:         { label: 'Toast Notifications',    type: 'toggle', tab: 'notifications',
@@ -195,7 +197,7 @@ export function SettingsPanel({ onClose, onSettingChange }) {
 
   // ── Scanner tab grouping ────────────────────────────────────────────────────
   const networkScanKeys = ['scan_interval','offline_miss_threshold','os_confidence_threshold','sniffer_workers','ip_range','nmap_args']
-  const vulnScanKeys    = ['vuln_scan_scripts','vuln_scan_schedule','vuln_scan_targets']
+  const vulnScanKeys    = ['vuln_scan_scripts','vuln_scan_schedule','vuln_scan_targets','vuln_scan_on_new_device']
 
   // ── Notifications tab grouping ──────────────────────────────────────────────
   const inAppKeys   = ['notifications_enabled','browser_notifications_enabled']

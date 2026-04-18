@@ -81,6 +81,41 @@ export const SMART_FILTERS = [
     description: 'Devices with a room/location set',
     fn:          d => Boolean(d.location),
   },
+  {
+    id:          'has_zone',
+    label:       'Zoned',
+    icon:        'Layers',
+    description: 'Devices with a network zone assigned',
+    fn:          d => Boolean(d.zone),
+  },
+  {
+    id:          'zone_trusted',
+    label:       'Trusted',
+    icon:        'ShieldCheck',
+    description: 'Devices in the Trusted zone',
+    fn:          d => d.zone === 'Trusted',
+  },
+  {
+    id:          'zone_iot',
+    label:       'IoT zone',
+    icon:        'Cpu',
+    description: 'Devices in the IoT zone',
+    fn:          d => d.zone === 'IoT',
+  },
+  {
+    id:          'zone_guest',
+    label:       'Guest zone',
+    icon:        'Users',
+    description: 'Devices in the Guest zone',
+    fn:          d => d.zone === 'Guest',
+  },
+  {
+    id:          'ignored',
+    label:       'Ignored',
+    icon:        'EyeOff',
+    description: 'Devices marked as ignored (hidden from main list)',
+    fn:          d => Boolean(d.is_ignored),
+  },
 ]
 
 const SAVED_VIEWS_KEY = 'inspectre_saved_views'

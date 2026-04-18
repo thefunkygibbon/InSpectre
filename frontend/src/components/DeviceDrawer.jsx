@@ -4,7 +4,8 @@ import {
   ShieldCheck, ScanLine, RefreshCw, ExternalLink,
   Activity, GitBranch, Bug, RotateCcw, Ban, History,
   ChevronDown, ChevronRight, Square, Tag, CheckCircle2,
-  FileText, Star as StarIcon, ShieldAlert,
+  FileText, Star as StarIcon, ShieldAlert, EyeOff, Eye, Layers,
+  AlertTriangle,
 } from 'lucide-react'
 import { OnlineDot }      from './OnlineDot'
 import { StarButton }     from './StarButton'
@@ -29,6 +30,34 @@ const HTTP_PORTS  = new Set([80, 8080, 8000, 3000, 5000, 8888, 8008, 8081, 8082,
 const HTTPS_PORTS = new Set([443, 8443, 4443, 9443])
 function isWebPort(port)   { return HTTP_PORTS.has(port) || HTTPS_PORTS.has(port) }
 function portUrl(ip, port) { return `${HTTPS_PORTS.has(port) ? 'https' : 'http'}://${ip}:${port}` }
+
+const PORT_DESCRIPTIONS = {
+  21:    'FTP',              22:    'SSH',
+  23:    'Telnet',           25:    'SMTP',
+  53:    'DNS',              80:    'HTTP',
+  110:   'POP3',             143:   'IMAP',
+  443:   'HTTPS',            445:   'SMB',
+  554:   'RTSP (stream)',    631:   'IPP (printer)',
+  993:   'IMAPS',            995:   'POP3S',
+  1883:  'MQTT',             3306:  'MySQL',
+  3389:  'RDP',              5353:  'mDNS',
+  5432:  'PostgreSQL',       5900:  'VNC',
+  6379:  'Redis',            8080:  'HTTP-alt',
+  8443:  'HTTPS-alt',        8883:  'MQTT/TLS',
+  9100:  'JetDirect (print)', 27017: 'MongoDB',
+}
+const DANGEROUS_PORTS = new Set([21, 23, 3389, 5900])
+
+const ZONE_COLORS = {
+  Trusted:        { bg: 'rgba(34,197,94,0.12)',   color: '#22c55e',   border: 'rgba(34,197,94,0.3)'   },
+  IoT:            { bg: 'rgba(20,184,166,0.12)',   color: '#14b8a6',   border: 'rgba(20,184,166,0.3)'  },
+  Guest:          { bg: 'rgba(251,191,36,0.12)',   color: '#f59e0b',   border: 'rgba(251,191,36,0.3)'  },
+  Lab:            { bg: 'rgba(139,92,246,0.12)',   color: '#8b5cf6',   border: 'rgba(139,92,246,0.3)'  },
+  Infrastructure: { bg: 'rgba(99,102,241,0.12)',   color: '#6366f1',   border: 'rgba(99,102,241,0.3)'  },
+}
+function zoneStyle(zone) {
+  return ZONE_COLORS[zone] || { bg: 'rgba(107,114,128,0.12)', color: '#6b7280', border: 'rgba(107,114,128,0.3)' }
+}
 
 const TABS = [
   { id: 'overview',  label: 'Overview' },
@@ -187,6 +216,7 @@ export function DeviceDrawer({ device, onClose, onRename, onResolveName, onRefre
   const [staticLines,  setStaticLines]  = useState([])
   const [activeTab,    setActiveTab]    = useState('overview')
   const [blocking,     setBlocking]     = useState(false)
+  const [ignoring,     setIgnoring]     = useState(false)
 
   useEffect(() => { setLocalDevice(device) }, [device])
 
@@ -254,6 +284,21 @@ export function DeviceDrawer({ device, onClose, onRename, onResolveName, onRefre
   async function handleStarClick(mac, value) {
     setLocalDevice(prev => ({ ...prev, is_important: value }))
     if (onStarToggle) onStarToggle(mac, value)
+  }
+
+  async function handleIgnoreToggle() {
+    setIgnoring(true)
+    const newVal = !localDevice.is_ignored
+    setLocalDevice(prev => ({ ...prev, is_ignored: newVal }))
+    try {
+      const updated = await api.updateMetadata(mac, { is_ignored: newVal })
+      setLocalDevice(updated)
+      if (onRefresh) onRefresh()
+    } catch {
+      setLocalDevice(prev => ({ ...prev, is_ignored: !newVal }))
+    } finally {
+      setIgnoring(false)
+    }
   }
 
   const termLines   = stream.lines.length ? stream.lines : staticLines
@@ -343,6 +388,19 @@ export function DeviceDrawer({ device, onClose, onRename, onResolveName, onRefre
                     <Ban size={11} />Blocked
                   </span>
                 )}
+                {localDevice.zone && (() => {
+                  const zs = zoneStyle(localDevice.zone)
+                  return (
+                    <span className="badge-online" style={{ background: zs.bg, color: zs.color, border: `1px solid ${zs.border}` }}>
+                      <Layers size={11} />{localDevice.zone}
+                    </span>
+                  )
+                })()}
+                {localDevice.is_ignored && (
+                  <span className="badge-online" style={{ background: 'rgba(107,114,128,0.12)', color: '#6b7280', border: '1px solid rgba(107,114,128,0.3)' }}>
+                    <EyeOff size={11} />Ignored
+                  </span>
+                )}
               </div>
 
               {/* Actions */}
@@ -373,6 +431,20 @@ export function DeviceDrawer({ device, onClose, onRename, onResolveName, onRefre
                     ? (localDevice.is_blocked ? 'Unblocking…' : 'Blocking…')
                     : (localDevice.is_blocked ? 'Unblock device' : 'Block internet access')}
                 </button>
+                <button
+                  onClick={handleIgnoreToggle}
+                  disabled={ignoring}
+                  className={`mt-2 w-full flex items-center justify-center gap-2 py-2 rounded-lg
+                             border text-xs font-medium transition-colors duration-150
+                             ${localDevice.is_ignored
+                               ? 'border-brand/40 bg-brand/10 text-brand hover:bg-brand/20'
+                               : 'border-border bg-surface-offset text-text-muted hover:text-text hover:border-border'
+                             }
+                             ${ignoring ? 'opacity-60 cursor-wait' : ''}`}>
+                  {localDevice.is_ignored
+                    ? <><Eye size={12} /> Un-ignore device</>
+                    : <><EyeOff size={12} /> Ignore device</>}
+                </button>
                 {/* Structured stream output */}
                 <StreamOutput
                   lines={termLines}
@@ -402,7 +474,20 @@ export function DeviceDrawer({ device, onClose, onRename, onResolveName, onRefre
                 />
                 {localDevice.custom_name && <Row label="Custom name" value={localDevice.custom_name} />}
                 {localDevice.location    && <Row label="Location"    value={localDevice.location} />}
+                {localDevice.zone        && <Row label="Zone"        value={localDevice.zone} />}
                 {localDevice.miss_count  !== undefined && <Row label="Miss count" value={localDevice.miss_count} />}
+                {scan?.mdns_services?.length > 0 && (
+                  <Row label="mDNS services" value={
+                    <div className="flex flex-wrap gap-1 justify-end">
+                      {scan.mdns_services.map(s => (
+                        <span key={s} className="text-[10px] px-1.5 py-0.5 rounded font-mono"
+                          style={{ background: 'var(--color-surface-offset)', color: 'var(--color-text-muted)', border: '1px solid var(--color-border)' }}>
+                          {s}
+                        </span>
+                      ))}
+                    </div>
+                  } />
+                )}
               </Section>
 
               {/* IP History */}
@@ -437,23 +522,35 @@ export function DeviceDrawer({ device, onClose, onRename, onResolveName, onRefre
               {scan?.open_ports?.length > 0 && (
                 <Section title={`Open Ports (${scan.open_ports.length})`} icon={Terminal}>
                   {scan.open_ports.map((p, i) => {
-                    const web = isWebPort(p.port)
-                    const url = web ? portUrl(localDevice.ip_address, p.port) : null
+                    const web       = isWebPort(p.port)
+                    const url       = web ? portUrl(localDevice.ip_address, p.port) : null
+                    const dangerous = DANGEROUS_PORTS.has(p.port)
+                    const svcLabel  = p.service || PORT_DESCRIPTIONS[p.port] || ''
                     return (
-                      <div key={i} className="flex items-center gap-3 py-1.5 border-b border-border last:border-0">
-                        {web ? (
-                          <a href={url} target="_blank" rel="noopener noreferrer"
-                            className="font-mono text-xs text-brand hover:text-brand-light underline
-                                       underline-offset-2 w-16 shrink-0 flex items-center gap-1 group">
-                            {p.port}/{p.proto}
-                            <ExternalLink size={9} className="opacity-60 group-hover:opacity-100" />
-                          </a>
-                        ) : (
-                          <span className="font-mono text-xs text-text-muted w-16 shrink-0">{p.port}/{p.proto}</span>
-                        )}
-                        <span className="text-sm text-text">{p.service}</span>
-                        {p.product && (
-                          <span className="text-xs text-text-muted ml-auto truncate">{p.product} {p.version}</span>
+                      <div key={i} className="py-2 border-b border-border last:border-0 space-y-0.5">
+                        <div className="flex items-center gap-3">
+                          {web ? (
+                            <a href={url} target="_blank" rel="noopener noreferrer"
+                              className="font-mono text-xs text-brand hover:text-brand-light underline
+                                         underline-offset-2 w-20 shrink-0 flex items-center gap-1 group">
+                              {p.port}/{p.proto}
+                              <ExternalLink size={9} className="opacity-60 group-hover:opacity-100" />
+                            </a>
+                          ) : (
+                            <span className={`font-mono text-xs w-20 shrink-0 ${dangerous ? 'text-amber-400' : 'text-text-muted'}`}>
+                              {dangerous && <AlertTriangle size={10} className="inline mr-1 opacity-70" />}
+                              {p.port}/{p.proto}
+                            </span>
+                          )}
+                          <span className="text-sm text-text flex-1 truncate">{svcLabel}</span>
+                          {(p.product || p.version) && (
+                            <span className="text-xs text-text-muted shrink-0 truncate max-w-[140px]">
+                              {[p.product, p.version].filter(Boolean).join(' ')}
+                            </span>
+                          )}
+                        </div>
+                        {p.cpe && (
+                          <p className="font-mono text-[10px] text-text-faint pl-20 truncate" title={p.cpe}>{p.cpe}</p>
                         )}
                       </div>
                     )

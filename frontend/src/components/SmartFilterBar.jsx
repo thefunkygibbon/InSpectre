@@ -2,13 +2,13 @@ import { useState } from 'react'
 import {
   Star, HelpCircle, Tag, Unlock, ScanLine,
   WifiOff, Tags, MapPin, ShieldAlert, Ban, FileText,
-  Bookmark, BookmarkCheck, X,
+  Bookmark, BookmarkCheck, X, Layers, ShieldCheck, Cpu, Users, EyeOff,
 } from 'lucide-react'
 import { SMART_FILTERS } from '../hooks/useSmartFilters'
 
 const ICON_MAP = {
   Star, HelpCircle, Tag, Unlock, ScanLine, WifiOff, Tags, MapPin,
-  ShieldAlert, Ban, FileText,
+  ShieldAlert, Ban, FileText, Layers, ShieldCheck, Cpu, Users, EyeOff,
 }
 
 export function SmartFilterBar({ devices, activeFilters, onToggle, onClear, savedViews, onSaveView, onLoadView, onDeleteView }) {

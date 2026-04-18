@@ -3,20 +3,21 @@ import {
   Wifi, WifiOff, Monitor, ScanSearch, Settings,
   RefreshCw, Search, AlertCircle, Activity,
   LayoutGrid, List, Sun, Moon, ChevronDown,
-  Bell, X, Layers, Star,
+  Bell, X, Layers, Star, ShieldAlert,
 } from 'lucide-react'
-import { useDevices }       from './hooks/useDevices'
-import { useTheme }         from './hooks/useTheme'
-import { useSmartFilters }  from './hooks/useSmartFilters'
-import { api }              from './api'
-import { Logo }             from './components/Logo'
-import { StatCard }         from './components/StatCard'
-import { DeviceCard }       from './components/DeviceCard'
-import { DeviceRow }        from './components/DeviceRow'
-import { DeviceDrawer }     from './components/DeviceDrawer'
-import { SettingsPanel }    from './components/SettingsPanel'
-import { CategoryView }     from './components/CategoryView'
-import { SmartFilterBar }   from './components/SmartFilterBar'
+import { useDevices }          from './hooks/useDevices'
+import { useTheme }            from './hooks/useTheme'
+import { useSmartFilters }     from './hooks/useSmartFilters'
+import { api }                 from './api'
+import { Logo }                from './components/Logo'
+import { StatCard }            from './components/StatCard'
+import { DeviceCard }          from './components/DeviceCard'
+import { DeviceRow }           from './components/DeviceRow'
+import { DeviceDrawer }        from './components/DeviceDrawer'
+import { SettingsPanel }       from './components/SettingsPanel'
+import { SecurityDashboard }   from './components/SecurityDashboard'
+import { CategoryView }        from './components/CategoryView'
+import { SmartFilterBar }      from './components/SmartFilterBar'
 
 const APP_VERSION = '1.0.0'
 
@@ -205,6 +206,7 @@ export default function App() {
   const [layout,        setLayout]        = useState('grid')
   const [selected,      setSelected]      = useState(null)
   const [showSettings,  setShowSettings]  = useState(false)
+  const [showSecurity,  setShowSecurity]  = useState(false)
   const [refreshing,    setRefreshing]    = useState(false)
   const [showAlertDrop, setShowAlertDrop] = useState(false)
 
@@ -253,9 +255,13 @@ export default function App() {
 
   const filtered = useMemo(() => {
     let list = devices
-    if (filter === 'online')  list = list.filter(d => d.is_online)
-    if (filter === 'offline') list = list.filter(d => !d.is_online)
-    if (filter === 'scanned') list = list.filter(d => d.deep_scanned)
+    // Hide ignored devices unless the 'ignored' smart filter is explicitly active
+    if (!activeFilters.includes('ignored')) {
+      list = list.filter(d => !d.is_ignored)
+    }
+    if (filter === 'online')    list = list.filter(d => d.is_online)
+    if (filter === 'offline')   list = list.filter(d => !d.is_online)
+    if (filter === 'scanned')   list = list.filter(d => d.deep_scanned)
     if (filter === 'important') list = list.filter(d => d.is_important)
     if (search.trim()) {
       const q = search.toLowerCase()
@@ -267,13 +273,14 @@ export default function App() {
         (d.vendor       || '').toLowerCase().includes(q) ||
         (d.display_name || '').toLowerCase().includes(q) ||
         (d.tags         || '').toLowerCase().includes(q) ||
-        (d.location     || '').toLowerCase().includes(q)
+        (d.location     || '').toLowerCase().includes(q) ||
+        (d.zone         || '').toLowerCase().includes(q)
       )
     }
     // Apply smart filters (AND logic)
     list = applyFilters(list)
     return sortDevices(list, sort)
-  }, [devices, filter, search, sort, applyFilters])
+  }, [devices, filter, search, sort, applyFilters, activeFilters])
 
   async function handleRefresh() {
     setRefreshing(true)
@@ -394,6 +401,9 @@ export default function App() {
               <button onClick={toggleTheme} className="btn-ghost p-2"
                 aria-label={isDark ? 'Switch to light mode' : 'Switch to dark mode'}>
                 {isDark ? <Sun size={16} /> : <Moon size={16} />}
+              </button>
+              <button onClick={() => setShowSecurity(true)} className="btn-ghost p-2" aria-label="Security overview">
+                <ShieldAlert size={16} />
               </button>
               <button onClick={() => setShowSettings(true)} className="btn-ghost p-2" aria-label="Settings">
                 <Settings size={16} />
@@ -584,6 +594,16 @@ export default function App() {
       )}
       {showSettings && (
         <SettingsPanel onClose={() => setShowSettings(false)} onSettingChange={handleSettingChange} />
+      )}
+      {showSecurity && (
+        <SecurityDashboard
+          onClose={() => setShowSecurity(false)}
+          onDeviceClick={(mac) => {
+            setShowSecurity(false)
+            const dev = devices.find(d => d.mac_address === mac)
+            if (dev) setSelected(dev)
+          }}
+        />
       )}
     </div>
   )

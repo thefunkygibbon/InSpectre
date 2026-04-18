@@ -74,6 +74,8 @@ def _migrate(db: Session):
         "ALTER TABLE devices ADD COLUMN IF NOT EXISTS vuln_severity VARCHAR",
         "ALTER TABLE devices ADD COLUMN IF NOT EXISTS is_blocked BOOLEAN NOT NULL DEFAULT FALSE",
         "ALTER TABLE devices ALTER COLUMN is_blocked SET DEFAULT FALSE",
+        "ALTER TABLE devices ADD COLUMN IF NOT EXISTS zone VARCHAR",
+        "ALTER TABLE devices ADD COLUMN IF NOT EXISTS is_ignored BOOLEAN NOT NULL DEFAULT FALSE",
     ]
     for sql in migrations:
         try:
@@ -103,6 +105,7 @@ DEFAULT_SETTINGS = {
     ),
     "vuln_scan_schedule":      ("disabled", "Scheduled vulnerability scan interval. Options: disabled, 6h, 12h, 24h, weekly."),
     "vuln_scan_targets":       ("important", "Devices to include in scheduled scans. Options: all, important."),
+    "vuln_scan_on_new_device": ("false", "Automatically run a vulnerability scan when a new device is first discovered."),
     # Alert delivery
     "alert_on_new_device":     ("false",  "Send an alert when a new device is discovered."),
     "alert_on_offline":        ("false",  "Send an alert when a watched device goes offline."),
@@ -320,15 +323,17 @@ async def _alert_dispatch_loop():
             db = SessionLocal()
             try:
                 settings = {s.key: s.value for s in db.query(Setting).all()}
-                alert_new     = settings.get("alert_on_new_device", "false") == "true"
-                alert_offline = settings.get("alert_on_offline",    "false") == "true"
-                alert_vuln    = settings.get("alert_on_vuln",       "false") == "true"
+                alert_new          = settings.get("alert_on_new_device",    "false") == "true"
+                alert_offline      = settings.get("alert_on_offline",       "false") == "true"
+                alert_vuln         = settings.get("alert_on_vuln",          "false") == "true"
+                vuln_on_new_device = settings.get("vuln_scan_on_new_device","false") == "true"
 
-                if alert_new or alert_offline or alert_vuln:
+                if alert_new or alert_offline or alert_vuln or vuln_on_new_device:
                     rows = db.execute(text("""
                         SELECT de.id, de.mac_address, de.type, de.detail, de.created_at,
                                COALESCE(d.custom_name, d.hostname, d.ip_address, de.mac_address) AS name,
-                               d.ip_address, d.is_important
+                               d.ip_address, d.is_important,
+                               COALESCE(d.is_ignored, false) AS is_ignored
                         FROM device_events de
                         JOIN devices d ON d.mac_address = de.mac_address
                         WHERE de.id > :last_id
@@ -343,11 +348,20 @@ async def _alert_dispatch_loop():
                     rows = []
 
                 pending_alerts = []
+                vuln_scans_to_run = []
                 for row in rows:
-                    eid, mac, etype, detail, created_at, name, ip, is_important = row
+                    eid, mac, etype, detail, created_at, name, ip, is_important, is_ignored = row
+                    if is_ignored:
+                        _last_alert_event_id = max(_last_alert_event_id, eid)
+                        continue
                     _last_alert_event_id = max(_last_alert_event_id, eid)
-                    if etype == "joined" and alert_new:
-                        pending_alerts.append((f"New device detected: {name} ({ip})", "new_device"))
+                    if etype == "joined":
+                        if alert_new:
+                            pending_alerts.append((f"New device detected: {name} ({ip})", "new_device"))
+                        if vuln_on_new_device and ip:
+                            scripts_s = db.get(Setting, "vuln_scan_scripts")
+                            scripts   = (scripts_s.value or "").strip() if scripts_s else ""
+                            vuln_scans_to_run.append((mac, ip, scripts))
                     elif etype == "offline" and alert_offline and is_important:
                         pending_alerts.append((f"Watched device offline: {name} ({ip})", "device_offline"))
                     elif etype == "vuln_scan_complete" and alert_vuln:
@@ -364,6 +378,9 @@ async def _alert_dispatch_loop():
 
             for message, alert_type in pending_alerts:
                 await _dispatch_alerts(settings, message, alert_type)
+            for mac, ip, scripts in vuln_scans_to_run:
+                print(f"[alerts] Auto vuln scan triggered for new device {ip} ({mac})", flush=True)
+                asyncio.ensure_future(_run_single_vuln_scan(mac, ip, scripts))
 
         except Exception as exc:
             print(f"[alerts] Dispatch loop error: {exc}", flush=True)
@@ -420,6 +437,8 @@ class MetadataUpdate(BaseModel):
     tags:         Optional[str]  = None
     location:     Optional[str]  = None
     is_important: Optional[bool] = None
+    zone:         Optional[str]  = None
+    is_ignored:   Optional[bool] = None
 
 
 class PrimaryIPUpdate(BaseModel):
@@ -575,6 +594,8 @@ def _to_dict(d: Device) -> dict:
         "vuln_last_scanned": d.vuln_last_scanned.isoformat() if d.vuln_last_scanned else None,
         "vuln_severity":     d.vuln_severity,
         "is_blocked":        bool(getattr(d, 'is_blocked', False)),
+        "zone":              getattr(d, 'zone', None),
+        "is_ignored":        bool(getattr(d, 'is_ignored', False)),
     }
 
 
@@ -661,10 +682,12 @@ def root():
 # Devices
 # ---------------------------------------------------------------------------
 @app.get("/devices")
-def list_devices(online_only: bool = False, db: Session = Depends(get_db)):
+def list_devices(online_only: bool = False, include_ignored: bool = True, db: Session = Depends(get_db)):
     q = db.query(Device)
     if online_only:
         q = q.filter(Device.is_online == True)
+    if not include_ignored:
+        q = q.filter(Device.is_ignored == False)
     return [_to_dict(d) for d in q.order_by(Device.last_seen.desc(), Device.mac_address.asc()).all()]
 
 
@@ -714,6 +737,7 @@ def update_metadata(mac: str, payload: MetadataUpdate, db: Session = Depends(get
     if payload.notes    is not None: d.notes    = payload.notes    or None
     if payload.tags     is not None: d.tags     = payload.tags     or None
     if payload.location is not None: d.location = payload.location or None
+    if payload.zone     is not None: d.zone     = payload.zone     or None
     if payload.is_important is not None:
         old_imp = bool(getattr(d, 'is_important', False))
         d.is_important = payload.is_important
@@ -721,6 +745,8 @@ def update_metadata(mac: str, payload: MetadataUpdate, db: Session = Depends(get
             _add_event(db, mac.lower(), 'marked_important', {'important': payload.is_important})
     if payload.tags is not None:
         _add_event(db, mac.lower(), 'tagged', {'tags': payload.tags})
+    if payload.is_ignored is not None:
+        d.is_ignored = payload.is_ignored
     db.commit(); db.refresh(d)
     return _to_dict(d)
 
@@ -965,6 +991,77 @@ def list_all_vuln_reports(
         }
         for r in reports
     ]
+
+
+@app.get("/vulns/summary")
+def vuln_summary(db: Session = Depends(get_db)):
+    sev_rows = db.execute(text("""
+        SELECT vuln_severity, COUNT(*) AS cnt
+        FROM devices
+        WHERE vuln_severity IS NOT NULL
+        GROUP BY vuln_severity
+    """)).fetchall()
+    sev_counts = {r[0]: int(r[1]) for r in sev_rows}
+
+    top_rows = db.execute(text("""
+        SELECT DISTINCT ON (d.mac_address)
+               d.mac_address, d.custom_name, d.hostname, d.ip_address,
+               d.vuln_severity, vr.vuln_count, vr.scanned_at
+        FROM devices d
+        JOIN vuln_reports vr ON vr.mac_address = d.mac_address
+        WHERE d.vuln_severity IS NOT NULL AND d.vuln_severity NOT IN ('clean', 'info')
+        ORDER BY d.mac_address, vr.scanned_at DESC
+    """)).fetchall()
+
+    def sev_rank(s):
+        return {'critical': 0, 'high': 1, 'medium': 2, 'low': 3}.get(s or '', 9)
+
+    top_rows = sorted(top_rows, key=lambda r: sev_rank(r[4]))[:8]
+    top_vulnerable = [
+        {
+            "mac_address":  r[0],
+            "display_name": r[1] or r[2] or r[3] or r[0],
+            "ip_address":   r[3],
+            "severity":     r[4],
+            "vuln_count":   r[5],
+            "scanned_at":   r[6].isoformat() if r[6] else None,
+        }
+        for r in top_rows
+    ]
+
+    recent_rows = db.execute(text("""
+        SELECT d.mac_address,
+               COALESCE(d.custom_name, d.hostname, d.ip_address, d.mac_address) AS display_name,
+               d.ip_address, vr.severity, vr.vuln_count, vr.scanned_at
+        FROM vuln_reports vr
+        JOIN devices d ON d.mac_address = vr.mac_address
+        ORDER BY vr.scanned_at DESC
+        LIMIT 20
+    """)).fetchall()
+    recent_scans = [
+        {
+            "mac_address":  r[0],
+            "display_name": r[1],
+            "ip_address":   r[2],
+            "severity":     r[3],
+            "vuln_count":   r[4],
+            "scanned_at":   r[5].isoformat() if r[5] else None,
+        }
+        for r in recent_rows
+    ]
+
+    total_scanned = db.execute(text(
+        "SELECT COUNT(*) FROM devices WHERE vuln_last_scanned IS NOT NULL"
+    )).scalar() or 0
+    total_devices = db.execute(text("SELECT COUNT(*) FROM devices")).scalar() or 0
+
+    return {
+        "severity_counts": sev_counts,
+        "total_scanned":   int(total_scanned),
+        "total_devices":   int(total_devices),
+        "top_vulnerable":  top_vulnerable,
+        "recent_scans":    recent_scans,
+    }
 
 
 # ---------------------------------------------------------------------------
