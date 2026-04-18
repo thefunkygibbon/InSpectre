@@ -1,7 +1,7 @@
 import { useState, useMemo, useEffect, useCallback, useRef } from 'react'
 import {
   Wifi, WifiOff, Monitor, ScanSearch, Settings,
-  RefreshCw, Search, Filter, AlertCircle, Activity,
+  RefreshCw, Search, AlertCircle, Activity,
   LayoutGrid, List, Sun, Moon, ChevronDown,
   Bell, X, Layers, Star,
 } from 'lucide-react'
@@ -19,8 +19,6 @@ import { CategoryView }     from './components/CategoryView'
 import { SmartFilterBar }   from './components/SmartFilterBar'
 
 const APP_VERSION = '0.7.0'
-
-const FILTERS = ['all', 'online', 'offline']
 
 const SORT_OPTIONS = [
   { value: 'last_seen_desc', label: 'Last seen (newest)' },
@@ -266,7 +264,6 @@ export default function App() {
 
   const isDark = theme === 'dark'
   const isCategoryMode = layout === 'category'
-  const pillFilter = FILTERS.includes(filter) ? filter : 'all'
   const hasActiveSmartFilters = activeFilters.length > 0
 
   return (
@@ -403,21 +400,6 @@ export default function App() {
                 style={{ color: 'var(--color-text-muted)' }} />
               <input className="input pl-9" placeholder="Search IP, MAC, hostname, vendor, tags…"
                 value={search} onChange={e => setSearch(e.target.value)} />
-            </div>
-
-            <div className="flex items-center gap-1 glass rounded-xl p-1">
-              <Filter size={13} className="ml-2" style={{ color: 'var(--color-text-muted)' }} />
-              {FILTERS.map(f => (
-                <button key={f}
-                  onClick={() => setFilter(prev => prev === f ? 'all' : f)}
-                  className="px-3 py-1.5 rounded-lg text-xs font-medium capitalize transition-all duration-150"
-                  style={filter === f
-                    ? { background: 'var(--color-brand)', color: 'white' }
-                    : { color: 'var(--color-text-muted)' }}
-                >
-                  {f}
-                </button>
-              ))}
             </div>
 
             {!isCategoryMode && (

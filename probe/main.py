@@ -1,4 +1,5 @@
 import asyncio
+import csv
 import json
 import os
 import queue
@@ -9,7 +10,6 @@ import time
 from datetime import datetime, timezone
 
 import nmap
-import requests
 import uvicorn
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
@@ -474,13 +474,27 @@ def resolve_hostname(ip: str) -> str | None:
 # ---------------------------------------------------------------------------
 # Vendor lookup
 # ---------------------------------------------------------------------------
-def lookup_vendor(mac: str) -> str:
+_MAC_VENDOR_DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "mac-vendors-export.csv")
+_mac_vendor_db: dict[str, str] = {}
+
+def _load_mac_vendor_db() -> None:
     try:
-        r = requests.get(f"https://api.macvendors.com/{mac}", timeout=3)
-        if r.status_code == 200:
-            return r.text.strip()
-    except Exception:
-        pass
+        with open(_MAC_VENDOR_DB_PATH, newline='', encoding='utf-8') as f:
+            for row in csv.DictReader(f):
+                prefix = row['Mac Prefix'].replace(':', '').lower()
+                vendor = row['Vendor Name'].strip()
+                if prefix and vendor:
+                    _mac_vendor_db[prefix] = vendor
+        print(f"[vendor] Loaded {len(_mac_vendor_db)} MAC prefixes from {_MAC_VENDOR_DB_PATH}", flush=True)
+    except Exception as e:
+        print(f"[vendor] Failed to load MAC vendor DB: {e}", flush=True)
+
+def lookup_vendor(mac: str) -> str:
+    norm = mac.replace(':', '').replace('-', '').lower()
+    for length in (9, 7, 6):
+        vendor = _mac_vendor_db.get(norm[:length])
+        if vendor:
+            return vendor
     return "Unknown"
 
 # ---------------------------------------------------------------------------
@@ -747,6 +761,30 @@ def upsert_seen_device(mac: str, ip: str, source: str) -> None:
         finally:
             session2.close()
 
+
+def refresh_missing_vendors() -> None:
+    if not _mac_vendor_db:
+        return
+    session = Session()
+    try:
+        unvendored = session.query(Device).filter(
+            (Device.vendor == None) | (Device.vendor == 'Unknown')
+        ).all()
+        updated = 0
+        for dev in unvendored:
+            vendor = lookup_vendor(dev.mac_address)
+            if vendor and vendor != 'Unknown':
+                dev.vendor = vendor
+                updated += 1
+                print(f"[vendor] Resolved: {dev.mac_address} -> {vendor}", flush=True)
+        if updated:
+            session.commit()
+            print(f"[vendor] Resolved {updated} vendor(s) from local DB.", flush=True)
+    except Exception as e:
+        session.rollback()
+        print(f"[vendor] Refresh error: {e}", flush=True)
+    finally:
+        session.close()
 
 def refresh_missing_hostnames() -> None:
     session = Session()
@@ -1055,8 +1093,10 @@ def start_probe_api() -> None:
 # ---------------------------------------------------------------------------
 def main() -> None:
     print(f"[*] InSpectre Probe v{VERSION} starting...", flush=True)
+    _load_mac_vendor_db()
     wait_for_db()
     init_db()
+    threading.Thread(target=refresh_missing_vendors, daemon=True, name="vendor-refresh").start()
 
     print(
         f"[*] Scanning {IP_RANGE} on {INTERFACE} every {SCAN_INTERVAL}s\n"

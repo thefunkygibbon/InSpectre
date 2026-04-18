@@ -16,5 +16,6 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 COPY main.py .
 COPY vuln_scanner.py .
+COPY mac-vendors-export.csv .
 
 CMD ["python", "main.py"]
