@@ -9,7 +9,7 @@ function enrich(d) {
   }
 }
 
-export function useDevices(intervalMs = 10000) {
+export function useDevices(intervalMs = 10000, { onAlert } = {}) {
   const [devices,     setDevices]     = useState([])
   const [stats,       setStats]       = useState(null)
   const [loading,     setLoading]     = useState(true)
@@ -22,6 +22,8 @@ export function useDevices(intervalMs = 10000) {
 
   const knownMacsRef  = useRef(null)
   const prevOnlineRef = useRef(new Map())
+  const onAlertRef    = useRef(onAlert)
+  useEffect(() => { onAlertRef.current = onAlert }, [onAlert])
 
   const fetchData = useCallback(async () => {
     try {
@@ -43,6 +45,7 @@ export function useDevices(intervalMs = 10000) {
           }))
           setNewDeviceAlerts(prev => [...prev, ...alerts])
           newOnes.forEach(d => knownMacsRef.current.add(d.mac_address))
+          alerts.forEach(a => onAlertRef.current?.({ kind: 'new_device', ...a }))
           setTimeout(() => {
             const ids = new Set(alerts.map(a => a.id))
             setNewDeviceAlerts(prev => prev.filter(a => !ids.has(a.id)))
@@ -50,23 +53,22 @@ export function useDevices(intervalMs = 10000) {
         }
       }
 
-      // Offline drop detection — important devices get their own alert class
+      // Offline drop detection
       const prevOnline = prevOnlineRef.current
       const droppedOff = devList.filter(d => {
         const wasOnline = prevOnline.get(d.mac_address)
         return wasOnline === true && d.is_online === false
       })
       if (droppedOff.length) {
-        setOfflineAlerts(prev => [
-          ...prev,
-          ...droppedOff.map(d => ({
-            id:          d.mac_address,
-            mac:         d.mac_address,
-            ip:          d.ip_address,
-            name:        d.display_name || d.ip_address,
-            is_important: d.is_important,
-          })),
-        ])
+        const offAlerts = droppedOff.map(d => ({
+          id:           d.mac_address,
+          mac:          d.mac_address,
+          ip:           d.ip_address,
+          name:         d.display_name || d.ip_address,
+          is_important: d.is_important,
+        }))
+        setOfflineAlerts(prev => [...prev, ...offAlerts])
+        offAlerts.forEach(a => onAlertRef.current?.({ kind: 'offline', ...a }))
       }
       prevOnlineRef.current = new Map(devList.map(d => [d.mac_address, d.is_online]))
 
@@ -87,7 +89,6 @@ export function useDevices(intervalMs = 10000) {
     return () => clearInterval(id)
   }, [fetchData, intervalMs])
 
-  // Optimistic update helpers — keeps UI snappy without waiting for next poll
   function optimisticUpdate(mac, patch) {
     setDevices(prev =>
       prev.map(d => d.mac_address === mac ? enrich({ ...d, ...patch }) : d)

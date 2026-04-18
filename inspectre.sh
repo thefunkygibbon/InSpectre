@@ -15,18 +15,20 @@ Usage:
   ./inspectre.sh logs
 
 Commands:
-  rebuild         Full local rebuild from the CURRENT folder, wiping containers,
-                  local images, build cache, and named volumes.
+  rebuild         Full rebuild from the current folder — wipes containers, images,
+                  build cache, AND the postgres_data/ folder (all device history).
   rebuild keep-data
-                  Full local rebuild from the CURRENT folder, but keeps volumes/data.
+                  Full rebuild but leaves postgres_data/ intact (devices, history, settings
+                  are preserved across the rebuild).
   up              Start the stack normally.
   down            Stop the stack.
   logs            Follow logs.
 
 Notes:
-  - This script DOES NOT run any git commands.
+  - This script does NOT run any git commands.
   - It rebuilds from the files currently present in this working directory.
-  - "rebuild" is destructive to Docker volumes/data for this project.
+  - Database data lives in ./postgres_data/ (a bind mount, not a named volume).
+    "rebuild" deletes that folder; "rebuild keep-data" leaves it untouched.
 EOF
 }
 
@@ -64,23 +66,27 @@ full_rebuild() {
   log "No git fetch/pull/reset will be performed."
 
   if [[ "$keep_data" == "true" ]]; then
-    if ! confirm "[InSpectre] Proceed with full rebuild and KEEP volumes/data?"; then
+    log "Database contents (postgres_data/) will be preserved."
+    if ! confirm "Proceed with full rebuild keeping existing data?"; then
       log "Aborted."
       exit 1
     fi
   else
-    log "This will remove containers, local images, build cache, and project volumes/data."
-    if ! confirm "[InSpectre] Are you sure?"; then
+    log "This will delete containers, images, build cache, AND the postgres_data/ folder (all device history)."
+    if ! confirm "Are you sure you want to wipe everything?"; then
       log "Aborted."
       exit 1
     fi
   fi
 
   log "Stopping existing stack..."
-  if [[ "$keep_data" == "true" ]]; then
-    "${COMPOSE_CMD[@]}" down --remove-orphans || true
-  else
-    "${COMPOSE_CMD[@]}" down --volumes --remove-orphans || true
+  "${COMPOSE_CMD[@]}" down --volumes --remove-orphans || true
+
+  if [[ "$keep_data" == "false" ]]; then
+    if [[ -d "$SCRIPT_DIR/postgres_data" ]]; then
+      log "Wiping postgres_data bind mount..."
+      rm -rf "$SCRIPT_DIR/postgres_data"
+    fi
   fi
 
   remove_project_images

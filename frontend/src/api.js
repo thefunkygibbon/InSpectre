@@ -66,6 +66,7 @@ export const api = {
   getSettings:     ()           => request('GET',  '/settings'),
   updateSetting:   (key, value) => request('PUT',  `/settings/${key}`, { value: String(value) }),
   resetSettings:   ()           => request('POST', '/settings/reset'),
+  applySettings:   ()           => request('POST', '/settings/apply'),
 
   // Export
   exportDevicesCsv:       ()     => fetch(`${BASE}/export/devices`),
@@ -78,6 +79,10 @@ export const api = {
     return fetch(`${BASE}/import/fingerprints`, { method: 'POST', body: form })
       .then(r => { if (!r.ok) throw new Error(`Import failed: ${r.status}`); return r.json() })
   },
+
+  // Notifications
+  sendPushbullet: (title, body) => request('POST', '/notify/pushbullet', { title, body }),
+  testPushbullet: (apiKey)      => request('POST', '/notify/test', { api_key: apiKey || '' }),
 
   // Streaming
   streamPing:       (mac, signal) => streamSSE(`/devices/${mac}/ping`,       (l) => l, signal),

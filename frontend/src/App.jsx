@@ -164,16 +164,40 @@ function NotificationToasts({ newAlerts, offlineAlerts, onDismissNew, onDismissO
 
 // ── Main App ────────────────────────────────────────────────────────────────────────────
 export default function App() {
+  // Notification state must be declared before useDevices so handleAlert can close over them
+  const [notificationsEnabled,  setNotificationsEnabled]  = useState(true)
+  const [browserNotifsEnabled,  setBrowserNotifsEnabled]  = useState(false)
+  const [pushbulletConfigured,  setPushbulletConfigured]  = useState(false)
+
+  const handleAlert = useCallback((alert) => {
+    if (browserNotifsEnabled &&
+        typeof Notification !== 'undefined' &&
+        Notification.permission === 'granted') {
+      const title = alert.kind === 'new_device' ? 'New device detected' : 'Device went offline'
+      const body  = alert.kind === 'new_device'
+        ? `${alert.ip}${alert.hostname || alert.vendor ? ' — ' + (alert.hostname || alert.vendor) : ''}`
+        : alert.name || alert.ip || ''
+      try { new Notification(title, { body, icon: '/favicon.svg' }) } catch {}
+    }
+    if (pushbulletConfigured) {
+      const title = alert.kind === 'new_device' ? 'New device on network' : 'Device went offline'
+      const body  = alert.kind === 'new_device'
+        ? `${alert.ip}${alert.hostname || alert.vendor ? ' — ' + (alert.hostname || alert.vendor) : ''}`
+        : alert.name || alert.ip || ''
+      api.sendPushbullet(title, body).catch(() => {})
+    }
+  }, [browserNotifsEnabled, pushbulletConfigured])
+
   const {
     devices, stats, loading, error, refresh, lastRefresh,
     newDeviceAlerts, offlineAlerts,
     dismissNewDevice, dismissOffline,
     dismissAllNew, dismissAllOffline,
     optimisticUpdate,
-  } = useDevices(10000)
+  } = useDevices(10000, { onAlert: handleAlert })
   const { theme, toggle: toggleTheme } = useTheme()
   const clock = useClock()
-  const { activeFilters, toggleFilter, clearFilters, applyFilters } = useSmartFilters()
+  const { activeFilters, toggleFilter, clearFilters, applyFilters, savedViews, saveView, loadView, deleteView } = useSmartFilters()
 
   const [search,        setSearch]        = useState('')
   const [filter,        setFilter]        = useState('all')
@@ -183,14 +207,23 @@ export default function App() {
   const [showSettings,  setShowSettings]  = useState(false)
   const [refreshing,    setRefreshing]    = useState(false)
   const [showAlertDrop, setShowAlertDrop] = useState(false)
-  const [notificationsEnabled, setNotificationsEnabled] = useState(true)
 
   useEffect(() => {
     api.getSettings().then(s => {
-      const n = s.find(x => x.key === 'notifications_enabled')
-      if (n) setNotificationsEnabled(n.value === 'true')
+      const n  = s.find(x => x.key === 'notifications_enabled')
+      const bn = s.find(x => x.key === 'browser_notifications_enabled')
+      const pb = s.find(x => x.key === 'pushbullet_api_key')
+      if (n)  setNotificationsEnabled(n.value === 'true')
+      if (bn) setBrowserNotifsEnabled(bn.value === 'true')
+      if (pb) setPushbulletConfigured((pb.value || '').trim().length > 0)
     }).catch(() => {})
   }, [])
+
+  function handleSettingChange(key, value) {
+    if (key === 'notifications_enabled')         setNotificationsEnabled(value === 'true')
+    if (key === 'browser_notifications_enabled') setBrowserNotifsEnabled(value === 'true')
+    if (key === 'pushbullet_api_key')            setPushbulletConfigured((value || '').trim().length > 0)
+  }
 
   const totalAlerts = newDeviceAlerts.length
 
@@ -439,6 +472,10 @@ export default function App() {
               activeFilters={activeFilters}
               onToggle={toggleFilter}
               onClear={clearFilters}
+              savedViews={savedViews}
+              onSaveView={saveView}
+              onLoadView={loadView}
+              onDeleteView={deleteView}
             />
           </section>
 
@@ -546,7 +583,7 @@ export default function App() {
         />
       )}
       {showSettings && (
-        <SettingsPanel onClose={() => setShowSettings(false)} onNotificationsChange={setNotificationsEnabled} />
+        <SettingsPanel onClose={() => setShowSettings(false)} onSettingChange={handleSettingChange} />
       )}
     </div>
   )

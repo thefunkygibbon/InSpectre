@@ -569,15 +569,27 @@ def _run_deep_scan_thread(ip: str, mac: str) -> None:
     try:
         device = session.get(Device, mac)
         if device:
+            old_scan   = device.scan_results or {}
+            old_ports  = {(p.get("port"), p.get("proto")) for p in (old_scan.get("open_ports") or [])}
+            new_ports  = {(p.get("port"), p.get("proto")) for p in (results.get("open_ports") or [])}
+            is_rescan  = bool(old_scan)  # False on first-ever scan
+
             device.scan_results = results
             device.deep_scanned = True
             if not device.hostname and results.get("hostnames"):
                 device.hostname = _strip_fqdn(results["hostnames"][0])
             session.commit()
+
             _write_event(mac, "scan_complete", {
                 "ports": len(results.get("open_ports") or []),
                 "os":    results["os_matches"][0]["name"] if results.get("os_matches") else None,
             })
+
+            if is_rescan and old_ports != new_ports:
+                added   = [{"port": p[0], "proto": p[1]} for p in (new_ports - old_ports)]
+                removed = [{"port": p[0], "proto": p[1]} for p in (old_ports - new_ports)]
+                _write_event(mac, "port_change", {"added": added, "removed": removed})
+                print(f"[scan] Port change on {ip} ({mac}): +{len(added)} -{len(removed)}", flush=True)
     except Exception as e:
         session.rollback()
         print(f"[DB] Scan save error {mac}: {e}", flush=True)
