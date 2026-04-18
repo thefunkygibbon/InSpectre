@@ -1,94 +1,100 @@
-Good, I now have a solid picture of the full stack. Let me give you well-considered feature ideas based on what's actually in the codebase.
+Absolutely — here’s a roadmap-style rewrite you can drop into `roadmap.md`.
 
-***
+## Roadmap ideas
 
-Based on reading the actual models, probe, backend, and frontend code , here are feature ideas that would naturally extend what InSpectre already does:
+InSpectre already has a strong base with device discovery, device metadata, event history, IP history, alert records, vulnerability reports, and a separate probe/backend/frontend architecture. The roadmap should now focus on turning that foundation into a more complete network visibility and lightweight security platform. 
 
-***
+## Alerting
 
-## 🔔 Alerting & Notifications
+### Notification delivery
+Implement outbound alert delivery for key events such as new devices, devices going offline, devices coming back online, IP changes, and vulnerability findings. The existing `Alert` model already defines these alert types, so the next step is to deliver them through channels such as webhooks, ntfy, Gotify, Pushover, email, or similar notification targets. 
 
-**Webhook / push notifications**
-You already have an `Alert` model with types like `new_device`, `device_offline`, `vuln_found`, etc.  — but there's no outbound delivery mechanism yet. Adding webhook support (POST to a user-defined URL) or ntfy/Gotify/Pushover integration would make alerts actually actionable without the user needing to have the UI open.
+### Alert rules
+Add configurable alert rules so alerts can be filtered by device tag, importance, location, device type, time window, or severity. This will allow the alerting system to evolve from fixed event generation into a policy-driven monitoring feature. 
 
-**Alert rules / conditions**
-Currently alerts are hardcoded event types. A rules engine where you define "alert me when a device with tag X goes offline" or "alert if a new device appears between 11pm and 6am" would make it much more useful as a security tool.
+## Device intelligence
 
-***
+### mDNS and local name enrichment
+Expand discovery with mDNS and DNS-SD enrichment to improve hostname accuracy and identify devices that advertise service identities on the local network. This is especially relevant for Apple devices, smart home gear, printers, streaming devices, and other consumer hardware that often exposes useful broadcast metadata. 
 
-## 📊 Dashboard & Analytics
+### Service and version detection
+Extend scan results to include detected services, banners, and version information in addition to open ports. The current data model already stores scan results and vulnerability findings, so richer service detection would improve identification, triage, and security usefulness. 
 
-**Network timeline / history graph**
-You store `first_seen`, `last_seen`, events, and IP history per device  — but there's no visual timeline of what the network looked like at any point in time. A "how many devices were online at X time" chart would be genuinely useful.
+### Rogue identity detection
+Add checks for suspicious identity mismatches such as vendor/OUI inconsistencies, unexpected hostname patterns, or devices presenting characteristics that conflict with their historical fingerprint. This would make InSpectre more useful as a network trust and anomaly detection tool. 
 
-**Device uptime stats**
-Given the online/offline event history, you could calculate per-device uptime percentages, longest offline periods, and average response times — surfaced as a small stats panel on each device card.
+## Vulnerability management
 
-**Vulnerability summary dashboard**
-You have `VulnReport` with `severity`, `vuln_count`, `findings`  — a dedicated security overview page showing critical/high/medium/low counts across all devices, with a drill-down, would make the vuln scanning feature much more visible and useful.
+### Scheduled vulnerability scanning
+Introduce scheduled vulnerability scans for all devices, important devices, new devices, or selected tag groups. Vulnerability scanning already exists in the probe and the data model already stores scan history, findings, severity, and timestamps, so scheduled execution is a natural progression. 
 
-***
+### Scan policy profiles
+Add reusable scan profiles such as safe, standard, deep, and recurring profiles with configurable Nmap arguments and scan scope. This would allow users to balance speed, network impact, and depth of analysis depending on device class or trust level. 
 
-## 🔍 Discovery & Scanning
+### Security dashboard
+Create a dedicated vulnerability dashboard showing device risk distribution, recent findings, severity totals, and vulnerable device trends over time. The current `VulnReport` structure already provides the data needed to support this view. 
 
-**Scheduled / automatic vuln scans**
-`vuln_scanner.py` exists  but scans appear to be manually triggered. Adding a setting like "auto-scan all devices every 24h" or "auto-scan new devices on first discovery" would make the security posture passive rather than requiring user action.
+## Device management
 
-**Service/banner detection**
-You already capture open ports in `scan_results`  — adding service version detection (Nmap `-sV`) and storing the banner/service name per port would give much richer context on what each device is actually running, not just which ports are open.
+### Groups and zones
+Add first-class device grouping for zones such as Trusted, IoT, Guest, Lab, or Infrastructure. The current model already contains tags, notes, location, importance, and override fields, so a formal grouping layer would improve filtering, reporting, and policy application. 
 
-**mDNS / DNS-SD device name enrichment**
-Many devices (Chromecast, Apple devices, printers) advertise themselves via mDNS. Listening for `_http._tcp`, `_airplay._tcp` etc. alongside ARP sweeps would dramatically improve device identification and hostname resolution for devices that otherwise show as unnamed.
+### Ignore and suppress controls
+Implement ignore lists and per-device suppression options for alerts, scans, and noise-heavy events. This would help reduce clutter from known devices while keeping the event stream useful. 
 
-***
+### Import and export
+Add import/export support for device metadata, naming, notes, tags, and other user-maintained data. This would improve backup, restore, migration, and long-term usability of the platform. 
 
-## 🗂️ Device Management
+## Network history
 
-**Device groups / zones**
-You have `tags` and `location` already on the `Device` model  — but no way to group devices into logical zones (e.g. "IoT", "Trusted", "Guest network") and filter/act on them as a group. This is a natural next step that would tie into blocking, vuln scanning scope, and alerting rules.
+### Device activity timeline
+Introduce a richer historical timeline view for each device showing discovery, online/offline transitions, IP changes, scan completions, renames, tagging, and vulnerability scan activity. The `DeviceEvent` model already captures this kind of timeline-oriented data. 
 
-**Ignore/whitelist list**
-A setting to permanently suppress alerts for known devices (e.g. your own router, known IoT devices) so the noise stays low.
+### Uptime and availability metrics
+Add per-device uptime summaries, offline duration tracking, and network presence statistics derived from device state changes over time. This would give the platform more operational value in addition to security visibility. 
 
-**Device import/export**
-A way to export the full device list (with custom names, tags, notes) to JSON/CSV and reimport it — useful for backups or migrating InSpectre to a new host.
+### Historical network snapshots
+Support a historical view of the network state at a given point in time, including which devices were online, which IPs they held, and what their known posture looked like then. Existing first-seen, last-seen, and IP history data provides the base for this feature. 
 
-***
+## Security detection
 
-## 🌐 Network Topology
+### ARP anomaly detection
+Add detection for suspicious ARP behaviour such as rapid IP ownership changes, conflicting MAC/IP relationships, or duplicate claims. Since IP history is already tracked per device and the product already includes ARP-based internet blocking concepts, ARP anomaly monitoring is highly relevant. 
 
-**Network map view**
-A visual diagram showing devices grouped by subnet, with online/offline state, vendor icons, and vuln severity badges. Given you already have MAC, IP, vendor, type, and port data , the data is there — it just needs a visual layer (something like a force-directed or subnet-grid layout in the frontend).
+### Port change monitoring
+Promote port change tracking into a surfaced security feature that highlights when a device suddenly exposes a new service or loses one unexpectedly. The event model already includes `port_change` as a device event type, making this a strong candidate for expansion. 
 
-**Router / gateway detection**
-Automatically identifying the default gateway and flagging it specially in the UI — useful context for understanding the network topology and for ARP-spoofing-style blocking which you already have (`is_blocked`) .
+### Trust change detection
+Track significant identity shifts over time, such as vendor change, hostname change, fingerprint confidence drops, device type shifts, or repeated IP churn. This would strengthen the product’s role as a network anomaly monitor rather than only a discovery scanner. 
 
-***
+## Multi-network support
 
-## 🔐 Security Specific
+### Multi-probe architecture
+Expand the current separated probe/backend design into first-class multi-probe support so a single backend can monitor multiple VLANs, subnets, or physical locations. The current repository already separates probe and backend concerns, making this a sensible roadmap direction. 
 
-**Rogue device detection**
-Flag any device whose MAC OUI doesn't match its expected vendor (e.g. a device claiming to be an Apple device with a non-Apple OUI) — a useful indicator of MAC spoofing.
+### Probe-aware reporting
+Add probe identity, probe assignment, and per-probe health/status views so device discovery can be traced back to the source collector. This will become increasingly important once multi-probe support is introduced. 
 
-**ARP spoofing detection**
-If two different MACs claim the same IP in quick succession, flag it as a potential ARP spoofing event. Given you track IP history per MAC , the data to detect this is already being collected.
+## Frontend improvements
 
-**Port change alerting**
-You have `port_change` as an event type in the `DeviceEvent` model already  but it's not clear it's being fired yet. Actually detecting and alerting when a device's open port set changes (e.g. a new service appears on a known device) is a solid security signal.
+### Dashboard refinement
+Extend the frontend with dedicated dashboard views for device activity, security posture, alert trends, and network composition. The frontend already has a React application and device categorisation support, so the next stage is better visual surfacing of the data already being collected. 
 
-***
+### Advanced filtering and saved views
+Add saved filters for tags, severity, online state, vendor, location, and device type, along with pinned views for common workflows. This would make the UI more usable once the dataset grows beyond a small home network. 
 
-## 🛠️ Operational / Quality of Life
+### Network map view
+Introduce a network map or topology-inspired view showing devices by subnet, category, trust zone, or physical/logical grouping. The combination of MAC, IP, vendor, fingerprint, device type, and event history makes this a strong fit for the product. 
 
-**Multi-probe support**
-The architecture already has a separate probe container  — supporting multiple probes reporting to a single backend (for monitoring multiple subnets/VLANs) would be a significant capability upgrade for anyone with a slightly more complex home or small office network.
+## Platform and usability
 
-**Settings live-apply to probe** *(this was already mentioned in the earlier conversation)*
-Settings saved in the UI currently don't flow to the probe at runtime — closing this gap would make configuration feel complete.
+### Live probe configuration
+Complete the loop between backend settings and probe behaviour so saved configuration changes can be applied without manual rework. The presence of a `Setting` model suggests the groundwork is already in place for broader runtime configurability. 
 
-**Dark mode**
-The frontend is React + Tailwind  — adding a dark mode toggle would be a low-effort but well-received quality-of-life improvement.
+### Role and access controls
+Add optional authentication and role-based access controls for deployments where multiple users may access the UI. This becomes more relevant as InSpectre grows from a single-user tool into a shared monitoring platform. 
 
-***
+### Backup and restore
+Provide a formal backup and restore workflow covering database contents, user settings, and user-maintained device metadata. This would make the platform safer to run long-term and easier to upgrade or move. 
 
-The ones I'd personally prioritise first given what's already built: **webhook alerts**, **scheduled vuln scans**, **mDNS enrichment**, and **port change alerting** — they all leverage existing data structures and would add the most day-to-day value with relatively contained code changes. Want me to start implementing any of these?
+If you want, I can turn that into a cleaner **actual `roadmap.md` markdown file** with sections like **Now / Next / Later** or **Phase 1 / Phase 2 / Phase 3**.
