@@ -1,4 +1,5 @@
 import asyncio
+import csv
 import json
 import os
 import queue
@@ -9,13 +10,12 @@ import time
 from datetime import datetime, timezone
 
 import nmap
-import requests
 import uvicorn
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
-from scapy.all import ARP, Ether, sniff, srp
+from scapy.all import ARP, Ether, sniff, srp, sendp
 from sqlalchemy import (
     Boolean, Column, DateTime, Integer, JSON, String, UniqueConstraint,
     cast, create_engine, text,
@@ -26,7 +26,7 @@ from sqlalchemy.orm import declarative_base, sessionmaker
 # ---------------------------------------------------------------------------
 # Version
 # ---------------------------------------------------------------------------
-VERSION = "0.6.5"
+VERSION = "1.0.0"
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -474,14 +474,131 @@ def resolve_hostname(ip: str) -> str | None:
 # ---------------------------------------------------------------------------
 # Vendor lookup
 # ---------------------------------------------------------------------------
-def lookup_vendor(mac: str) -> str:
+_MAC_VENDOR_DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "mac-vendors-export.csv")
+_mac_vendor_db: dict[str, str] = {}
+
+def _load_mac_vendor_db() -> None:
     try:
-        r = requests.get(f"https://api.macvendors.com/{mac}", timeout=3)
-        if r.status_code == 200:
-            return r.text.strip()
-    except Exception:
-        pass
+        with open(_MAC_VENDOR_DB_PATH, newline='', encoding='utf-8') as f:
+            for row in csv.DictReader(f):
+                prefix = row['Mac Prefix'].replace(':', '').lower()
+                vendor = row['Vendor Name'].strip()
+                if prefix and vendor:
+                    _mac_vendor_db[prefix] = vendor
+        print(f"[vendor] Loaded {len(_mac_vendor_db)} MAC prefixes from {_MAC_VENDOR_DB_PATH}", flush=True)
+    except Exception as e:
+        print(f"[vendor] Failed to load MAC vendor DB: {e}", flush=True)
+
+def lookup_vendor(mac: str) -> str:
+    norm = mac.replace(':', '').replace('-', '').lower()
+    for length in (9, 7, 6):
+        vendor = _mac_vendor_db.get(norm[:length])
+        if vendor:
+            return vendor
     return "Unknown"
+
+# ---------------------------------------------------------------------------
+# mDNS enrichment
+# ---------------------------------------------------------------------------
+def _mdns_browse() -> dict[str, dict]:
+    """
+    Run avahi-browse -a -t -r to discover mDNS services on the LAN.
+    Returns a dict keyed by IP address:
+        { "mdns_name": str|None, "services": [str, ...] }
+    Silently returns {} if avahi-browse is not available.
+    """
+    result: dict[str, dict] = {}
+    try:
+        out = subprocess.run(
+            ["avahi-browse", "-a", "-t", "-r", "--no-fail"],
+            capture_output=True, text=True, timeout=20,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired, Exception) as e:
+        print(f"[mdns] avahi-browse unavailable: {e}", flush=True)
+        return result
+
+    # Parse output: blocks separated by blank lines.
+    # A resolved entry looks like:
+    #   = eth0 IPv4 DeviceName  _service._tcp  local
+    #      hostname = [name.local]
+    #      address = [192.168.x.y]
+    #      port = [N]
+    #      txt = [...]
+    current_service: str | None = None
+    current_hostname: str | None = None
+
+    for line in out.stdout.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            current_service = None
+            current_hostname = None
+            continue
+
+        if stripped.startswith("="):
+            # Resolved entry header
+            parts = stripped.split(None, 6)
+            # parts: ['=', iface, 'IPv4', name, service_type, 'local']
+            if len(parts) >= 5:
+                current_service = parts[4]  # e.g. _apple-mobdev2._tcp
+            current_hostname = None
+            continue
+
+        if current_service is None:
+            continue  # skip '+' (found but not resolved) lines
+
+        if stripped.startswith("hostname = ["):
+            h = stripped[len("hostname = ["):].rstrip("]").strip()
+            current_hostname = _strip_fqdn(h) if h else None
+
+        elif stripped.startswith("address = ["):
+            ip = stripped[len("address = ["):].rstrip("]").strip()
+            if ip and _is_valid_ip(ip):
+                if ip not in result:
+                    result[ip] = {"mdns_name": None, "services": []}
+                if current_hostname and not result[ip]["mdns_name"]:
+                    result[ip]["mdns_name"] = current_hostname
+                if current_service and current_service not in result[ip]["services"]:
+                    result[ip]["services"].append(current_service)
+
+    if result:
+        print(f"[mdns] Discovered {len(result)} device(s) via mDNS", flush=True)
+    return result
+
+
+def _apply_mdns_enrichment(mdns_data: dict[str, dict]) -> None:
+    """Update device records with mDNS name and service list."""
+    if not mdns_data:
+        return
+    session = Session()
+    try:
+        updated = 0
+        for ip, info in mdns_data.items():
+            dev = session.query(Device).filter(Device.ip_address == ip).first()
+            if not dev:
+                continue
+            changed = False
+            if info.get("mdns_name") and not dev.hostname:
+                dev.hostname = info["mdns_name"]
+                changed = True
+            if info.get("services"):
+                scan = dict(dev.scan_results) if dev.scan_results else {}
+                existing = scan.get("mdns_services", [])
+                merged = list(dict.fromkeys(existing + info["services"]))  # dedup, preserve order
+                if merged != existing:
+                    scan["mdns_services"] = merged
+                    dev.scan_results = scan
+                    changed = True
+            if changed:
+                updated += 1
+        if updated:
+            session.commit()
+            print(f"[mdns] Enriched {updated} device(s)", flush=True)
+    except Exception as e:
+        session.rollback()
+        print(f"[mdns] Enrichment error: {e}", flush=True)
+    finally:
+        session.close()
+
 
 # ---------------------------------------------------------------------------
 # ARP sweep
@@ -555,15 +672,27 @@ def _run_deep_scan_thread(ip: str, mac: str) -> None:
     try:
         device = session.get(Device, mac)
         if device:
+            old_scan   = device.scan_results or {}
+            old_ports  = {(p.get("port"), p.get("proto")) for p in (old_scan.get("open_ports") or [])}
+            new_ports  = {(p.get("port"), p.get("proto")) for p in (results.get("open_ports") or [])}
+            is_rescan  = bool(old_scan)  # False on first-ever scan
+
             device.scan_results = results
             device.deep_scanned = True
             if not device.hostname and results.get("hostnames"):
                 device.hostname = _strip_fqdn(results["hostnames"][0])
             session.commit()
+
             _write_event(mac, "scan_complete", {
                 "ports": len(results.get("open_ports") or []),
                 "os":    results["os_matches"][0]["name"] if results.get("os_matches") else None,
             })
+
+            if is_rescan and old_ports != new_ports:
+                added   = [{"port": p[0], "proto": p[1]} for p in (new_ports - old_ports)]
+                removed = [{"port": p[0], "proto": p[1]} for p in (old_ports - new_ports)]
+                _write_event(mac, "port_change", {"added": added, "removed": removed})
+                print(f"[scan] Port change on {ip} ({mac}): +{len(added)} -{len(removed)}", flush=True)
     except Exception as e:
         session.rollback()
         print(f"[DB] Scan save error {mac}: {e}", flush=True)
@@ -650,7 +779,7 @@ def upsert_seen_device(mac: str, ip: str, source: str) -> None:
                                 "THEN devices.primary_ip ELSE EXCLUDED.primary_ip END"
                             ),
                             is_online  = True,
-                            last_seen  = now,
+                            last_seen  = text("CASE WHEN devices.is_online = false THEN NOW() ELSE devices.last_seen END"),
                             miss_count = 0,
                             hostname   = text(
                                 "CASE WHEN devices.hostname IS NOT NULL AND devices.hostname != '' "
@@ -685,7 +814,7 @@ def upsert_seen_device(mac: str, ip: str, source: str) -> None:
                                 "THEN devices.primary_ip ELSE EXCLUDED.primary_ip END"
                             ),
                             is_online  = True,
-                            last_seen  = now,
+                            last_seen  = text("CASE WHEN devices.is_online = false THEN NOW() ELSE devices.last_seen END"),
                             miss_count = 0,
                             hostname   = text(
                                 "CASE WHEN devices.hostname IS NOT NULL AND devices.hostname != '' "
@@ -747,6 +876,30 @@ def upsert_seen_device(mac: str, ip: str, source: str) -> None:
         finally:
             session2.close()
 
+
+def refresh_missing_vendors() -> None:
+    if not _mac_vendor_db:
+        return
+    session = Session()
+    try:
+        unvendored = session.query(Device).filter(
+            (Device.vendor == None) | (Device.vendor == 'Unknown')
+        ).all()
+        updated = 0
+        for dev in unvendored:
+            vendor = lookup_vendor(dev.mac_address)
+            if vendor and vendor != 'Unknown':
+                dev.vendor = vendor
+                updated += 1
+                print(f"[vendor] Resolved: {dev.mac_address} -> {vendor}", flush=True)
+        if updated:
+            session.commit()
+            print(f"[vendor] Resolved {updated} vendor(s) from local DB.", flush=True)
+    except Exception as e:
+        session.rollback()
+        print(f"[vendor] Refresh error: {e}", flush=True)
+    finally:
+        session.close()
 
 def refresh_missing_hostnames() -> None:
     session = Session()
@@ -877,6 +1030,146 @@ def update_presence_from_sweep(session, active_macs: set) -> None:
             flush=True,
         )
         _write_event(dev.mac_address, "offline", {"ip": confirm_ip or dev.ip_address})
+
+# ---------------------------------------------------------------------------
+# ARP blocking (internet cut-off via ARP spoofing)
+# ---------------------------------------------------------------------------
+_blocked_devices: dict[str, dict] = {}
+_blocked_lock = threading.Lock()
+
+
+def _get_mac_for_ip(ip: str) -> str | None:
+    """Send a unicast ARP request and return the MAC, or None if unreachable."""
+    try:
+        pkt = Ether(dst="ff:ff:ff:ff:ff:ff") / ARP(pdst=ip)
+        result = srp(pkt, iface=INTERFACE, timeout=3, retry=1, verbose=0)[0]
+        if result:
+            return result[0][1].hwsrc.lower()
+    except Exception as e:
+        print(f"[block] MAC lookup failed for {ip}: {e}", flush=True)
+    return None
+
+
+def _block_table_id(target_ip: str) -> int:
+    import ipaddress
+    return 10000 + (int(ipaddress.ip_address(target_ip)) % 50000)
+
+
+def _ip_rule_block(target_ip: str) -> None:
+    """
+    Policy-routing blackhole: packets forwarded from target_ip are sent to a
+    dedicated routing table that has only a blackhole default route.
+    Works with iproute2 alone — no iptables required.
+    """
+    table = _block_table_id(target_ip)
+    steps = [
+        ["ip", "route", "replace", "blackhole", "default", "table", str(table)],
+        ["ip", "rule",  "add", "from", target_ip, "table", str(table), "priority", "100"],
+    ]
+    for cmd in steps:
+        try:
+            r = subprocess.run(cmd, capture_output=True, timeout=5)
+            print(f"[block] {' '.join(cmd)}: {'OK' if r.returncode == 0 else r.stderr.decode().strip()}", flush=True)
+        except Exception as e:
+            print(f"[block] ip rule error: {e}", flush=True)
+
+
+def _ip_rule_unblock(target_ip: str) -> None:
+    table = _block_table_id(target_ip)
+    for cmd in [
+        ["ip", "rule",  "del", "from", target_ip, "table", str(table), "priority", "100"],
+        ["ip", "route", "del", "blackhole", "default", "table", str(table)],
+    ]:
+        try:
+            subprocess.run(cmd, capture_output=True, timeout=5)
+        except Exception:
+            pass
+
+
+def _iptables(action: str, target_ip: str) -> None:
+    """
+    iptables FORWARD DROP as defence-in-depth alongside the ip-rule blackhole.
+    Uses -I (insert at top) to block, -D to remove.  -D errors are silenced
+    because the rule may already be gone after a container restart.
+    """
+    for direction in ["-s", "-d"]:
+        cmd = ["iptables", action, "FORWARD", direction, target_ip, "-j", "DROP"]
+        try:
+            r = subprocess.run(cmd, capture_output=True, timeout=5)
+            if r.returncode == 0:
+                print(f"[block] {' '.join(cmd)}: OK", flush=True)
+            elif action != "-D":
+                print(f"[block] {' '.join(cmd)}: {r.stderr.decode().strip()}", flush=True)
+        except FileNotFoundError:
+            if action == "-I":
+                print("[block] iptables not found — skipping (ip rule is primary)", flush=True)
+        except Exception as e:
+            if action == "-I":
+                print(f"[block] iptables error: {e}", flush=True)
+
+
+def _arp_spoof_loop(
+    target_ip: str, target_mac: str,
+    gateway_ip: str, gateway_mac: str,
+    iface: str, stop_event: threading.Event,
+) -> None:
+    """
+    Blocks internet access for target_ip using two complementary mechanisms:
+    1. ARP spoofing — continuously tells both the target and the gateway that
+       the other party lives at the probe's MAC, so all traffic is redirected
+       through this host.
+    2. iptables FORWARD DROP — since Docker hosts have IP forwarding enabled,
+       the redirected packets would otherwise be forwarded to the real gateway.
+       The iptables rules ensure they are dropped instead.
+    Both are reversed cleanly when the stop_event is set.
+    """
+    print(
+        f"[block] Starting block: {target_ip} ({target_mac}), "
+        f"gateway {gateway_ip} ({gateway_mac})",
+        flush=True,
+    )
+
+    # Install drop rules before spoofing starts so no packets slip through
+    _ip_rule_block(target_ip)
+    _iptables("-I", target_ip)
+
+    # Poison packets (hwsrc left unset → Scapy uses the interface's own MAC)
+    poison_target = Ether(dst=target_mac) / ARP(
+        op=2, pdst=target_ip, hwdst=target_mac, psrc=gateway_ip,
+    )
+    poison_gateway = Ether(dst=gateway_mac) / ARP(
+        op=2, pdst=gateway_ip, hwdst=gateway_mac, psrc=target_ip,
+    )
+
+    while not stop_event.is_set():
+        try:
+            sendp(poison_target,  iface=iface, verbose=0)
+            sendp(poison_gateway, iface=iface, verbose=0)
+        except Exception as e:
+            print(f"[block] send error: {e}", flush=True)
+        stop_event.wait(timeout=2)
+
+    # Remove drop rules before restoring ARP so connectivity comes back cleanly
+    _ip_rule_unblock(target_ip)
+    _iptables("-D", target_ip)
+
+    # Restore correct ARP entries so both devices update their caches
+    print(f"[block] Restoring ARP for {target_ip}", flush=True)
+    restore_target = Ether(dst=target_mac) / ARP(
+        op=2, pdst=target_ip, hwdst=target_mac, psrc=gateway_ip, hwsrc=gateway_mac,
+    )
+    restore_gateway = Ether(dst=gateway_mac) / ARP(
+        op=2, pdst=gateway_ip, hwdst=gateway_mac, psrc=target_ip, hwsrc=target_mac,
+    )
+    for _ in range(5):
+        try:
+            sendp(restore_target,  iface=iface, verbose=0)
+            sendp(restore_gateway, iface=iface, verbose=0)
+        except Exception:
+            pass
+        time.sleep(0.5)
+    print(f"[block] Block lifted for {target_ip}", flush=True)
+
 
 # ---------------------------------------------------------------------------
 # Probe HTTP API (port 8001)
@@ -1040,6 +1333,77 @@ async def stream_vuln_scan(ip: str, scripts: str = ""):
     )
 
 
+@probe_api.post("/block/{mac}")
+def probe_block_device(mac: str):
+    mac = mac.lower()
+    session = Session()
+    try:
+        device = session.get(Device, mac)
+        if not device:
+            raise HTTPException(404, "Device not found")
+        target_ip = device.primary_ip or device.ip_address
+        if not target_ip or not _is_valid_ip(target_ip):
+            raise HTTPException(422, "Device has no valid IP address")
+        target_mac = mac
+    finally:
+        session.close()
+
+    with _blocked_lock:
+        if mac in _blocked_devices:
+            return {"ok": True, "already_blocked": True, "target_ip": target_ip}
+
+    gateway_ip = _get_default_gateway()
+    if not gateway_ip:
+        raise HTTPException(500, "Could not detect default gateway")
+
+    gateway_mac = _get_mac_for_ip(gateway_ip)
+    if not gateway_mac:
+        raise HTTPException(500, f"Could not resolve gateway MAC for {gateway_ip}")
+
+    stop_event = threading.Event()
+    t = threading.Thread(
+        target=_arp_spoof_loop,
+        args=(target_ip, target_mac, gateway_ip, gateway_mac, INTERFACE, stop_event),
+        daemon=True,
+        name=f"arp-block-{mac}",
+    )
+
+    with _blocked_lock:
+        _blocked_devices[mac] = {
+            "target_ip":   target_ip,
+            "target_mac":  target_mac,
+            "gateway_ip":  gateway_ip,
+            "gateway_mac": gateway_mac,
+            "stop_event":  stop_event,
+            "thread":      t,
+        }
+
+    t.start()
+    return {"ok": True, "blocked": True, "target_ip": target_ip, "gateway_ip": gateway_ip}
+
+
+@probe_api.delete("/block/{mac}")
+def probe_unblock_device(mac: str):
+    mac = mac.lower()
+    with _blocked_lock:
+        entry = _blocked_devices.pop(mac, None)
+    if not entry:
+        return {"ok": True, "was_blocked": False}
+    entry["stop_event"].set()
+    return {"ok": True, "was_blocked": True}
+
+
+@probe_api.get("/blocked")
+def probe_list_blocked():
+    with _blocked_lock:
+        return {
+            "blocked": [
+                {"mac": m, "target_ip": e["target_ip"], "gateway_ip": e["gateway_ip"]}
+                for m, e in _blocked_devices.items()
+            ]
+        }
+
+
 def start_probe_api() -> None:
     print(f"[*] Probe API v{VERSION} listening on :{PROBE_API_PORT}", flush=True)
     uvicorn.run(
@@ -1055,8 +1419,10 @@ def start_probe_api() -> None:
 # ---------------------------------------------------------------------------
 def main() -> None:
     print(f"[*] InSpectre Probe v{VERSION} starting...", flush=True)
+    _load_mac_vendor_db()
     wait_for_db()
     init_db()
+    threading.Thread(target=refresh_missing_vendors, daemon=True, name="vendor-refresh").start()
 
     print(
         f"[*] Scanning {IP_RANGE} on {INTERFACE} every {SCAN_INTERVAL}s\n"
@@ -1092,6 +1458,9 @@ def main() -> None:
             session.commit()
             print(f"[*] Sweep done -- {len(active_macs)} online", flush=True)
             threading.Thread(target=refresh_missing_hostnames, daemon=True).start()
+            mdns_data = _mdns_browse()
+            if mdns_data:
+                _apply_mdns_enrichment(mdns_data)
         except Exception as e:
             session.rollback()
             print(f"[!] Sweep error: {e}", flush=True)

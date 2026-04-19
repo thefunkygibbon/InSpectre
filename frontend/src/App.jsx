@@ -1,26 +1,25 @@
 import { useState, useMemo, useEffect, useCallback, useRef } from 'react'
 import {
   Wifi, WifiOff, Monitor, ScanSearch, Settings,
-  RefreshCw, Search, Filter, AlertCircle, Activity,
+  RefreshCw, Search, AlertCircle, Activity,
   LayoutGrid, List, Sun, Moon, ChevronDown,
-  Bell, X, Layers, Star,
+  Bell, X, Layers, Star, ShieldAlert,
 } from 'lucide-react'
-import { useDevices }       from './hooks/useDevices'
-import { useTheme }         from './hooks/useTheme'
-import { useSmartFilters }  from './hooks/useSmartFilters'
-import { api }              from './api'
-import { Logo }             from './components/Logo'
-import { StatCard }         from './components/StatCard'
-import { DeviceCard }       from './components/DeviceCard'
-import { DeviceRow }        from './components/DeviceRow'
-import { DeviceDrawer }     from './components/DeviceDrawer'
-import { SettingsPanel }    from './components/SettingsPanel'
-import { CategoryView }     from './components/CategoryView'
-import { SmartFilterBar }   from './components/SmartFilterBar'
+import { useDevices }          from './hooks/useDevices'
+import { useTheme }            from './hooks/useTheme'
+import { useSmartFilters }     from './hooks/useSmartFilters'
+import { api }                 from './api'
+import { Logo }                from './components/Logo'
+import { StatCard }            from './components/StatCard'
+import { DeviceCard }          from './components/DeviceCard'
+import { DeviceRow }           from './components/DeviceRow'
+import { DeviceDrawer }        from './components/DeviceDrawer'
+import { SettingsPanel }       from './components/SettingsPanel'
+import { SecurityDashboard }   from './components/SecurityDashboard'
+import { CategoryView }        from './components/CategoryView'
+import { SmartFilterBar }      from './components/SmartFilterBar'
 
-const APP_VERSION = '0.7.0'
-
-const FILTERS = ['all', 'online', 'offline']
+const APP_VERSION = '1.0.0'
 
 const SORT_OPTIONS = [
   { value: 'last_seen_desc', label: 'Last seen (newest)' },
@@ -166,16 +165,40 @@ function NotificationToasts({ newAlerts, offlineAlerts, onDismissNew, onDismissO
 
 // ── Main App ────────────────────────────────────────────────────────────────────────────
 export default function App() {
+  // Notification state must be declared before useDevices so handleAlert can close over them
+  const [notificationsEnabled,  setNotificationsEnabled]  = useState(true)
+  const [browserNotifsEnabled,  setBrowserNotifsEnabled]  = useState(false)
+  const [pushbulletConfigured,  setPushbulletConfigured]  = useState(false)
+
+  const handleAlert = useCallback((alert) => {
+    if (browserNotifsEnabled &&
+        typeof Notification !== 'undefined' &&
+        Notification.permission === 'granted') {
+      const title = alert.kind === 'new_device' ? 'New device detected' : 'Device went offline'
+      const body  = alert.kind === 'new_device'
+        ? `${alert.ip}${alert.hostname || alert.vendor ? ' — ' + (alert.hostname || alert.vendor) : ''}`
+        : alert.name || alert.ip || ''
+      try { new Notification(title, { body, icon: '/favicon.svg' }) } catch {}
+    }
+    if (pushbulletConfigured) {
+      const title = alert.kind === 'new_device' ? 'New device on network' : 'Device went offline'
+      const body  = alert.kind === 'new_device'
+        ? `${alert.ip}${alert.hostname || alert.vendor ? ' — ' + (alert.hostname || alert.vendor) : ''}`
+        : alert.name || alert.ip || ''
+      api.sendPushbullet(title, body).catch(() => {})
+    }
+  }, [browserNotifsEnabled, pushbulletConfigured])
+
   const {
     devices, stats, loading, error, refresh, lastRefresh,
     newDeviceAlerts, offlineAlerts,
     dismissNewDevice, dismissOffline,
     dismissAllNew, dismissAllOffline,
     optimisticUpdate,
-  } = useDevices(10000)
+  } = useDevices(10000, { onAlert: handleAlert })
   const { theme, toggle: toggleTheme } = useTheme()
   const clock = useClock()
-  const { activeFilters, toggleFilter, clearFilters, applyFilters } = useSmartFilters()
+  const { activeFilters, toggleFilter, clearFilters, applyFilters, savedViews, saveView, loadView, deleteView } = useSmartFilters()
 
   const [search,        setSearch]        = useState('')
   const [filter,        setFilter]        = useState('all')
@@ -183,16 +206,26 @@ export default function App() {
   const [layout,        setLayout]        = useState('grid')
   const [selected,      setSelected]      = useState(null)
   const [showSettings,  setShowSettings]  = useState(false)
+  const [showSecurity,  setShowSecurity]  = useState(false)
   const [refreshing,    setRefreshing]    = useState(false)
   const [showAlertDrop, setShowAlertDrop] = useState(false)
-  const [notificationsEnabled, setNotificationsEnabled] = useState(true)
 
   useEffect(() => {
     api.getSettings().then(s => {
-      const n = s.find(x => x.key === 'notifications_enabled')
-      if (n) setNotificationsEnabled(n.value === 'true')
+      const n  = s.find(x => x.key === 'notifications_enabled')
+      const bn = s.find(x => x.key === 'browser_notifications_enabled')
+      const pb = s.find(x => x.key === 'pushbullet_api_key')
+      if (n)  setNotificationsEnabled(n.value === 'true')
+      if (bn) setBrowserNotifsEnabled(bn.value === 'true')
+      if (pb) setPushbulletConfigured((pb.value || '').trim().length > 0)
     }).catch(() => {})
   }, [])
+
+  function handleSettingChange(key, value) {
+    if (key === 'notifications_enabled')         setNotificationsEnabled(value === 'true')
+    if (key === 'browser_notifications_enabled') setBrowserNotifsEnabled(value === 'true')
+    if (key === 'pushbullet_api_key')            setPushbulletConfigured((value || '').trim().length > 0)
+  }
 
   const totalAlerts = newDeviceAlerts.length
 
@@ -222,9 +255,13 @@ export default function App() {
 
   const filtered = useMemo(() => {
     let list = devices
-    if (filter === 'online')  list = list.filter(d => d.is_online)
-    if (filter === 'offline') list = list.filter(d => !d.is_online)
-    if (filter === 'scanned') list = list.filter(d => d.deep_scanned)
+    // Hide ignored devices unless the 'ignored' smart filter is explicitly active
+    if (!activeFilters.includes('ignored')) {
+      list = list.filter(d => !d.is_ignored)
+    }
+    if (filter === 'online')    list = list.filter(d => d.is_online)
+    if (filter === 'offline')   list = list.filter(d => !d.is_online)
+    if (filter === 'scanned')   list = list.filter(d => d.deep_scanned)
     if (filter === 'important') list = list.filter(d => d.is_important)
     if (search.trim()) {
       const q = search.toLowerCase()
@@ -236,13 +273,14 @@ export default function App() {
         (d.vendor       || '').toLowerCase().includes(q) ||
         (d.display_name || '').toLowerCase().includes(q) ||
         (d.tags         || '').toLowerCase().includes(q) ||
-        (d.location     || '').toLowerCase().includes(q)
+        (d.location     || '').toLowerCase().includes(q) ||
+        (d.zone         || '').toLowerCase().includes(q)
       )
     }
     // Apply smart filters (AND logic)
     list = applyFilters(list)
     return sortDevices(list, sort)
-  }, [devices, filter, search, sort, applyFilters])
+  }, [devices, filter, search, sort, applyFilters, activeFilters])
 
   async function handleRefresh() {
     setRefreshing(true)
@@ -266,7 +304,6 @@ export default function App() {
 
   const isDark = theme === 'dark'
   const isCategoryMode = layout === 'category'
-  const pillFilter = FILTERS.includes(filter) ? filter : 'all'
   const hasActiveSmartFilters = activeFilters.length > 0
 
   return (
@@ -365,6 +402,9 @@ export default function App() {
                 aria-label={isDark ? 'Switch to light mode' : 'Switch to dark mode'}>
                 {isDark ? <Sun size={16} /> : <Moon size={16} />}
               </button>
+              <button onClick={() => setShowSecurity(true)} className="btn-ghost p-2" aria-label="Security overview">
+                <ShieldAlert size={16} />
+              </button>
               <button onClick={() => setShowSettings(true)} className="btn-ghost p-2" aria-label="Settings">
                 <Settings size={16} />
               </button>
@@ -405,21 +445,6 @@ export default function App() {
                 value={search} onChange={e => setSearch(e.target.value)} />
             </div>
 
-            <div className="flex items-center gap-1 glass rounded-xl p-1">
-              <Filter size={13} className="ml-2" style={{ color: 'var(--color-text-muted)' }} />
-              {FILTERS.map(f => (
-                <button key={f}
-                  onClick={() => setFilter(prev => prev === f ? 'all' : f)}
-                  className="px-3 py-1.5 rounded-lg text-xs font-medium capitalize transition-all duration-150"
-                  style={filter === f
-                    ? { background: 'var(--color-brand)', color: 'white' }
-                    : { color: 'var(--color-text-muted)' }}
-                >
-                  {f}
-                </button>
-              ))}
-            </div>
-
             {!isCategoryMode && (
               <div className="relative">
                 <select value={sort} onChange={e => setSort(e.target.value)}
@@ -457,6 +482,10 @@ export default function App() {
               activeFilters={activeFilters}
               onToggle={toggleFilter}
               onClear={clearFilters}
+              savedViews={savedViews}
+              onSaveView={saveView}
+              onLoadView={loadView}
+              onDeleteView={deleteView}
             />
           </section>
 
@@ -564,7 +593,17 @@ export default function App() {
         />
       )}
       {showSettings && (
-        <SettingsPanel onClose={() => setShowSettings(false)} onNotificationsChange={setNotificationsEnabled} />
+        <SettingsPanel onClose={() => setShowSettings(false)} onSettingChange={handleSettingChange} />
+      )}
+      {showSecurity && (
+        <SecurityDashboard
+          onClose={() => setShowSecurity(false)}
+          onDeviceClick={(mac) => {
+            setShowSecurity(false)
+            const dev = devices.find(d => d.mac_address === mac)
+            if (dev) setSelected(dev)
+          }}
+        />
       )}
     </div>
   )

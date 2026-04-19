@@ -34,7 +34,7 @@ async function streamSSE(path, onLine, signal) {
 
 export const api = {
   // Devices
-  getDevices:      ()           => request('GET',   '/devices'),
+  getDevices:      (includeIgnored = true) => request('GET', `/devices${includeIgnored ? '' : '?include_ignored=false'}`),
   getDevice:       (mac)        => request('GET',   `/devices/${mac}`),
   updateDevice:    (mac, body)  => request('PATCH', `/devices/${mac}`, body),
   updateIdentity:  (mac, body)  => request('PATCH', `/devices/${mac}/identity`, body),
@@ -66,6 +66,7 @@ export const api = {
   getSettings:     ()           => request('GET',  '/settings'),
   updateSetting:   (key, value) => request('PUT',  `/settings/${key}`, { value: String(value) }),
   resetSettings:   ()           => request('POST', '/settings/reset'),
+  applySettings:   ()           => request('POST', '/settings/apply'),
 
   // Export
   exportDevicesCsv:       ()     => fetch(`${BASE}/export/devices`),
@@ -79,15 +80,24 @@ export const api = {
       .then(r => { if (!r.ok) throw new Error(`Import failed: ${r.status}`); return r.json() })
   },
 
+  // Notifications
+  sendPushbullet: (title, body) => request('POST', '/notify/pushbullet', { title, body }),
+  testPushbullet: (apiKey)      => request('POST', '/notify/test', { api_key: apiKey || '' }),
+
   // Streaming
   streamPing:       (mac, signal) => streamSSE(`/devices/${mac}/ping`,       (l) => l, signal),
   streamTraceroute: (mac, signal) => streamSSE(`/devices/${mac}/traceroute`, (l) => l, signal),
+
+  // Phase 4 — ARP block
+  blockDevice:   (mac) => request('POST', `/devices/${mac}/block`),
+  unblockDevice: (mac) => request('POST', `/devices/${mac}/unblock`),
 
   // Phase 3 — Vuln scanning
   getVulnReports:       (mac, limit) => request('GET',    `/devices/${mac}/vuln-reports${limit ? `?limit=${limit}` : ''}`),
   getVulnReportDetail:  (mac, id)    => request('GET',    `/devices/${mac}/vuln-reports/${id}`),
   deleteVulnReport:     (mac, id)    => request('DELETE', `/devices/${mac}/vuln-reports/${id}`),
   getAllVulnReports:     (severity)   => request('GET',    `/vuln-reports${severity ? `?severity=${severity}` : ''}`),
+  getVulnSummary:       ()           => request('GET',    '/vulns/summary'),
 }
 
 export { streamSSE }

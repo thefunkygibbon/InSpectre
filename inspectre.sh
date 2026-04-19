@@ -1,247 +1,159 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-APP_NAME="InSpectre"
-
-# ------------------------------------------------------------------
-# Paths
-# ------------------------------------------------------------------
-# Recommended layout:
-#   ~/InSpectre-main   -> stable checkout on main
-#   ~/InSpectre-test   -> test checkout / worktree for test branches
-#
-# You can override any of these with env vars before running the script.
-MAIN_REPO_DIR="${MAIN_REPO_DIR:-$HOME/InSpectre-main}"
-TEST_REPO_DIR="${TEST_REPO_DIR:-$HOME/InSpectre-test}"
-
-# Default branch aliases
-MAIN_BRANCH="${MAIN_BRANCH:-main}"
-TEST_BRANCH="${TEST_BRANCH:-test}"
-
-COMPOSE_BIN="${COMPOSE_BIN:-docker compose}"
-
-# ------------------------------------------------------------------
-# Helpers
-# ------------------------------------------------------------------
-info()  { echo "[$APP_NAME] $*"; }
-warn()  { echo "[$APP_NAME] WARNING: $*" >&2; }
-error() { echo "[$APP_NAME] ERROR: $*" >&2; exit 1; }
+PROJECT_NAME="${COMPOSE_PROJECT_NAME:-inspectre}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$SCRIPT_DIR"
 
 usage() {
-  cat <<'EOF'
+  cat <<EOF
 Usage:
-  ./inspectre.sh rebuild main
-  ./inspectre.sh rebuild test
-  ./inspectre.sh rebuild <branch-name>
-  ./inspectre.sh status [main|test|branch-name]
-  ./inspectre.sh logs [main|test|branch-name]
-  ./inspectre.sh branch [main|test|branch-name]
-  ./inspectre.sh pull [main|test|branch-name]
-  ./inspectre.sh help
+  ./inspectre.sh rebuild
+  ./inspectre.sh rebuild keep-data
+  ./inspectre.sh up
+  ./inspectre.sh down
+  ./inspectre.sh logs
 
-Examples:
-  ./inspectre.sh rebuild main
-  ./inspectre.sh rebuild test
-  ./inspectre.sh rebuild fix/offline-ping
-  ./inspectre.sh logs test
+Commands:
+  rebuild         Full rebuild from the current folder — wipes containers, images,
+                  build cache, AND the postgres_data/ folder (all device history).
+  rebuild keep-data
+                  Full rebuild but leaves postgres_data/ intact (devices, history, settings
+                  are preserved across the rebuild).
+  up              Start the stack normally.
+  down            Stop the stack.
+  logs            Follow logs.
 
 Notes:
-- "main" uses MAIN_REPO_DIR and MAIN_BRANCH.
-- "test" uses TEST_REPO_DIR and TEST_BRANCH.
-- Any other branch name uses TEST_REPO_DIR by default.
-- rebuild is destructive to the selected working tree:
-  it does git reset --hard origin/<branch> and git clean -fd
+  - This script does NOT run any git commands.
+  - It rebuilds from the files currently present in this working directory.
+  - Database data lives in ./postgres_data/ (a bind mount, not a named volume).
+    "rebuild" deletes that folder; "rebuild keep-data" leaves it untouched.
 EOF
-  exit 1
 }
 
-require_repo() {
-  local repo_dir="$1"
-  [ -d "$repo_dir/.git" ] || error "Git repo not found at $repo_dir"
-}
-
-resolve_target() {
-  local target="${1:-main}"
-
-  case "$target" in
-    main)
-      RESOLVED_REPO_DIR="$MAIN_REPO_DIR"
-      RESOLVED_BRANCH="$MAIN_BRANCH"
-      ;;
-    test)
-      RESOLVED_REPO_DIR="$TEST_REPO_DIR"
-      RESOLVED_BRANCH="$TEST_BRANCH"
-      ;;
-    *)
-      RESOLVED_REPO_DIR="$TEST_REPO_DIR"
-      RESOLVED_BRANCH="$target"
-      ;;
-  esac
-}
-
-run_compose() {
-  local repo_dir="$1"
-  shift
-  (cd "$repo_dir" && $COMPOSE_BIN "$@")
-}
-
-confirm_destructive() {
-  local repo_dir="$1"
-  local branch="$2"
-
-  info "About to fully reset repo:"
-  info "  Repo:   $repo_dir"
-  info "  Branch: $branch"
-  info "This will discard ALL local changes in that working tree."
-  read -r -p "Continue? [y/N]: " reply
-  case "$reply" in
-    y|Y|yes|YES) ;;
-    *) error "Cancelled." ;;
-  esac
-}
-
-ensure_local_branch_tracks_remote() {
-  local repo_dir="$1"
-  local branch="$2"
-
-  cd "$repo_dir"
-
-  info "Fetching latest refs from origin..."
-  git fetch origin --prune
-
-  if git show-ref --verify --quiet "refs/remotes/origin/$branch"; then
-    if git show-ref --verify --quiet "refs/heads/$branch"; then
-      info "Checking out existing local branch: $branch"
-      git checkout "$branch"
-    else
-      info "Creating local branch $branch tracking origin/$branch"
-      git checkout -b "$branch" "origin/$branch"
-    fi
+require_compose() {
+  if docker compose version >/dev/null 2>&1; then
+    COMPOSE_CMD=(docker compose)
+  elif command -v docker-compose >/dev/null 2>&1; then
+    COMPOSE_CMD=(docker-compose)
   else
-    error "Remote branch origin/$branch does not exist."
+    echo "[InSpectre] ERROR: docker compose / docker-compose not found."
+    exit 1
   fi
 }
 
-hard_sync_branch() {
-  local repo_dir="$1"
-  local branch="$2"
-
-  require_repo "$repo_dir"
-  ensure_local_branch_tracks_remote "$repo_dir" "$branch"
-
-  cd "$repo_dir"
-
-  info "Resetting working tree to origin/$branch"
-  git reset --hard "origin/$branch"
-  git clean -fd
-
-  info "Now on branch: $(git branch --show-current)"
-  info "Commit: $(git rev-parse --short HEAD)"
+confirm() {
+  local prompt="$1"
+  read -r -p "$prompt [y/N]: " reply
+  [[ "$reply" =~ ^[Yy]([Ee][Ss])?$ ]]
 }
 
-pull_branch_only() {
-  local repo_dir="$1"
-  local branch="$2"
-
-  require_repo "$repo_dir"
-  ensure_local_branch_tracks_remote "$repo_dir" "$branch"
-
-  cd "$repo_dir"
-
-  info "Hard syncing from GitHub..."
-  git reset --hard "origin/$branch"
-  git clean -fd
-
-  info "Repo updated to:"
-  info "  Branch: $(git branch --show-current)"
-  info "  Commit: $(git rev-parse --short HEAD)"
+log() {
+  echo "[InSpectre] $*"
 }
 
-docker_rebuild_stack() {
-  local repo_dir="$1"
-
-  require_repo "$repo_dir"
-
-  info "Stopping containers and removing orphans..."
-  run_compose "$repo_dir" down --remove-orphans || true
-
-  info "Building fresh images with no cache..."
-  run_compose "$repo_dir" build --no-cache
-
-  info "Starting fresh stack..."
-  run_compose "$repo_dir" up -d --force-recreate
-
-  info "Stack status:"
-  run_compose "$repo_dir" ps
+remove_project_images() {
+  log "Removing local project images if present..."
+  docker image rm "${PROJECT_NAME}-probe" "${PROJECT_NAME}-web" "${PROJECT_NAME}-backend" 2>/dev/null || true
 }
 
-show_status() {
-  local repo_dir="$1"
+full_rebuild() {
+  local keep_data="${1:-false}"
 
-  require_repo "$repo_dir"
-  cd "$repo_dir"
+  log "Working directory: $SCRIPT_DIR"
+  log "This rebuild uses the LOCAL files currently in this folder."
+  log "No git fetch/pull/reset will be performed."
 
-  info "Repo:   $repo_dir"
-  info "Branch: $(git branch --show-current)"
-  info "Commit: $(git rev-parse --short HEAD)"
-  info "Remote: $(git remote get-url origin)"
-  echo
-  run_compose "$repo_dir" ps || true
+  if [[ "$keep_data" == "true" ]]; then
+    log "Database contents (postgres_data/) will be preserved."
+    if ! confirm "Proceed with full rebuild keeping existing data?"; then
+      log "Aborted."
+      exit 1
+    fi
+  else
+    log "This will delete containers, images, build cache, AND the postgres_data/ folder (all device history)."
+    if ! confirm "Are you sure you want to wipe everything?"; then
+      log "Aborted."
+      exit 1
+    fi
+  fi
+
+  log "Stopping existing stack..."
+  "${COMPOSE_CMD[@]}" down --volumes --remove-orphans || true
+
+  if [[ "$keep_data" == "false" ]]; then
+    if [[ -d "$SCRIPT_DIR/postgres_data" ]]; then
+      log "Wiping postgres_data bind mount..."
+      rm -rf "$SCRIPT_DIR/postgres_data"
+    fi
+  fi
+
+  remove_project_images
+
+  log "Pruning Docker build cache..."
+  docker builder prune -af || true
+
+  log "Rebuilding from LOCAL source with no cache..."
+  "${COMPOSE_CMD[@]}" build --no-cache --pull
+
+  log "Starting fresh stack..."
+  "${COMPOSE_CMD[@]}" up -d --force-recreate
+
+  log "Current container status:"
+  "${COMPOSE_CMD[@]}" ps || true
+
+  log "Recent logs:"
+  "${COMPOSE_CMD[@]}" logs --tail=100 || true
+}
+
+up_stack() {
+  log "Starting stack..."
+  "${COMPOSE_CMD[@]}" up -d
+  "${COMPOSE_CMD[@]}" ps
+}
+
+down_stack() {
+  log "Stopping stack..."
+  "${COMPOSE_CMD[@]}" down --remove-orphans
 }
 
 show_logs() {
-  local repo_dir="$1"
-
-  require_repo "$repo_dir"
-  info "Streaming docker logs from $repo_dir"
-  run_compose "$repo_dir" logs -f
+  "${COMPOSE_CMD[@]}" logs -f
 }
 
-show_branch() {
-  local repo_dir="$1"
+main() {
+  require_compose
 
-  require_repo "$repo_dir"
-  cd "$repo_dir"
-
-  echo "Repo:   $repo_dir"
-  echo "Branch: $(git branch --show-current)"
-  echo "Commit: $(git rev-parse --short HEAD)"
+  case "${1:-}" in
+    rebuild)
+      case "${2:-}" in
+        keep-data)
+          full_rebuild true
+          ;;
+        "" )
+          full_rebuild false
+          ;;
+        *)
+          usage
+          exit 1
+          ;;
+      esac
+      ;;
+    up)
+      up_stack
+      ;;
+    down)
+      down_stack
+      ;;
+    logs)
+      show_logs
+      ;;
+    *)
+      usage
+      exit 1
+      ;;
+  esac
 }
 
-# ------------------------------------------------------------------
-# Main
-# ------------------------------------------------------------------
-ACTION="${1:-help}"
-TARGET="${2:-main}"
-
-case "$ACTION" in
-  rebuild)
-    resolve_target "$TARGET"
-    confirm_destructive "$RESOLVED_REPO_DIR" "$RESOLVED_BRANCH"
-    hard_sync_branch "$RESOLVED_REPO_DIR" "$RESOLVED_BRANCH"
-    docker_rebuild_stack "$RESOLVED_REPO_DIR"
-    ;;
-  pull)
-    resolve_target "$TARGET"
-    confirm_destructive "$RESOLVED_REPO_DIR" "$RESOLVED_BRANCH"
-    pull_branch_only "$RESOLVED_REPO_DIR" "$RESOLVED_BRANCH"
-    ;;
-  status)
-    resolve_target "$TARGET"
-    show_status "$RESOLVED_REPO_DIR"
-    ;;
-  logs)
-    resolve_target "$TARGET"
-    show_logs "$RESOLVED_REPO_DIR"
-    ;;
-  branch)
-    resolve_target "$TARGET"
-    show_branch "$RESOLVED_REPO_DIR"
-    ;;
-  help|-h|--help)
-    usage
-    ;;
-  *)
-    usage
-    ;;
-esac
+main "$@"

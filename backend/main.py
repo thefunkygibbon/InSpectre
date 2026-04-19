@@ -5,12 +5,14 @@ from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker, Session
 from pydantic import BaseModel
 from typing import Optional, List
+import asyncio
 import os
 import json
 import csv
 import io
 import socket
 import subprocess
+from datetime import datetime, timezone
 
 import httpx
 
@@ -70,6 +72,10 @@ def _migrate(db: Session):
         # vuln_last_scanned / vuln_severity columns on devices
         "ALTER TABLE devices ADD COLUMN IF NOT EXISTS vuln_last_scanned TIMESTAMPTZ",
         "ALTER TABLE devices ADD COLUMN IF NOT EXISTS vuln_severity VARCHAR",
+        "ALTER TABLE devices ADD COLUMN IF NOT EXISTS is_blocked BOOLEAN NOT NULL DEFAULT FALSE",
+        "ALTER TABLE devices ALTER COLUMN is_blocked SET DEFAULT FALSE",
+        "ALTER TABLE devices ADD COLUMN IF NOT EXISTS zone VARCHAR",
+        "ALTER TABLE devices ADD COLUMN IF NOT EXISTS is_ignored BOOLEAN NOT NULL DEFAULT FALSE",
     ]
     for sql in migrations:
         try:
@@ -89,12 +95,26 @@ DEFAULT_SETTINGS = {
     "sniffer_workers":         ("4",     "Number of parallel scanner threads."),
     "ip_range":                ("192.168.0.0/24", "CIDR range to scan."),
     "nmap_args":               ("-O --osscan-limit -sV --version-intensity 5 -T4", "Extra arguments passed to nmap."),
-    "notifications_enabled":   ("true",  "Show popup toasts when new devices appear or go offline."),
+    "notifications_enabled":              ("true",  "Show popup toasts when new devices appear or go offline."),
+    "browser_notifications_enabled":      ("false", "Show OS-level browser notifications for device events."),
+    "pushbullet_api_key":                 ("",      "Pushbullet API access token for push notifications."),
     "vuln_scan_scripts":       (
         "vulners,http-vuln-cve2017-5638,http-shellshock,smb-vuln-ms17-010,"
         "smb-vuln-cve-2020-0796,ssl-heartbleed,ssl-poodle,ftp-vsftpd-backdoor,ftp-anon",
         "Comma-separated Nmap NSE scripts used for vulnerability scanning."
     ),
+    "vuln_scan_schedule":      ("disabled", "Scheduled vulnerability scan interval. Options: disabled, 6h, 12h, 24h, weekly."),
+    "vuln_scan_targets":       ("important", "Devices to include in scheduled scans. Options: all, important."),
+    "vuln_scan_on_new_device": ("false", "Automatically run a vulnerability scan when a new device is first discovered."),
+    # Alert delivery
+    "alert_on_new_device":     ("false",  "Send an alert when a new device is discovered."),
+    "alert_on_offline":        ("false",  "Send an alert when a watched device goes offline."),
+    "alert_on_vuln":           ("false",  "Send an alert when a vulnerability scan finds issues."),
+    "alert_webhook_url":       ("",       "HTTP POST webhook URL for alerts (leave blank to disable)."),
+    "ntfy_url":                ("https://ntfy.sh", "ntfy server base URL."),
+    "ntfy_topic":              ("",       "ntfy topic name (leave blank to disable ntfy alerts)."),
+    "gotify_url":              ("",       "Gotify server URL (leave blank to disable)."),
+    "gotify_token":            ("",       "Gotify application token."),
 }
 
 
@@ -105,7 +125,270 @@ def _seed_settings(db: Session):
     db.commit()
 
 
-app = FastAPI(title="InSpectre API", version="0.7.2")
+# ---------------------------------------------------------------------------
+# Shared helper — save a vuln scan RESULT payload to DB
+# ---------------------------------------------------------------------------
+def _save_vuln_result(mac: str, ip: str, data: dict, scripts: str):
+    from models import VulnReport
+    db2 = SessionLocal()
+    try:
+        dev = db2.get(Device, mac)
+        if not dev:
+            return
+        report = VulnReport(
+            mac_address = mac,
+            ip_address  = ip,
+            duration_s  = data.get("duration_s"),
+            severity    = data.get("severity", "clean"),
+            vuln_count  = data.get("vuln_count", 0),
+            findings    = data.get("findings"),
+            raw_output  = data.get("raw_output"),
+            nmap_args   = scripts or None,
+        )
+        db2.add(report)
+        dev.vuln_last_scanned = datetime.now(timezone.utc)
+        dev.vuln_severity     = data.get("severity", "clean")
+        db2.commit()
+        _add_event(db2, mac, "vuln_scan_complete", {
+            "severity":   data.get("severity"),
+            "vuln_count": data.get("vuln_count", 0),
+        })
+        db2.commit()
+    except Exception as exc:
+        db2.rollback()
+        print(f"[vuln] Save error {mac}: {exc}", flush=True)
+    finally:
+        db2.close()
+
+
+# ---------------------------------------------------------------------------
+# Scheduled vuln scanner
+# ---------------------------------------------------------------------------
+_last_scheduled_vuln_scan: datetime | None = None
+
+
+async def _run_single_vuln_scan(mac: str, ip: str, scripts: str):
+    probe_url = f"{PROBE_URL}/stream/vuln-scan/{ip}"
+    params    = {"scripts": scripts} if scripts else {}
+    try:
+        async with httpx.AsyncClient(timeout=None) as client:
+            async with client.stream("GET", probe_url, params=params) as resp:
+                if resp.status_code != 200:
+                    print(f"[scheduler] Vuln scan {ip} HTTP {resp.status_code}", flush=True)
+                    return
+                async for raw_line in resp.aiter_lines():
+                    if raw_line.startswith("data: RESULT:"):
+                        payload_str = raw_line[len("data: RESULT:"):]
+                        try:
+                            data = json.loads(payload_str)
+                            _save_vuln_result(mac, ip, data, scripts)
+                            print(f"[scheduler] Vuln scan done: {ip} ({mac}) severity={data.get('severity')}", flush=True)
+                        except Exception as exc:
+                            print(f"[scheduler] Parse error {mac}: {exc}", flush=True)
+                        return
+    except httpx.ConnectError:
+        print(f"[scheduler] Cannot reach probe for {ip}", flush=True)
+    except Exception as exc:
+        print(f"[scheduler] Scan error {ip}: {exc}", flush=True)
+
+
+async def _run_scheduled_vuln_scans():
+    db = SessionLocal()
+    try:
+        settings_s = db.get(Setting, "vuln_scan_scripts")
+        scripts    = (settings_s.value or "").strip() if settings_s else ""
+        targets_s  = db.get(Setting, "vuln_scan_targets")
+        targets    = targets_s.value if targets_s else "important"
+        q = db.query(Device).filter(Device.is_online == True, Device.ip_address != None)
+        if targets == "important":
+            q = q.filter(Device.is_important == True)
+        devices = [(d.mac_address, d.ip_address) for d in q.all()]
+    finally:
+        db.close()
+
+    print(f"[scheduler] Starting scheduled vuln scan: {len(devices)} device(s)", flush=True)
+    for mac, ip in devices:
+        await _run_single_vuln_scan(mac, ip, scripts)
+        await asyncio.sleep(10)
+
+
+async def _scheduled_vuln_scan_loop():
+    global _last_scheduled_vuln_scan
+    await asyncio.sleep(30)  # startup grace period
+    while True:
+        try:
+            db = SessionLocal()
+            try:
+                sched_s   = db.get(Setting, "vuln_scan_schedule")
+                schedule  = sched_s.value if sched_s else "disabled"
+            finally:
+                db.close()
+
+            if schedule != "disabled":
+                intervals = {"6h": 21600, "12h": 43200, "24h": 86400, "weekly": 604800}
+                interval  = intervals.get(schedule, 86400)
+                now       = datetime.now(timezone.utc)
+                if _last_scheduled_vuln_scan is None or (now - _last_scheduled_vuln_scan).total_seconds() >= interval:
+                    await _run_scheduled_vuln_scans()
+                    _last_scheduled_vuln_scan = now
+        except Exception as exc:
+            print(f"[scheduler] Loop error: {exc}", flush=True)
+        await asyncio.sleep(900)  # check every 15 minutes
+
+
+# ---------------------------------------------------------------------------
+# Alert dispatch
+# ---------------------------------------------------------------------------
+_last_alert_event_id: int = 0
+
+
+async def _send_webhook(url: str, message: str, alert_type: str):
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            await client.post(url, json={"message": message, "type": alert_type, "source": "InSpectre"})
+    except Exception as exc:
+        print(f"[alerts] Webhook error: {exc}", flush=True)
+
+
+async def _send_ntfy(url: str, message: str):
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            await client.post(url, content=message.encode(),
+                              headers={"Title": "InSpectre Alert", "Priority": "default"})
+    except Exception as exc:
+        print(f"[alerts] ntfy error: {exc}", flush=True)
+
+
+async def _send_gotify(base_url: str, token: str, message: str):
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            await client.post(
+                f"{base_url.rstrip('/')}/message",
+                params={"token": token},
+                json={"title": "InSpectre Alert", "message": message, "priority": 5},
+            )
+    except Exception as exc:
+        print(f"[alerts] Gotify error: {exc}", flush=True)
+
+
+async def _send_pushbullet(api_key: str, title: str, body: str):
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            await client.post(
+                "https://api.pushbullet.com/v2/pushes",
+                json={"type": "note", "title": title, "body": body},
+                headers={"Access-Token": api_key, "Content-Type": "application/json"},
+            )
+    except Exception as exc:
+        print(f"[alerts] Pushbullet error: {exc}", flush=True)
+
+
+async def _dispatch_alerts(settings: dict, message: str, alert_type: str):
+    tasks = []
+    if settings.get("alert_webhook_url", "").strip():
+        tasks.append(_send_webhook(settings["alert_webhook_url"].strip(), message, alert_type))
+    ntfy_topic = settings.get("ntfy_topic", "").strip()
+    if ntfy_topic:
+        ntfy_base = settings.get("ntfy_url", "https://ntfy.sh").rstrip("/")
+        tasks.append(_send_ntfy(f"{ntfy_base}/{ntfy_topic}", message))
+    gotify_url   = settings.get("gotify_url", "").strip()
+    gotify_token = settings.get("gotify_token", "").strip()
+    if gotify_url and gotify_token:
+        tasks.append(_send_gotify(gotify_url, gotify_token, message))
+    pb_key = settings.get("pushbullet_api_key", "").strip()
+    if pb_key:
+        title = {"new_device": "New device on network", "device_offline": "Device went offline",
+                 "vuln_found": "Vulnerability found"}.get(alert_type, "InSpectre Alert")
+        tasks.append(_send_pushbullet(pb_key, title, message))
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+
+async def _alert_dispatch_loop():
+    global _last_alert_event_id
+    await asyncio.sleep(20)  # startup grace
+
+    # Initialise _last_alert_event_id to current max so we don't replay history
+    db = SessionLocal()
+    try:
+        row = db.execute(text("SELECT COALESCE(MAX(id), 0) FROM device_events")).scalar()
+        _last_alert_event_id = int(row or 0)
+    except Exception:
+        pass
+    finally:
+        db.close()
+
+    while True:
+        try:
+            db = SessionLocal()
+            try:
+                settings = {s.key: s.value for s in db.query(Setting).all()}
+                alert_new          = settings.get("alert_on_new_device",    "false") == "true"
+                alert_offline      = settings.get("alert_on_offline",       "false") == "true"
+                alert_vuln         = settings.get("alert_on_vuln",          "false") == "true"
+                vuln_on_new_device = settings.get("vuln_scan_on_new_device","false") == "true"
+
+                if alert_new or alert_offline or alert_vuln or vuln_on_new_device:
+                    rows = db.execute(text("""
+                        SELECT de.id, de.mac_address, de.type, de.detail, de.created_at,
+                               COALESCE(d.custom_name, d.hostname, d.ip_address, de.mac_address) AS name,
+                               d.ip_address, d.is_important,
+                               COALESCE(d.is_ignored, false) AS is_ignored
+                        FROM device_events de
+                        JOIN devices d ON d.mac_address = de.mac_address
+                        WHERE de.id > :last_id
+                          AND de.type = ANY(:types)
+                        ORDER BY de.id ASC
+                        LIMIT 50
+                    """), {
+                        "last_id": _last_alert_event_id,
+                        "types":   ["joined", "offline", "vuln_scan_complete"],
+                    }).fetchall()
+                else:
+                    rows = []
+
+                pending_alerts = []
+                vuln_scans_to_run = []
+                for row in rows:
+                    eid, mac, etype, detail, created_at, name, ip, is_important, is_ignored = row
+                    if is_ignored:
+                        _last_alert_event_id = max(_last_alert_event_id, eid)
+                        continue
+                    _last_alert_event_id = max(_last_alert_event_id, eid)
+                    if etype == "joined":
+                        if alert_new:
+                            pending_alerts.append((f"New device detected: {name} ({ip})", "new_device"))
+                        if vuln_on_new_device and ip:
+                            scripts_s = db.get(Setting, "vuln_scan_scripts")
+                            scripts   = (scripts_s.value or "").strip() if scripts_s else ""
+                            vuln_scans_to_run.append((mac, ip, scripts))
+                    elif etype == "offline" and alert_offline and is_important:
+                        pending_alerts.append((f"Watched device offline: {name} ({ip})", "device_offline"))
+                    elif etype == "vuln_scan_complete" and alert_vuln:
+                        severity = (detail or {}).get("severity", "unknown")
+                        if severity not in ("clean", "info"):
+                            count = (detail or {}).get("vuln_count", 0)
+                            pending_alerts.append((
+                                f"Vulnerabilities found on {name} ({ip}): {severity} severity, {count} finding(s)",
+                                "vuln_found",
+                            ))
+
+            finally:
+                db.close()
+
+            for message, alert_type in pending_alerts:
+                await _dispatch_alerts(settings, message, alert_type)
+            for mac, ip, scripts in vuln_scans_to_run:
+                print(f"[alerts] Auto vuln scan triggered for new device {ip} ({mac})", flush=True)
+                asyncio.ensure_future(_run_single_vuln_scan(mac, ip, scripts))
+
+        except Exception as exc:
+            print(f"[alerts] Dispatch loop error: {exc}", flush=True)
+
+        await asyncio.sleep(30)
+
+
+app = FastAPI(title="InSpectre API", version="1.0.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -115,13 +398,15 @@ app.add_middleware(
 
 
 @app.on_event("startup")
-def on_startup():
+async def on_startup():
     db = SessionLocal()
     try:
         _migrate(db)
         _seed_settings(db)
     finally:
         db.close()
+    asyncio.ensure_future(_scheduled_vuln_scan_loop())
+    asyncio.ensure_future(_alert_dispatch_loop())
 
 
 def get_db():
@@ -152,10 +437,19 @@ class MetadataUpdate(BaseModel):
     tags:         Optional[str]  = None
     location:     Optional[str]  = None
     is_important: Optional[bool] = None
+    zone:         Optional[str]  = None
+    is_ignored:   Optional[bool] = None
 
 
 class PrimaryIPUpdate(BaseModel):
     ip_address: str
+
+class NotifyPayload(BaseModel):
+    title: str
+    body: str
+
+class TestNotifyPayload(BaseModel):
+    api_key: Optional[str] = None
 
 
 # ---------------------------------------------------------------------------
@@ -299,6 +593,9 @@ def _to_dict(d: Device) -> dict:
         "device_type_inferred": inferred,
         "vuln_last_scanned": d.vuln_last_scanned.isoformat() if d.vuln_last_scanned else None,
         "vuln_severity":     d.vuln_severity,
+        "is_blocked":        bool(getattr(d, 'is_blocked', False)),
+        "zone":              getattr(d, 'zone', None),
+        "is_ignored":        bool(getattr(d, 'is_ignored', False)),
     }
 
 
@@ -378,17 +675,19 @@ def _add_event(db: Session, mac: str, event_type: str, detail: dict = None):
 # ---------------------------------------------------------------------------
 @app.get("/")
 def root():
-    return {"message": "InSpectre API", "version": "0.7.2"}
+    return {"message": "InSpectre API", "version": "1.0.0"}
 
 
 # ---------------------------------------------------------------------------
 # Devices
 # ---------------------------------------------------------------------------
 @app.get("/devices")
-def list_devices(online_only: bool = False, db: Session = Depends(get_db)):
+def list_devices(online_only: bool = False, include_ignored: bool = True, db: Session = Depends(get_db)):
     q = db.query(Device)
     if online_only:
         q = q.filter(Device.is_online == True)
+    if not include_ignored:
+        q = q.filter(Device.is_ignored == False)
     return [_to_dict(d) for d in q.order_by(Device.last_seen.desc(), Device.mac_address.asc()).all()]
 
 
@@ -438,6 +737,7 @@ def update_metadata(mac: str, payload: MetadataUpdate, db: Session = Depends(get
     if payload.notes    is not None: d.notes    = payload.notes    or None
     if payload.tags     is not None: d.tags     = payload.tags     or None
     if payload.location is not None: d.location = payload.location or None
+    if payload.zone     is not None: d.zone     = payload.zone     or None
     if payload.is_important is not None:
         old_imp = bool(getattr(d, 'is_important', False))
         d.is_important = payload.is_important
@@ -445,6 +745,8 @@ def update_metadata(mac: str, payload: MetadataUpdate, db: Session = Depends(get
             _add_event(db, mac.lower(), 'marked_important', {'important': payload.is_important})
     if payload.tags is not None:
         _add_event(db, mac.lower(), 'tagged', {'tags': payload.tags})
+    if payload.is_ignored is not None:
+        d.is_ignored = payload.is_ignored
     db.commit(); db.refresh(d)
     return _to_dict(d)
 
@@ -555,8 +857,6 @@ def get_identity_score(mac: str, db: Session = Depends(get_db)):
 # ---------------------------------------------------------------------------
 @app.get("/devices/{mac}/vuln-scan")
 async def stream_vuln_scan(mac: str, db: Session = Depends(get_db)):
-    from datetime import datetime, timezone
-
     d = db.get(Device, mac.lower())
     if not d:
         raise HTTPException(404, "Device not found")
@@ -588,32 +888,8 @@ async def stream_vuln_scan(mac: str, db: Session = Depends(get_db)):
                             payload_str = raw_line[len("data: RESULT:"):]
                             try:
                                 data = json.loads(payload_str)
-                                db2  = SessionLocal()
-                                try:
-                                    dev = db2.get(Device, mac_lower)
-                                    if dev:
-                                        report = VulnReport(
-                                            mac_address = mac_lower,
-                                            ip_address  = ip,
-                                            duration_s  = data.get("duration_s"),
-                                            severity    = data.get("severity", "clean"),
-                                            vuln_count  = data.get("vuln_count", 0),
-                                            findings    = data.get("findings"),
-                                            raw_output  = data.get("raw_output"),
-                                            nmap_args   = scripts or None,
-                                        )
-                                        db2.add(report)
-                                        dev.vuln_last_scanned = datetime.now(timezone.utc)
-                                        dev.vuln_severity     = data.get("severity", "clean")
-                                        db2.commit()
-                                        _add_event(db2, mac_lower, "vuln_scan_complete", {
-                                            "severity":   data.get("severity"),
-                                            "vuln_count": data.get("vuln_count", 0),
-                                        })
-                                        db2.commit()
-                                        result_saved = True
-                                finally:
-                                    db2.close()
+                                _save_vuln_result(mac_lower, ip, data, scripts)
+                                result_saved = True
                             except Exception as exc:
                                 yield f"data: [WARN] Could not save report: {exc}\n\n"
 
@@ -715,6 +991,77 @@ def list_all_vuln_reports(
         }
         for r in reports
     ]
+
+
+@app.get("/vulns/summary")
+def vuln_summary(db: Session = Depends(get_db)):
+    sev_rows = db.execute(text("""
+        SELECT vuln_severity, COUNT(*) AS cnt
+        FROM devices
+        WHERE vuln_severity IS NOT NULL
+        GROUP BY vuln_severity
+    """)).fetchall()
+    sev_counts = {r[0]: int(r[1]) for r in sev_rows}
+
+    top_rows = db.execute(text("""
+        SELECT DISTINCT ON (d.mac_address)
+               d.mac_address, d.custom_name, d.hostname, d.ip_address,
+               d.vuln_severity, vr.vuln_count, vr.scanned_at
+        FROM devices d
+        JOIN vuln_reports vr ON vr.mac_address = d.mac_address
+        WHERE d.vuln_severity IS NOT NULL AND d.vuln_severity NOT IN ('clean', 'info')
+        ORDER BY d.mac_address, vr.scanned_at DESC
+    """)).fetchall()
+
+    def sev_rank(s):
+        return {'critical': 0, 'high': 1, 'medium': 2, 'low': 3}.get(s or '', 9)
+
+    top_rows = sorted(top_rows, key=lambda r: sev_rank(r[4]))[:8]
+    top_vulnerable = [
+        {
+            "mac_address":  r[0],
+            "display_name": r[1] or r[2] or r[3] or r[0],
+            "ip_address":   r[3],
+            "severity":     r[4],
+            "vuln_count":   r[5],
+            "scanned_at":   r[6].isoformat() if r[6] else None,
+        }
+        for r in top_rows
+    ]
+
+    recent_rows = db.execute(text("""
+        SELECT d.mac_address,
+               COALESCE(d.custom_name, d.hostname, d.ip_address, d.mac_address) AS display_name,
+               d.ip_address, vr.severity, vr.vuln_count, vr.scanned_at
+        FROM vuln_reports vr
+        JOIN devices d ON d.mac_address = vr.mac_address
+        ORDER BY vr.scanned_at DESC
+        LIMIT 20
+    """)).fetchall()
+    recent_scans = [
+        {
+            "mac_address":  r[0],
+            "display_name": r[1],
+            "ip_address":   r[2],
+            "severity":     r[3],
+            "vuln_count":   r[4],
+            "scanned_at":   r[5].isoformat() if r[5] else None,
+        }
+        for r in recent_rows
+    ]
+
+    total_scanned = db.execute(text(
+        "SELECT COUNT(*) FROM devices WHERE vuln_last_scanned IS NOT NULL"
+    )).scalar() or 0
+    total_devices = db.execute(text("SELECT COUNT(*) FROM devices")).scalar() or 0
+
+    return {
+        "severity_counts": sev_counts,
+        "total_scanned":   int(total_scanned),
+        "total_devices":   int(total_devices),
+        "top_vulnerable":  top_vulnerable,
+        "recent_scans":    recent_scans,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -891,6 +1238,55 @@ async def apply_settings(db: Session = Depends(get_db)):
             return {"applied": True, "probe_response": body}
     except httpx.ConnectError:
         raise HTTPException(502, f"Cannot reach probe at {PROBE_URL}")
+
+
+# ---------------------------------------------------------------------------
+# Notifications
+# ---------------------------------------------------------------------------
+@app.post("/notify/pushbullet")
+async def send_pushbullet_notify(payload: NotifyPayload, db: Session = Depends(get_db)):
+    s   = db.get(Setting, "pushbullet_api_key")
+    key = (s.value or "").strip() if s else ""
+    if not key:
+        raise HTTPException(400, "Pushbullet API key not configured")
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.post(
+                "https://api.pushbullet.com/v2/pushes",
+                json={"type": "note", "title": payload.title, "body": payload.body},
+                headers={"Access-Token": key, "Content-Type": "application/json"},
+            )
+    except httpx.ConnectError:
+        raise HTTPException(502, "Cannot reach Pushbullet API")
+    if resp.status_code == 401:
+        raise HTTPException(401, "Invalid Pushbullet API key")
+    if resp.status_code >= 400:
+        raise HTTPException(502, f"Pushbullet error {resp.status_code}")
+    return {"sent": True}
+
+
+@app.post("/notify/test")
+async def test_pushbullet_notify(payload: TestNotifyPayload, db: Session = Depends(get_db)):
+    key = (payload.api_key or "").strip()
+    if not key:
+        s   = db.get(Setting, "pushbullet_api_key")
+        key = (s.value or "").strip() if s else ""
+    if not key:
+        raise HTTPException(400, "No Pushbullet API key configured")
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.post(
+                "https://api.pushbullet.com/v2/pushes",
+                json={"type": "note", "title": "InSpectre Test", "body": "Push notifications are working!"},
+                headers={"Access-Token": key, "Content-Type": "application/json"},
+            )
+    except httpx.ConnectError:
+        raise HTTPException(502, "Cannot reach Pushbullet API")
+    if resp.status_code == 401:
+        raise HTTPException(401, "Invalid API key — check your Pushbullet access token")
+    if resp.status_code >= 400:
+        raise HTTPException(502, f"Pushbullet error {resp.status_code}: {resp.text[:200]}")
+    return {"sent": True}
 
 
 # ---------------------------------------------------------------------------
@@ -1094,6 +1490,44 @@ async def stream_ping(mac: str, db: Session = Depends(get_db)):
 
     return StreamingResponse(_gen(), media_type="text/event-stream",
                              headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+
+@app.post("/devices/{mac}/block")
+async def block_device(mac: str, db: Session = Depends(get_db)):
+    d = db.get(Device, mac.lower())
+    if not d:
+        raise HTTPException(404, "Device not found")
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            resp = await client.post(f"{PROBE_URL}/block/{mac.lower()}")
+            if resp.status_code >= 400:
+                body = resp.text
+                raise HTTPException(502, f"Probe error: {body[:200]}")
+    except httpx.ConnectError:
+        raise HTTPException(502, f"Cannot reach probe at {PROBE_URL}")
+    d.is_blocked = True
+    _add_event(db, mac.lower(), "blocked", {"ip": d.ip_address})
+    db.commit(); db.refresh(d)
+    return _to_dict(d)
+
+
+@app.post("/devices/{mac}/unblock")
+async def unblock_device(mac: str, db: Session = Depends(get_db)):
+    d = db.get(Device, mac.lower())
+    if not d:
+        raise HTTPException(404, "Device not found")
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            resp = await client.delete(f"{PROBE_URL}/block/{mac.lower()}")
+            if resp.status_code >= 400:
+                body = resp.text
+                raise HTTPException(502, f"Probe error: {body[:200]}")
+    except httpx.ConnectError:
+        raise HTTPException(502, f"Cannot reach probe at {PROBE_URL}")
+    d.is_blocked = False
+    _add_event(db, mac.lower(), "unblocked", {"ip": d.ip_address})
+    db.commit(); db.refresh(d)
+    return _to_dict(d)
 
 
 @app.get("/devices/{mac}/traceroute")

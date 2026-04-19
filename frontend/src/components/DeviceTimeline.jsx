@@ -1,20 +1,24 @@
 import { useState, useEffect } from 'react'
 import {
   Wifi, WifiOff, Plus, ArrowLeftRight, ScanLine,
-  Star, Tag, Edit3, AlertCircle, Clock,
+  Star, Tag, Edit3, AlertCircle, Clock, ShieldAlert, Ban, CheckCircle,
 } from 'lucide-react'
 import { api } from '../api'
 
 const EVENT_CONFIG = {
-  joined:           { icon: Plus,           color: '#10b981', label: 'First seen' },
-  online:           { icon: Wifi,           color: '#10b981', label: 'Came online' },
-  offline:          { icon: WifiOff,        color: '#ef4444', label: 'Went offline' },
-  ip_change:        { icon: ArrowLeftRight, color: '#f59e0b', label: 'IP changed' },
-  scan_complete:    { icon: ScanLine,       color: '#6366f1', label: 'Scan complete' },
-  renamed:          { icon: Edit3,          color: '#8b5cf6', label: 'Renamed' },
-  tagged:           { icon: Tag,            color: '#06b6d4', label: 'Tags updated' },
-  marked_important: { icon: Star,           color: '#f59e0b', label: 'Watch status changed' },
-  port_change:      { icon: AlertCircle,    color: '#ef4444', label: 'Ports changed' },
+  joined:             { icon: Plus,           color: '#10b981', label: 'First seen' },
+  online:             { icon: Wifi,           color: '#10b981', label: 'Came online' },
+  offline:            { icon: WifiOff,        color: '#ef4444', label: 'Went offline' },
+  ip_change:          { icon: ArrowLeftRight, color: '#f59e0b', label: 'IP changed' },
+  scan_complete:      { icon: ScanLine,       color: '#6366f1', label: 'Scan complete' },
+  renamed:            { icon: Edit3,          color: '#8b5cf6', label: 'Renamed' },
+  tagged:             { icon: Tag,            color: '#06b6d4', label: 'Tags updated' },
+  marked_important:   { icon: Star,           color: '#f59e0b', label: 'Watch status changed' },
+  port_change:        { icon: AlertCircle,    color: '#ef4444', label: 'Ports changed' },
+  vuln_scan_complete: { icon: ShieldAlert,    color: '#f97316', label: 'Vulnerability scan' },
+  blocked:            { icon: Ban,            color: '#ef4444', label: 'Blocked' },
+  unblocked:          { icon: CheckCircle,    color: '#10b981', label: 'Unblocked' },
+  primary_ip_changed: { icon: ArrowLeftRight, color: '#f59e0b', label: 'Primary IP changed' },
 }
 
 function relativeTime(iso) {
@@ -38,7 +42,14 @@ function eventDetail(event) {
     case 'renamed':          return d.new ? `\u201c${d.new}\u201d` : 'Name cleared'
     case 'tagged':           return d.tags ? `Tags: ${d.tags}` : null
     case 'marked_important': return d.important ? '\u2605 Marked as watched' : 'Removed from watched'
-    case 'scan_complete':    return d.open_ports != null ? `${d.open_ports} open port${d.open_ports !== 1 ? 's' : ''}` : null
+    case 'scan_complete':       return d.open_ports != null ? `${d.open_ports} open port${d.open_ports !== 1 ? 's' : ''}` : null
+    case 'vuln_scan_complete':  return d.severity ? `${d.severity} (${d.vuln_count ?? 0} finding${d.vuln_count !== 1 ? 's' : ''})` : null
+    case 'port_change': {
+      const parts = []
+      if (d.added?.length)   parts.push(`+${d.added.length} port${d.added.length !== 1 ? 's' : ''} (${d.added.map(p => p.port).join(', ')})`)
+      if (d.removed?.length) parts.push(`-${d.removed.length} port${d.removed.length !== 1 ? 's' : ''} (${d.removed.map(p => p.port).join(', ')})`)
+      return parts.length ? parts.join(' · ') : null
+    }
     default:                 return null
   }
 }

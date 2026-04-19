@@ -1,6 +1,16 @@
 import { useState, useEffect } from 'react'
-import { Save, MapPin, Tag, X, Plus } from 'lucide-react'
+import { Save, MapPin, Tag, X, Layers } from 'lucide-react'
 import { api } from '../api'
+
+const ZONE_OPTIONS = [
+  { value: '',               label: '— None —' },
+  { value: 'Trusted',        label: 'Trusted' },
+  { value: 'IoT',            label: 'IoT' },
+  { value: 'Guest',          label: 'Guest' },
+  { value: 'Lab',            label: 'Lab' },
+  { value: 'Infrastructure', label: 'Infrastructure' },
+  { value: '__custom__',     label: 'Custom…' },
+]
 
 /**
  * DeviceNotes — Phase 1
@@ -8,12 +18,19 @@ import { api } from '../api'
  * Calls onSaved(updatedDevice) when the backend confirms.
  */
 export function DeviceNotes({ device, onSaved }) {
-  const [notes,    setNotes]    = useState(device.notes    || '')
-  const [location, setLocation] = useState(device.location || '')
-  const [tagInput, setTagInput] = useState('')
-  const [tags,     setTags]     = useState(
+  const [notes,      setNotes]      = useState(device.notes    || '')
+  const [location,   setLocation]   = useState(device.location || '')
+  const [tagInput,   setTagInput]   = useState('')
+  const [tags,       setTags]       = useState(
     device.tags ? device.tags.split(',').map(t => t.trim()).filter(Boolean) : []
   )
+
+  // zone: select or custom text
+  const knownValues = ZONE_OPTIONS.filter(o => o.value && o.value !== '__custom__').map(o => o.value)
+  const initSelect  = !device.zone ? '' : knownValues.includes(device.zone) ? device.zone : '__custom__'
+  const [zoneSelect,  setZoneSelect]  = useState(initSelect)
+  const [zoneCustom,  setZoneCustom]  = useState(knownValues.includes(device.zone || '') ? '' : (device.zone || ''))
+
   const [saving,   setSaving]   = useState(false)
   const [saved,    setSaved]    = useState(false)
   const [error,    setError]    = useState(null)
@@ -23,6 +40,10 @@ export function DeviceNotes({ device, onSaved }) {
     setNotes(device.notes || '')
     setLocation(device.location || '')
     setTags(device.tags ? device.tags.split(',').map(t => t.trim()).filter(Boolean) : [])
+    const known = ZONE_OPTIONS.filter(o => o.value && o.value !== '__custom__').map(o => o.value)
+    const sel   = !device.zone ? '' : known.includes(device.zone) ? device.zone : '__custom__'
+    setZoneSelect(sel)
+    setZoneCustom(known.includes(device.zone || '') ? '' : (device.zone || ''))
   }, [device.mac_address])
 
   function addTag(e) {
@@ -44,10 +65,12 @@ export function DeviceNotes({ device, onSaved }) {
     setError(null)
     setSaved(false)
     try {
+      const effectiveZone = zoneSelect === '__custom__' ? zoneCustom.trim() : zoneSelect
       const updated = await api.updateMetadata(device.mac_address, {
         notes:    notes.trim() || null,
         tags:     tags.join(',') || null,
         location: location.trim() || null,
+        zone:     effectiveZone || null,
       })
       setSaved(true)
       setTimeout(() => setSaved(false), 2500)
@@ -75,6 +98,40 @@ export function DeviceNotes({ device, onSaved }) {
           placeholder="Add notes about this device…"
           style={{ fontFamily: 'inherit', fontSize: 'var(--text-sm)' }}
         />
+      </div>
+
+      {/* Zone */}
+      <div>
+        <label className="block text-xs font-medium mb-1.5" style={{ color: 'var(--color-text-muted)' }}>
+          <span className="flex items-center gap-1.5">
+            <Layers size={11} />
+            Network Zone
+          </span>
+        </label>
+        <div className="relative">
+          <select
+            className="input w-full appearance-none pr-8"
+            value={zoneSelect}
+            onChange={e => setZoneSelect(e.target.value)}
+          >
+            {ZONE_OPTIONS.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
+          </select>
+          <svg className="pointer-events-none absolute right-2.5 top-1/2 -translate-y-1/2 w-3 h-3 opacity-50"
+            viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+            <polyline points="6 9 12 15 18 9" />
+          </svg>
+        </div>
+        {zoneSelect === '__custom__' && (
+          <input
+            className="input w-full mt-1.5"
+            value={zoneCustom}
+            onChange={e => setZoneCustom(e.target.value)}
+            placeholder="Enter custom zone name…"
+          />
+        )}
+        <p className="text-[10px] mt-1" style={{ color: 'var(--color-text-faint)' }}>
+          Assign a network trust zone to group this device
+        </p>
       </div>
 
       {/* Location */}

@@ -1,0 +1,15 @@
+# temp files
+tmp/
+temp/
+*.tmp
+
+# db files
+*.db
+*.sqlite
+*.sqlite3
+
+# app-specific runtime dirs
+data/
+var/
+.cache/
+postgres_data/
