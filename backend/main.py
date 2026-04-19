@@ -76,6 +76,8 @@ def _migrate(db: Session):
         "ALTER TABLE devices ALTER COLUMN is_blocked SET DEFAULT FALSE",
         "ALTER TABLE devices ADD COLUMN IF NOT EXISTS zone VARCHAR",
         "ALTER TABLE devices ADD COLUMN IF NOT EXISTS is_ignored BOOLEAN NOT NULL DEFAULT FALSE",
+        # Nuclei migration: add scan_args column (replaces nmap_args semantically)
+        "ALTER TABLE vuln_reports ADD COLUMN IF NOT EXISTS scan_args VARCHAR",
     ]
     for sql in migrations:
         try:
@@ -98,10 +100,9 @@ DEFAULT_SETTINGS = {
     "notifications_enabled":              ("true",  "Show popup toasts when new devices appear or go offline."),
     "browser_notifications_enabled":      ("false", "Show OS-level browser notifications for device events."),
     "pushbullet_api_key":                 ("",      "Pushbullet API access token for push notifications."),
-    "vuln_scan_scripts":       (
-        "vulners,http-vuln-cve2017-5638,http-shellshock,smb-vuln-ms17-010,"
-        "smb-vuln-cve-2020-0796,ssl-heartbleed,ssl-poodle,ftp-vsftpd-backdoor,ftp-anon",
-        "Comma-separated Nmap NSE scripts used for vulnerability scanning."
+    "vuln_scan_templates":      (
+        "cve,exposure,misconfig,default-login,network",
+        "Comma-separated Nuclei template tags used for vulnerability scanning."
     ),
     "vuln_scan_schedule":      ("disabled", "Scheduled vulnerability scan interval. Options: disabled, 6h, 12h, 24h, weekly."),
     "vuln_scan_targets":       ("important", "Devices to include in scheduled scans. Options: all, important."),
@@ -143,7 +144,7 @@ def _save_vuln_result(mac: str, ip: str, data: dict, scripts: str):
             vuln_count  = data.get("vuln_count", 0),
             findings    = data.get("findings"),
             raw_output  = data.get("raw_output"),
-            nmap_args   = scripts or None,
+            scan_args   = scripts or None,
         )
         db2.add(report)
         dev.vuln_last_scanned = datetime.now(timezone.utc)
@@ -169,7 +170,7 @@ _last_scheduled_vuln_scan: datetime | None = None
 
 async def _run_single_vuln_scan(mac: str, ip: str, scripts: str):
     probe_url = f"{PROBE_URL}/stream/vuln-scan/{ip}"
-    params    = {"scripts": scripts} if scripts else {}
+    params    = {"templates": scripts} if scripts else {}
     try:
         async with httpx.AsyncClient(timeout=None) as client:
             async with client.stream("GET", probe_url, params=params) as resp:
@@ -195,7 +196,7 @@ async def _run_single_vuln_scan(mac: str, ip: str, scripts: str):
 async def _run_scheduled_vuln_scans():
     db = SessionLocal()
     try:
-        settings_s = db.get(Setting, "vuln_scan_scripts")
+        settings_s = db.get(Setting, "vuln_scan_templates")
         scripts    = (settings_s.value or "").strip() if settings_s else ""
         targets_s  = db.get(Setting, "vuln_scan_targets")
         targets    = targets_s.value if targets_s else "important"
@@ -359,7 +360,7 @@ async def _alert_dispatch_loop():
                         if alert_new:
                             pending_alerts.append((f"New device detected: {name} ({ip})", "new_device"))
                         if vuln_on_new_device and ip:
-                            scripts_s = db.get(Setting, "vuln_scan_scripts")
+                            scripts_s = db.get(Setting, "vuln_scan_templates")
                             scripts   = (scripts_s.value or "").strip() if scripts_s else ""
                             vuln_scans_to_run.append((mac, ip, scripts))
                     elif etype == "offline" and alert_offline and is_important:
@@ -863,13 +864,13 @@ async def stream_vuln_scan(mac: str, db: Session = Depends(get_db)):
     if not d.ip_address:
         raise HTTPException(400, "Device has no IP address")
 
-    scripts_setting = db.get(Setting, "vuln_scan_scripts")
-    scripts = (scripts_setting.value or "").strip() if scripts_setting else ""
+    templates_setting = db.get(Setting, "vuln_scan_templates")
+    templates = (templates_setting.value or "").strip() if templates_setting else ""
 
     ip        = d.ip_address
     mac_lower = mac.lower()
     probe_url = f"{PROBE_URL}/stream/vuln-scan/{ip}"
-    params    = {"scripts": scripts} if scripts else {}
+    params    = {"templates": templates} if templates else {}
 
     async def _event_stream():
         result_saved = False
@@ -888,7 +889,7 @@ async def stream_vuln_scan(mac: str, db: Session = Depends(get_db)):
                             payload_str = raw_line[len("data: RESULT:"):]
                             try:
                                 data = json.loads(payload_str)
-                                _save_vuln_result(mac_lower, ip, data, scripts)
+                                _save_vuln_result(mac_lower, ip, data, templates)
                                 result_saved = True
                             except Exception as exc:
                                 yield f"data: [WARN] Could not save report: {exc}\n\n"
@@ -929,7 +930,7 @@ def get_vuln_reports(mac: str, limit: int = Query(10, ge=1, le=100), db: Session
             "severity":   r.severity,
             "vuln_count": r.vuln_count,
             "findings":   r.findings or [],
-            "nmap_args":  r.nmap_args,
+            "scan_args":  r.scan_args,
         }
         for r in reports
     ]
@@ -952,7 +953,7 @@ def get_vuln_report_detail(mac: str, report_id: int, db: Session = Depends(get_d
         "vuln_count":   r.vuln_count,
         "findings":     r.findings or [],
         "raw_output":   r.raw_output,
-        "nmap_args":    r.nmap_args,
+        "scan_args":    r.scan_args,
     }
 
 

@@ -35,7 +35,7 @@ DATABASE_URL            = os.environ.get("DATABASE_URL",            "postgresql:
 SCAN_INTERVAL           = int(os.environ.get("SCAN_INTERVAL",           60))
 IP_RANGE                = os.environ.get("IP_RANGE",                "192.168.0.0/24")
 INTERFACE               = os.environ.get("INTERFACE",               "eth0")
-NMAP_ARGS               = os.environ.get("NMAP_ARGS",               "-O --osscan-limit -sV --version-intensity 5 -T4")
+NMAP_ARGS               = os.environ.get("NMAP_ARGS",               "-O --osscan-limit -sV --version-intensity 5 -T4 -p-")
 OS_CONFIDENCE_THRESHOLD = int(os.environ.get("OS_CONFIDENCE_THRESHOLD", 85))
 OFFLINE_MISS_THRESHOLD  = int(os.environ.get("OFFLINE_MISS_THRESHOLD",   3))
 SNIFFER_WORKERS         = int(os.environ.get("SNIFFER_WORKERS",          4))
@@ -1307,20 +1307,34 @@ def stream_traceroute(ip: str):
 
 
 @probe_api.get("/stream/vuln-scan/{ip}")
-async def stream_vuln_scan(ip: str, scripts: str = ""):
+async def stream_vuln_scan(ip: str, templates: str = ""):
     import ipaddress
-    from vuln_scanner import run_vuln_scan, DEFAULT_VULN_SCRIPTS
+    from vuln_scanner import run_vuln_scan, DEFAULT_TEMPLATES
 
     try:
         ipaddress.ip_address(ip)
     except ValueError:
         raise HTTPException(400, "Invalid IP address")
 
-    effective_scripts = scripts.strip() if scripts.strip() else DEFAULT_VULN_SCRIPTS
+    effective_templates = templates.strip() if templates.strip() else DEFAULT_TEMPLATES
+
+    # Pull ports already found by the nmap deep scan for this device
+    known_ports: list[int] = []
+    try:
+        session = Session()
+        device = session.query(Device).filter(Device.ip_address == ip).first()
+        if device and device.scan_results:
+            known_ports = [
+                p["port"] for p in (device.scan_results.get("open_ports") or [])
+                if isinstance(p.get("port"), int)
+            ]
+        session.close()
+    except Exception:
+        pass
 
     async def _gen():
         yield f"data: [INFO] Initiating vulnerability scan…\n\n"
-        async for line in run_vuln_scan(ip, scripts=effective_scripts):
+        async for line in run_vuln_scan(ip, templates=effective_templates, known_ports=known_ports):
             safe = line.replace("\n", " ").replace("\r", "")
             yield f"data: {safe}\n\n"
         yield "data: --- done ---\n\n"

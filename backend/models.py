@@ -74,8 +74,9 @@ class DeviceEvent(Base):
 
 class VulnReport(Base):
     """
-    Stores the result of a vulnerability scan (Nmap NSE vuln scripts) for a device.
+    Stores the result of a Nuclei vulnerability scan for a device.
     severity: 'critical' | 'high' | 'medium' | 'low' | 'info' | 'clean'
+    findings: list of dicts with keys template_id, name, severity, cvss, cves, description, etc.
     """
     __tablename__ = "vuln_reports"
     id           = Column(Integer, primary_key=True, autoincrement=True)
@@ -83,12 +84,12 @@ class VulnReport(Base):
                           nullable=False, index=True)
     ip_address   = Column(String, nullable=True)
     scanned_at   = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), index=True)
-    duration_s   = Column(Float,   nullable=True)   # seconds the scan took
-    severity     = Column(String,  nullable=False, default="clean")  # highest severity found
+    duration_s   = Column(Float,   nullable=True)
+    severity     = Column(String,  nullable=False, default="clean")
     vuln_count   = Column(Integer, nullable=False, default=0)
-    findings     = Column(JSON,    nullable=True)   # list of finding dicts
-    raw_output   = Column(Text,    nullable=True)   # full nmap stdout
-    nmap_args    = Column(String,  nullable=True)   # args used
+    findings     = Column(JSON,    nullable=True)   # list of Nuclei finding dicts
+    raw_output   = Column(Text,    nullable=True)   # raw Nuclei JSONL stdout
+    scan_args    = Column(String,  nullable=True)   # template tags / severity used
     device       = relationship("Device", back_populates="vuln_reports")
 
 

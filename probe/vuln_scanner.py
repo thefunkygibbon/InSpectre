@@ -1,56 +1,55 @@
 """
-Phase 3 — Vulnerability Scanner  (runs in the PROBE container)
+Nuclei-based vulnerability scanner (runs in the PROBE container).
 
-nmap runs here because the probe is on the host network and can reach every
-LAN IP directly.  The backend container cannot — it is on a Docker bridge and
-nmap scans from there never reach the target.
+Workflow:
+  1. nmap quick port-scan to discover open services on the target IP
+  2. Build HTTP/HTTPS/raw target strings from the discovered ports
+  3. Run Nuclei in JSONL mode (-json) against all targets
+  4. Stream Nuclei's stderr (progress/stats) live to keep the SSE connection alive
+  5. Collect Nuclei's stdout (JSONL findings) silently in a background task
+  6. Emit per-finding summary lines, then a final RESULT:<json> line
 
-Called from probe/main.py's  /stream/vuln-scan/{ip}  SSE endpoint.
+The probe runs on the host network so both nmap and nuclei reach every LAN IP directly.
+Called from probe/main.py's /stream/vuln-scan/{ip} SSE endpoint.
 """
 import asyncio
+import json
 import os
 import re
 import time
 from datetime import datetime, timezone
 from typing import AsyncGenerator
 
-# ---------------------------------------------------------------------------
-# NSE script set
-# ---------------------------------------------------------------------------
-DEFAULT_VULN_SCRIPTS = (
-    "vulners,"
-    "http-vuln-cve2017-5638,"
-    "http-shellshock,"
-    "smb-vuln-ms17-010,"
-    "ssl-heartbleed,"
-    "ssl-poodle,"
-    "ssl-ccs-injection,"
-    "ftp-vsftpd-backdoor,"
-    "ftp-anon"
+_SEV_RANK = {"critical": 5, "high": 4, "medium": 3, "low": 2, "info": 1, "clean": 0}
+
+# Common service ports scanned for target discovery
+DEFAULT_SCAN_PORTS = (
+    "21,22,23,25,53,80,110,111,139,143,443,445,465,993,995,"
+    "1723,3000,3306,3389,5900,5901,6379,8000,8008,8080,8081,"
+    "8443,8888,9000,9090,9200,27017"
 )
 
-# -sV is required for vulners to cross-reference CVEs.
-# -v makes nmap write timing/progress to stderr so the UI isn't silent.
-# -oN - writes normal-format results to stdout so we can capture them directly.
-DEFAULT_EXTRA_ARGS = "-T4 --open -sV --version-intensity 5 -v -oN -"
+# Nuclei template tags suited for LAN device scanning
+DEFAULT_TEMPLATES = "cve,exposure,misconfig,default-login,network"
 
-# Lines from nmap stderr (or stdout noise) that are pure noise — suppress them.
-# NOTE: "Error in input stream" is an nmap cosmetic message when stdin is
-# /dev/null; it is harmless and should be silently dropped, not surfaced.
+# Severity levels included by default
+DEFAULT_SEVERITY = "critical,high,medium,low"
+
+# Ports that are definitively HTTPS
+_HTTPS_PORTS = {443, 8443, 4443, 9443}
+# Ports that are definitively HTTP
+_HTTP_PORTS  = {80, 8080, 8000, 8008, 8888, 9000, 9090, 3000, 7080}
+
+# Nuclei stderr lines that are pure informational noise
 _NOISE_RE = re.compile(
-    r"(Error in input stream"
-    r"|NSE: Loaded"
-    r"|NSE: Script Pre-scanning"
-    r"|NSE: Script Post-scanning"
-    r"|Initiating.*Ping Scan"
-    r"|Scanning.*\["
-    r"|Completed.*Ping Scan"
+    r"(Current nuclei version"
+    r"|Current nuclei-templates version"
+    r"|New templates added in latest"
+    r"|nuclei-templates are not installed"
+    r"|Using retries"
     r")",
     re.IGNORECASE,
 )
-
-# Severity ordering
-_SEV_RANK = {"critical": 5, "high": 4, "medium": 3, "low": 2, "info": 1, "clean": 0}
 
 
 def _bump_severity(current: str, candidate: str) -> str:
@@ -59,152 +58,174 @@ def _bump_severity(current: str, candidate: str) -> str:
     return current
 
 
-async def _validate_scripts(scripts: str) -> tuple[str, list[str]]:
-    """
-    Run ``nmap --script-help <scripts>`` to check which script names nmap
-    recognises.  Returns (valid_csv, rejected_list).
-    """
-    rejected: list[str] = []
-    names = [s.strip() for s in scripts.split(",") if s.strip()]
-
+async def _quick_port_scan(ip: str, ports: str) -> list[int]:
+    """nmap greppable-format scan to discover open ports. Returns sorted list."""
     try:
-        devnull = open(os.devnull, "rb")
         proc = await asyncio.create_subprocess_exec(
-            "nmap", "--script-help", ",".join(names),
-            stdin=devnull,
-            stdout=asyncio.subprocess.DEVNULL,
-            stderr=asyncio.subprocess.PIPE,
+            "nmap", "-p", ports, "--open", "-T4", "-n", "-oG", "-", ip,
+            stdin=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
         )
-        _, stderr_bytes = await proc.communicate()
-        devnull.close()
-        stderr_text = stderr_bytes.decode(errors="replace")
-
-        bad_re = re.compile(r"'([^']+)'\s+did not match")
-        rejected = bad_re.findall(stderr_text)
-
-        if rejected:
-            valid = [n for n in names if n not in rejected]
-            return ",".join(valid), rejected
-    except FileNotFoundError:
-        pass
-
-    return scripts, []
+        stdout, _ = await proc.communicate()
+        text = stdout.decode(errors="replace")
+        found: list[int] = []
+        for line in text.splitlines():
+            if "Ports:" in line:
+                for m in re.finditer(r"(\d+)/open", line):
+                    found.append(int(m.group(1)))
+        return sorted(set(found))
+    except Exception:
+        return []
 
 
-def _parse_nmap_output(raw: str) -> tuple[list[dict], str]:
-    """
-    Parse NSE script output blocks from nmap normal-format output.
-    Returns (findings_list, highest_severity).
-    """
-    findings: list[dict] = []
-    highest = "clean"
+def _build_targets(ip: str, open_ports: list[int]) -> list[str]:
+    """Build nuclei target strings from discovered open ports."""
+    targets: list[str] = []
+    seen: set[str] = set()
 
-    vuln_state_re = re.compile(
-        r"STATE:\s*(VULNERABLE|LIKELY VULNERABLE|NOT VULNERABLE|UNKNOWN)",
-        re.IGNORECASE,
-    )
-    cvss_re = re.compile(r"cvss[\s:]+([0-9]+(\.[0-9]+)?)", re.IGNORECASE)
-    cve_re  = re.compile(r"(CVE-[0-9]{4}-[0-9]+)", re.IGNORECASE)
+    def add(t: str) -> None:
+        if t not in seen:
+            seen.add(t)
+            targets.append(t)
 
-    lines = raw.splitlines()
-    i = 0
-    while i < len(lines):
-        line = lines[i]
-        m = re.match(r"^\| {0,2}([-\w.]+):", line)
-        if not m:
-            i += 1
-            continue
+    for port in open_ports:
+        if port in _HTTPS_PORTS:
+            add(f"https://{ip}:{port}")
+        elif port in _HTTP_PORTS:
+            add(f"http://{ip}:{port}")
+        elif port == 80:
+            add(f"http://{ip}")
+        elif port == 443:
+            add(f"https://{ip}")
+        else:
+            # Ambiguous port: probe all three ways
+            add(f"http://{ip}:{port}")
+            add(f"https://{ip}:{port}")
+            add(f"{ip}:{port}")
 
-        script_name = m.group(1)
-        block_lines = [line]
-        i += 1
-        while i < len(lines) and (lines[i].startswith("|") or lines[i].startswith("/_")):
-            block_lines.append(lines[i])
-            i += 1
-        block_text = "\n".join(block_lines)
+    # Always include bare HTTP/HTTPS for the IP itself
+    if not any(t in (f"http://{ip}", f"http://{ip}:80") for t in targets):
+        add(f"http://{ip}")
+    if not any(t in (f"https://{ip}", f"https://{ip}:443") for t in targets):
+        add(f"https://{ip}")
 
-        state_m = vuln_state_re.search(block_text)
-        state   = state_m.group(1).upper() if state_m else None
+    return targets
 
-        if state == "NOT VULNERABLE":
-            continue
 
+def _parse_nuclei_finding(line: str) -> dict | None:
+    """Parse one Nuclei JSONL output line into a normalised finding dict."""
+    try:
+        raw = json.loads(line)
+    except (json.JSONDecodeError, ValueError):
+        return None
+
+    # Only process actual template match events
+    if "info" not in raw or "template-id" not in raw:
+        return None
+
+    info           = raw.get("info", {})
+    classification = info.get("classification", {})
+
+    severity = (info.get("severity") or "info").lower()
+    if severity not in _SEV_RANK:
         severity = "info"
-        cvss_m   = cvss_re.search(block_text)
-        if cvss_m:
-            score = float(cvss_m.group(1))
-            if score >= 9.0:   severity = "critical"
-            elif score >= 7.0: severity = "high"
-            elif score >= 4.0: severity = "medium"
-            else:              severity = "low"
-        elif state == "VULNERABLE":
-            severity = "high"
-        elif state == "LIKELY VULNERABLE":
-            severity = "medium"
 
-        cves = list({c.upper() for c in cve_re.findall(block_text)})
-        title_lines = [ln.lstrip("| ").strip() for ln in block_lines[1:] if ln.strip().lstrip("|").strip()]
-        title = title_lines[0] if title_lines else script_name
+    cvss_score = classification.get("cvss-score")
 
-        findings.append({
-            "script":   script_name,
-            "title":    title,
-            "severity": severity,
-            "state":    state or "VULNERABLE",
-            "cves":     cves,
-            "cvss":     float(cvss_m.group(1)) if cvss_m else None,
-            "detail":   block_text,
-        })
-        highest = _bump_severity(highest, severity)
+    cve_raw = classification.get("cve-id", "")
+    if isinstance(cve_raw, list):
+        cves = [c.upper() for c in cve_raw if c]
+    elif cve_raw:
+        cves = [c.strip().upper() for c in str(cve_raw).split(",") if c.strip()]
+    else:
+        cves = []
 
-    return findings, highest
+    reference = info.get("reference", [])
+    if isinstance(reference, str):
+        reference = [reference] if reference else []
+
+    tags = info.get("tags", [])
+    if isinstance(tags, str):
+        tags = [t.strip() for t in tags.split(",") if t.strip()]
+
+    return {
+        "template_id":  raw.get("template-id", ""),
+        "name":         info.get("name") or raw.get("template-id", "Unknown"),
+        "severity":     severity,
+        "cvss":         float(cvss_score) if cvss_score is not None else None,
+        "cvss_metrics": classification.get("cvss-metrics"),
+        "cves":         cves,
+        "cwe_id":       classification.get("cwe-id"),
+        "description":  info.get("description"),
+        "reference":    reference[:4],
+        "tags":         tags[:10],
+        "host":         raw.get("host", ""),
+        "matched_at":   raw.get("matched-at", ""),
+        "type":         raw.get("type", ""),
+    }
 
 
 async def run_vuln_scan(
     ip: str,
-    scripts: str = DEFAULT_VULN_SCRIPTS,
-    extra_args: str = DEFAULT_EXTRA_ARGS,
+    templates: str = DEFAULT_TEMPLATES,
+    severity: str = DEFAULT_SEVERITY,
+    known_ports: list[int] | None = None,
 ) -> AsyncGenerator[str, None]:
     """
-    Async generator — yields log lines for SSE streaming.
+    Async generator — yields SSE log lines, ending with ``RESULT:<json>``.
 
-    stderr lines are yielded in real-time as nmap produces them so that the
-    SSE connection stays alive through nginx and the UI shows live progress.
-    stdout (the -oN report) is collected in the background and only parsed
-    after the process exits.
-
-    Final line is always ``RESULT:<json>``.
+    Phase 1: nmap discovers open ports (fast greppable scan, no service detection).
+             Any ports already found by the nmap deep scan (known_ports) are merged in.
+    Phase 2: Nuclei tests all discovered HTTP/HTTPS/raw endpoints with matching templates.
+    Nuclei stdout (JSONL findings) is drained silently in a background task to prevent
+    OS pipe buffer deadlock.  Nuclei stderr (progress/stats) is streamed live so the
+    SSE connection stays alive through nginx.
     """
-    import json
-
-    yield f"[INFO] Starting vulnerability scan against {ip}…"
-
-    scripts, rejected = await _validate_scripts(scripts)
-    if rejected:
-        yield f"[WARN] Skipping unsupported script(s): {', '.join(rejected)}"
-    if not scripts.strip(","):
-        yield "[ERROR] No valid scripts remaining after validation."
-        yield 'RESULT:{"severity":"clean","vuln_count":0,"findings":[],"error":"no_valid_scripts"}'
-        return
-
-    script_names = [s.strip() for s in scripts.split(",") if s.strip()]
-    yield f"[INFO] Scripts: {', '.join(script_names)}"
-
-    cmd = [
-        "nmap",
-        "--script", scripts,
-        *extra_args.split(),
-        ip,
-    ]
-
-    yield f"[INFO] Command: {' '.join(cmd)}"
-
+    yield f"[INFO] Starting Nuclei vulnerability scan against {ip}…"
     t0 = time.monotonic()
 
-    devnull_in = open(os.devnull, "rb")
+    # ── Phase 1: Port discovery ──────────────────────────────────────────────
+    port_count = DEFAULT_SCAN_PORTS.count(",") + 1
+    yield f"[INFO] Discovering open ports (checking {port_count} common ports)…"
+    open_ports = await _quick_port_scan(ip, DEFAULT_SCAN_PORTS)
+
+    # Merge ports already discovered by the nmap deep scan
+    if known_ports:
+        merged = sorted(set(open_ports) | set(known_ports))
+        extra = sorted(set(known_ports) - set(open_ports))
+        if extra:
+            yield f"[INFO] Adding {len(extra)} port(s) from prior nmap scan: {', '.join(map(str, extra))}"
+        open_ports = merged
+
+    if open_ports:
+        yield f"[INFO] Open ports: {', '.join(map(str, open_ports))}"
+    else:
+        yield "[INFO] No open ports detected — scanning default HTTP/HTTPS endpoints"
+
+    # ── Phase 2: Build targets ───────────────────────────────────────────────
+    targets = _build_targets(ip, open_ports)
+    yield f"[INFO] Nuclei will test {len(targets)} endpoint(s)"
+
+    # ── Phase 3: Run Nuclei ──────────────────────────────────────────────────
+    cmd = [
+        "nuclei",
+        "-json",
+        "-no-color",
+        "-severity", severity,
+        "-tags",     templates,
+        "-timeout",  "10",
+        "-retries",  "1",
+        "-rate-limit", "100",
+        "-stats", "-stats-interval", "20",
+        *[arg for t in targets for arg in ("-u", t)],
+    ]
+    yield f"[INFO] nuclei -severity {severity} -tags {templates} — {len(targets)} target(s)"
+
     stdout_chunks: list[str] = []
 
     try:
+        devnull_in = open(os.devnull, "rb")
         proc = await asyncio.create_subprocess_exec(
             *cmd,
             stdin=devnull_in,
@@ -212,9 +233,7 @@ async def run_vuln_scan(
             stderr=asyncio.subprocess.PIPE,
         )
 
-        # --- Collect stdout quietly in the background ---
-        # We MUST drain stdout concurrently otherwise the OS pipe buffer fills
-        # and nmap deadlocks waiting for the reader.
+        # Drain stdout silently in background — prevents OS pipe buffer deadlock
         async def _collect_stdout() -> None:
             assert proc.stdout is not None
             async for chunk in proc.stdout:
@@ -222,48 +241,54 @@ async def run_vuln_scan(
 
         stdout_task = asyncio.create_task(_collect_stdout())
 
-        # --- Stream stderr in real-time so SSE stays alive ---
-        # This is the key fix: previously we gathered both coroutines and only
-        # yielded after both finished, which meant nginx saw silence for the
-        # entire scan duration and killed the connection at 60 s.
+        # Stream stderr in real-time so the SSE connection stays alive
         assert proc.stderr is not None
         async for raw in proc.stderr:
             line = raw.decode(errors="replace").rstrip()
             if not line:
                 continue
             if _NOISE_RE.search(line):
-                # Silently drop cosmetic noise (incl. "Error in input stream")
                 continue
-            yield f"[NMAP] {line}"
+            yield f"[NUCLEI] {line}"
 
-        # Wait for stdout collection and process exit
         await stdout_task
         await proc.wait()
+        devnull_in.close()
 
-        rc = proc.returncode
-        if rc not in (0, 1):
-            yield f"[WARN] nmap exited with code {rc}"
+        if proc.returncode not in (0, 1):
+            yield f"[WARN] nuclei exited with code {proc.returncode}"
 
     except FileNotFoundError:
-        yield "[ERROR] nmap not found in probe container — check probe/Dockerfile"
-        yield 'RESULT:{"severity":"clean","vuln_count":0,"findings":[],"error":"nmap_not_found"}'
+        yield "[ERROR] nuclei binary not found — rebuild the probe container (./inspectre.sh rebuild)"
+        yield 'RESULT:{"severity":"clean","vuln_count":0,"findings":[],"error":"nuclei_not_found"}'
         return
     except Exception as exc:
         yield f"[ERROR] Scan failed: {exc}"
         yield f'RESULT:{{"severity":"clean","vuln_count":0,"findings":[],"error":"{exc}"}}'
         return
-    finally:
-        devnull_in.close()
 
+    # ── Parse findings from collected JSONL stdout ───────────────────────────
     raw_text = "".join(stdout_chunks)
+    findings: list[dict] = []
+    for line in raw_text.splitlines():
+        f = _parse_nuclei_finding(line)
+        if f:
+            findings.append(f)
+
+    # Surface individual findings to the SSE stream before the RESULT block
+    for f in findings:
+        matched = f.get("matched_at") or f.get("host", "")
+        yield f"[{f['severity'].upper()}] {f['name']} — {matched}"
 
     duration = round(time.monotonic() - t0, 1)
-    findings, severity = _parse_nmap_output(raw_text)
+    highest = "clean"
+    for f in findings:
+        highest = _bump_severity(highest, f["severity"])
 
-    yield f"[INFO] Scan complete in {duration}s — {len(findings)} finding(s), highest severity: {severity}"
+    yield f"[INFO] Scan complete in {duration}s — {len(findings)} finding(s), highest severity: {highest}"
 
     summary = {
-        "severity":   severity,
+        "severity":   highest,
         "vuln_count": len(findings),
         "findings":   findings,
         "duration_s": duration,

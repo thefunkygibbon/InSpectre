@@ -14,8 +14,8 @@ const SETTING_META = {
   sniffer_workers:         { label: 'Sniffer Workers',     unit: 'threads',       type: 'number', min: 1,  max: 16,   tab: 'scanner' },
   ip_range:                { label: 'IP Range',            unit: '',              type: 'text',              tab: 'scanner' },
   nmap_args:               { label: 'Nmap Arguments',      unit: '',              type: 'text',              tab: 'scanner' },
-  vuln_scan_scripts:       { label: 'Vuln Scan Scripts',   unit: '',              type: 'text',              tab: 'scanner',
-    description: 'Comma-separated Nmap NSE scripts for vulnerability scanning.' },
+  vuln_scan_templates:     { label: 'Nuclei Template Tags', unit: '',              type: 'text',              tab: 'scanner',
+    description: 'Comma-separated Nuclei template tags for vulnerability scanning (e.g. cve,exposure,misconfig,default-login,network).' },
   vuln_scan_schedule:      { label: 'Scheduled Vuln Scans', unit: '',             type: 'select', tab: 'scanner',
     options: [
       { value: 'disabled', label: 'Disabled' },
@@ -197,7 +197,7 @@ export function SettingsPanel({ onClose, onSettingChange }) {
 
   // ── Scanner tab grouping ────────────────────────────────────────────────────
   const networkScanKeys = ['scan_interval','offline_miss_threshold','os_confidence_threshold','sniffer_workers','ip_range','nmap_args']
-  const vulnScanKeys    = ['vuln_scan_scripts','vuln_scan_schedule','vuln_scan_targets','vuln_scan_on_new_device']
+  const vulnScanKeys    = ['vuln_scan_templates','vuln_scan_schedule','vuln_scan_targets','vuln_scan_on_new_device']
 
   // ── Notifications tab grouping ──────────────────────────────────────────────
   const inAppKeys   = ['notifications_enabled','browser_notifications_enabled']
