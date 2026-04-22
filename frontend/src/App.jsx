@@ -196,6 +196,16 @@ export default function App() {
     dismissAllNew, dismissAllOffline,
     optimisticUpdate,
   } = useDevices(10000, { onAlert: handleAlert })
+
+  // Vuln scan state lives here so it survives DeviceDrawer close/reopen
+  const [vulnScansByMac, setVulnScansByMac] = useState({})
+  function updateVulnScan(mac, patchOrFn) {
+    setVulnScansByMac(prev => {
+      const current = { lines: [], scanning: false, ...(prev[mac] || {}) }
+      const patch = typeof patchOrFn === 'function' ? patchOrFn(current) : patchOrFn
+      return { ...prev, [mac]: { ...current, ...patch } }
+    })
+  }
   const { theme, toggle: toggleTheme } = useTheme()
   const clock = useClock()
   const { activeFilters, toggleFilter, clearFilters, applyFilters, savedViews, saveView, loadView, deleteView } = useSmartFilters()
@@ -204,9 +214,10 @@ export default function App() {
   const [filter,        setFilter]        = useState('all')
   const [sort,          setSort]          = useState('last_seen_desc')
   const [layout,        setLayout]        = useState('grid')
-  const [selected,      setSelected]      = useState(null)
-  const [showSettings,  setShowSettings]  = useState(false)
-  const [showSecurity,  setShowSecurity]  = useState(false)
+  const [selected,         setSelected]         = useState(null)
+  const [drawerInitialTab, setDrawerInitialTab] = useState('overview')
+  const [showSettings,     setShowSettings]     = useState(false)
+  const [showSecurity,     setShowSecurity]     = useState(false)
   const [refreshing,    setRefreshing]    = useState(false)
   const [showAlertDrop, setShowAlertDrop] = useState(false)
 
@@ -237,7 +248,12 @@ export default function App() {
     const mac = alert.mac || alert.mac_address
     if (!mac) return
     const device = devices.find(d => d.mac_address === mac)
-    if (device) setSelected(device)
+    if (device) openDevice(device)
+  }
+
+  function openDevice(dev, tab = 'overview') {
+    setDrawerInitialTab(tab)
+    setSelected(dev)
   }
 
   // Star toggle — optimistic update then persist
@@ -259,6 +275,9 @@ export default function App() {
     if (!activeFilters.includes('ignored')) {
       list = list.filter(d => !d.is_ignored)
     }
+    // Hide virtual interfaces (macvlan/container MACs) — they appear as duplicates
+    // of the physical NIC on the same host. Accessible via IP History on the real device.
+    list = list.filter(d => !d.is_virtual_interface)
     if (filter === 'online')    list = list.filter(d => d.is_online)
     if (filter === 'offline')   list = list.filter(d => !d.is_online)
     if (filter === 'scanned')   list = list.filter(d => d.deep_scanned)
@@ -500,7 +519,7 @@ export default function App() {
                 <p className="text-xs mb-4" style={{ color: 'var(--color-text-faint)' }}>
                   Showing {filtered.length} of {devices.length} device{devices.length !== 1 ? 's' : ''} &middot; grouped by device type
                 </p>
-                <CategoryView devices={filtered} layout="grid" onDeviceClick={setSelected} />
+                <CategoryView devices={filtered} layout="grid" onDeviceClick={openDevice} />
               </>
             ) : (
               <>
@@ -521,8 +540,9 @@ export default function App() {
                   <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-4">
                     {filtered.map(d => (
                       <DeviceCard key={d.mac_address} device={d}
-                        onClick={() => setSelected(d)}
+                        onClick={() => openDevice(d)}
                         onStarToggle={handleStarToggle}
+                        isVulnScanning={vulnScansByMac[d.mac_address]?.scanning || false}
                       />
                     ))}
                   </div>
@@ -537,8 +557,9 @@ export default function App() {
                       <span>Last Seen</span><span>Status</span><span />
                     </div>
                     {filtered.map((d, i) => (
-                      <DeviceRow key={d.mac_address} device={d} onClick={() => setSelected(d)}
-                        striped={i % 2 === 1} onStarToggle={handleStarToggle} />
+                      <DeviceRow key={d.mac_address} device={d} onClick={() => openDevice(d)}
+                        striped={i % 2 === 1} onStarToggle={handleStarToggle}
+                        isVulnScanning={vulnScansByMac[d.mac_address]?.scanning || false} />
                     ))}
                   </div>
                 )}
@@ -580,16 +601,21 @@ export default function App() {
 
       {selected && (
         <DeviceDrawer
+          key={selected.mac_address}
           device={selected}
           onClose={() => setSelected(null)}
           onRename={handleRename}
           onResolveName={handleResolveName}
+          onRefresh={refresh}
           onStarToggle={handleStarToggle}
           onMetadataUpdate={async (mac, patch) => {
             const updated = await api.updateMetadata(mac, patch)
             setSelected(prev => prev?.mac_address === mac ? { ...prev, ...updated } : prev)
             await refresh()
           }}
+          vulnScanState={vulnScansByMac[selected.mac_address] || { lines: [], scanning: false }}
+          onVulnScanChange={(patchOrFn) => updateVulnScan(selected.mac_address, patchOrFn)}
+          initialTab={drawerInitialTab}
         />
       )}
       {showSettings && (
@@ -598,10 +624,10 @@ export default function App() {
       {showSecurity && (
         <SecurityDashboard
           onClose={() => setShowSecurity(false)}
-          onDeviceClick={(mac) => {
+          onDeviceClick={(mac, tab) => {
             setShowSecurity(false)
             const dev = devices.find(d => d.mac_address === mac)
-            if (dev) setSelected(dev)
+            if (dev) openDevice(dev, tab || 'overview')
           }}
         />
       )}

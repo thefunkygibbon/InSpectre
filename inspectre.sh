@@ -12,7 +12,7 @@ Usage:
   ./inspectre.sh rebuild keep-data
   ./inspectre.sh up
   ./inspectre.sh down
-  ./inspectre.sh logs
+  ./inspectre.sh logs [service]
 
 Commands:
   rebuild         Full rebuild from the current folder — wipes containers, images,
@@ -22,7 +22,7 @@ Commands:
                   are preserved across the rebuild).
   up              Start the stack normally.
   down            Stop the stack.
-  logs            Follow logs.
+  logs [service]  Follow logs. Optionally filter to a single service, e.g. probe, backend, web.
 
 Notes:
   - This script does NOT run any git commands.
@@ -119,7 +119,12 @@ down_stack() {
 }
 
 show_logs() {
-  "${COMPOSE_CMD[@]}" logs -f
+  local service="${1:-}"
+  if [[ -n "$service" ]]; then
+    "${COMPOSE_CMD[@]}" logs -f "$service"
+  else
+    "${COMPOSE_CMD[@]}" logs -f
+  fi
 }
 
 main() {
@@ -147,7 +152,7 @@ main() {
       down_stack
       ;;
     logs)
-      show_logs
+      show_logs "${2:-}"
       ;;
     *)
       usage

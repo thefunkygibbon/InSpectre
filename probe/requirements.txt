@@ -1,5 +1,4 @@
 scapy==2.6.1
-python-nmap==0.7.1
 SQLAlchemy==2.0.30
 psycopg2-binary==2.9.9
 requests==2.31.0

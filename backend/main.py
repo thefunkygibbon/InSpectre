@@ -78,6 +78,9 @@ def _migrate(db: Session):
         "ALTER TABLE devices ADD COLUMN IF NOT EXISTS is_ignored BOOLEAN NOT NULL DEFAULT FALSE",
         # Nuclei migration: add scan_args column (replaces nmap_args semantically)
         "ALTER TABLE vuln_reports ADD COLUMN IF NOT EXISTS scan_args VARCHAR",
+        # Ensure nmap_args always includes -p- (full port scan); only updates if
+        # the value is still an unmodified old default (no -p flag at all).
+        "UPDATE settings SET value = value || ' -p-' WHERE key = 'nmap_args' AND value NOT LIKE '%-p%'",
     ]
     for sql in migrations:
         try:
@@ -96,7 +99,7 @@ DEFAULT_SETTINGS = {
     "os_confidence_threshold": ("85",    "Minimum nmap OS-match confidence (%) to record."),
     "sniffer_workers":         ("4",     "Number of parallel scanner threads."),
     "ip_range":                ("192.168.0.0/24", "CIDR range to scan."),
-    "nmap_args":               ("-O --osscan-limit -sV --version-intensity 5 -T4", "Extra arguments passed to nmap."),
+    "nmap_args":               ("-O --osscan-limit -sV --version-intensity 5 -T4 -p-", "Extra arguments passed to nmap."),
     "notifications_enabled":              ("true",  "Show popup toasts when new devices appear or go offline."),
     "browser_notifications_enabled":      ("false", "Show OS-level browser notifications for device events."),
     "pushbullet_api_key":                 ("",      "Pushbullet API access token for push notifications."),
@@ -107,6 +110,7 @@ DEFAULT_SETTINGS = {
     "vuln_scan_schedule":      ("disabled", "Scheduled vulnerability scan interval. Options: disabled, 6h, 12h, 24h, weekly."),
     "vuln_scan_targets":       ("important", "Devices to include in scheduled scans. Options: all, important."),
     "vuln_scan_on_new_device": ("false", "Automatically run a vulnerability scan when a new device is first discovered."),
+    "nuclei_template_update_interval": ("24h", "How often to update Nuclei templates. Options: disabled, 12h, 24h, 48h, weekly."),
     # Alert delivery
     "alert_on_new_device":     ("false",  "Send an alert when a new device is discovered."),
     "alert_on_offline":        ("false",  "Send an alert when a watched device goes offline."),
@@ -587,6 +591,8 @@ def _to_dict(d: Device) -> dict:
         "first_seen":           d.first_seen.isoformat()  if d.first_seen  else None,
         "last_seen":            d.last_seen.isoformat()   if d.last_seen   else None,
         "scan_results":         d.scan_results,
+        "services":             (d.scan_results or {}).get("services"),
+        "pipeline_stage":       (d.scan_results or {}).get("pipeline_stage"),
         "display_name":         d.custom_name or d.hostname or d.ip_address,
         "identity_score":       id_score["score"],
         "identity_reasons":     id_score["reasons"],
@@ -594,9 +600,12 @@ def _to_dict(d: Device) -> dict:
         "device_type_inferred": inferred,
         "vuln_last_scanned": d.vuln_last_scanned.isoformat() if d.vuln_last_scanned else None,
         "vuln_severity":     d.vuln_severity,
-        "is_blocked":        bool(getattr(d, 'is_blocked', False)),
-        "zone":              getattr(d, 'zone', None),
-        "is_ignored":        bool(getattr(d, 'is_ignored', False)),
+        "is_blocked":            bool(getattr(d, 'is_blocked', False)),
+        "zone":                  getattr(d, 'zone', None),
+        "is_ignored":            bool(getattr(d, 'is_ignored', False)),
+        # Populated by list_devices; single-device endpoints return defaults
+        "is_virtual_interface":  False,
+        "virtual_of":            None,
     }
 
 
@@ -682,6 +691,14 @@ def root():
 # ---------------------------------------------------------------------------
 # Devices
 # ---------------------------------------------------------------------------
+def _is_locally_admin_mac(mac: str) -> bool:
+    """Return True if MAC has the locally-administered bit set (e.g. macvlan, VMs, containers)."""
+    try:
+        return bool(int(mac.split(':')[0], 16) & 0x02)
+    except Exception:
+        return False
+
+
 @app.get("/devices")
 def list_devices(online_only: bool = False, include_ignored: bool = True, db: Session = Depends(get_db)):
     q = db.query(Device)
@@ -689,7 +706,48 @@ def list_devices(online_only: bool = False, include_ignored: bool = True, db: Se
         q = q.filter(Device.is_online == True)
     if not include_ignored:
         q = q.filter(Device.is_ignored == False)
-    return [_to_dict(d) for d in q.order_by(Device.last_seen.desc(), Device.mac_address.asc()).all()]
+    devices = q.order_by(Device.last_seen.desc(), Device.mac_address.asc()).all()
+
+    # Identify virtual interfaces: locally-administered MACs that share one or more IPs with
+    # a real (globally-administered) MAC.  This covers macvlan, container, and VM interfaces
+    # that appear alongside the physical NIC at the same IP addresses.
+    try:
+        ip_rows = db.execute(text("SELECT mac_address, ip_address FROM ip_history")).fetchall()
+    except Exception:
+        ip_rows = []
+
+    ip_to_macs: dict[str, set] = {}
+    for row in ip_rows:
+        if row[1]:
+            ip_to_macs.setdefault(row[1], set()).add(row[0])
+    # Also include current / primary IPs not yet in history
+    for d in devices:
+        for addr in filter(None, [d.ip_address, getattr(d, 'primary_ip', None)]):
+            ip_to_macs.setdefault(addr, set()).add(d.mac_address)
+
+    mac_set = {d.mac_address for d in devices}
+    virtual_of: dict[str, str] = {}
+    for d in devices:
+        if not _is_locally_admin_mac(d.mac_address):
+            continue
+        my_ips = {ip for ip, macs in ip_to_macs.items() if d.mac_address in macs}
+        for ip in my_ips:
+            for other_mac in ip_to_macs.get(ip, set()):
+                if (other_mac != d.mac_address
+                        and other_mac in mac_set
+                        and not _is_locally_admin_mac(other_mac)):
+                    virtual_of[d.mac_address] = other_mac
+                    break
+            if d.mac_address in virtual_of:
+                break
+
+    result = []
+    for d in devices:
+        dct = _to_dict(d)
+        dct['is_virtual_interface'] = d.mac_address in virtual_of
+        dct['virtual_of']           = virtual_of.get(d.mac_address)
+        result.append(dct)
+    return result
 
 
 @app.get("/devices/{mac}")
@@ -867,40 +925,54 @@ async def stream_vuln_scan(mac: str, db: Session = Depends(get_db)):
     templates_setting = db.get(Setting, "vuln_scan_templates")
     templates = (templates_setting.value or "").strip() if templates_setting else ""
 
-    ip        = d.ip_address
+    # Use primary_ip — it's the stable address. ip_address can be temporarily
+    # updated to a secondary IP by the sniffer, which would break the probe lookup.
+    ip        = getattr(d, "primary_ip", None) or d.ip_address
     mac_lower = mac.lower()
     probe_url = f"{PROBE_URL}/stream/vuln-scan/{ip}"
-    params    = {"templates": templates} if templates else {}
+    params    = {"templates": templates, "mac": mac_lower}
 
-    async def _event_stream():
-        result_saved = False
+    # Queue bridges the probe reader (background task) and the browser stream.
+    # The reader runs as an independent asyncio task so the result is always
+    # saved even if the browser navigates away before the scan finishes.
+    line_queue: asyncio.Queue[str | None] = asyncio.Queue()
+
+    async def _probe_reader() -> None:
         try:
             async with httpx.AsyncClient(timeout=None) as client:
                 async with client.stream("GET", probe_url, params=params) as resp:
                     if resp.status_code != 200:
                         body = await resp.aread()
-                        yield f"data: [ERROR] Probe returned HTTP {resp.status_code}: {body.decode()[:200]}\n\n"
+                        await line_queue.put(f"data: [ERROR] Probe returned HTTP {resp.status_code}: {body.decode()[:200]}\n\n")
                         return
-
                     async for raw_line in resp.aiter_lines():
-                        yield f"{raw_line}\n"
-
+                        await line_queue.put(f"{raw_line}\n")
                         if raw_line.startswith("data: RESULT:"):
                             payload_str = raw_line[len("data: RESULT:"):]
                             try:
                                 data = json.loads(payload_str)
                                 _save_vuln_result(mac_lower, ip, data, templates)
-                                result_saved = True
                             except Exception as exc:
-                                yield f"data: [WARN] Could not save report: {exc}\n\n"
-
+                                await line_queue.put(f"data: [WARN] Could not save report: {exc}\n\n")
         except httpx.ConnectError:
-            yield f"data: [ERROR] Cannot reach probe at {PROBE_URL} — is it running?\n\n"
+            await line_queue.put(f"data: [ERROR] Cannot reach probe at {PROBE_URL} — is it running?\n\n")
         except Exception as exc:
-            yield f"data: [ERROR] Proxy error: {exc}\n\n"
+            await line_queue.put(f"data: [ERROR] Proxy error: {exc}\n\n")
+        finally:
+            await line_queue.put(None)  # sentinel: stream finished
 
-        if not result_saved:
-            yield "data: [WARN] No RESULT line received from probe\n\n"
+    asyncio.create_task(_probe_reader())
+
+    async def _event_stream():
+        while True:
+            try:
+                line = await asyncio.wait_for(line_queue.get(), timeout=30)
+            except asyncio.TimeoutError:
+                yield ": heartbeat\n\n"
+                continue
+            if line is None:
+                break
+            yield line
 
     return StreamingResponse(
         _event_stream(),
@@ -1097,7 +1169,7 @@ def get_all_events(limit: int = Query(100, ge=1, le=1000), event_type: Optional[
 def get_change_feed(limit: int = Query(100, ge=1, le=500), db: Session = Depends(get_db)):
     CHANGE_TYPES = ["joined", "online", "offline", "ip_change", "scan_complete",
                     "renamed", "tagged", "marked_important", "port_change", "hostname_change",
-                    "vuln_scan_complete"]
+                    "vuln_scan_complete", "service_fingerprint_complete"]
     try:
         rows = db.execute(text("""
             SELECT de.id, de.mac_address, de.type, de.detail, de.created_at,
@@ -1229,6 +1301,8 @@ async def apply_settings(db: Session = Depends(get_db)):
         payload["ip_range"] = settings["ip_range"]
     if "nmap_args" in settings:
         payload["nmap_args"] = settings["nmap_args"]
+    if "nuclei_template_update_interval" in settings:
+        payload["nuclei_template_update_interval"] = settings["nuclei_template_update_interval"]
 
     try:
         async with httpx.AsyncClient(timeout=15.0) as client:

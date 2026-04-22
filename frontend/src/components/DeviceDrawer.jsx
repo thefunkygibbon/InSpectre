@@ -1,11 +1,11 @@
 import { useState, useEffect, useRef } from 'react'
 import {
-  X, Wifi, WifiOff, Cpu, Globe, Clock, Terminal,
+  X, Wifi, WifiOff, Globe, Clock, Terminal,
   ShieldCheck, ScanLine, RefreshCw, ExternalLink,
-  Activity, GitBranch, Bug, RotateCcw, Ban, History,
+  Activity, GitBranch, RotateCcw, Ban, History,
   ChevronDown, ChevronRight, Square, Tag, CheckCircle2,
   FileText, Star as StarIcon, ShieldAlert, EyeOff, Eye, Layers,
-  AlertTriangle,
+  AlertTriangle, Network, Loader2, GitMerge,
 } from 'lucide-react'
 import { OnlineDot }      from './OnlineDot'
 import { StarButton }     from './StarButton'
@@ -14,7 +14,7 @@ import { DeviceTimeline } from './DeviceTimeline'
 import { VulnPanel }      from './VulnPanel'
 import { StreamOutput }   from './StreamOutput'
 import { api }            from '../api'
-import { useStreamAction } from '../hooks/useStreamAction'
+import { useStreamAction }  from '../hooks/useStreamAction'
 import { CATEGORIES, OVERRIDE_OPTIONS } from '../deviceCategories'
 
 function fmt(iso) {
@@ -60,10 +60,10 @@ function zoneStyle(zone) {
 }
 
 const TABS = [
-  { id: 'overview',  label: 'Overview' },
-  { id: 'vulns',     label: 'Vulnerabilities' },
-  { id: 'timeline',  label: 'Timeline' },
-  { id: 'notes',     label: 'Notes & Tags' },
+  { id: 'overview',  label: 'Overview'         },
+  { id: 'vulns',     label: 'Vulnerabilities'  },
+  { id: 'timeline',  label: 'Timeline'         },
+  { id: 'admin',     label: 'Admin'            },
 ]
 
 function Collapsible({ title, icon: Icon, defaultOpen = false, children }) {
@@ -203,10 +203,98 @@ function IdentityForm({ device, onSaved }) {
   )
 }
 
+// Service label display helper (maps Nerva scheme names to readable labels)
+const SERVICE_LABELS = {
+  http: 'HTTP',         https: 'HTTPS',         ssh: 'SSH',
+  ftp: 'FTP',           telnet: 'Telnet',        smtp: 'SMTP',
+  pop3: 'POP3',         imap: 'IMAP',            imaps: 'IMAPS',
+  mysql: 'MySQL',       postgresql: 'PostgreSQL', mssql: 'MSSQL',
+  redis: 'Redis',       mongodb: 'MongoDB',       elasticsearch: 'Elasticsearch',
+  mqtt: 'MQTT',         mqtts: 'MQTT/TLS',       smb: 'SMB',
+  rdp: 'RDP',           vnc: 'VNC',              ldap: 'LDAP',
+  ldaps: 'LDAPS',       ftps: 'FTPS',
+  dns: 'DNS',           ntp: 'NTP',              amqp: 'AMQP',
+  amqps: 'AMQPS',       cassandra: 'Cassandra',   memcached: 'Memcached',
+  ws: 'WebSocket',      wss: 'WebSocket/TLS',
+}
+function svcLabel(scheme) {
+  return SERVICE_LABELS[scheme] || scheme
+}
+
+// Pipeline stage indicator
+const PIPELINE_STEPS = [
+  { key: 'discovered',  label: 'Discovered'  },
+  { key: 'ports',       label: 'Ports'       },
+  { key: 'services',    label: 'Services'    },
+  { key: 'vulns',       label: 'Vuln scan'   },
+]
+
+function ScanPipeline({ device, vulnScanning }) {
+  const { deep_scanned, pipeline_stage, vuln_last_scanned, is_online } = device
+
+  function stepStatus(key) {
+    if (key === 'discovered') return 'done'
+    if (key === 'ports') {
+      if (deep_scanned) return 'done'
+      return is_online ? 'running' : 'pending'
+    }
+    if (key === 'services') {
+      if (pipeline_stage === 'services_done') return 'done'
+      if (deep_scanned) return 'running'
+      return 'pending'
+    }
+    if (key === 'vulns') {
+      if (vulnScanning) return 'running'
+      if (vuln_last_scanned) return 'done'
+      return 'pending'
+    }
+    return 'pending'
+  }
+
+  return (
+    <div className="card p-3">
+      <div className="flex items-center gap-2 mb-2.5">
+        <Network size={13} className="text-brand" />
+        <span className="text-[11px] font-semibold text-text-muted uppercase tracking-wider">Scan Pipeline</span>
+      </div>
+      <div className="flex items-center gap-0">
+        {PIPELINE_STEPS.map((step, i) => {
+          const status = stepStatus(step.key)
+          const isLast = i === PIPELINE_STEPS.length - 1
+          return (
+            <div key={step.key} className="flex items-center flex-1 min-w-0">
+              <div className="flex flex-col items-center flex-1 min-w-0">
+                <div className={`w-5 h-5 rounded-full flex items-center justify-center shrink-0 mb-1
+                  ${status === 'done'    ? 'bg-green-500/20 border border-green-500/50'
+                  : status === 'running' ? 'bg-brand/20 border border-brand/50'
+                  : 'bg-surface-offset border border-border'}`}>
+                  {status === 'done' && <CheckCircle2 size={10} className="text-green-400" />}
+                  {status === 'running' && <Loader2 size={10} className="text-brand animate-spin" />}
+                  {status === 'pending' && <span className="w-1.5 h-1.5 rounded-full bg-text-faint" />}
+                </div>
+                <span className={`text-[9px] font-medium leading-none text-center truncate w-full px-0.5
+                  ${status === 'done' ? 'text-green-400'
+                  : status === 'running' ? 'text-brand'
+                  : 'text-text-faint'}`}>
+                  {step.label}
+                </span>
+              </div>
+              {!isLast && (
+                <div className={`h-px flex-1 mx-0.5 -mt-3
+                  ${status === 'done' ? 'bg-green-500/40' : 'bg-border'}`} />
+              )}
+            </div>
+          )
+        })}
+      </div>
+    </div>
+  )
+}
+
 // ---------------------------------------------------------------------------
 // Main component
 // ---------------------------------------------------------------------------
-export function DeviceDrawer({ device, onClose, onRename, onResolveName, onRefresh, onStarToggle, onMetadataUpdate }) {
+export function DeviceDrawer({ device, onClose, onRename, onResolveName, onRefresh, onStarToggle, onMetadataUpdate, vulnScanState, onVulnScanChange, initialTab }) {
   if (!device) return null
 
   const [localDevice,  setLocalDevice]  = useState(device)
@@ -214,9 +302,30 @@ export function DeviceDrawer({ device, onClose, onRename, onResolveName, onRefre
   const [rescanning,   setRescanning]   = useState(false)
   const [activeAction, setActiveAction] = useState(null)  // 'ping' | 'traceroute' | 'rescan'
   const [staticLines,  setStaticLines]  = useState([])
-  const [activeTab,    setActiveTab]    = useState('overview')
+  const [activeTab,    setActiveTab]    = useState(initialTab || 'overview')
   const [blocking,     setBlocking]     = useState(false)
   const [ignoring,     setIgnoring]     = useState(false)
+
+  // Vuln scan state is owned by the parent (App.jsx) so it survives drawer close/reopen.
+  // Proxy setters propagate functional updaters so rapid SSE lines don't get lost to stale closures.
+  const vulnLines    = vulnScanState?.lines    ?? []
+  const vulnScanning = vulnScanState?.scanning ?? false
+  function setVulnLines(updater) {
+    if (!onVulnScanChange) return
+    if (typeof updater === 'function') {
+      onVulnScanChange(s => ({ lines: updater(s.lines) }))
+    } else {
+      onVulnScanChange({ lines: updater })
+    }
+  }
+  function setVulnScanning(updater) {
+    if (!onVulnScanChange) return
+    if (typeof updater === 'function') {
+      onVulnScanChange(s => ({ scanning: updater(s.scanning) }))
+    } else {
+      onVulnScanChange({ scanning: updater })
+    }
+  }
 
   useEffect(() => { setLocalDevice(device) }, [device])
 
@@ -360,6 +469,21 @@ export function DeviceDrawer({ device, onClose, onRename, onResolveName, onRefre
 
           {activeTab === 'overview' && (
             <>
+              {/* Scan pipeline progress */}
+              <ScanPipeline device={localDevice} vulnScanning={vulnScanning} />
+
+              {/* Virtual interface notice */}
+              {localDevice.is_virtual_interface && (
+                <div className="flex items-start gap-2 px-3 py-2.5 rounded-lg"
+                  style={{ background: 'rgba(99,102,241,0.1)', border: '1px solid rgba(99,102,241,0.25)' }}>
+                  <GitMerge size={13} className="mt-0.5 shrink-0" style={{ color: '#818cf8' }} />
+                  <p className="text-[11px] leading-snug" style={{ color: '#a5b4fc' }}>
+                    Virtual interface (macvlan / container) — shares IPs with the physical NIC on
+                    this host. Scan data may differ from the primary device entry.
+                  </p>
+                </div>
+              )}
+
               {/* Status badges */}
               <div className="flex gap-2 flex-wrap">
                 {localDevice.is_online
@@ -404,7 +528,7 @@ export function DeviceDrawer({ device, onClose, onRename, onResolveName, onRefre
               </div>
 
               {/* Actions */}
-              <Section title="Actions" icon={Activity}>
+              <Collapsible title="Actions" icon={Activity} defaultOpen={true}>
                 <div className="grid grid-cols-2 gap-2 pt-1">
                   {pingRunning
                     ? <StopBtn label="Stop Ping"  onClick={handlePing} />
@@ -445,17 +569,16 @@ export function DeviceDrawer({ device, onClose, onRename, onResolveName, onRefre
                     ? <><Eye size={12} /> Un-ignore device</>
                     : <><EyeOff size={12} /> Ignore device</>}
                 </button>
-                {/* Structured stream output */}
                 <StreamOutput
                   lines={termLines}
                   running={termRunning}
                   onStop={stream.stop}
                   mode={streamMode}
                 />
-              </Section>
+              </Collapsible>
 
               {/* Network */}
-              <Section title="Network" icon={Globe}>
+              <Collapsible title="Network" icon={Globe} defaultOpen={true}>
                 <Row label="IP Address"  value={localDevice.ip_address} mono />
                 <Row label="MAC Address" value={mac} mono />
                 <Row label="Vendor"      value={localDevice.vendor_override || localDevice.vendor || 'Unknown'} />
@@ -488,7 +611,7 @@ export function DeviceDrawer({ device, onClose, onRename, onResolveName, onRefre
                     </div>
                   } />
                 )}
-              </Section>
+              </Collapsible>
 
               {/* IP History */}
               <Collapsible title="IP History" icon={History} defaultOpen={false}>
@@ -496,36 +619,24 @@ export function DeviceDrawer({ device, onClose, onRename, onResolveName, onRefre
               </Collapsible>
 
               {/* Timeline summary */}
-              <Section title="Timeline" icon={Clock}>
+              <Collapsible title="Timeline" icon={Clock} defaultOpen={true}>
                 <Row label="First seen" value={fmt(localDevice.first_seen)} />
                 <Row label="Last seen"  value={fmt(localDevice.last_seen)} />
                 {scan?.scanned_at && <Row label="Scanned at" value={fmt(scan.scanned_at)} />}
-              </Section>
-
-              {/* OS Detection */}
-              {scan && (
-                <Section title="OS Detection" icon={Cpu}>
-                  {scan.os_matches?.length > 0 ? (
-                    scan.os_matches.map((m, i) => (
-                      <div key={i} className="flex items-center justify-between py-1.5 border-b border-border last:border-0">
-                        <span className="text-sm text-text">{m.name}</span>
-                        <span className="text-xs font-medium text-brand tabular-nums">{m.accuracy}%</span>
-                      </div>
-                    ))
-                  ) : (
-                    <p className="text-sm text-text-muted italic">No confident OS match found</p>
-                  )}
-                </Section>
-              )}
+              </Collapsible>
 
               {/* Open Ports */}
               {scan?.open_ports?.length > 0 && (
-                <Section title={`Open Ports (${scan.open_ports.length})`} icon={Terminal}>
+                <Collapsible title={`Open Ports (${scan.open_ports.length})`} icon={Terminal} defaultOpen={true}>
                   {scan.open_ports.map((p, i) => {
-                    const web       = isWebPort(p.port)
-                    const url       = web ? portUrl(localDevice.ip_address, p.port) : null
-                    const dangerous = DANGEROUS_PORTS.has(p.port)
-                    const svcLabel  = p.service || PORT_DESCRIPTIONS[p.port] || ''
+                    const web        = isWebPort(p.port)
+                    const url        = web ? portUrl(localDevice.ip_address, p.port) : null
+                    const dangerous  = DANGEROUS_PORTS.has(p.port)
+                    const nervaSvc   = (localDevice.services || []).find(s => s.port === p.port)
+                    const label      = nervaSvc
+                      ? svcLabel(nervaSvc.service)
+                      : (p.service || PORT_DESCRIPTIONS[p.port] || '')
+                    const hasTls     = nervaSvc?.tls
                     return (
                       <div key={i} className="py-2 border-b border-border last:border-0 space-y-0.5">
                         <div className="flex items-center gap-3">
@@ -542,12 +653,20 @@ export function DeviceDrawer({ device, onClose, onRename, onResolveName, onRefre
                               {p.port}/{p.proto}
                             </span>
                           )}
-                          <span className="text-sm text-text flex-1 truncate">{svcLabel}</span>
-                          {(p.product || p.version) && (
-                            <span className="text-xs text-text-muted shrink-0 truncate max-w-[140px]">
-                              {[p.product, p.version].filter(Boolean).join(' ')}
-                            </span>
-                          )}
+                          <span className="text-sm text-text flex-1 truncate">{label}</span>
+                          <div className="flex items-center gap-1.5 shrink-0">
+                            {hasTls && (
+                              <span className="text-[9px] px-1 py-0.5 rounded font-medium"
+                                style={{ background: 'rgba(34,197,94,0.1)', color: '#22c55e', border: '1px solid rgba(34,197,94,0.25)' }}>
+                                TLS
+                              </span>
+                            )}
+                            {(p.product || p.version) && (
+                              <span className="text-xs text-text-muted truncate max-w-[110px]">
+                                {[p.product, p.version].filter(Boolean).join(' ')}
+                              </span>
+                            )}
+                          </div>
                         </div>
                         {p.cpe && (
                           <p className="font-mono text-[10px] text-text-faint pl-20 truncate" title={p.cpe}>{p.cpe}</p>
@@ -555,30 +674,18 @@ export function DeviceDrawer({ device, onClose, onRename, onResolveName, onRefre
                       </div>
                     )
                   })}
-                </Section>
+                </Collapsible>
               )}
-
-              {/* Identity */}
-              <Section title="Device Identity" icon={Tag}>
-                <IdentityForm
-                  device={localDevice}
-                  onSaved={updated => {
-                    setLocalDevice(updated)
-                    if (onRefresh) onRefresh()
-                  }}
-                />
-              </Section>
-
-              {/* Rename */}
-              <Section title="Rename Device" icon={null}>
-                <RenameForm device={localDevice} onRename={onRename} />
-              </Section>
             </>
           )}
 
           {activeTab === 'vulns' && (
             <VulnPanel
               device={localDevice}
+              lines={vulnLines}
+              setLines={setVulnLines}
+              scanning={vulnScanning}
+              setScanning={setVulnScanning}
               onScanComplete={() => {
                 api.getDevice(mac).then(updated => {
                   setLocalDevice(updated)
@@ -598,20 +705,32 @@ export function DeviceDrawer({ device, onClose, onRename, onResolveName, onRefre
             </>
           )}
 
-          {activeTab === 'notes' && (
-            <>
-              <div className="flex items-center gap-2 mb-4">
-                <FileText size={14} className="text-brand" />
-                <h3 className="text-xs font-semibold text-text-muted uppercase tracking-wider">Notes, Tags & Location</h3>
-              </div>
-              <DeviceNotes
-                device={localDevice}
-                onSaved={updated => {
-                  setLocalDevice(prev => ({ ...prev, ...updated }))
-                  if (onMetadataUpdate) onMetadataUpdate(mac, updated)
-                }}
-              />
-            </>
+          {activeTab === 'admin' && (
+            <div className="space-y-6">
+              <Collapsible title="Notes, Tags & Location" icon={FileText} defaultOpen={true}>
+                <DeviceNotes
+                  device={localDevice}
+                  onSaved={updated => {
+                    setLocalDevice(prev => ({ ...prev, ...updated }))
+                    if (onMetadataUpdate) onMetadataUpdate(mac, updated)
+                  }}
+                />
+              </Collapsible>
+
+              <Collapsible title="Device Identity" icon={Tag} defaultOpen={true}>
+                <IdentityForm
+                  device={localDevice}
+                  onSaved={updated => {
+                    setLocalDevice(updated)
+                    if (onRefresh) onRefresh()
+                  }}
+                />
+              </Collapsible>
+
+              <Collapsible title="Rename Device" icon={RotateCcw} defaultOpen={true}>
+                <RenameForm device={localDevice} onRename={onRename} />
+              </Collapsible>
+            </div>
           )}
 
         </div>

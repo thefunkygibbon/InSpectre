@@ -9,7 +9,6 @@ import threading
 import time
 from datetime import datetime, timezone
 
-import nmap
 import uvicorn
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
@@ -45,6 +44,37 @@ LAN_DNS_SERVER_ENV      = os.environ.get("LAN_DNS_SERVER", "").strip()
 PING_COUNT    = 10
 TRACE_MAX_HOP = 30
 
+NUCLEI_TEMPLATE_UPDATE_INTERVAL = os.environ.get("NUCLEI_TEMPLATE_UPDATE_INTERVAL", "24h")
+_last_nuclei_template_update: datetime | None = None
+
+
+def _load_settings_from_db() -> None:
+    """
+    Override probe globals with values from the settings DB table.
+    Called at startup (after DB is ready) and at the top of each scan cycle
+    so that UI changes take effect without a container restart.
+    Silently skips any key that is missing from the DB.
+    """
+    global SCAN_INTERVAL, IP_RANGE, NMAP_ARGS, OS_CONFIDENCE_THRESHOLD
+    global OFFLINE_MISS_THRESHOLD, SNIFFER_WORKERS, NUCLEI_TEMPLATE_UPDATE_INTERVAL
+    try:
+        session = Session()
+        try:
+            rows = session.execute(text("SELECT key, value FROM settings")).fetchall()
+        finally:
+            session.close()
+        db = {r[0]: r[1] for r in rows}
+        if "scan_interval"           in db: SCAN_INTERVAL           = int(db["scan_interval"])
+        if "ip_range"                in db: IP_RANGE                = db["ip_range"].strip()
+        if "nmap_args"               in db: NMAP_ARGS               = db["nmap_args"].strip()
+        if "os_confidence_threshold" in db: OS_CONFIDENCE_THRESHOLD = int(db["os_confidence_threshold"])
+        if "offline_miss_threshold"  in db: OFFLINE_MISS_THRESHOLD  = int(db["offline_miss_threshold"])
+        if "sniffer_workers"         in db: SNIFFER_WORKERS         = int(db["sniffer_workers"])
+        if "nuclei_template_update_interval" in db:
+            NUCLEI_TEMPLATE_UPDATE_INTERVAL = db["nuclei_template_update_interval"]
+    except Exception as exc:
+        print(f"[settings] DB load failed (using current values): {exc}", flush=True)
+
 
 def ping_once(ip: str, timeout_s: int = 2) -> bool:
     if not _is_valid_ip(ip):
@@ -62,7 +92,7 @@ def ping_once(ip: str, timeout_s: int = 2) -> bool:
 
 
 def apply_runtime_config(payload: dict) -> dict:
-    global SCAN_INTERVAL, IP_RANGE, NMAP_ARGS, OS_CONFIDENCE_THRESHOLD, OFFLINE_MISS_THRESHOLD, SNIFFER_WORKERS
+    global SCAN_INTERVAL, IP_RANGE, NMAP_ARGS, OS_CONFIDENCE_THRESHOLD, OFFLINE_MISS_THRESHOLD, SNIFFER_WORKERS, NUCLEI_TEMPLATE_UPDATE_INTERVAL
 
     changes = {}
 
@@ -87,6 +117,9 @@ def apply_runtime_config(payload: dict) -> dict:
             "applied": SNIFFER_WORKERS,
             "note": "worker count changes require probe restart",
         }
+    if "nuclei_template_update_interval" in payload:
+        NUCLEI_TEMPLATE_UPDATE_INTERVAL = str(payload["nuclei_template_update_interval"]).strip()
+        changes["nuclei_template_update_interval"] = NUCLEI_TEMPLATE_UPDATE_INTERVAL
 
     return {
         "applied": True,
@@ -98,6 +131,7 @@ def apply_runtime_config(payload: dict) -> dict:
             "os_confidence_threshold": OS_CONFIDENCE_THRESHOLD,
             "offline_miss_threshold": OFFLINE_MISS_THRESHOLD,
             "sniffer_workers": SNIFFER_WORKERS,
+            "nuclei_template_update_interval": NUCLEI_TEMPLATE_UPDATE_INTERVAL,
         },
     }
 
@@ -155,6 +189,9 @@ _upsert_locks_lock = threading.Lock()
 # window, so we don't falsely increment miss counts for devices the sniffer saw.
 _sniffer_seen_this_interval: set[str] = set()
 _sniffer_seen_lock = threading.Lock()
+
+# IPs where hostname resolution already failed — skip until device reconnects.
+_hostname_failed: set[str] = set()
 
 def _get_mac_lock(mac: str) -> threading.Lock:
     with _upsert_locks_lock:
@@ -611,95 +648,105 @@ def arp_scan(interface: str, ip_range: str) -> list[dict]:
     return [{"ip": rcv.psrc, "mac": rcv.hwsrc.lower()} for _, rcv in result]
 
 # ---------------------------------------------------------------------------
-# Nmap deep scan
+# TCP port sweep (all 65535 ports, pure Python)
 # ---------------------------------------------------------------------------
-def deep_scan(ip: str, mac: str) -> dict:
-    print(f"[nmap] Starting deep scan: {ip} ({mac})", flush=True)
-    nm = nmap.PortScanner()
+
+# Cap simultaneous deep scans so 21 newly-detected devices don't all scan at once
+_deep_scan_semaphore = threading.Semaphore(3)
+
+
+def _fast_port_sweep(ip: str) -> list[int]:
+    """
+    Pure-Python TCP connect sweep of all 65535 ports.
+    Uses a thread pool — no nmap, no raw sockets, no config file dependencies.
+    300 workers × 0.5 s timeout ≈ 60-120 s per host on a typical LAN.
+    """
+    import concurrent.futures
+    import socket as _socket
+
+    def _check(port: int) -> int | None:
+        try:
+            s = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
+            s.settimeout(0.5)
+            result = s.connect_ex((ip, port))
+            s.close()
+            return port if result == 0 else None
+        except Exception:
+            return None
+
+    open_ports: list[int] = []
     try:
-        nm.scan(hosts=ip, arguments=NMAP_ARGS)
-    except nmap.PortScannerError as e:
-        return {"error": str(e), "scanned_at": datetime.now(timezone.utc).isoformat()}
+        with concurrent.futures.ThreadPoolExecutor(max_workers=300) as ex:
+            for port in concurrent.futures.as_completed(
+                {ex.submit(_check, p): p for p in range(1, 65536)}
+            ):
+                r = port.result()
+                if r is not None:
+                    open_ports.append(r)
+    except Exception as exc:
+        print(f"[fast-scan] socket sweep error for {ip}: {exc}", flush=True)
+    return sorted(open_ports)
 
-    host_data: dict = {
-        "scanned_at": datetime.now(timezone.utc).isoformat(),
-        "os_matches": [],
-        "open_ports": [],
-        "hostnames":  [],
-    }
 
-    if ip not in nm.all_hosts():
-        host_data["error"] = "Host not found in nmap results"
-        return host_data
-
-    host = nm[ip]
-    for match in host.get("osmatch", [])[:3]:
-        confidence = int(match.get("accuracy", 0))
-        if confidence < OS_CONFIDENCE_THRESHOLD:
-            continue
-        host_data["os_matches"].append({
-            "name":     match.get("name", ""),
-            "accuracy": confidence,
-            "osclass": [{
-                "type":     c.get("type", ""),
-                "vendor":   c.get("vendor", ""),
-                "osfamily": c.get("osfamily", ""),
-                "osgen":    c.get("osgen", ""),
-            } for c in match.get("osclass", [])],
-        })
-    for proto in host.all_protocols():
-        for port, info in host[proto].items():
-            if info.get("state") == "open":
-                host_data["open_ports"].append({
-                    "port":    port,
-                    "proto":   proto,
-                    "service": info.get("name", ""),
-                    "product": info.get("product", ""),
-                    "version": info.get("version", ""),
-                    "cpe":     info.get("cpe", ""),
-                })
-    host_data["hostnames"] = [
-        h["name"] for h in host.get("hostnames", [])
-        if h.get("name") and h["name"] != ip
-    ]
-    os_label = host_data["os_matches"][0]["name"] if host_data["os_matches"] else "unknown"
-    print(f"[nmap] Done: {ip} -- {len(host_data['open_ports'])} ports, OS: {os_label}", flush=True)
-    return host_data
-
+# ---------------------------------------------------------------------------
+# TCP port scan + scan result storage
+# ---------------------------------------------------------------------------
 def _run_deep_scan_thread(ip: str, mac: str) -> None:
-    results = deep_scan(ip, mac)
-    session = Session()
-    try:
-        device = session.get(Device, mac)
-        if device:
-            old_scan   = device.scan_results or {}
-            old_ports  = {(p.get("port"), p.get("proto")) for p in (old_scan.get("open_ports") or [])}
-            new_ports  = {(p.get("port"), p.get("proto")) for p in (results.get("open_ports") or [])}
-            is_rescan  = bool(old_scan)  # False on first-ever scan
+    with _deep_scan_semaphore:
+        try:
+            t0 = time.monotonic()
+            print(f"[scan] TCP sweep starting: {ip} ({mac})", flush=True)
+            fast_ports = _fast_port_sweep(ip)
+            elapsed = round(time.monotonic() - t0, 1)
+            print(f"[scan] {len(fast_ports)} open TCP port(s) on {ip} in {elapsed}s", flush=True)
 
-            device.scan_results = results
-            device.deep_scanned = True
-            if not device.hostname and results.get("hostnames"):
-                device.hostname = _strip_fqdn(results["hostnames"][0])
-            session.commit()
+            scan_results = {
+                "scanned_at":    datetime.now(timezone.utc).isoformat(),
+                "open_ports":    [
+                    {"port": p, "proto": "tcp", "service": "", "product": "", "version": ""}
+                    for p in fast_ports
+                ],
+                "os_matches":    [],
+                "hostnames":     [],
+                "pipeline_stage": "ports_done",
+            }
 
-            _write_event(mac, "scan_complete", {
-                "ports": len(results.get("open_ports") or []),
-                "os":    results["os_matches"][0]["name"] if results.get("os_matches") else None,
-            })
+            session = Session()
+            try:
+                device = session.get(Device, mac)
+                if device:
+                    old_scan  = device.scan_results or {}
+                    old_ports = {(p.get("port"), p.get("proto")) for p in (old_scan.get("open_ports") or [])}
+                    new_ports = {(p.get("port"), p.get("proto")) for p in scan_results["open_ports"]}
+                    is_rescan = bool(old_scan)
 
-            if is_rescan and old_ports != new_ports:
-                added   = [{"port": p[0], "proto": p[1]} for p in (new_ports - old_ports)]
-                removed = [{"port": p[0], "proto": p[1]} for p in (old_ports - new_ports)]
-                _write_event(mac, "port_change", {"added": added, "removed": removed})
-                print(f"[scan] Port change on {ip} ({mac}): +{len(added)} -{len(removed)}", flush=True)
-    except Exception as e:
-        session.rollback()
-        print(f"[DB] Scan save error {mac}: {e}", flush=True)
-    finally:
-        session.close()
-        with _scan_lock:
-            _scanning.discard(mac)
+                    device.scan_results = scan_results
+                    device.deep_scanned = True
+                    session.commit()
+
+                    _write_event(mac, "scan_complete", {"ports": len(fast_ports), "os": None})
+
+                    if is_rescan and old_ports != new_ports:
+                        added   = [{"port": p[0], "proto": p[1]} for p in (new_ports - old_ports)]
+                        removed = [{"port": p[0], "proto": p[1]} for p in (old_ports - new_ports)]
+                        _write_event(mac, "port_change", {"added": added, "removed": removed})
+                        print(f"[scan] Port change on {ip} ({mac}): +{len(added)} -{len(removed)}", flush=True)
+            except Exception as e:
+                session.rollback()
+                print(f"[DB] Scan save error {mac}: {e}", flush=True)
+            finally:
+                session.close()
+
+            # Stage 3: Nerva service fingerprinting (automatic after port sweep)
+            threading.Thread(
+                target=_run_nerva_fingerprint,
+                args=(ip, mac, fast_ports),
+                daemon=True,
+                name=f"nerva-{mac}",
+            ).start()
+        finally:
+            with _scan_lock:
+                _scanning.discard(mac)
 
 def trigger_deep_scan(ip: str, mac: str) -> None:
     if not _is_valid_ip(ip):
@@ -742,13 +789,19 @@ def upsert_seen_device(mac: str, ip: str, source: str) -> None:
             ip_changed = (not is_new) and (old_ip != ip)
 
             if is_new:
-                hostname = resolve_hostname(ip)
+                hostname = None if ip in _hostname_failed else resolve_hostname(ip)
+                if not hostname and ip not in _hostname_failed:
+                    _hostname_failed.add(ip)
                 vendor   = lookup_vendor(mac)
             else:
                 if existing.hostname:
                     hostname = existing.hostname
+                elif ip in _hostname_failed:
+                    hostname = None
                 else:
                     hostname = resolve_hostname(ip)
+                    if not hostname:
+                        _hostname_failed.add(ip)
                 vendor   = existing.vendor
 
             safe_hostname = (hostname or '').replace("'", "''")
@@ -809,9 +862,14 @@ def upsert_seen_device(mac: str, ip: str, source: str) -> None:
                         index_elements=["mac_address"],
                         set_=dict(
                             ip_address = ip,
+                            # When device was offline and comes back at a different IP that's
+                            # a permanent DHCP reassignment — adopt new IP as primary.
+                            # While online a new IP is just a secondary — keep existing primary.
                             primary_ip = text(
-                                "CASE WHEN devices.primary_ip IS NOT NULL "
-                                "THEN devices.primary_ip ELSE EXCLUDED.primary_ip END"
+                                "CASE "
+                                "WHEN devices.is_online = false THEN EXCLUDED.primary_ip "
+                                "WHEN devices.primary_ip IS NOT NULL THEN devices.primary_ip "
+                                "ELSE EXCLUDED.primary_ip END"
                             ),
                             is_online  = True,
                             last_seen  = text("CASE WHEN devices.is_online = false THEN NOW() ELSE devices.last_seen END"),
@@ -835,14 +893,21 @@ def upsert_seen_device(mac: str, ip: str, source: str) -> None:
                 if not was_online:
                     print(f"[~] Back online via {source}: {ip} ({mac})", flush=True)
                     _write_event(mac, "online", {"ip": ip})
+                    _hostname_failed.discard(ip)
                 if ip_changed:
+                    _hostname_failed.discard(ip)
                     primary = existing.primary_ip or old_ip
-                    if ip == primary:
-                        print(f"[~] IP reverted to primary {ip} for {mac}", flush=True)
+                    if ip == primary or not was_online:
+                        # Device came back from offline at new IP → primary updated to new IP
+                        if not was_online and ip != primary:
+                            print(f"[~] Primary IP updated {primary} → {ip} for {mac} (came back from offline)", flush=True)
+                            _write_event(mac, "primary_ip_changed", {"old_ip": primary, "new_ip": ip})
+                        else:
+                            print(f"[~] IP reverted to primary {ip} for {mac}", flush=True)
                     else:
                         print(f"[~] Secondary IP seen {ip} for {mac} (primary={primary}, source={source})", flush=True)
                     _write_event(mac, "ip_change", {"old_ip": old_ip, "new_ip": ip,
-                                                     "primary_ip": primary})
+                                                     "primary_ip": ip if not was_online else primary})
 
         except Exception as e:
             session.rollback()
@@ -913,11 +978,15 @@ def refresh_missing_hostnames() -> None:
             scan_ip = dev.primary_ip or dev.ip_address
             if not _is_valid_ip(scan_ip):
                 continue
+            if scan_ip in _hostname_failed:
+                continue
             name = resolve_hostname(scan_ip)
             if name:
                 dev.hostname = name
                 updated += 1
                 print(f"[hostname] Resolved: {scan_ip} -> {name}", flush=True)
+            else:
+                _hostname_failed.add(scan_ip)
         if updated:
             session.commit()
             print(f"[hostname] Resolved {updated} new hostnames this pass.", flush=True)
@@ -936,11 +1005,15 @@ def bulk_reresolve_all() -> None:
             scan_ip = dev.primary_ip or dev.ip_address
             if not _is_valid_ip(scan_ip):
                 continue
+            if dev.hostname:
+                continue
             name = resolve_hostname(scan_ip)
             if name and name != dev.hostname:
                 print(f"[hostname] Re-resolved: {scan_ip} -> {name}", flush=True)
                 dev.hostname = name
                 updated += 1
+            elif not name:
+                _hostname_failed.add(scan_ip)
         if updated:
             session.commit()
         print(f"[hostname] Startup re-resolve complete: {updated}/{len(all_devs)} updated.", flush=True)
@@ -1172,6 +1245,141 @@ def _arp_spoof_loop(
 
 
 # ---------------------------------------------------------------------------
+# Nerva service fingerprinting (Stage 3 of scan pipeline)
+# ---------------------------------------------------------------------------
+
+def _parse_nerva_output(output: str) -> list[dict]:
+    """Parse Nerva URI output into service records: [{port, service, protocol, tls}].
+    Handles Nerva's ' (tls)' annotation on TLS lines, e.g. 'https://ip:443 (tls)'."""
+    services: list[dict] = []
+    seen_ports: set[int] = set()
+    for line in output.strip().splitlines():
+        line = line.strip()
+        if not line or "://" not in line:
+            continue
+        try:
+            scheme, rest = line.split("://", 1)
+            # Strip path component and any trailing annotations like " (tls)"
+            host_part = rest.split("/")[0].split(" ")[0]
+            if ":" not in host_part:
+                continue
+            _, port_str = host_part.rsplit(":", 1)
+            port = int(port_str)
+            if port in seen_ports:
+                continue
+            seen_ports.add(port)
+            service = scheme.lower()
+            tls = service in ("https", "mqtts", "ldaps", "ftps", "imaps", "pop3s", "smtps", "rediss", "wss")
+            services.append({"port": port, "service": service, "protocol": "tcp", "tls": tls})
+        except (ValueError, IndexError):
+            continue
+    return services
+
+
+def _run_nerva_fingerprint(ip: str, mac: str, open_ports: list[int]) -> None:
+    """Pipe open host:port pairs through Nerva and store service fingerprints.
+
+    Always advances pipeline_stage to 'services_done' — even if Nerva is absent,
+    returns no output, or the port list is empty — so the UI never spins forever.
+    """
+    services: list[dict] = []
+
+    if open_ports:
+        input_data = "\n".join(f"{ip}:{p}" for p in open_ports)
+        try:
+            # Scale timeout with port count — each port can take a few seconds to probe
+            nerva_timeout = max(300, len(open_ports) * 4)
+            result = subprocess.run(
+                ["nerva"],
+                input=input_data,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,  # merge stderr so we capture regardless of which fd Nerva uses
+                text=True,
+                timeout=nerva_timeout,
+            )
+            output = (result.stdout or "").strip()
+            print(f"[nerva] raw output for {ip} ({len(output)} chars, exit={result.returncode}): {output[:300]}", flush=True)
+            if output:
+                services = _parse_nerva_output(output)
+                print(
+                    f"[nerva] {ip} ({mac}): {len(services)} service(s) — "
+                    + ", ".join(f"{s['service']}:{s['port']}" for s in services),
+                    flush=True,
+                )
+            if result.returncode != 0:
+                print(f"[nerva] Non-zero exit ({result.returncode}) for {ip}", flush=True)
+        except FileNotFoundError:
+            print(f"[nerva] Binary not found — service fingerprinting skipped for {ip}", flush=True)
+        except subprocess.TimeoutExpired:
+            print(f"[nerva] Timeout fingerprinting {ip}", flush=True)
+        except Exception as e:
+            print(f"[nerva] Error for {ip}: {e}", flush=True)
+
+    # Always persist — advances pipeline_stage to 'services_done' regardless of outcome
+    session = Session()
+    try:
+        device = session.get(Device, mac)
+        if device:
+            scan = dict(device.scan_results or {})
+            scan["services"]       = services
+            scan["pipeline_stage"] = "services_done"
+            device.scan_results    = scan
+            session.commit()
+            if services:
+                _write_event(mac, "service_fingerprint_complete", {
+                    "service_count": len(services),
+                    "services": [f"{s['service']}:{s['port']}" for s in services[:20]],
+                })
+    except Exception as e:
+        session.rollback()
+        print(f"[nerva] DB save error {mac}: {e}", flush=True)
+    finally:
+        session.close()
+
+
+# ---------------------------------------------------------------------------
+# Nuclei template updater
+# ---------------------------------------------------------------------------
+def _nuclei_template_update_loop() -> None:
+    """Background thread that periodically runs nuclei -update-templates."""
+    global _last_nuclei_template_update
+    time.sleep(120)  # startup grace period
+    _update_intervals = {"12h": 43200, "24h": 86400, "48h": 172800, "weekly": 604800}
+    while True:
+        try:
+            session = Session()
+            try:
+                row = session.execute(
+                    text("SELECT value FROM settings WHERE key = 'nuclei_template_update_interval'")
+                ).fetchone()
+                interval_str = row[0] if row else NUCLEI_TEMPLATE_UPDATE_INTERVAL
+            finally:
+                session.close()
+
+            if interval_str != "disabled":
+                interval = _update_intervals.get(interval_str, 86400)
+                now = datetime.now(timezone.utc)
+                if _last_nuclei_template_update is None or (now - _last_nuclei_template_update).total_seconds() >= interval:
+                    print(f"[nuclei] Updating templates (interval: {interval_str})…", flush=True)
+                    result = subprocess.run(
+                        ["nuclei", "-update-templates"],
+                        capture_output=True, text=True, timeout=300,
+                    )
+                    if result.stdout:
+                        print(f"[nuclei] {result.stdout.strip()[:500]}", flush=True)
+                    if result.returncode == 0:
+                        print("[nuclei] Templates updated successfully.", flush=True)
+                        _last_nuclei_template_update = now
+                    else:
+                        print(f"[nuclei] Template update failed (exit {result.returncode})", flush=True)
+        except FileNotFoundError:
+            print("[nuclei] nuclei binary not found — skipping template update.", flush=True)
+        except Exception as exc:
+            print(f"[nuclei-updater] Error: {exc}", flush=True)
+        time.sleep(3600)  # re-check every hour
+
+
+# ---------------------------------------------------------------------------
 # Probe HTTP API (port 8001)
 # ---------------------------------------------------------------------------
 probe_api = FastAPI(
@@ -1239,6 +1447,7 @@ class ConfigReloadRequest(BaseModel):
     os_confidence_threshold: int | None = None
     offline_miss_threshold: int | None = None
     sniffer_workers: int | None = None
+    nuclei_template_update_interval: str | None = None
 
 
 @probe_api.post("/config/reload")
@@ -1307,7 +1516,7 @@ def stream_traceroute(ip: str):
 
 
 @probe_api.get("/stream/vuln-scan/{ip}")
-async def stream_vuln_scan(ip: str, templates: str = ""):
+async def stream_vuln_scan(ip: str, templates: str = "", mac: str = ""):
     import ipaddress
     from vuln_scanner import run_vuln_scan, DEFAULT_TEMPLATES
 
@@ -1318,23 +1527,61 @@ async def stream_vuln_scan(ip: str, templates: str = ""):
 
     effective_templates = templates.strip() if templates.strip() else DEFAULT_TEMPLATES
 
-    # Pull ports already found by the nmap deep scan for this device
+    # Pull port + service info from the device's prior port sweep.
+    # Prefer MAC lookup (stable) over IP lookup (can be stale if sniffer
+    # recently updated ip_address to a secondary address).
     known_ports: list[int] = []
+    port_services: dict[int, dict] = {}
+    pipeline_stage: str = ""
     try:
         session = Session()
-        device = session.query(Device).filter(Device.ip_address == ip).first()
+        if mac:
+            device = session.get(Device, mac.lower())
+        else:
+            device = (
+                session.query(Device)
+                .filter((Device.primary_ip == ip) | (Device.ip_address == ip))
+                .first()
+            )
         if device and device.scan_results:
-            known_ports = [
-                p["port"] for p in (device.scan_results.get("open_ports") or [])
-                if isinstance(p.get("port"), int)
-            ]
+            for p in (device.scan_results.get("open_ports") or []):
+                if isinstance(p.get("port"), int):
+                    port = p["port"]
+                    known_ports.append(port)
+                    port_services[port] = {
+                        "service": p.get("service", ""),
+                        "product": p.get("product", ""),
+                        "version": p.get("version", ""),
+                        "cpe":     p.get("cpe", ""),
+                    }
+            # Overlay Nerva service data — more accurate than empty TCP-connect labels
+            for svc in (device.scan_results.get("services") or []):
+                port = svc.get("port")
+                if isinstance(port, int) and port in port_services:
+                    if not port_services[port].get("service"):
+                        port_services[port]["service"] = svc.get("service", "")
+            pipeline_stage = device.scan_results.get("pipeline_stage", "")
+        print(
+            f"[vuln-scan] {ip} (mac={mac or 'unknown'}): "
+            f"{len(known_ports)} port(s), pipeline_stage={pipeline_stage!r}",
+            flush=True,
+        )
         session.close()
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"[vuln-scan] scan_results lookup error for {ip}: {e}", flush=True)
 
     async def _gen():
         yield f"data: [INFO] Initiating vulnerability scan…\n\n"
-        async for line in run_vuln_scan(ip, templates=effective_templates, known_ports=known_ports):
+        if pipeline_stage == "ports_done":
+            yield f"data: [WARN] Service fingerprinting not yet complete — template selection may be less precise\n\n"
+        elif not pipeline_stage:
+            yield f"data: [WARN] No prior port scan — will run full TCP sweep first\n\n"
+        async for line in run_vuln_scan(
+            ip,
+            templates=effective_templates,
+            known_ports=known_ports,
+            port_services=port_services,
+        ):
             safe = line.replace("\n", " ").replace("\r", "")
             yield f"data: {safe}\n\n"
         yield "data: --- done ---\n\n"
@@ -1429,6 +1676,56 @@ def start_probe_api() -> None:
     )
 
 # ---------------------------------------------------------------------------
+# Startup Nerva backfill
+# ---------------------------------------------------------------------------
+def _startup_nerva_backfill() -> None:
+    """Re-fingerprint devices whose services are empty (Nerva was broken or scanned stale IP).
+    Always uses the device's CURRENT ip_address, not the historical primary_ip."""
+    time.sleep(5)  # let sniffer / ARP threads settle first
+    active = {t.name for t in threading.enumerate()}
+    session = Session()
+    count = 0
+    try:
+        devices = session.query(Device).filter(Device.deep_scanned == True).all()
+        for dev in devices:
+            sr = dev.scan_results or {}
+            pipeline_stage = sr.get("pipeline_stage")
+            services       = sr.get("services")
+            # Backfill if: pipeline ran to services_done with empty result, OR stuck at ports_done
+            needs_backfill = (
+                pipeline_stage in ("services_done", "ports_done")
+                and not services  # catches [] and None
+                and sr.get("open_ports")
+            )
+            if not needs_backfill:
+                continue
+            # Skip if a Nerva thread is already running for this device
+            if (f"nerva-{dev.mac_address}" in active or
+                    f"nerva-backfill-{dev.mac_address}" in active):
+                continue
+            ports = [p["port"] for p in sr["open_ports"] if isinstance(p.get("port"), int)]
+            if not ports:
+                continue
+            # Use CURRENT ip_address — primary_ip may be a stale DHCP address
+            scan_ip = dev.ip_address or dev.primary_ip
+            if not _is_valid_ip(scan_ip):
+                continue
+            threading.Thread(
+                target=_run_nerva_fingerprint,
+                args=(scan_ip, dev.mac_address, ports),
+                daemon=True,
+                name=f"nerva-backfill-{dev.mac_address}",
+            ).start()
+            count += 1
+            print(f"[nerva] Backfill queued: {scan_ip} ({dev.mac_address}), {len(ports)} port(s)", flush=True)
+    except Exception as e:
+        print(f"[nerva] Backfill query error: {e}", flush=True)
+    finally:
+        session.close()
+    print(f"[nerva] Backfill: {count} device(s) queued for re-fingerprint", flush=True)
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 def main() -> None:
@@ -1436,6 +1733,7 @@ def main() -> None:
     _load_mac_vendor_db()
     wait_for_db()
     init_db()
+    _load_settings_from_db()
     threading.Thread(target=refresh_missing_vendors, daemon=True, name="vendor-refresh").start()
 
     print(
@@ -1450,14 +1748,18 @@ def main() -> None:
     print(f"[*] DNS server: {_DNS_SERVER or 'NOT DETECTED — set LAN_DNS_SERVER in docker-compose!'}", flush=True)
 
     threading.Thread(target=start_probe_api, daemon=True, name="probe-api").start()
+    threading.Thread(target=_nuclei_template_update_loop, daemon=True, name="nuclei-updater").start()
     time.sleep(2)
 
     print("[*] Running startup hostname resolution pass...", flush=True)
     threading.Thread(target=bulk_reresolve_all, daemon=True, name="startup-resolve").start()
+    threading.Thread(target=_startup_nerva_backfill, daemon=True, name="nerva-backfill").start()
 
     threading.Thread(target=start_arp_sniffer, daemon=True, name="arp-sniffer").start()
 
     while True:
+        _load_settings_from_db()
+
         with _sniffer_seen_lock:
             _sniffer_seen_this_interval.clear()
 
@@ -1471,6 +1773,18 @@ def main() -> None:
             update_presence_from_sweep(session, active_macs)
             session.commit()
             print(f"[*] Sweep done -- {len(active_macs)} online", flush=True)
+
+            # Retry any online devices that never got a completed deep scan
+            unscanned = session.query(Device).filter(
+                Device.is_online == True,
+                Device.deep_scanned == False,
+            ).all()
+            for dev in unscanned:
+                scan_ip = dev.primary_ip or dev.ip_address
+                if _is_valid_ip(scan_ip):
+                    print(f"[scan] Retrying unscanned device: {scan_ip} ({dev.mac_address})", flush=True)
+                    trigger_deep_scan(scan_ip, dev.mac_address)
+
             threading.Thread(target=refresh_missing_hostnames, daemon=True).start()
             mdns_data = _mdns_browse()
             if mdns_data:

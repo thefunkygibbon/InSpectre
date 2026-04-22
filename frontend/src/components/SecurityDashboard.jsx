@@ -1,7 +1,7 @@
 import { useState, useEffect } from 'react'
 import {
   ShieldAlert, ShieldCheck, X, RefreshCw,
-  AlertTriangle, Info, Clock,
+  AlertTriangle, Info, Clock, ChevronDown, ChevronRight,
 } from 'lucide-react'
 import { api } from '../api'
 
@@ -50,9 +50,10 @@ function fmtRelative(iso) {
 }
 
 export function SecurityDashboard({ onClose, onDeviceClick }) {
-  const [data,     setData]     = useState(null)
-  const [loading,  setLoading]  = useState(true)
-  const [error,    setError]    = useState(null)
+  const [data,        setData]        = useState(null)
+  const [loading,     setLoading]     = useState(true)
+  const [error,       setError]       = useState(null)
+  const [expandedVuln, setExpandedVuln] = useState({}) // mac → { loading } | { findings: [] }
 
   async function load() {
     setLoading(true)
@@ -69,6 +70,21 @@ export function SecurityDashboard({ onClose, onDeviceClick }) {
 
   useEffect(() => { load() }, [])
 
+  async function toggleVulnExpand(mac) {
+    if (expandedVuln[mac]) {
+      setExpandedVuln(prev => { const n = { ...prev }; delete n[mac]; return n })
+      return
+    }
+    setExpandedVuln(prev => ({ ...prev, [mac]: { loading: true } }))
+    try {
+      const reports = await api.getVulnReports(mac, 1)
+      const findings = reports?.[0]?.findings || []
+      setExpandedVuln(prev => ({ ...prev, [mac]: { findings } }))
+    } catch {
+      setExpandedVuln(prev => ({ ...prev, [mac]: { findings: [] } }))
+    }
+  }
+
   const sevCounts  = data?.severity_counts  || {}
   const totalScan  = data?.total_scanned    || 0
   const totalDev   = data?.total_devices    || 0
@@ -76,7 +92,8 @@ export function SecurityDashboard({ onClose, onDeviceClick }) {
   const recentScan = data?.recent_scans     || []
   const coveragePct = totalDev > 0 ? Math.round((totalScan / totalDev) * 100) : 0
 
-  const atRisk = ['critical', 'high', 'medium'].reduce((s, k) => s + (sevCounts[k] || 0), 0)
+  const atRisk  = ['critical', 'high', 'medium'].reduce((s, k) => s + (sevCounts[k] || 0), 0)
+  const nClean  = sevCounts.clean || 0
 
   return (
     <>
@@ -129,40 +146,34 @@ export function SecurityDashboard({ onClose, onDeviceClick }) {
 
           {data && (
             <>
-              {/* Summary pills */}
-              <div className="grid grid-cols-2 gap-3">
-                <div className="card p-4">
-                  <p className="text-xs" style={{ color: 'var(--color-text-faint)' }}>Devices at risk</p>
-                  <p className="text-2xl font-bold mt-1" style={{ color: atRisk > 0 ? '#ef4444' : '#22c55e' }}>
+              {/* Summary cards */}
+              <div className="grid grid-cols-3 gap-2">
+                <div className="card p-3">
+                  <p className="text-[11px]" style={{ color: 'var(--color-text-faint)' }}>At risk</p>
+                  <p className="text-xl font-bold mt-0.5" style={{ color: atRisk > 0 ? '#ef4444' : '#22c55e' }}>
                     {atRisk}
                   </p>
-                  <p className="text-[11px] mt-0.5" style={{ color: 'var(--color-text-faint)' }}>
-                    critical / high / medium
+                  <p className="text-[10px] mt-0.5 leading-tight" style={{ color: 'var(--color-text-faint)' }}>
+                    crit / high / med
                   </p>
                 </div>
-                <div className="card p-4">
-                  <p className="text-xs" style={{ color: 'var(--color-text-faint)' }}>Scan coverage</p>
-                  <p className="text-2xl font-bold mt-1" style={{ color: 'var(--color-text)' }}>
+                <div className="card p-3">
+                  <p className="text-[11px]" style={{ color: 'var(--color-text-faint)' }}>Coverage</p>
+                  <p className="text-xl font-bold mt-0.5" style={{ color: 'var(--color-text)' }}>
                     {coveragePct}%
                   </p>
-                  <p className="text-[11px] mt-0.5" style={{ color: 'var(--color-text-faint)' }}>
-                    {totalScan} of {totalDev} devices
+                  <p className="text-[10px] mt-0.5" style={{ color: 'var(--color-text-faint)' }}>
+                    {totalScan}/{totalDev} scanned
                   </p>
                 </div>
-              </div>
-
-              {/* Coverage bar */}
-              <div>
-                <div className="flex justify-between items-center mb-1">
-                  <span className="text-xs font-semibold uppercase tracking-wider"
-                    style={{ color: 'var(--color-text-muted)' }}>Scan Coverage</span>
-                  <span className="text-xs" style={{ color: 'var(--color-text-faint)' }}>
-                    {totalScan}/{totalDev} scanned
-                  </span>
-                </div>
-                <div className="h-2 rounded-full overflow-hidden" style={{ background: 'var(--color-surface-offset)' }}>
-                  <div className="h-full rounded-full transition-all duration-500"
-                    style={{ width: `${coveragePct}%`, background: coveragePct >= 80 ? '#22c55e' : coveragePct >= 50 ? '#f59e0b' : '#ef4444' }} />
+                <div className="card p-3">
+                  <p className="text-[11px]" style={{ color: 'var(--color-text-faint)' }}>Clean</p>
+                  <p className="text-xl font-bold mt-0.5" style={{ color: '#22c55e' }}>
+                    {nClean}
+                  </p>
+                  <p className="text-[10px] mt-0.5" style={{ color: 'var(--color-text-faint)' }}>
+                    no findings
+                  </p>
                 </div>
               </div>
 
@@ -196,26 +207,66 @@ export function SecurityDashboard({ onClose, onDeviceClick }) {
                   <p className="text-xs font-semibold uppercase tracking-wider mb-3"
                     style={{ color: 'var(--color-text-muted)' }}>Most Vulnerable</p>
                   <div className="space-y-2">
-                    {topVuln.map((d, i) => (
-                      <button
-                        key={d.mac_address}
-                        onClick={() => onDeviceClick && onDeviceClick(d.mac_address)}
-                        className="card p-3 w-full text-left flex items-center gap-3 hover:border-brand/40 transition-colors"
-                      >
-                        <SevBadge severity={d.severity} />
-                        <div className="flex-1 min-w-0">
-                          <p className="text-sm font-medium truncate" style={{ color: 'var(--color-text)' }}>
-                            {d.display_name}
-                          </p>
-                          <p className="text-xs font-mono" style={{ color: 'var(--color-text-faint)' }}>
-                            {d.ip_address || d.mac_address}
-                          </p>
+                    {topVuln.map(d => {
+                      const exp = expandedVuln[d.mac_address]
+                      const isOpen = !!exp
+                      return (
+                        <div key={d.mac_address} className="card overflow-hidden">
+                          <button
+                            onClick={() => toggleVulnExpand(d.mac_address)}
+                            className="w-full p-3 text-left flex items-center gap-3 hover:bg-surface-offset/40 transition-colors"
+                          >
+                            {isOpen
+                              ? <ChevronDown size={12} style={{ color: 'var(--color-text-faint)', flexShrink: 0 }} />
+                              : <ChevronRight size={12} style={{ color: 'var(--color-text-faint)', flexShrink: 0 }} />}
+                            <SevBadge severity={d.severity} />
+                            <div className="flex-1 min-w-0">
+                              <p className="text-sm font-medium truncate" style={{ color: 'var(--color-text)' }}>
+                                {d.display_name}
+                              </p>
+                              <p className="text-xs font-mono" style={{ color: 'var(--color-text-faint)' }}>
+                                {d.ip_address || d.mac_address}
+                              </p>
+                            </div>
+                            <span className="text-xs shrink-0" style={{ color: 'var(--color-text-faint)' }}>
+                              {d.vuln_count} finding{d.vuln_count !== 1 ? 's' : ''}
+                            </span>
+                          </button>
+                          {isOpen && (
+                            <div className="px-3 pb-3 pt-1 border-t" style={{ borderColor: 'var(--color-border)' }}>
+                              {exp.loading ? (
+                                <p className="text-[11px] animate-pulse" style={{ color: 'var(--color-text-faint)' }}>Loading findings…</p>
+                              ) : exp.findings?.length === 0 ? (
+                                <p className="text-[11px]" style={{ color: '#22c55e' }}>No findings in latest report</p>
+                              ) : (
+                                <div className="space-y-1 mt-1">
+                                  {(exp.findings || []).map((f, i) => {
+                                    const cfg = SEV_CFG[f.severity] || SEV_CFG.info
+                                    return (
+                                      <div key={i} className="flex items-center gap-2">
+                                        <span className="px-1.5 py-0.5 rounded text-[9px] font-bold uppercase shrink-0"
+                                          style={{ background: cfg.bg, color: cfg.color, border: `1px solid ${cfg.border}` }}>
+                                          {f.severity.slice(0, 4)}
+                                        </span>
+                                        <span className="text-[11px] truncate" style={{ color: 'var(--color-text-muted)' }}>
+                                          {f.name}
+                                        </span>
+                                        {f.matched_at && (
+                                          <span className="text-[10px] font-mono shrink-0 truncate max-w-[100px]"
+                                            style={{ color: 'var(--color-text-faint)' }}>
+                                            {f.matched_at}
+                                          </span>
+                                        )}
+                                      </div>
+                                    )
+                                  })}
+                                </div>
+                              )}
+                            </div>
+                          )}
                         </div>
-                        <span className="text-xs shrink-0" style={{ color: 'var(--color-text-faint)' }}>
-                          {d.vuln_count} finding{d.vuln_count !== 1 ? 's' : ''}
-                        </span>
-                      </button>
-                    ))}
+                      )
+                    })}
                   </div>
                 </div>
               )}
@@ -231,7 +282,7 @@ export function SecurityDashboard({ onClose, onDeviceClick }) {
                       return (
                         <button
                           key={i}
-                          onClick={() => onDeviceClick && onDeviceClick(r.mac_address)}
+                          onClick={() => onDeviceClick && onDeviceClick(r.mac_address, 'vuln')}
                           className="w-full px-3 py-2.5 flex items-center gap-3 text-left hover:bg-surface-offset transition-colors first:rounded-t-lg last:rounded-b-lg"
                         >
                           <span className="w-2 h-2 rounded-full shrink-0 mt-0.5" style={{ background: cfg.color }} />

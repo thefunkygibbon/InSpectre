@@ -19,7 +19,7 @@ function cleanVendor(vendor) {
     .trim()
 }
 
-export function DeviceRow({ device, onClick, striped, onStarToggle }) {
+export function DeviceRow({ device, onClick, striped, onStarToggle, isVulnScanning }) {
   const name = device.custom_name || device.hostname || device.ip_address || device.mac_address
 
   return (
@@ -49,13 +49,19 @@ export function DeviceRow({ device, onClick, striped, onStarToggle }) {
         {relativeTime(device.last_seen)}
       </span>
 
-      <div>
+      <div className="flex flex-col gap-1 items-start">
         <span
           className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[11px] font-medium
                       ${device.is_online ? 'badge-online' : 'badge-offline'}`}
         >
           {device.is_online ? 'Online' : 'Offline'}
         </span>
+        {isVulnScanning && (
+          <span className="text-[10px] font-medium rounded-full px-2 py-0.5"
+            style={{ color: 'var(--color-brand)', background: 'color-mix(in srgb, var(--color-brand) 12%, transparent)', border: '1px solid color-mix(in srgb, var(--color-brand) 25%, transparent)' }}>
+            Vuln Scan
+          </span>
+        )}
       </div>
 
       <div onClick={e => e.stopPropagation()}>

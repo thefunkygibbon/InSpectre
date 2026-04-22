@@ -293,15 +293,15 @@ function ReportDetail({ mac, report, onDelete }) {
 
 // ---------------------------------------------------------------------------
 // VulnPanel — main export
+// Scan state (lines, scanning) is owned by the parent (DeviceDrawer) so it
+// survives tab switches within the drawer.
 // ---------------------------------------------------------------------------
-export function VulnPanel({ device, onScanComplete }) {
+export function VulnPanel({ device, onScanComplete, lines, setLines, scanning, setScanning }) {
   const mac = device?.mac_address
   const ip  = device?.ip_address
 
   const [reports,  setReports]  = useState(null)
   const [loading,  setLoading]  = useState(false)
-  const [scanning, setScanning] = useState(false)
-  const [lines,    setLines]    = useState([])
   const abortRef = useRef(null)
 
   useEffect(() => {
@@ -417,7 +417,7 @@ export function VulnPanel({ device, onScanComplete }) {
         </div>
       )}
 
-      {!loading && reports?.length === 0 && !scanning && (
+      {!loading && reports?.length === 0 && !scanning && lines.length === 0 && (
         <div className="card p-4 flex items-center gap-2">
           <ShieldQuestion size={16} className="text-text-faint" />
           <p className="text-sm text-text-muted italic">No vulnerability scans run yet.</p>

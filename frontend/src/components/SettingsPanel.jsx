@@ -33,6 +33,15 @@ const SETTING_META = {
   },
   vuln_scan_on_new_device: { label: 'Auto-scan New Devices', type: 'toggle', tab: 'scanner',
     description: 'Automatically run a vulnerability scan when a new device is first discovered.' },
+  nuclei_template_update_interval: { label: 'Nuclei Template Updates', type: 'select', tab: 'scanner',
+    options: [
+      { value: 'disabled', label: 'Disabled' },
+      { value: '12h',      label: 'Every 12 hours' },
+      { value: '24h',      label: 'Daily (default)' },
+      { value: '48h',      label: 'Every 48 hours' },
+      { value: 'weekly',   label: 'Weekly' },
+    ],
+    description: 'How often the probe automatically updates Nuclei vulnerability templates.' },
 
   // Notifications tab — in-app
   notifications_enabled:         { label: 'Toast Notifications',    type: 'toggle', tab: 'notifications',
@@ -197,7 +206,7 @@ export function SettingsPanel({ onClose, onSettingChange }) {
 
   // ── Scanner tab grouping ────────────────────────────────────────────────────
   const networkScanKeys = ['scan_interval','offline_miss_threshold','os_confidence_threshold','sniffer_workers','ip_range','nmap_args']
-  const vulnScanKeys    = ['vuln_scan_templates','vuln_scan_schedule','vuln_scan_targets','vuln_scan_on_new_device']
+  const vulnScanKeys    = ['vuln_scan_templates','vuln_scan_schedule','vuln_scan_targets','vuln_scan_on_new_device','nuclei_template_update_interval']
 
   // ── Notifications tab grouping ──────────────────────────────────────────────
   const inAppKeys   = ['notifications_enabled','browser_notifications_enabled']

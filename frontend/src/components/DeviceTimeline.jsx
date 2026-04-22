@@ -1,7 +1,7 @@
 import { useState, useEffect } from 'react'
 import {
   Wifi, WifiOff, Plus, ArrowLeftRight, ScanLine,
-  Star, Tag, Edit3, AlertCircle, Clock, ShieldAlert, Ban, CheckCircle,
+  Star, Tag, Edit3, AlertCircle, Clock, ShieldAlert, Ban, CheckCircle, Radio,
 } from 'lucide-react'
 import { api } from '../api'
 
@@ -15,7 +15,8 @@ const EVENT_CONFIG = {
   tagged:             { icon: Tag,            color: '#06b6d4', label: 'Tags updated' },
   marked_important:   { icon: Star,           color: '#f59e0b', label: 'Watch status changed' },
   port_change:        { icon: AlertCircle,    color: '#ef4444', label: 'Ports changed' },
-  vuln_scan_complete: { icon: ShieldAlert,    color: '#f97316', label: 'Vulnerability scan' },
+  vuln_scan_complete:            { icon: ShieldAlert,    color: '#f97316', label: 'Vulnerability scan' },
+  service_fingerprint_complete:  { icon: Radio,          color: '#14b8a6', label: 'Services fingerprinted' },
   blocked:            { icon: Ban,            color: '#ef4444', label: 'Blocked' },
   unblocked:          { icon: CheckCircle,    color: '#10b981', label: 'Unblocked' },
   primary_ip_changed: { icon: ArrowLeftRight, color: '#f59e0b', label: 'Primary IP changed' },
@@ -42,7 +43,8 @@ function eventDetail(event) {
     case 'renamed':          return d.new ? `\u201c${d.new}\u201d` : 'Name cleared'
     case 'tagged':           return d.tags ? `Tags: ${d.tags}` : null
     case 'marked_important': return d.important ? '\u2605 Marked as watched' : 'Removed from watched'
-    case 'scan_complete':       return d.open_ports != null ? `${d.open_ports} open port${d.open_ports !== 1 ? 's' : ''}` : null
+    case 'scan_complete':                return d.open_ports != null ? `${d.open_ports} open port${d.open_ports !== 1 ? 's' : ''}` : null
+    case 'service_fingerprint_complete': return d.service_count != null ? `${d.service_count} service${d.service_count !== 1 ? 's' : ''} identified` : null
     case 'vuln_scan_complete':  return d.severity ? `${d.severity} (${d.vuln_count ?? 0} finding${d.vuln_count !== 1 ? 's' : ''})` : null
     case 'port_change': {
       const parts = []

@@ -2,7 +2,7 @@ FROM python:3.12-slim
 
 # nmap + network tools + wget/unzip for Nuclei
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    nmap libpcap-dev gcc \
+    libpcap-dev gcc \
     avahi-utils \
     samba-common-bin \
     dnsutils \
@@ -15,13 +15,23 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # Install Nuclei vulnerability scanner
-ARG NUCLEI_VERSION=3.3.7
+ARG NUCLEI_VERSION=3.4.4
 RUN wget -q "https://github.com/projectdiscovery/nuclei/releases/download/v${NUCLEI_VERSION}/nuclei_${NUCLEI_VERSION}_linux_amd64.zip" \
          -O /tmp/nuclei.zip \
     && unzip -q /tmp/nuclei.zip -d /tmp/nuclei_unzip \
     && mv /tmp/nuclei_unzip/nuclei /usr/local/bin/nuclei \
     && chmod +x /usr/local/bin/nuclei \
     && rm -rf /tmp/nuclei.zip /tmp/nuclei_unzip
+
+# Install Nerva service fingerprinting tool (graceful failure — probe handles absence)
+ARG NERVA_VERSION=1.3.0
+RUN wget -q "https://github.com/praetorian-inc/nerva/releases/download/v${NERVA_VERSION}/nerva-linux-amd64.tar.gz" \
+         -O /tmp/nerva.tar.gz \
+    && tar -xzf /tmp/nerva.tar.gz -C /tmp/ \
+    && mv /tmp/nerva /usr/local/bin/nerva \
+    && chmod +x /usr/local/bin/nerva \
+    && rm -f /tmp/nerva.tar.gz \
+    || echo "[WARN] Nerva download failed — service fingerprinting will be skipped"
 
 # Pre-fetch Nuclei community templates (baked into image; rebuild to refresh)
 RUN nuclei -update-templates -no-color 2>&1 | tail -5 || true

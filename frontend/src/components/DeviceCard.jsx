@@ -78,7 +78,7 @@ function openPortCount(device) {
   return null
 }
 
-export function DeviceCard({ device, onClick, onStarToggle }) {
+export function DeviceCard({ device, onClick, onStarToggle, isVulnScanning }) {
   const name     = deviceDisplayName(device)
   const vendor   = cleanVendor(device.vendor_override || device.vendor)
   const DevIcon  = getDeviceIcon(device)
@@ -118,12 +118,20 @@ export function DeviceCard({ device, onClick, onStarToggle }) {
             )}
           </div>
         </div>
-        {scanning && (
-          <span className="shrink-0 text-[10px] font-medium text-amber-400 bg-amber-400/10
-                           border border-amber-400/20 rounded-full px-2 py-0.5 mt-0.5">
-            Scanning
-          </span>
-        )}
+        <div className="flex flex-col gap-1 items-end shrink-0">
+          {scanning && (
+            <span className="text-[10px] font-medium text-amber-400 bg-amber-400/10
+                             border border-amber-400/20 rounded-full px-2 py-0.5">
+              Scanning
+            </span>
+          )}
+          {isVulnScanning && (
+            <span className="text-[10px] font-medium rounded-full px-2 py-0.5"
+              style={{ color: 'var(--color-brand)', background: 'color-mix(in srgb, var(--color-brand) 12%, transparent)', border: '1px solid color-mix(in srgb, var(--color-brand) 25%, transparent)' }}>
+              Vuln Scan
+            </span>
+          )}
+        </div>
       </div>
 
       {/* Details grid */}

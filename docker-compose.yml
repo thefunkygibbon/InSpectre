@@ -44,7 +44,7 @@ services:
       IP_RANGE: "192.168.0.0/24"
       INTERFACE: "eno1"
       SCAN_INTERVAL: "60"
-      NMAP_ARGS: "-O --osscan-guess -sV --version-intensity 5 -T4"
+      NMAP_ARGS: "-O --osscan-guess -sV --version-intensity 5 -T4 -p-"
       PROBE_API_PORT: "8666"
       PYTHONUNBUFFERED: "1"
       # ── DNS / Hostname resolution ──────────────────────────────────────────
