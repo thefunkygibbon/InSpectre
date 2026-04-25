@@ -93,16 +93,19 @@ function latencyColor(ms) {
 
 function PingView({ lines, running }) {
   const { packets, tx, rx, loss, rttMin, rttAvg, rttMax } = parsePing(lines)
-  const maxMs = Math.max(...packets.map(p => p.ms), 1)
+  const BAR_MAX_H = 56
+  const visible = packets.slice(-40)
+  // Log scale so a 200ms outlier doesn't crush 1-5ms bars to invisibility
+  const maxLog = Math.max(...visible.map(p => Math.log1p(p.ms)), 1)
 
   return (
     <div className="space-y-3">
       {/* spark bars */}
       {packets.length > 0 && (
         <div>
-          <div className="flex items-end gap-[3px]" style={{ height: 32 }}>
-            {packets.slice(-40).map((p, i) => {
-              const h = Math.max(3, Math.round((p.ms / maxMs) * 30))
+          <div className="flex items-end gap-[3px]" style={{ height: BAR_MAX_H + 4 }}>
+            {visible.map((p, i) => {
+              const h = Math.max(4, Math.round((Math.log1p(p.ms) / maxLog) * BAR_MAX_H))
               return (
                 <div key={i} title={`seq ${p.seq}: ${p.ms} ms`}
                   style={{ width: 6, height: h, background: latencyColor(p.ms), borderRadius: 2, flexShrink: 0 }} />
@@ -366,6 +369,13 @@ function VulnProgressView({ lines, running }) {
 // ---------------------------------------------------------------------------
 // Generic fallback (rescan status messages, etc.)
 // ---------------------------------------------------------------------------
+function lineStyle(l) {
+  if (l.startsWith('[ERROR]') || l.startsWith('ERROR:')) return { color: '#f87171' }
+  if (l.startsWith('[WARN]'))                             return { color: '#fbbf24' }
+  if (l.startsWith('[INFO]'))                             return { color: '#8b949e' }
+  return { color: '#c9d1d9' }
+}
+
 function GenericView({ lines, running }) {
   return (
     <div className="space-y-0.5">

@@ -14,8 +14,8 @@ const SETTING_META = {
   sniffer_workers:         { label: 'Sniffer Workers',     unit: 'threads',       type: 'number', min: 1,  max: 16,   tab: 'scanner' },
   ip_range:                { label: 'IP Range',            unit: '',              type: 'text',              tab: 'scanner' },
   nmap_args:               { label: 'Nmap Arguments',      unit: '',              type: 'text',              tab: 'scanner' },
-  vuln_scan_templates:     { label: 'Nuclei Template Tags', unit: '',              type: 'text',              tab: 'scanner',
-    description: 'Comma-separated Nuclei template tags for vulnerability scanning (e.g. cve,exposure,misconfig,default-login,network).' },
+  vuln_scan_templates:     { label: 'Vuln Scan Templates', unit: '',              type: 'text',              tab: 'scanner',
+    description: 'Comma-separated template tags for vulnerability scanning (e.g. cve,exposure,misconfig,default-login,network).' },
   vuln_scan_schedule:      { label: 'Scheduled Vuln Scans', unit: '',             type: 'select', tab: 'scanner',
     options: [
       { value: 'disabled', label: 'Disabled' },
@@ -33,7 +33,7 @@ const SETTING_META = {
   },
   vuln_scan_on_new_device: { label: 'Auto-scan New Devices', type: 'toggle', tab: 'scanner',
     description: 'Automatically run a vulnerability scan when a new device is first discovered.' },
-  nuclei_template_update_interval: { label: 'Nuclei Template Updates', type: 'select', tab: 'scanner',
+  nuclei_template_update_interval: { label: 'Vuln Template Updates', type: 'select', tab: 'scanner',
     options: [
       { value: 'disabled', label: 'Disabled' },
       { value: '12h',      label: 'Every 12 hours' },
@@ -41,7 +41,7 @@ const SETTING_META = {
       { value: '48h',      label: 'Every 48 hours' },
       { value: 'weekly',   label: 'Weekly' },
     ],
-    description: 'How often the probe automatically updates Nuclei vulnerability templates.' },
+    description: 'How often the probe automatically updates vulnerability scan templates.' },
 
   // Notifications tab — in-app
   notifications_enabled:         { label: 'Toast Notifications',    type: 'toggle', tab: 'notifications',

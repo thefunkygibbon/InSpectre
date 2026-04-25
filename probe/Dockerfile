@@ -3,6 +3,7 @@ FROM python:3.12-slim
 # nmap + network tools + wget/unzip for Nuclei
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libpcap-dev gcc \
+    nmap \
     avahi-utils \
     samba-common-bin \
     dnsutils \

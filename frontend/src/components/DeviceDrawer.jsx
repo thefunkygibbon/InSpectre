@@ -5,7 +5,7 @@ import {
   Activity, GitBranch, RotateCcw, Ban, History,
   ChevronDown, ChevronRight, Square, Tag, CheckCircle2,
   FileText, Star as StarIcon, ShieldAlert, EyeOff, Eye, Layers,
-  AlertTriangle, Network, Loader2, GitMerge,
+  AlertTriangle, Network, Loader2, GitMerge, Radio, BellOff, Plus, Trash2,
 } from 'lucide-react'
 import { OnlineDot }      from './OnlineDot'
 import { StarButton }     from './StarButton'
@@ -294,7 +294,7 @@ function ScanPipeline({ device, vulnScanning }) {
 // ---------------------------------------------------------------------------
 // Main component
 // ---------------------------------------------------------------------------
-export function DeviceDrawer({ device, onClose, onRename, onResolveName, onRefresh, onStarToggle, onMetadataUpdate, vulnScanState, onVulnScanChange, initialTab }) {
+export function DeviceDrawer({ device, onClose, onRename, onResolveName, onRefresh, onStarToggle, onMetadataUpdate, onZoneChange, vulnScanState, onVulnScanChange, initialTab }) {
   if (!device) return null
 
   const [localDevice,  setLocalDevice]  = useState(device)
@@ -347,7 +347,7 @@ export function DeviceDrawer({ device, onClose, onRename, onResolveName, onRefre
   }
 
   async function handleRescan() {
-    setRescanning(true); setActiveAction('rescan'); stream.stop(); setStaticLines([])
+    setRescanning(true); setActiveAction('rescan'); stream.stop(); stream.clear(); setStaticLines([])
     try {
       await api.rescanDevice(mac)
       setStaticLines(['[INFO] Deep scan queued — results will update shortly.'])
@@ -597,20 +597,12 @@ export function DeviceDrawer({ device, onClose, onRename, onResolveName, onRefre
                 />
                 {localDevice.custom_name && <Row label="Custom name" value={localDevice.custom_name} />}
                 {localDevice.location    && <Row label="Location"    value={localDevice.location} />}
-                {localDevice.zone        && <Row label="Zone"        value={localDevice.zone} />}
+                <ZoneEditor mac={mac} currentZone={localDevice.zone} onChanged={zone => {
+                  setLocalDevice(prev => ({ ...prev, zone }))
+                  if (onZoneChange) onZoneChange(zone)
+                }} />
                 {localDevice.miss_count  !== undefined && <Row label="Miss count" value={localDevice.miss_count} />}
-                {scan?.mdns_services?.length > 0 && (
-                  <Row label="mDNS services" value={
-                    <div className="flex flex-wrap gap-1 justify-end">
-                      {scan.mdns_services.map(s => (
-                        <span key={s} className="text-[10px] px-1.5 py-0.5 rounded font-mono"
-                          style={{ background: 'var(--color-surface-offset)', color: 'var(--color-text-muted)', border: '1px solid var(--color-border)' }}>
-                          {s}
-                        </span>
-                      ))}
-                    </div>
-                  } />
-                )}
+                <MdnsRow mac={mac} scan={scan} onRefreshed={updated => setLocalDevice(prev => ({ ...prev, scan_results: { ...(prev.scan_results || {}), mdns_services: updated } }))} />
               </Collapsible>
 
               {/* IP History */}
@@ -730,6 +722,10 @@ export function DeviceDrawer({ device, onClose, onRename, onResolveName, onRefre
               <Collapsible title="Rename Device" icon={RotateCcw} defaultOpen={true}>
                 <RenameForm device={localDevice} onRename={onRename} />
               </Collapsible>
+
+              <Collapsible title="Alert Suppressions" icon={BellOff} defaultOpen={false}>
+                <SuppressionManager mac={mac} />
+              </Collapsible>
             </div>
           )}
 
@@ -810,5 +806,232 @@ function RenameForm({ device, onRename }) {
         {saving ? '…' : 'Save'}
       </button>
     </form>
+  )
+}
+
+function ZoneEditor({ mac, currentZone, onChanged }) {
+  const [editing,   setEditing]   = useState(false)
+  const [value,     setValue]     = useState(currentZone || '')
+  const [zones,     setZones]     = useState([])
+  const [saving,    setSaving]    = useState(false)
+
+  useEffect(() => {
+    api.getDeviceZones().then(setZones).catch(() => {})
+  }, [])
+
+  const [saveError, setSaveError] = useState(null)
+
+  async function handleSave(e) {
+    e.preventDefault()
+    setSaving(true)
+    setSaveError(null)
+    const zoneVal = (value.trim() === '' || value.trim() === '-NONE-') ? null : value.trim()
+    try {
+      await api.assignZone({ mac_addresses: [mac], zone: zoneVal })
+      onChanged(zoneVal)
+      setEditing(false)
+    } catch (err) {
+      setSaveError(err.message || 'Save failed')
+    } finally { setSaving(false) }
+  }
+
+  const displayZone = currentZone || 'Unassigned'
+  if (!editing) {
+    return (
+      <div className="flex items-center justify-between py-1.5 gap-4 border-b border-border last:border-0">
+        <span className="text-xs text-text-muted shrink-0">Zone</span>
+        <span className="flex items-center gap-2 text-sm text-text">
+          <span className={currentZone ? 'text-text' : 'text-text-faint italic'}>{displayZone}</span>
+          <button onClick={() => { setValue(currentZone || ''); setEditing(true) }}
+            className="text-brand hover:text-brand opacity-60 hover:opacity-100 transition-opacity" title="Edit zone">
+            <Tag size={11} />
+          </button>
+        </span>
+      </div>
+    )
+  }
+
+  return (
+    <div className="flex flex-col py-1.5 gap-1 border-b border-border last:border-0">
+      <div className="flex items-center justify-between gap-4">
+        <span className="text-xs text-text-muted shrink-0">Zone</span>
+        <form onSubmit={handleSave} className="flex gap-1 items-center">
+          <input
+            list="zone-list"
+            className="input py-0.5 px-2 text-xs h-6 w-32"
+            value={value}
+            onChange={e => { setValue(e.target.value); setSaveError(null) }}
+            placeholder="Zone name or leave blank…"
+            autoFocus
+          />
+          <datalist id="zone-list">
+            <option value="-NONE-" />
+            {zones.map(z => <option key={z} value={z} />)}
+          </datalist>
+          <button type="submit" disabled={saving}
+            className="text-xs px-2 py-0.5 rounded" style={{ background: 'var(--color-brand)', color: '#fff' }}>
+            {saving ? '…' : 'Set'}
+          </button>
+          <button type="button" onClick={() => { setEditing(false); setSaveError(null) }}
+            className="text-xs px-1 py-0.5 rounded opacity-60 hover:opacity-100" style={{ color: 'var(--color-text-faint)' }}>
+            <X size={10} />
+          </button>
+        </form>
+      </div>
+      {saveError && <p className="text-[10px] text-red-400 text-right">{saveError}</p>}
+    </div>
+  )
+}
+
+function MdnsRow({ mac, scan, onRefreshed }) {
+  const [refreshing, setRefreshing] = useState(false)
+  const services = scan?.mdns_services || []
+
+  async function handleRefresh() {
+    setRefreshing(true)
+    try {
+      const result = await api.refreshMdns(mac)
+      onRefreshed(result.mdns_services || [])
+    } catch {}
+    finally { setRefreshing(false) }
+  }
+
+  return (
+    <div className="flex items-start justify-between py-1.5 gap-4 border-b border-border last:border-0">
+      <span className="text-xs text-text-muted shrink-0 mt-0.5">mDNS services</span>
+      <div className="flex flex-col items-end gap-1">
+        {services.length > 0 ? (
+          <div className="flex flex-wrap gap-1 justify-end">
+            {services.map(s => (
+              <span key={s} className="text-[10px] px-1.5 py-0.5 rounded font-mono"
+                style={{ background: 'var(--color-surface-offset)', color: 'var(--color-text-muted)', border: '1px solid var(--color-border)' }}>
+                {s}
+              </span>
+            ))}
+          </div>
+        ) : (
+          <span className="text-xs text-text-faint italic">None discovered</span>
+        )}
+        <button onClick={handleRefresh} disabled={refreshing}
+          className="flex items-center gap-1 text-[10px] opacity-60 hover:opacity-100 transition-opacity"
+          style={{ color: 'var(--color-brand)' }}>
+          <Radio size={9} className={refreshing ? 'animate-pulse' : ''} />
+          {refreshing ? 'Scanning…' : 'Refresh mDNS'}
+        </button>
+      </div>
+    </div>
+  )
+}
+
+const SUPPRESSION_EVENT_TYPES = [
+  { value: '', label: 'All events (global suppress)' },
+  { value: 'joined',      label: 'New device joined' },
+  { value: 'offline',     label: 'Device offline' },
+  { value: 'online',      label: 'Device online' },
+  { value: 'port_change', label: 'Port change' },
+  { value: 'vuln_scan_complete', label: 'Vuln scan complete' },
+]
+
+function SuppressionManager({ mac }) {
+  const [suppressions, setSuppressions] = useState(null)
+  const [adding,       setAdding]       = useState(false)
+  const [newType,      setNewType]      = useState('')
+  const [newReason,    setNewReason]    = useState('')
+  const [newExpiry,    setNewExpiry]    = useState('')
+  const [saving,       setSaving]       = useState(false)
+
+  async function load() {
+    try {
+      const list = await api.getSuppressions(mac)
+      setSuppressions(list)
+    } catch { setSuppressions([]) }
+  }
+
+  useEffect(() => { load() }, [mac])
+
+  async function handleAdd(e) {
+    e.preventDefault()
+    setSaving(true)
+    try {
+      await api.createSuppression({
+        mac_address: mac,
+        event_type:  newType || null,
+        reason:      newReason || null,
+        expires_at:  newExpiry || null,
+      })
+      setAdding(false); setNewType(''); setNewReason(''); setNewExpiry('')
+      await load()
+    } catch {}
+    finally { setSaving(false) }
+  }
+
+  async function handleDelete(id) {
+    await api.deleteSuppression(id)
+    await load()
+  }
+
+  if (suppressions === null) return <p className="text-xs text-text-faint">Loading…</p>
+
+  return (
+    <div className="space-y-2 pt-1">
+      {suppressions.length === 0 ? (
+        <p className="text-xs italic" style={{ color: 'var(--color-text-faint)' }}>No active suppressions.</p>
+      ) : (
+        <div className="space-y-1">
+          {suppressions.map(s => (
+            <div key={s.id} className="flex items-center justify-between gap-2 px-2 py-1.5 rounded-lg"
+              style={{ background: 'var(--color-surface-offset)', border: '1px solid var(--color-border)' }}>
+              <div className="flex-1 min-w-0">
+                <p className="text-xs font-medium" style={{ color: 'var(--color-text)' }}>
+                  {s.event_type ? SUPPRESSION_EVENT_TYPES.find(t => t.value === s.event_type)?.label || s.event_type : 'All events'}
+                </p>
+                {s.reason && <p className="text-[10px] truncate" style={{ color: 'var(--color-text-faint)' }}>{s.reason}</p>}
+                {s.expires_at && <p className="text-[10px]" style={{ color: 'var(--color-text-faint)' }}>Expires: {new Date(s.expires_at).toLocaleDateString()}</p>}
+              </div>
+              <button onClick={() => handleDelete(s.id)}
+                className="opacity-40 hover:opacity-100 transition-opacity shrink-0"
+                style={{ color: '#ef4444' }} aria-label="Delete suppression">
+                <Trash2 size={12} />
+              </button>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {!adding ? (
+        <button onClick={() => setAdding(true)}
+          className="flex items-center gap-1.5 text-xs px-2.5 py-1.5 rounded-lg border w-full justify-center transition-colors"
+          style={{ borderColor: 'var(--color-border)', color: 'var(--color-text-muted)' }}>
+          <Plus size={11} />Add suppression
+        </button>
+      ) : (
+        <form onSubmit={handleAdd} className="space-y-2 p-2 rounded-lg"
+          style={{ background: 'var(--color-surface-offset)', border: '1px solid var(--color-border)' }}>
+          <div>
+            <label className="block text-[10px] text-text-faint mb-1">Event type</label>
+            <select value={newType} onChange={e => setNewType(e.target.value)}
+              className="input w-full text-xs py-1">
+              {SUPPRESSION_EVENT_TYPES.map(t => <option key={t.value} value={t.value}>{t.label}</option>)}
+            </select>
+          </div>
+          <div>
+            <label className="block text-[10px] text-text-faint mb-1">Reason (optional)</label>
+            <input value={newReason} onChange={e => setNewReason(e.target.value)}
+              className="input w-full text-xs py-1" placeholder="Reason…" />
+          </div>
+          <div>
+            <label className="block text-[10px] text-text-faint mb-1">Expires (optional)</label>
+            <input type="datetime-local" value={newExpiry} onChange={e => setNewExpiry(e.target.value)}
+              className="input w-full text-xs py-1" />
+          </div>
+          <div className="flex gap-2">
+            <button type="submit" disabled={saving}
+              className="btn-primary text-xs py-1 flex-1">{saving ? 'Adding…' : 'Add'}</button>
+            <button type="button" onClick={() => setAdding(false)}
+              className="btn-ghost text-xs py-1">Cancel</button>
+          </div>
+        </form>
+      )}
+    </div>
   )
 }

@@ -10,7 +10,7 @@ import time
 from datetime import datetime, timezone
 
 import uvicorn
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
@@ -41,7 +41,7 @@ SNIFFER_WORKERS         = int(os.environ.get("SNIFFER_WORKERS",          4))
 PROBE_API_PORT          = int(os.environ.get("PROBE_API_PORT",         8001))
 LAN_DNS_SERVER_ENV      = os.environ.get("LAN_DNS_SERVER", "").strip()
 
-PING_COUNT    = 10
+PING_COUNT    = 40
 TRACE_MAX_HOP = 30
 
 NUCLEI_TEMPLATE_UPDATE_INTERVAL = os.environ.get("NUCLEI_TEMPLATE_UPDATE_INTERVAL", "24h")
@@ -539,63 +539,188 @@ def lookup_vendor(mac: str) -> str:
 # ---------------------------------------------------------------------------
 def _mdns_browse() -> dict[str, dict]:
     """
-    Run avahi-browse -a -t -r to discover mDNS services on the LAN.
-    Returns a dict keyed by IP address:
-        { "mdns_name": str|None, "services": [str, ...] }
-    Silently returns {} if avahi-browse is not available.
+    Discover mDNS services by querying the mDNS multicast group (RFC 6762).
+    Uses raw UDP sockets — no avahi-daemon or D-Bus required.
+    Returns {ip: {"mdns_name": str|None, "services": [str, ...]}}
     """
-    result: dict[str, dict] = {}
+    import socket, struct, time
+
+    MDNS_ADDR   = "224.0.0.251"
+    MDNS_PORT   = 5353
+    LISTEN_SECS = 8
+
+    ptr_records: dict[str, list[str]] = {}
+    srv_records: dict[str, str]        = {}
+    a_records:   dict[str, str]        = {}
+
+    def _decode_name(data: bytes, offset: int, depth: int = 0) -> tuple[str, int]:
+        if depth > 10:
+            return "", offset
+        labels: list[str] = []
+        jumped = False
+        jump_ret = offset
+        while offset < len(data):
+            length = data[offset]
+            if length == 0:
+                offset += 1
+                break
+            elif (length & 0xC0) == 0xC0:
+                if offset + 1 >= len(data):
+                    break
+                ptr = ((length & 0x3F) << 8) | data[offset + 1]
+                if not jumped:
+                    jump_ret = offset + 2
+                jumped = True
+                suffix, _ = _decode_name(data, ptr, depth + 1)
+                if suffix:
+                    labels.append(suffix)
+                break
+            else:
+                end = offset + 1 + length
+                if end > len(data):
+                    break
+                labels.append(data[offset + 1:end].decode("utf-8", errors="replace"))
+                offset = end
+        return ".".join(labels), (jump_ret if jumped else offset)
+
+    def _parse_packet(data: bytes):
+        try:
+            if len(data) < 12:
+                return
+            flags = struct.unpack_from(">H", data, 2)[0]
+            if not (flags & 0x8000):
+                return
+            qdcount, ancount, nscount, arcount = struct.unpack_from(">HHHH", data, 4)
+            offset = 12
+            for _ in range(qdcount):
+                _, offset = _decode_name(data, offset)
+                offset += 4
+            for _ in range(ancount + nscount + arcount):
+                if offset + 10 > len(data):
+                    break
+                name, offset = _decode_name(data, offset)
+                if offset + 10 > len(data):
+                    break
+                rtype, _, _, rdlen = struct.unpack_from(">HHIH", data, offset)
+                offset += 10
+                rdata_start = offset
+                offset += rdlen
+                if rdlen == 0 or rdata_start + rdlen > len(data):
+                    continue
+                name_l = name.lower().rstrip(".")
+                if rtype == 12:  # PTR
+                    target, _ = _decode_name(data, rdata_start)
+                    tgt = target.lower().rstrip(".")
+                    if tgt:
+                        lst = ptr_records.setdefault(name_l, [])
+                        if tgt not in lst:
+                            lst.append(tgt)
+                elif rtype == 33 and rdlen >= 7:  # SRV
+                    tgt, _ = _decode_name(data, rdata_start + 6)
+                    srv_records[name_l] = tgt.lower().rstrip(".")
+                elif rtype == 1 and rdlen == 4:  # A
+                    ip = ".".join(str(b) for b in data[rdata_start:rdata_start + 4])
+                    a_records[name_l] = ip
+        except Exception:
+            pass
+
+    def _build_query(*qnames: str) -> bytes:
+        questions = b""
+        for qname in qnames:
+            for label in qname.rstrip(".").split("."):
+                lb = label.encode()
+                questions += bytes([len(lb)]) + lb
+            questions += b"\x00"
+            questions += struct.pack(">HH", 12, 1)  # PTR, IN
+        return struct.pack(">HHHHHH", 0, 0, len(qnames), 0, 0, 0) + questions
+
+    sock = None
     try:
-        out = subprocess.run(
-            ["avahi-browse", "-a", "-t", "-r", "--no-fail"],
-            capture_output=True, text=True, timeout=20,
-        )
-    except (FileNotFoundError, subprocess.TimeoutExpired, Exception) as e:
-        print(f"[mdns] avahi-browse unavailable: {e}", flush=True)
-        return result
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+        except (AttributeError, OSError):
+            pass
+        sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 255)
+        sock.bind(("", MDNS_PORT))
+        mreq = struct.pack("4sL", socket.inet_aton(MDNS_ADDR), socket.INADDR_ANY)
+        sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
+        sock.settimeout(0.5)
 
-    # Parse output: blocks separated by blank lines.
-    # A resolved entry looks like:
-    #   = eth0 IPv4 DeviceName  _service._tcp  local
-    #      hostname = [name.local]
-    #      address = [192.168.x.y]
-    #      port = [N]
-    #      txt = [...]
-    current_service: str | None = None
-    current_hostname: str | None = None
+        service_types = [
+            "_services._dns-sd._udp.local",
+            "_googlecast._tcp.local",
+            "_airplay._tcp.local",
+            "_raop._tcp.local",
+            "_printer._tcp.local",
+            "_ipp._tcp.local",
+            "_http._tcp.local",
+            "_https._tcp.local",
+            "_smb._tcp.local",
+            "_afpovertcp._tcp.local",
+            "_ssh._tcp.local",
+            "_hap._tcp.local",
+            "_companion-link._tcp.local",
+            "_amzn-wplay._tcp.local",
+        ]
+        for i in range(0, len(service_types), 3):
+            try:
+                sock.sendto(_build_query(*service_types[i:i + 3]), (MDNS_ADDR, MDNS_PORT))
+            except Exception:
+                pass
 
-    for line in out.stdout.splitlines():
-        stripped = line.strip()
-        if not stripped:
-            current_service = None
-            current_hostname = None
+        deadline = time.monotonic() + LISTEN_SECS
+        while time.monotonic() < deadline:
+            try:
+                data, _ = sock.recvfrom(8192)
+                _parse_packet(data)
+            except socket.timeout:
+                continue
+            except Exception:
+                break
+    except PermissionError as e:
+        print(f"[mdns] permission denied (need privileged/host network): {e}", flush=True)
+        return {}
+    except Exception as e:
+        print(f"[mdns] socket error: {e}", flush=True)
+        return {}
+    finally:
+        if sock:
+            try:
+                mreq = struct.pack("4sL", socket.inet_aton(MDNS_ADDR), socket.INADDR_ANY)
+                sock.setsockopt(socket.IPPROTO_IP, socket.IP_DROP_MEMBERSHIP, mreq)
+            except Exception:
+                pass
+            try:
+                sock.close()
+            except Exception:
+                pass
+
+    result: dict[str, dict] = {}
+
+    # Map A records: hostname → IP
+    for hostname, ip in a_records.items():
+        if _is_valid_ip(ip):
+            entry = result.setdefault(ip, {"mdns_name": None, "services": []})
+            if not entry["mdns_name"]:
+                entry["mdns_name"] = hostname.removesuffix(".local")
+
+    # Map PTR → SRV → A to associate service types with IPs
+    for svc_type, instances in ptr_records.items():
+        if "._dns-sd." in svc_type:
             continue
-
-        if stripped.startswith("="):
-            # Resolved entry header
-            parts = stripped.split(None, 6)
-            # parts: ['=', iface, 'IPv4', name, service_type, 'local']
-            if len(parts) >= 5:
-                current_service = parts[4]  # e.g. _apple-mobdev2._tcp
-            current_hostname = None
-            continue
-
-        if current_service is None:
-            continue  # skip '+' (found but not resolved) lines
-
-        if stripped.startswith("hostname = ["):
-            h = stripped[len("hostname = ["):].rstrip("]").strip()
-            current_hostname = _strip_fqdn(h) if h else None
-
-        elif stripped.startswith("address = ["):
-            ip = stripped[len("address = ["):].rstrip("]").strip()
+        parts = svc_type.removesuffix(".local").split(".")
+        svc_label = ".".join(parts[-2:]) if len(parts) >= 2 else svc_type.removesuffix(".local")
+        for instance in instances:
+            hostname = srv_records.get(instance)
+            ip = None
+            if hostname:
+                ip = a_records.get(hostname) or a_records.get(hostname + ".local")
             if ip and _is_valid_ip(ip):
-                if ip not in result:
-                    result[ip] = {"mdns_name": None, "services": []}
-                if current_hostname and not result[ip]["mdns_name"]:
-                    result[ip]["mdns_name"] = current_hostname
-                if current_service and current_service not in result[ip]["services"]:
-                    result[ip]["services"].append(current_service)
+                entry = result.setdefault(ip, {"mdns_name": None, "services": []})
+                if svc_label not in entry["services"]:
+                    entry["services"].append(svc_label)
 
     if result:
         print(f"[mdns] Discovered {len(result)} device(s) via mDNS", flush=True)
@@ -1321,9 +1446,19 @@ def _run_nerva_fingerprint(ip: str, mac: str, open_ports: list[int]) -> None:
         device = session.get(Device, mac)
         if device:
             scan = dict(device.scan_results or {})
-            scan["services"]       = services
+            scan["services"] = services
             scan["pipeline_stage"] = "services_done"
-            device.scan_results    = scan
+            # Merge Nerva service names back into open_ports records
+            if services:
+                port_map = {s["port"]: s for s in services}
+                scan["open_ports"] = [
+                    {**p,
+                     "service": port_map[p["port"]].get("service", p.get("service", "")),
+                     "tls":     port_map[p["port"]].get("tls", False)}
+                    if p.get("port") in port_map else p
+                    for p in (scan.get("open_ports") or [])
+                ]
+            device.scan_results = scan
             session.commit()
             if services:
                 _write_event(mac, "service_fingerprint_complete", {
@@ -1335,6 +1470,83 @@ def _run_nerva_fingerprint(ip: str, mac: str, open_ports: list[int]) -> None:
         print(f"[nerva] DB save error {mac}: {e}", flush=True)
     finally:
         session.close()
+
+    # Stage 3b: optional nmap -sV version enrichment
+    if open_ports:
+        threading.Thread(
+            target=_run_nmap_version_scan,
+            args=(ip, mac, open_ports),
+            daemon=True,
+            name=f"nmap-ver-{mac}",
+        ).start()
+
+
+# ---------------------------------------------------------------------------
+# nmap version scan (Stage 3b — runs after Nerva)
+# ---------------------------------------------------------------------------
+def _run_nmap_version_scan(ip: str, mac: str, open_ports: list[int]) -> None:
+    """Run nmap -sV on known open ports to get service banners and versions."""
+    if not open_ports:
+        return
+    port_str = ",".join(str(p) for p in open_ports[:50])
+    try:
+        result = subprocess.run(
+            ["nmap", "-sV", "--version-intensity", "5", "-T4",
+             "-p", port_str, "--open", "-oX", "-", ip],
+            capture_output=True, text=True, timeout=300,
+        )
+        if result.returncode != 0 or not result.stdout.strip():
+            return
+        import xml.etree.ElementTree as ET
+        root = ET.fromstring(result.stdout)
+        version_map: dict[int, dict] = {}
+        for host in root.findall("host"):
+            for port_el in host.findall("ports/port"):
+                portid = int(port_el.get("portid", 0))
+                svc = port_el.find("service")
+                if svc is not None:
+                    version_map[portid] = {
+                        "service":   svc.get("name", ""),
+                        "product":   svc.get("product", ""),
+                        "version":   svc.get("version", ""),
+                        "extrainfo": svc.get("extrainfo", ""),
+                        "cpe":       svc.get("cpe", ""),
+                    }
+        if not version_map:
+            return
+
+        session = Session()
+        try:
+            device = session.get(Device, mac)
+            if device and device.scan_results:
+                scan = dict(device.scan_results)
+                updated_ports = []
+                for p in (scan.get("open_ports") or []):
+                    port_num = p.get("port")
+                    if port_num in version_map:
+                        p = dict(p)
+                        p.update(version_map[port_num])
+                    updated_ports.append(p)
+                scan["open_ports"] = updated_ports
+                scan["pipeline_stage"] = "versions_done"
+                device.scan_results = scan
+                session.commit()
+                _write_event(mac, "version_scan_complete", {
+                    "versioned_ports": len(version_map)
+                })
+                print(f"[nmap-version] {ip} ({mac}): {len(version_map)} port(s) versioned", flush=True)
+        except Exception as e:
+            session.rollback()
+            print(f"[nmap-version] DB save error {mac}: {e}", flush=True)
+        finally:
+            session.close()
+
+    except FileNotFoundError:
+        print(f"[nmap-version] nmap not found — skipping version scan for {ip}", flush=True)
+    except subprocess.TimeoutExpired:
+        print(f"[nmap-version] Timeout for {ip}", flush=True)
+    except Exception as e:
+        print(f"[nmap-version] Error for {ip}: {e}", flush=True)
 
 
 # ---------------------------------------------------------------------------
@@ -1515,6 +1727,47 @@ def stream_traceroute(ip: str):
     )
 
 
+@probe_api.get("/stream/tools/ping")
+def stream_tools_ping(host: str = Query(...)):
+    import re
+    if not re.match(r'^[a-zA-Z0-9._\-]{1,253}$', host):
+        raise HTTPException(400, "Invalid host")
+    cmd = ["ping", "-c", str(PING_COUNT), "-W", "2", host]
+    return StreamingResponse(
+        _stream_subprocess(cmd),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+@probe_api.get("/stream/tools/traceroute")
+def stream_tools_traceroute(host: str = Query(...)):
+    import re
+    if not re.match(r'^[a-zA-Z0-9._\-]{1,253}$', host):
+        raise HTTPException(400, "Invalid host")
+    cmd = ["traceroute", "-m", str(TRACE_MAX_HOP), "-w", "2", host]
+    return StreamingResponse(
+        _stream_subprocess(cmd),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+@probe_api.get("/stream/tools/portscan")
+def stream_tools_portscan(host: str = Query(...), ports: str = Query("1-1024")):
+    import re
+    if not re.match(r'^[a-zA-Z0-9._\-]{1,253}$', host):
+        raise HTTPException(400, "Invalid host")
+    if not re.match(r'^[\d,\-]{1,100}$', ports):
+        raise HTTPException(400, "Invalid ports specification")
+    cmd = ["nmap", "-sV", "--open", "-T4", "--host-timeout", "120s", "-p", ports, host]
+    return StreamingResponse(
+        _stream_subprocess(cmd),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
 @probe_api.get("/stream/vuln-scan/{ip}")
 async def stream_vuln_scan(ip: str, templates: str = "", mac: str = ""):
     import ipaddress
@@ -1592,6 +1845,15 @@ async def stream_vuln_scan(ip: str, templates: str = "", mac: str = ""):
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
+
+
+@probe_api.post("/mdns/refresh")
+def probe_mdns_refresh():
+    """Trigger a full mDNS browse and apply enrichment to all devices."""
+    mdns_data = _mdns_browse()
+    if mdns_data:
+        _apply_mdns_enrichment(mdns_data)
+    return {"discovered": len(mdns_data), "ips": list(mdns_data.keys())}
 
 
 @probe_api.post("/block/{mac}")

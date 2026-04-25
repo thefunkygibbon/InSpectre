@@ -34,7 +34,12 @@ async function streamSSE(path, onLine, signal) {
 
 export const api = {
   // Devices
-  getDevices:      (includeIgnored = true) => request('GET', `/devices${includeIgnored ? '' : '?include_ignored=false'}`),
+  getDevices:      (params = {}) => {
+    const p = new URLSearchParams()
+    Object.entries(params).forEach(([k, v]) => { if (v !== undefined && v !== null && v !== '') p.set(k, v) })
+    const qs = p.toString()
+    return request('GET', `/devices${qs ? '?' + qs : ''}`)
+  },
   getDevice:       (mac)        => request('GET',   `/devices/${mac}`),
   updateDevice:    (mac, body)  => request('PATCH', `/devices/${mac}`, body),
   updateIdentity:  (mac, body)  => request('PATCH', `/devices/${mac}/identity`, body),
@@ -43,8 +48,16 @@ export const api = {
   rescanDevice:    (mac)        => request('POST',  `/devices/${mac}/rescan`),
   getScanResults:  (mac)        => request('GET',   `/devices/${mac}/scan`),
   getIpHistory:    (mac)        => request('GET',   `/devices/${mac}/ip-history`),
-  getDeviceEvents: (mac, limit) => request('GET',   `/devices/${mac}/events${limit ? `?limit=${limit}` : ''}`),
-  getStats:        ()           => request('GET',   '/stats'),
+  getDeviceEvents: (mac, limit, type) => {
+    const p = new URLSearchParams()
+    if (limit) p.set('limit', limit)
+    if (type)  p.set('type', type)
+    return request('GET', `/devices/${mac}/events${p.toString() ? '?' + p : ''}`)
+  },
+  getDeviceServices: (mac)      => request('GET',  `/devices/${mac}/services`),
+  refreshMdns:       (mac)      => request('POST', `/devices/${mac}/mdns-refresh`),
+  getDeviceZones:    ()         => request('GET',  '/devices/meta/zones'),
+  getStats:          ()         => request('GET',  '/stats'),
 
   // Global events feed
   getAllEvents:    (limit, type) => {
@@ -98,6 +111,34 @@ export const api = {
   deleteVulnReport:     (mac, id)    => request('DELETE', `/devices/${mac}/vuln-reports/${id}`),
   getAllVulnReports:     (severity)   => request('GET',    `/vuln-reports${severity ? `?severity=${severity}` : ''}`),
   getVulnSummary:       ()           => request('GET',    '/vulns/summary'),
+  getVulnTrend:         (days)       => request('GET',    `/vulns/trend${days ? `?days=${days}` : ''}`),
+  getTopVulnDevices:    (limit)      => request('GET',    `/vulns/top-devices${limit ? `?limit=${limit}` : ''}`),
+
+  // Network Tools (one-shot)
+  toolsDns:           (host, type)  => request('GET', `/tools/dns?host=${encodeURIComponent(host)}&type=${encodeURIComponent(type)}`),
+  toolsRdns:          (ip)          => request('GET', `/tools/rdns?ip=${encodeURIComponent(ip)}`),
+  toolsDnsPropagation:(host, type)  => request('GET', `/tools/dns-propagation?host=${encodeURIComponent(host)}&type=${encodeURIComponent(type)}`),
+  toolsHttpHeaders:   (url)         => request('GET', `/tools/http-headers?url=${encodeURIComponent(url)}`),
+  toolsSsl:           (host, port)  => request('GET', `/tools/ssl?host=${encodeURIComponent(host)}&port=${port || 443}`),
+  toolsGeo:           (ip)          => request('GET', `/tools/geo?ip=${encodeURIComponent(ip)}`),
+  toolsWhois:         (host)        => request('GET', `/tools/whois?host=${encodeURIComponent(host)}`),
+  toolsEmail:         (domain)      => request('GET', `/tools/email?domain=${encodeURIComponent(domain)}`),
+
+  // Zones
+  getZones:     ()     => request('GET',  '/zones'),
+  assignZone:   (body) => request('POST', '/zones/assign', body),
+  renameZone:   (body) => request('POST', '/zones/rename', body),
+
+  // Saved views (server-side)
+  getSavedViews:    ()          => request('GET',    '/saved-views'),
+  createSavedView:  (body)      => request('POST',   '/saved-views', body),
+  updateSavedView:  (id, body)  => request('PUT',    `/saved-views/${id}`, body),
+  deleteSavedView:  (id)        => request('DELETE', `/saved-views/${id}`),
+
+  // Alert suppressions
+  getSuppressions:    (mac)  => request('GET',    `/suppressions${mac ? `?mac=${mac}` : ''}`),
+  createSuppression:  (body) => request('POST',   '/suppressions', body),
+  deleteSuppression:  (id)   => request('DELETE', `/suppressions/${id}`),
 }
 
 export { streamSSE }

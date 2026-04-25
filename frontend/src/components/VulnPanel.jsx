@@ -46,7 +46,7 @@ function fmt(iso) {
 }
 
 // ---------------------------------------------------------------------------
-// FindingCard — Nuclei finding (rich metadata from templates)
+// FindingCard — vulnerability finding (rich metadata from scan templates)
 // ---------------------------------------------------------------------------
 function FindingCard({ finding }) {
   const [open, setOpen] = useState(false)
@@ -140,7 +140,7 @@ function FindingCard({ finding }) {
             </p>
           )}
 
-          {/* Description from Nuclei template */}
+          {/* Description */}
           {finding.description && (
             <InfoRow icon={<BookOpen size={11} />} label="Description">
               {finding.description}
@@ -324,7 +324,7 @@ export function VulnPanel({ device, onScanComplete, lines, setLines, scanning, s
   async function startScan() {
     if (scanning) { stopScan(); return }
     setScanning(true)
-    setLines(['[INFO] Initiating Nuclei vulnerability scan…'])
+    setLines(['[INFO] Initiating vulnerability scan…'])
 
     const ctrl = new AbortController()
     abortRef.current = ctrl
@@ -367,7 +367,7 @@ export function VulnPanel({ device, onScanComplete, lines, setLines, scanning, s
         <div className="flex items-center gap-2">
           <ShieldAlert size={14} className="text-brand" />
           <h3 className="text-xs font-semibold text-text-muted uppercase tracking-wider">
-            Nuclei Vulnerability Scan
+            Vulnerability Scan
           </h3>
           {lastReport && <SevBadge severity={lastReport.severity} />}
         </div>
@@ -398,7 +398,7 @@ export function VulnPanel({ device, onScanComplete, lines, setLines, scanning, s
                       }`}>
           {scanning
             ? <><Square size={12} className="fill-current" /> Stop Scan</>
-            : <><ShieldAlert size={12} /> Run Nuclei Scan</>}
+            : <><ShieldAlert size={12} /> Run Vulnerability Scan</>}
         </button>
       )}
 

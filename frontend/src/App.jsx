@@ -3,7 +3,7 @@ import {
   Wifi, WifiOff, Monitor, ScanSearch, Settings,
   RefreshCw, Search, AlertCircle, Activity,
   LayoutGrid, List, Sun, Moon, ChevronDown,
-  Bell, X, Layers, Star, ShieldAlert,
+  Bell, X, Layers, Star, ShieldAlert, Wrench,
 } from 'lucide-react'
 import { useDevices }          from './hooks/useDevices'
 import { useTheme }            from './hooks/useTheme'
@@ -16,6 +16,7 @@ import { DeviceRow }           from './components/DeviceRow'
 import { DeviceDrawer }        from './components/DeviceDrawer'
 import { SettingsPanel }       from './components/SettingsPanel'
 import { SecurityDashboard }   from './components/SecurityDashboard'
+import { NetworkTools }        from './components/NetworkTools'
 import { CategoryView }        from './components/CategoryView'
 import { SmartFilterBar }      from './components/SmartFilterBar'
 
@@ -218,6 +219,7 @@ export default function App() {
   const [drawerInitialTab, setDrawerInitialTab] = useState('overview')
   const [showSettings,     setShowSettings]     = useState(false)
   const [showSecurity,     setShowSecurity]     = useState(false)
+  const [showNetTools,     setShowNetTools]     = useState(false)
   const [refreshing,    setRefreshing]    = useState(false)
   const [showAlertDrop, setShowAlertDrop] = useState(false)
 
@@ -421,6 +423,9 @@ export default function App() {
                 aria-label={isDark ? 'Switch to light mode' : 'Switch to dark mode'}>
                 {isDark ? <Sun size={16} /> : <Moon size={16} />}
               </button>
+              <button onClick={() => setShowNetTools(true)} className="btn-ghost p-2" aria-label="Network Tools">
+                <Wrench size={16} />
+              </button>
               <button onClick={() => setShowSecurity(true)} className="btn-ghost p-2" aria-label="Security overview">
                 <ShieldAlert size={16} />
               </button>
@@ -613,10 +618,14 @@ export default function App() {
             setSelected(prev => prev?.mac_address === mac ? { ...prev, ...updated } : prev)
             await refresh()
           }}
+          onZoneChange={(zone) => setSelected(prev => prev?.mac_address === selected.mac_address ? { ...prev, zone } : prev)}
           vulnScanState={vulnScansByMac[selected.mac_address] || { lines: [], scanning: false }}
           onVulnScanChange={(patchOrFn) => updateVulnScan(selected.mac_address, patchOrFn)}
           initialTab={drawerInitialTab}
         />
+      )}
+      {showNetTools && (
+        <NetworkTools onClose={() => setShowNetTools(false)} />
       )}
       {showSettings && (
         <SettingsPanel onClose={() => setShowSettings(false)} onSettingChange={handleSettingChange} />

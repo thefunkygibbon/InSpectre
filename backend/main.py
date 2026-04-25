@@ -81,6 +81,30 @@ def _migrate(db: Session):
         # Ensure nmap_args always includes -p- (full port scan); only updates if
         # the value is still an unmodified old default (no -p flag at all).
         "UPDATE settings SET value = value || ' -p-' WHERE key = 'nmap_args' AND value NOT LIKE '%-p%'",
+        # saved_views table for server-side persisted filter views
+        """
+        CREATE TABLE IF NOT EXISTS saved_views (
+            id          SERIAL PRIMARY KEY,
+            name        VARCHAR NOT NULL UNIQUE,
+            description VARCHAR,
+            filters     JSONB NOT NULL DEFAULT '{}',
+            created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+        """,
+        # alert_suppressions table for per-device per-type alert muting
+        """
+        CREATE TABLE IF NOT EXISTS alert_suppressions (
+            id          SERIAL PRIMARY KEY,
+            mac_address VARCHAR REFERENCES devices(mac_address) ON DELETE CASCADE,
+            event_type  VARCHAR,
+            reason      VARCHAR,
+            expires_at  TIMESTAMPTZ,
+            created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+        """,
+        "CREATE INDEX IF NOT EXISTS ix_alert_suppressions_mac  ON alert_suppressions(mac_address)",
+        "CREATE INDEX IF NOT EXISTS ix_alert_suppressions_type ON alert_suppressions(event_type)",
     ]
     for sql in migrations:
         try:
@@ -112,6 +136,7 @@ DEFAULT_SETTINGS = {
     "vuln_scan_on_new_device": ("false", "Automatically run a vulnerability scan when a new device is first discovered."),
     "nuclei_template_update_interval": ("24h", "How often to update Nuclei templates. Options: disabled, 12h, 24h, 48h, weekly."),
     # Alert delivery
+    "alert_on_port_change":    ("true",   "Send an alert when a device's open ports change."),
     "alert_on_new_device":     ("false",  "Send an alert when a new device is discovered."),
     "alert_on_offline":        ("false",  "Send an alert when a watched device goes offline."),
     "alert_on_vuln":           ("false",  "Send an alert when a vulnerability scan finds issues."),
@@ -309,6 +334,27 @@ async def _dispatch_alerts(settings: dict, message: str, alert_type: str):
         await asyncio.gather(*tasks, return_exceptions=True)
 
 
+def _is_suppressed(mac: str, event_type: str, cache: dict) -> bool:
+    """Check if an alert for (mac, event_type) is suppressed. Uses cache to avoid N+1 queries."""
+    key = (mac, event_type)
+    if key in cache:
+        return cache[key]
+    db = SessionLocal()
+    try:
+        row = db.execute(text("""
+            SELECT id FROM alert_suppressions
+            WHERE (mac_address = :mac OR mac_address IS NULL)
+              AND (event_type = :type OR event_type IS NULL)
+              AND (expires_at IS NULL OR expires_at > NOW())
+            LIMIT 1
+        """), {"mac": mac, "type": event_type}).fetchone()
+        result = row is not None
+        cache[key] = result
+        return result
+    finally:
+        db.close()
+
+
 async def _alert_dispatch_loop():
     global _last_alert_event_id
     await asyncio.sleep(20)  # startup grace
@@ -331,9 +377,10 @@ async def _alert_dispatch_loop():
                 alert_new          = settings.get("alert_on_new_device",    "false") == "true"
                 alert_offline      = settings.get("alert_on_offline",       "false") == "true"
                 alert_vuln         = settings.get("alert_on_vuln",          "false") == "true"
+                alert_port_change  = settings.get("alert_on_port_change",   "true")  == "true"
                 vuln_on_new_device = settings.get("vuln_scan_on_new_device","false") == "true"
 
-                if alert_new or alert_offline or alert_vuln or vuln_on_new_device:
+                if alert_new or alert_offline or alert_vuln or alert_port_change or vuln_on_new_device:
                     rows = db.execute(text("""
                         SELECT de.id, de.mac_address, de.type, de.detail, de.created_at,
                                COALESCE(d.custom_name, d.hostname, d.ip_address, de.mac_address) AS name,
@@ -347,19 +394,22 @@ async def _alert_dispatch_loop():
                         LIMIT 50
                     """), {
                         "last_id": _last_alert_event_id,
-                        "types":   ["joined", "offline", "vuln_scan_complete"],
+                        "types":   ["joined", "offline", "vuln_scan_complete", "port_change"],
                     }).fetchall()
                 else:
                     rows = []
 
                 pending_alerts = []
                 vuln_scans_to_run = []
+                suppression_cache: dict = {}
                 for row in rows:
                     eid, mac, etype, detail, created_at, name, ip, is_important, is_ignored = row
                     if is_ignored:
                         _last_alert_event_id = max(_last_alert_event_id, eid)
                         continue
                     _last_alert_event_id = max(_last_alert_event_id, eid)
+                    if _is_suppressed(mac, etype, suppression_cache):
+                        continue
                     if etype == "joined":
                         if alert_new:
                             pending_alerts.append((f"New device detected: {name} ({ip})", "new_device"))
@@ -376,6 +426,20 @@ async def _alert_dispatch_loop():
                             pending_alerts.append((
                                 f"Vulnerabilities found on {name} ({ip}): {severity} severity, {count} finding(s)",
                                 "vuln_found",
+                            ))
+                    elif etype == "port_change" and alert_port_change:
+                        d = detail or {}
+                        added   = d.get("added", [])
+                        removed = d.get("removed", [])
+                        parts = []
+                        if added:
+                            parts.append(f"Opened: {', '.join(str(p['port']) for p in added)}")
+                        if removed:
+                            parts.append(f"Closed: {', '.join(str(p['port']) for p in removed)}")
+                        if parts:
+                            pending_alerts.append((
+                                f"Port change on {name} — " + "; ".join(parts),
+                                "port_change",
                             ))
 
             finally:
@@ -699,14 +763,70 @@ def _is_locally_admin_mac(mac: str) -> bool:
         return False
 
 
+@app.get("/devices/meta/zones")
+def get_device_zones(db: Session = Depends(get_db)):
+    try:
+        rows = db.execute(
+            text("SELECT DISTINCT zone FROM devices WHERE zone IS NOT NULL ORDER BY zone")
+        ).fetchall()
+        return [r[0] for r in rows]
+    except Exception:
+        return []
+
+
 @app.get("/devices")
-def list_devices(online_only: bool = False, include_ignored: bool = True, db: Session = Depends(get_db)):
+def list_devices(
+    online_only: bool = False,
+    include_ignored: bool = True,
+    vendor: Optional[str] = None,
+    hostname: Optional[str] = None,
+    zone: Optional[str] = None,
+    has_vulns: Optional[bool] = None,
+    severity: Optional[str] = None,
+    port: Optional[int] = None,
+    is_important: Optional[bool] = None,
+    sort_by: Optional[str] = None,
+    sort_dir: Optional[str] = None,
+    db: Session = Depends(get_db),
+):
     q = db.query(Device)
     if online_only:
         q = q.filter(Device.is_online == True)
     if not include_ignored:
         q = q.filter(Device.is_ignored == False)
-    devices = q.order_by(Device.last_seen.desc(), Device.mac_address.asc()).all()
+    if vendor:
+        q = q.filter(Device.vendor.ilike(f"%{vendor}%"))
+    if hostname:
+        q = q.filter(
+            (Device.hostname.ilike(f"%{hostname}%")) |
+            (Device.custom_name.ilike(f"%{hostname}%"))
+        )
+    if zone:
+        q = q.filter(Device.zone == zone)
+    if has_vulns is True:
+        q = q.filter(Device.vuln_severity != None, Device.vuln_severity != 'clean')
+    if severity:
+        q = q.filter(Device.vuln_severity == severity)
+    if is_important is True:
+        q = q.filter(Device.is_important == True)
+    if port is not None:
+        q = q.filter(text(f"scan_results->'open_ports' @> '[{{\"port\": {int(port)}}}]'::jsonb"))
+
+    valid_sorts = {"last_seen", "first_seen", "hostname", "ip_address"}
+    sort_col = sort_by if sort_by in valid_sorts else "last_seen"
+    col_map = {
+        "last_seen":  Device.last_seen,
+        "first_seen": Device.first_seen,
+        "hostname":   Device.hostname,
+        "ip_address": Device.ip_address,
+    }
+    col = col_map.get(sort_col, Device.last_seen)
+    if sort_dir == "asc":
+        q = q.order_by(col.asc().nulls_last(), Device.mac_address.asc())
+    else:
+        q = q.order_by(col.desc().nulls_last(), Device.mac_address.asc())
+
+    devices = q.all()
 
     # Identify virtual interfaces: locally-administered MACs that share one or more IPs with
     # a real (globally-administered) MAC.  This covers macvlan, container, and VM interfaces
@@ -889,14 +1009,27 @@ def set_primary_ip(mac: str, payload: PrimaryIPUpdate, db: Session = Depends(get
 
 
 @app.get("/devices/{mac}/events")
-def get_device_events(mac: str, limit: int = Query(50, ge=1, le=500), db: Session = Depends(get_db)):
+def get_device_events(
+    mac: str,
+    type: Optional[str] = Query(default=None),
+    limit: int = Query(50, ge=1, le=500),
+    offset: int = Query(default=0),
+    db: Session = Depends(get_db),
+):
     d = db.get(Device, mac.lower())
     if not d:
         raise HTTPException(404, "Device not found")
     try:
         rows = db.execute(
-            text("SELECT id, type, detail, created_at FROM device_events WHERE mac_address = :mac ORDER BY created_at DESC LIMIT :limit"),
-            {"mac": mac.lower(), "limit": limit}
+            text("""
+                SELECT id, type, detail, created_at
+                FROM device_events
+                WHERE mac_address = :mac
+                  AND (:type IS NULL OR type = :type)
+                ORDER BY created_at DESC
+                LIMIT :limit OFFSET :offset
+            """),
+            {"mac": mac.lower(), "type": type, "limit": limit, "offset": offset}
         ).fetchall()
         return [{"id": r[0], "type": r[1], "detail": r[2], "created_at": r[3].isoformat() if r[3] else None} for r in rows]
     except Exception:
@@ -1135,6 +1268,352 @@ def vuln_summary(db: Session = Depends(get_db)):
         "top_vulnerable":  top_vulnerable,
         "recent_scans":    recent_scans,
     }
+
+
+# ---------------------------------------------------------------------------
+# Device services endpoint
+# ---------------------------------------------------------------------------
+@app.get("/devices/{mac}/services")
+def get_device_services(mac: str, db: Session = Depends(get_db)):
+    device = db.execute(
+        text("SELECT scan_results FROM devices WHERE mac_address = :mac"),
+        {"mac": mac.lower()}
+    ).fetchone()
+    if not device or not device[0]:
+        return {"services": [], "pipeline_stage": None}
+    scan = device[0]
+    ports = scan.get("open_ports") or []
+    nerva = {s["port"]: s for s in (scan.get("services") or [])}
+    merged = []
+    for p in ports:
+        port_num = p.get("port")
+        entry = {
+            "port":      port_num,
+            "proto":     p.get("proto", "tcp"),
+            "service":   p.get("service") or nerva.get(port_num, {}).get("service", ""),
+            "product":   p.get("product", ""),
+            "version":   p.get("version", ""),
+            "tls":       p.get("tls") or nerva.get(port_num, {}).get("tls", False),
+            "extrainfo": p.get("extrainfo", ""),
+        }
+        merged.append(entry)
+    return {
+        "services": sorted(merged, key=lambda x: x["port"] or 0),
+        "pipeline_stage": scan.get("pipeline_stage"),
+    }
+
+
+@app.post("/devices/{mac}/mdns-refresh")
+async def refresh_device_mdns(mac: str, db: Session = Depends(get_db)):
+    d = db.get(Device, mac.lower())
+    if not d:
+        raise HTTPException(404, "Device not found")
+    try:
+        async with httpx.AsyncClient(timeout=35.0) as client:
+            resp = await client.post(f"{PROBE_URL}/mdns/refresh")
+            resp.raise_for_status()
+    except httpx.ConnectError:
+        raise HTTPException(502, f"Cannot reach probe at {PROBE_URL}")
+    except Exception as e:
+        raise HTTPException(502, f"mDNS refresh failed: {e}")
+    db.refresh(d)
+    mdns_services = (d.scan_results or {}).get("mdns_services", []) if d.scan_results else []
+    return {"mdns_services": mdns_services}
+
+
+# ---------------------------------------------------------------------------
+# Zone management
+# ---------------------------------------------------------------------------
+@app.get("/zones")
+def list_zones(db: Session = Depends(get_db)):
+    try:
+        rows = db.execute(text("""
+            SELECT
+                COALESCE(zone, 'Unassigned') AS zone,
+                COUNT(*) AS total,
+                COUNT(*) FILTER (WHERE is_online = true) AS online
+            FROM devices
+            GROUP BY zone
+            ORDER BY zone
+        """)).fetchall()
+        return [{"zone": r[0], "total": int(r[1]), "online": int(r[2])} for r in rows]
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+
+class ZoneAssign(BaseModel):
+    mac_addresses: List[str]
+    zone: Optional[str] = None
+
+
+@app.post("/zones/assign")
+def assign_zone(body: ZoneAssign, db: Session = Depends(get_db)):
+    try:
+        db.execute(
+            text("UPDATE devices SET zone = :zone WHERE mac_address = ANY(:macs)"),
+            {"zone": body.zone, "macs": [m.lower() for m in body.mac_addresses]},
+        )
+        db.commit()
+        return {"updated": len(body.mac_addresses)}
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(500, str(e))
+
+
+class ZoneRename(BaseModel):
+    old_name: str
+    new_name: str
+
+
+@app.post("/zones/rename")
+def rename_zone(body: ZoneRename, db: Session = Depends(get_db)):
+    try:
+        result = db.execute(
+            text("UPDATE devices SET zone = :new WHERE zone = :old"),
+            {"new": body.new_name, "old": body.old_name},
+        )
+        db.commit()
+        return {"updated": result.rowcount}
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(500, str(e))
+
+
+# ---------------------------------------------------------------------------
+# Saved views
+# ---------------------------------------------------------------------------
+class SavedViewCreate(BaseModel):
+    name: str
+    description: Optional[str] = None
+    filters: dict = {}
+
+
+@app.get("/saved-views")
+def list_saved_views(db: Session = Depends(get_db)):
+    try:
+        rows = db.execute(text(
+            "SELECT id, name, description, filters, created_at, updated_at FROM saved_views ORDER BY name"
+        )).fetchall()
+        return [
+            {
+                "id": r[0], "name": r[1], "description": r[2],
+                "filters": r[3] or {},
+                "created_at": r[4].isoformat() if r[4] else None,
+                "updated_at": r[5].isoformat() if r[5] else None,
+            }
+            for r in rows
+        ]
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+
+@app.get("/saved-views/{view_id}")
+def get_saved_view(view_id: int, db: Session = Depends(get_db)):
+    row = db.execute(
+        text("SELECT id, name, description, filters, created_at, updated_at FROM saved_views WHERE id = :id"),
+        {"id": view_id}
+    ).fetchone()
+    if not row:
+        raise HTTPException(404, "View not found")
+    return {
+        "id": row[0], "name": row[1], "description": row[2],
+        "filters": row[3] or {},
+        "created_at": row[4].isoformat() if row[4] else None,
+        "updated_at": row[5].isoformat() if row[5] else None,
+    }
+
+
+@app.post("/saved-views", status_code=201)
+def create_saved_view(body: SavedViewCreate, db: Session = Depends(get_db)):
+    try:
+        row = db.execute(
+            text("""
+                INSERT INTO saved_views (name, description, filters)
+                VALUES (:name, :description, cast(:filters AS jsonb))
+                RETURNING id, name, description, filters, created_at, updated_at
+            """),
+            {"name": body.name, "description": body.description, "filters": json.dumps(body.filters)}
+        ).fetchone()
+        db.commit()
+        return {
+            "id": row[0], "name": row[1], "description": row[2],
+            "filters": row[3] or {},
+            "created_at": row[4].isoformat() if row[4] else None,
+            "updated_at": row[5].isoformat() if row[5] else None,
+        }
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(500, str(e))
+
+
+@app.put("/saved-views/{view_id}")
+def update_saved_view(view_id: int, body: SavedViewCreate, db: Session = Depends(get_db)):
+    try:
+        row = db.execute(
+            text("""
+                UPDATE saved_views
+                SET name = :name, description = :description,
+                    filters = cast(:filters AS jsonb), updated_at = NOW()
+                WHERE id = :id
+                RETURNING id, name, description, filters, created_at, updated_at
+            """),
+            {"id": view_id, "name": body.name, "description": body.description, "filters": json.dumps(body.filters)}
+        ).fetchone()
+        if not row:
+            raise HTTPException(404, "View not found")
+        db.commit()
+        return {
+            "id": row[0], "name": row[1], "description": row[2],
+            "filters": row[3] or {},
+            "created_at": row[4].isoformat() if row[4] else None,
+            "updated_at": row[5].isoformat() if row[5] else None,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(500, str(e))
+
+
+@app.delete("/saved-views/{view_id}", status_code=204)
+def delete_saved_view(view_id: int, db: Session = Depends(get_db)):
+    db.execute(text("DELETE FROM saved_views WHERE id = :id"), {"id": view_id})
+    db.commit()
+
+
+# ---------------------------------------------------------------------------
+# Alert suppressions
+# ---------------------------------------------------------------------------
+class SuppressionCreate(BaseModel):
+    mac_address: Optional[str] = None
+    event_type:  Optional[str] = None
+    reason:      Optional[str] = None
+    expires_at:  Optional[str] = None
+
+
+@app.get("/suppressions")
+def list_suppressions(mac: Optional[str] = None, db: Session = Depends(get_db)):
+    try:
+        if mac:
+            rows = db.execute(text("""
+                SELECT id, mac_address, event_type, reason, expires_at, created_at
+                FROM alert_suppressions
+                WHERE mac_address = :mac
+                ORDER BY created_at DESC
+            """), {"mac": mac.lower()}).fetchall()
+        else:
+            rows = db.execute(text("""
+                SELECT id, mac_address, event_type, reason, expires_at, created_at
+                FROM alert_suppressions
+                ORDER BY created_at DESC
+            """)).fetchall()
+        return [
+            {
+                "id": r[0], "mac_address": r[1], "event_type": r[2],
+                "reason": r[3],
+                "expires_at": r[4].isoformat() if r[4] else None,
+                "created_at": r[5].isoformat() if r[5] else None,
+            }
+            for r in rows
+        ]
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+
+@app.post("/suppressions", status_code=201)
+def create_suppression(body: SuppressionCreate, db: Session = Depends(get_db)):
+    try:
+        expires = None
+        if body.expires_at:
+            from datetime import datetime
+            expires = datetime.fromisoformat(body.expires_at.replace("Z", "+00:00"))
+        row = db.execute(
+            text("""
+                INSERT INTO alert_suppressions (mac_address, event_type, reason, expires_at)
+                VALUES (:mac, :type, :reason, :expires)
+                RETURNING id, mac_address, event_type, reason, expires_at, created_at
+            """),
+            {
+                "mac": body.mac_address.lower() if body.mac_address else None,
+                "type": body.event_type,
+                "reason": body.reason,
+                "expires": expires,
+            }
+        ).fetchone()
+        db.commit()
+        return {
+            "id": row[0], "mac_address": row[1], "event_type": row[2],
+            "reason": row[3],
+            "expires_at": row[4].isoformat() if row[4] else None,
+            "created_at": row[5].isoformat() if row[5] else None,
+        }
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(500, str(e))
+
+
+@app.delete("/suppressions/{suppression_id}", status_code=204)
+def delete_suppression(suppression_id: int, db: Session = Depends(get_db)):
+    db.execute(text("DELETE FROM alert_suppressions WHERE id = :id"), {"id": suppression_id})
+    db.commit()
+
+
+# ---------------------------------------------------------------------------
+# Vuln trend + top devices (for dashboard)
+# ---------------------------------------------------------------------------
+@app.get("/vulns/trend")
+def get_vuln_trend(days: int = Query(default=30, le=90), db: Session = Depends(get_db)):
+    try:
+        rows = db.execute(text("""
+            SELECT
+                date_trunc('day', scanned_at)::date AS day,
+                severity,
+                COUNT(*) AS count
+            FROM vuln_reports
+            WHERE scanned_at >= NOW() - (INTERVAL '1 day' * :days)
+            GROUP BY day, severity
+            ORDER BY day ASC, severity
+        """), {"days": days}).fetchall()
+        from collections import defaultdict
+        by_day: dict = defaultdict(dict)
+        for row in rows:
+            by_day[str(row[0])][row[1]] = int(row[2])
+        return [{"date": d, **severities} for d, severities in sorted(by_day.items())]
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+
+@app.get("/vulns/top-devices")
+def get_top_vulnerable_devices(limit: int = Query(default=10, le=50), db: Session = Depends(get_db)):
+    try:
+        rows = db.execute(text("""
+            SELECT DISTINCT ON (d.mac_address)
+                d.mac_address,
+                COALESCE(d.custom_name, d.hostname, d.ip_address) AS name,
+                d.ip_address,
+                d.vuln_severity,
+                vr.vuln_count,
+                vr.scanned_at,
+                vr.findings
+            FROM devices d
+            JOIN vuln_reports vr ON vr.mac_address = d.mac_address
+            WHERE d.vuln_severity IN ('critical', 'high', 'medium')
+            ORDER BY d.mac_address, vr.scanned_at DESC
+        """)).fetchall()
+        def sev_rank(s):
+            return {'critical': 1, 'high': 2, 'medium': 3}.get(s or '', 9)
+        rows_sorted = sorted(rows, key=lambda r: sev_rank(r[3]))[:limit]
+        return [
+            {
+                "mac": r[0], "name": r[1], "ip": r[2],
+                "severity": r[3], "vuln_count": r[4],
+                "scanned_at": r[5].isoformat() if r[5] else None,
+                "top_findings": (r[6] or [])[:3],
+            }
+            for r in rows_sorted
+        ]
+    except Exception as e:
+        raise HTTPException(500, str(e))
 
 
 # ---------------------------------------------------------------------------
@@ -1624,3 +2103,297 @@ async def stream_traceroute(mac: str, db: Session = Depends(get_db)):
 
     return StreamingResponse(_gen(), media_type="text/event-stream",
                              headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+
+# ---------------------------------------------------------------------------
+# Network Tools
+# ---------------------------------------------------------------------------
+import re as _re
+import ssl as _ssl
+import ipaddress as _ipaddress
+
+_HOST_RE  = _re.compile(r'^[a-zA-Z0-9._\-]{1,253}$')
+_PORTS_RE = _re.compile(r'^[\d,\-]{1,100}$')
+
+
+def _validate_tool_host(host: str):
+    if not host or not _HOST_RE.match(host):
+        raise HTTPException(400, "Invalid host")
+
+
+def _validate_tool_url(url: str):
+    if not url or not (url.startswith("http://") or url.startswith("https://")):
+        raise HTTPException(400, "URL must start with http:// or https://")
+    if len(url) > 2048:
+        raise HTTPException(400, "URL too long")
+
+
+@app.get("/tools/ping")
+async def tools_ping(host: str = Query(...)):
+    _validate_tool_host(host)
+
+    async def _gen():
+        try:
+            async with httpx.AsyncClient(timeout=None) as client:
+                async with client.stream("GET", f"{PROBE_URL}/stream/tools/ping",
+                                         params={"host": host}) as resp:
+                    async for line in resp.aiter_lines():
+                        yield f"{line}\n"
+        except httpx.ConnectError:
+            yield f"data: [ERROR] Cannot reach probe at {PROBE_URL}\n\n"
+        except Exception as e:
+            yield f"data: [ERROR] {e}\n\n"
+
+    return StreamingResponse(_gen(), media_type="text/event-stream",
+                             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+
+@app.get("/tools/traceroute")
+async def tools_traceroute(host: str = Query(...)):
+    _validate_tool_host(host)
+
+    async def _gen():
+        try:
+            async with httpx.AsyncClient(timeout=None) as client:
+                async with client.stream("GET", f"{PROBE_URL}/stream/tools/traceroute",
+                                         params={"host": host}) as resp:
+                    async for line in resp.aiter_lines():
+                        yield f"{line}\n"
+        except httpx.ConnectError:
+            yield f"data: [ERROR] Cannot reach probe at {PROBE_URL}\n\n"
+        except Exception as e:
+            yield f"data: [ERROR] {e}\n\n"
+
+    return StreamingResponse(_gen(), media_type="text/event-stream",
+                             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+
+@app.get("/tools/portscan")
+async def tools_portscan(host: str = Query(...), ports: str = Query("1-1024")):
+    _validate_tool_host(host)
+    if not _PORTS_RE.match(ports):
+        raise HTTPException(400, "Invalid ports specification")
+
+    async def _gen():
+        try:
+            async with httpx.AsyncClient(timeout=None) as client:
+                async with client.stream("GET", f"{PROBE_URL}/stream/tools/portscan",
+                                         params={"host": host, "ports": ports}) as resp:
+                    async for line in resp.aiter_lines():
+                        yield f"{line}\n"
+        except httpx.ConnectError:
+            yield f"data: [ERROR] Cannot reach probe at {PROBE_URL}\n\n"
+        except Exception as e:
+            yield f"data: [ERROR] {e}\n\n"
+
+    return StreamingResponse(_gen(), media_type="text/event-stream",
+                             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+
+@app.get("/tools/dns")
+async def tools_dns(host: str = Query(...), type: str = Query("A")):
+    import dns.resolver
+    _validate_tool_host(host)
+    valid_types = {"A", "AAAA", "MX", "CNAME", "TXT", "NS", "SOA", "PTR"}
+    qtype = type.upper()
+    if qtype not in valid_types:
+        raise HTTPException(400, f"Type must be one of: {', '.join(sorted(valid_types))}")
+    try:
+        answers = dns.resolver.resolve(host, qtype, lifetime=10)
+        return {"host": host, "type": qtype,
+                "records": [str(r) for r in answers],
+                "ttl": answers.rrset.ttl, "error": None}
+    except dns.resolver.NXDOMAIN:
+        return {"host": host, "type": qtype, "records": [], "ttl": None,
+                "error": "NXDOMAIN — domain does not exist"}
+    except dns.resolver.NoAnswer:
+        return {"host": host, "type": qtype, "records": [], "ttl": None,
+                "error": "No records of that type found"}
+    except Exception as e:
+        return {"host": host, "type": qtype, "records": [], "ttl": None, "error": str(e)}
+
+
+@app.get("/tools/rdns")
+async def tools_rdns(ip: str = Query(...)):
+    try:
+        _ipaddress.ip_address(ip)
+    except ValueError:
+        raise HTTPException(400, "Invalid IP address")
+    try:
+        hostname = socket.gethostbyaddr(ip)[0]
+        return {"ip": ip, "hostname": hostname, "error": None}
+    except socket.herror:
+        return {"ip": ip, "hostname": None, "error": "No reverse DNS record found"}
+    except Exception as e:
+        return {"ip": ip, "hostname": None, "error": str(e)}
+
+
+@app.get("/tools/dns-propagation")
+async def tools_dns_propagation(host: str = Query(...), type: str = Query("A")):
+    import dns.resolver
+    _validate_tool_host(host)
+    qtype = type.upper()
+    if qtype not in {"A", "AAAA", "MX", "CNAME", "TXT", "NS"}:
+        raise HTTPException(400, "Invalid record type")
+
+    servers = {
+        "Google (8.8.8.8)":         "8.8.8.8",
+        "Google (8.8.4.4)":         "8.8.4.4",
+        "Cloudflare (1.1.1.1)":     "1.1.1.1",
+        "Cloudflare (1.0.0.1)":     "1.0.0.1",
+        "OpenDNS (208.67.222.222)": "208.67.222.222",
+        "OpenDNS (208.67.220.220)": "208.67.220.220",
+        "Quad9 (9.9.9.9)":          "9.9.9.9",
+        "AdGuard (94.140.14.14)":   "94.140.14.14",
+    }
+
+    async def _query(name: str, ns_ip: str) -> dict:
+        def _resolve():
+            resolver = dns.resolver.Resolver(configure=False)
+            resolver.nameservers = [ns_ip]
+            resolver.timeout = 4
+            resolver.lifetime = 4
+            return [str(r) for r in resolver.resolve(host, qtype)]
+        try:
+            records = await asyncio.get_event_loop().run_in_executor(None, _resolve)
+            return {"name": name, "ip": ns_ip, "records": records, "error": None}
+        except dns.resolver.NXDOMAIN:
+            return {"name": name, "ip": ns_ip, "records": [], "error": "NXDOMAIN"}
+        except dns.resolver.NoAnswer:
+            return {"name": name, "ip": ns_ip, "records": [], "error": "No answer"}
+        except Exception as e:
+            return {"name": name, "ip": ns_ip, "records": [], "error": str(e)[:80]}
+
+    results = await asyncio.gather(*[_query(n, ip) for n, ip in servers.items()])
+    return {"host": host, "type": qtype, "results": results}
+
+
+@app.get("/tools/http-headers")
+async def tools_http_headers(url: str = Query(...)):
+    _validate_tool_url(url)
+    try:
+        async with httpx.AsyncClient(timeout=10, follow_redirects=False, verify=False) as client:
+            resp = await client.get(url)
+            return {
+                "url": url,
+                "status": resp.status_code,
+                "reason": resp.reason_phrase,
+                "headers": dict(resp.headers),
+                "redirect": resp.headers.get("location"),
+            }
+    except httpx.ConnectError as e:
+        raise HTTPException(502, f"Connection failed: {e}")
+    except httpx.TimeoutException:
+        raise HTTPException(504, "Request timed out")
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+
+@app.get("/tools/ssl")
+async def tools_ssl(host: str = Query(...), port: int = Query(443)):
+    _validate_tool_host(host)
+    if not (1 <= port <= 65535):
+        raise HTTPException(400, "Invalid port")
+
+    def _check() -> dict:
+        import socket as _sock
+        ctx = _ssl.create_default_context()
+        try:
+            with ctx.wrap_socket(_sock.socket(), server_hostname=host) as s:
+                s.settimeout(10)
+                s.connect((host, port))
+                cert = s.getpeercert()
+                cipher = s.cipher()
+                return {
+                    "host": host, "port": port, "valid": True,
+                    "subject": {k: v for tup in cert.get("subject", []) for k, v in tup},
+                    "issuer":  {k: v for tup in cert.get("issuer",  []) for k, v in tup},
+                    "not_before": cert.get("notBefore"),
+                    "not_after":  cert.get("notAfter"),
+                    "san": [v for t, v in cert.get("subjectAltName", []) if t == "DNS"],
+                    "serial": cert.get("serialNumber"),
+                    "version": cert.get("version"),
+                    "cipher": cipher[0] if cipher else None,
+                    "protocol": cipher[1] if cipher else None,
+                    "error": None,
+                }
+        except _ssl.SSLCertVerificationError as e:
+            return {"host": host, "port": port, "valid": False,
+                    "subject": {}, "issuer": {}, "not_before": None, "not_after": None,
+                    "san": [], "serial": None, "version": None, "cipher": None,
+                    "protocol": None, "error": f"Certificate verification failed: {e}"}
+        except ConnectionRefusedError:
+            raise HTTPException(502, f"Connection refused to {host}:{port}")
+        except _sock.timeout:
+            raise HTTPException(504, "Connection timed out")
+        except Exception as e:
+            raise HTTPException(500, str(e))
+
+    try:
+        return await asyncio.get_event_loop().run_in_executor(None, _check)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+
+@app.get("/tools/geo")
+async def tools_geo(ip: str = Query(...)):
+    try:
+        _ipaddress.ip_address(ip)
+    except ValueError:
+        raise HTTPException(400, "Invalid IP address")
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.get(
+                f"http://ip-api.com/json/{ip}",
+                params={"fields": "status,message,country,countryCode,region,regionName,city,zip,lat,lon,timezone,isp,org,as,query"},
+            )
+            return resp.json()
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+
+@app.get("/tools/whois")
+async def tools_whois(host: str = Query(...)):
+    _validate_tool_host(host)
+    try:
+        result = await asyncio.get_event_loop().run_in_executor(
+            None,
+            lambda: subprocess.run(["whois", host],
+                                   capture_output=True, text=True, timeout=20)
+        )
+        output = (result.stdout or result.stderr or "").strip()
+        return {"host": host, "output": output[:8000]}
+    except FileNotFoundError:
+        raise HTTPException(501, "whois binary not available")
+    except subprocess.TimeoutExpired:
+        raise HTTPException(504, "WHOIS query timed out")
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+
+@app.get("/tools/email")
+async def tools_email(domain: str = Query(...)):
+    import dns.resolver
+    _validate_tool_host(domain)
+
+    def _resolve(name: str, qtype: str) -> list[str]:
+        try:
+            return [str(r) for r in dns.resolver.resolve(name, qtype, lifetime=8)]
+        except Exception:
+            return []
+
+    out: dict = {"domain": domain}
+    out["mx"]          = sorted(_resolve(domain, "MX"))
+    out["spf"]         = [r.strip('"') for r in _resolve(domain, "TXT") if "v=spf" in r.lower()]
+    out["dmarc"]       = [r.strip('"') for r in _resolve(f"_dmarc.{domain}", "TXT")]
+    out["nameservers"] = _resolve(domain, "NS")
+
+    dkim: dict = {}
+    for sel in ["default", "google", "mail", "k1", "selector1", "selector2", "dkim"]:
+        recs = _resolve(f"{sel}._domainkey.{domain}", "TXT")
+        if recs:
+            dkim[sel] = [r.strip('"') for r in recs]
+    out["dkim"] = dkim
+    return out

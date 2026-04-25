@@ -26,6 +26,10 @@ export function useStreamAction() {
     setRunning(false)
   }, [])
 
+  const clear = useCallback(() => {
+    setLines([])
+  }, [])
+
   const start = useCallback((path) => {
     // Cancel any in-flight stream first
     if (abortRef.current) {
@@ -98,5 +102,5 @@ export function useStreamAction() {
   // Clean up on unmount
   useEffect(() => () => stop(), [stop])
 
-  return { lines, running, start, stop }
+  return { lines, running, start, stop, clear }
 }

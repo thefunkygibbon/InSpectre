@@ -16,6 +16,33 @@ const SEV_CFG = {
 
 const SEV_ORDER = ['critical', 'high', 'medium', 'low', 'info', 'clean']
 
+function TrendBars({ trend }) {
+  const SEV_PRIORITY = ['critical', 'high', 'medium', 'low', 'info', 'clean']
+  const SEV_COLORS = {
+    critical: '#ef4444', high: '#f97316', medium: '#f59e0b',
+    low: '#3b82f6', info: '#8b5cf6', clean: '#22c55e',
+  }
+  const maxTotal = Math.max(...trend.map(d => {
+    return SEV_PRIORITY.reduce((s, k) => s + (d[k] || 0), 0)
+  }), 1)
+
+  return (
+    <div className="flex items-end gap-0.5 h-16">
+      {trend.slice(-30).map((day, i) => {
+        const total = SEV_PRIORITY.reduce((s, k) => s + (day[k] || 0), 0)
+        const heightPct = total > 0 ? Math.max(8, Math.round((total / maxTotal) * 100)) : 2
+        const topSev = SEV_PRIORITY.find(k => (day[k] || 0) > 0)
+        const color = topSev ? SEV_COLORS[topSev] : 'var(--color-border)'
+        return (
+          <div key={i} title={`${day.date}: ${total} scan${total !== 1 ? 's' : ''}`}
+            className="flex-1 rounded-sm cursor-default transition-opacity hover:opacity-80"
+            style={{ height: `${heightPct}%`, background: color, opacity: total > 0 ? 0.8 : 0.2 }} />
+        )
+      })}
+    </div>
+  )
+}
+
 function SevBadge({ severity }) {
   const cfg = SEV_CFG[severity] || SEV_CFG.info
   return (
@@ -50,17 +77,22 @@ function fmtRelative(iso) {
 }
 
 export function SecurityDashboard({ onClose, onDeviceClick }) {
-  const [data,        setData]        = useState(null)
-  const [loading,     setLoading]     = useState(true)
-  const [error,       setError]       = useState(null)
-  const [expandedVuln, setExpandedVuln] = useState({}) // mac → { loading } | { findings: [] }
+  const [data,         setData]         = useState(null)
+  const [trend,        setTrend]        = useState(null)
+  const [loading,      setLoading]      = useState(true)
+  const [error,        setError]        = useState(null)
+  const [expandedVuln, setExpandedVuln] = useState({})
 
   async function load() {
     setLoading(true)
     setError(null)
     try {
-      const d = await api.getVulnSummary()
+      const [d, t] = await Promise.all([
+        api.getVulnSummary(),
+        api.getVulnTrend(30).catch(() => []),
+      ])
       setData(d)
+      setTrend(t)
     } catch (e) {
       setError(e.message)
     } finally {
@@ -201,6 +233,15 @@ export function SecurityDashboard({ onClose, onDeviceClick }) {
                 </div>
               )}
 
+              {/* 30-day scan trend */}
+              {trend && trend.length >= 2 && (
+                <div>
+                  <p className="text-xs font-semibold uppercase tracking-wider mb-3"
+                    style={{ color: 'var(--color-text-muted)' }}>30-Day Scan Activity</p>
+                  <TrendBars trend={trend} />
+                </div>
+              )}
+
               {/* Most vulnerable devices */}
               {topVuln.length > 0 && (
                 <div>
@@ -282,7 +323,7 @@ export function SecurityDashboard({ onClose, onDeviceClick }) {
                       return (
                         <button
                           key={i}
-                          onClick={() => onDeviceClick && onDeviceClick(r.mac_address, 'vuln')}
+                          onClick={() => onDeviceClick && onDeviceClick(r.mac_address, 'vulns')}
                           className="w-full px-3 py-2.5 flex items-center gap-3 text-left hover:bg-surface-offset transition-colors first:rounded-t-lg last:rounded-b-lg"
                         >
                           <span className="w-2 h-2 rounded-full shrink-0 mt-0.5" style={{ background: cfg.color }} />
