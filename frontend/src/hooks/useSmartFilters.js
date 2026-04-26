@@ -1,11 +1,4 @@
-/**
- * useSmartFilters
- *
- * Manages a set of active smart-filter IDs and exposes a function to apply
- * them to a device list.  Filters are additive (AND logic).
- * Saved views are persisted to localStorage.
- */
-import { useState, useCallback, useEffect } from 'react'
+import { useState, useCallback } from 'react'
 
 export const SMART_FILTERS = [
   {
@@ -54,13 +47,6 @@ export const SMART_FILTERS = [
     fn:          d => Boolean(d.vuln_last_scanned),
   },
   {
-    id:          'not_vuln_scanned',
-    label:       'Not vuln scanned',
-    icon:        'ShieldOff',
-    description: 'Devices that have never had a vulnerability scan run',
-    fn:          d => !d.vuln_last_scanned,
-  },
-  {
     id:          'blocked',
     label:       'Blocked',
     icon:        'Ban',
@@ -96,41 +82,54 @@ function loadSavedViews() {
   try {
     const raw = localStorage.getItem(SAVED_VIEWS_KEY)
     return raw ? JSON.parse(raw) : []
-  } catch {
-    return []
-  }
+  } catch { return [] }
 }
 
 function persistSavedViews(views) {
-  try {
-    localStorage.setItem(SAVED_VIEWS_KEY, JSON.stringify(views))
-  } catch {}
+  try { localStorage.setItem(SAVED_VIEWS_KEY, JSON.stringify(views)) } catch {}
 }
 
 export function useSmartFilters() {
-  const [activeFilters, setActiveFilters] = useState([])
+  // activeFilters: { [id]: 'include' | 'exclude' }
+  const [activeFilters, setActiveFilters] = useState({})
   const [savedViews,    setSavedViews]    = useState(() => loadSavedViews())
 
+  // Cycle: off → include → exclude → off
   const toggleFilter = useCallback(id => {
-    setActiveFilters(prev =>
-      prev.includes(id) ? prev.filter(f => f !== id) : [...prev, id]
-    )
+    setActiveFilters(prev => {
+      const current = prev[id]
+      if (!current)             return { ...prev, [id]: 'include' }
+      if (current === 'include') return { ...prev, [id]: 'exclude' }
+      // exclude → remove key entirely
+      const next = { ...prev }
+      delete next[id]
+      return next
+    })
   }, [])
 
-  const clearFilters = useCallback(() => setActiveFilters([]), [])
+  const clearFilters = useCallback(() => setActiveFilters({}), [])
 
   const applyFilters = useCallback((devices) => {
-    if (!activeFilters.length) return devices
-    const activeFns = SMART_FILTERS
-      .filter(f => activeFilters.includes(f.id))
-      .map(f => f.fn)
-    return devices.filter(d => activeFns.every(fn => fn(d)))
+    const entries = Object.entries(activeFilters)
+    if (!entries.length) return devices
+
+    return devices.filter(d => {
+      for (const [id, mode] of entries) {
+        const filter = SMART_FILTERS.find(f => f.id === id)
+        if (!filter) continue
+        const match = filter.fn(d)
+        if (mode === 'include' && !match) return false
+        if (mode === 'exclude' &&  match) return false
+      }
+      return true
+    })
   }, [activeFilters])
 
+  // Saved views store the full activeFilters object now
   const saveView = useCallback((name) => {
-    if (!name.trim() || !activeFilters.length) return
+    if (!name.trim() || !Object.keys(activeFilters).length) return
     setSavedViews(prev => {
-      const next = [...prev, { id: Date.now().toString(), name: name.trim(), filters: [...activeFilters] }]
+      const next = [...prev, { id: Date.now().toString(), name: name.trim(), filters: { ...activeFilters } }]
       persistSavedViews(next)
       return next
     })
@@ -138,7 +137,7 @@ export function useSmartFilters() {
 
   const loadView = useCallback((viewId) => {
     const view = savedViews.find(v => v.id === viewId)
-    if (view) setActiveFilters([...view.filters])
+    if (view) setActiveFilters({ ...view.filters })
   }, [savedViews])
 
   const deleteView = useCallback((viewId) => {
@@ -149,5 +148,13 @@ export function useSmartFilters() {
     })
   }, [])
 
-  return { activeFilters, toggleFilter, clearFilters, applyFilters, savedViews, saveView, loadView, deleteView }
+  // Helpers for components
+  const getFilterState = useCallback((id) => activeFilters[id] || null, [activeFilters])
+  const hasActiveFilters = Object.keys(activeFilters).length > 0
+
+  return {
+    activeFilters, toggleFilter, clearFilters, applyFilters,
+    savedViews, saveView, loadView, deleteView,
+    getFilterState, hasActiveFilters,
+  }
 }

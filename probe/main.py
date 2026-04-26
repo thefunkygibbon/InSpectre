@@ -43,7 +43,10 @@ OFFLINE_MISS_THRESHOLD  = int(os.environ.get("OFFLINE_MISS_THRESHOLD",   3))
 SNIFFER_WORKERS         = int(os.environ.get("SNIFFER_WORKERS",          4))
 PROBE_API_PORT          = int(os.environ.get("PROBE_API_PORT",         8001))
 LAN_DNS_SERVER_ENV      = os.environ.get("LAN_DNS_SERVER", "").strip()
+MDNS_INTERVAL           = int(os.environ.get("MDNS_INTERVAL", 3600))  # default: 1 hour
 
+# mDNS rate-limiting — tracks last time a full browse was run
+_last_mdns_browse: float = 0.0
 PING_COUNT    = 40
 TRACE_MAX_HOP = 30
 
@@ -550,7 +553,7 @@ def _mdns_browse() -> dict[str, dict]:
 
     MDNS_ADDR   = "224.0.0.251"
     MDNS_PORT   = 5353
-    LISTEN_SECS = 8
+    LISTEN_SECS = 4
 
     ptr_records: dict[str, list[str]] = {}
     srv_records: dict[str, str]        = {}
@@ -1017,6 +1020,13 @@ def upsert_seen_device(mac: str, ip: str, source: str) -> None:
                 print(f"[+] New device via {source}: {ip} ({mac}) hostname={hostname} vendor={vendor}", flush=True)
                 _write_event(mac, "joined", {"ip": ip, "vendor": vendor or "Unknown"})
                 trigger_deep_scan(ip, mac)
+                # Trigger a one-shot mDNS browse shortly after a brand-new device joins
+                # so it gets hostname/services enriched quickly without waiting for the
+                # scheduled interval. Re-joins of known devices do NOT trigger this.
+                threading.Timer(
+                    5.0,
+                    lambda: _apply_mdns_enrichment(_mdns_browse()),
+                ).start()
             else:
                 if not was_online:
                     print(f"[~] Back online via {source}: {ip} ({mac})", flush=True)
@@ -2178,9 +2188,19 @@ def main() -> None:
                     trigger_deep_scan(scan_ip, dev.mac_address)
 
             threading.Thread(target=refresh_missing_hostnames, daemon=True).start()
-            mdns_data = _mdns_browse()
-            if mdns_data:
-                _apply_mdns_enrichment(mdns_data)
+
+            # Rate-limited mDNS: only run a full browse if MDNS_INTERVAL seconds
+            # have elapsed since the last run. New device joins trigger their own
+            # one-shot browse via upsert_seen_device(), so this is just a
+            # periodic refresh to catch any devices that were missed or updated.
+            _now_ts = time.monotonic()
+            global _last_mdns_browse
+            if (_now_ts - _last_mdns_browse) >= MDNS_INTERVAL:
+                print(f"[mdns] Scheduled browse (interval={MDNS_INTERVAL}s)", flush=True)
+                mdns_data = _mdns_browse()
+                if mdns_data:
+                    _apply_mdns_enrichment(mdns_data)
+                _last_mdns_browse = _now_ts
         except Exception as e:
             session.rollback()
             print(f"[!] Sweep error: {e}", flush=True)

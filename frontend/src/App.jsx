@@ -281,7 +281,7 @@ export default function App() {
 
   const filtered = useMemo(() => {
     let list = devices
-    if (!activeFilters.includes('ignored')) {
+    if (activeFilters['ignored'] !== 'include') {
       list = list.filter(d => !d.is_ignored)
     }
     list = list.filter(d => !d.is_virtual_interface)
@@ -323,7 +323,7 @@ export default function App() {
 
   const isDark = theme === 'dark'
   const isCategoryMode = layout === 'category'
-  const hasActiveSmartFilters = activeFilters.length > 0
+  const hasActiveSmartFilters = Object.keys(activeFilters).length > 0
   const activepageInfo = PAGES.find(p => p.id === activePage)
 
   return (
@@ -565,7 +565,7 @@ export default function App() {
                 <button
                   onClick={() => setShowFilters(v => !v)}
                   className="flex items-center gap-1.5 px-3 py-2 rounded-xl text-xs font-medium border transition-colors relative"
-                  style={showFilters || activeFilters.length > 0
+                  style={showFilters || Object.keys(activeFilters).length > 0
                     ? { background: 'var(--color-brand)', color: 'white', borderColor: 'transparent' }
                     : { background: 'var(--color-surface-offset)', color: 'var(--color-text-muted)', borderColor: 'var(--color-border)' }}
                   title="Toggle smart filters"
@@ -573,10 +573,10 @@ export default function App() {
                 >
                   <SlidersHorizontal size={13} />
                   <span>Filters</span>
-                  {activeFilters.length > 0 && !showFilters && (
+                  {Object.keys(activeFilters).length > 0 && !showFilters && (
                     <span className="ml-0.5 px-1.5 py-0.5 rounded-full text-[10px] font-bold"
                       style={{ background: 'rgba(255,255,255,0.25)', color: 'white' }}>
-                      {activeFilters.length}
+                      {Object.keys(activeFilters).length}
                     </span>
                   )}
                 </button>

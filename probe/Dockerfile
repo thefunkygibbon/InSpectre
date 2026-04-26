@@ -16,7 +16,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # Install Nuclei vulnerability scanner
-ARG NUCLEI_VERSION=3.4.4
+ARG NUCLEI_VERSION=3.8.0
 RUN wget -q "https://github.com/projectdiscovery/nuclei/releases/download/v${NUCLEI_VERSION}/nuclei_${NUCLEI_VERSION}_linux_amd64.zip" \
          -O /tmp/nuclei.zip \
     && unzip -q /tmp/nuclei.zip -d /tmp/nuclei_unzip \
