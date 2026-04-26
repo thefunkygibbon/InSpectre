@@ -560,7 +560,8 @@ async def run_vuln_scan(
             "-jsonl",
             "-no-color",
             "-duc",                          # disable update check
-            "-ni",                           # no interactsh
+            "-ni",  
+            "-no-httpx",          # ← ADD THIS — prevents httpx pre-probing non-HTTP ports                         # no interactsh
             "-severity", severity,
             "-exclude-tags", "nmap",
             "-timeout", "10",
@@ -586,7 +587,10 @@ async def run_vuln_scan(
 
             async def _collect_stdout() -> None:
                 assert proc.stdout
-                async for chunk in proc.stdout:
+                while True:
+                    chunk = await proc.stdout.read(65536)  # 64 KiB chunks, no line-length limit
+                    if not chunk:
+                        break
                     stdout_chunks.append(chunk.decode(errors="replace"))
 
             stdout_task = asyncio.create_task(_collect_stdout())

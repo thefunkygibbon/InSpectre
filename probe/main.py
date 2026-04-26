@@ -1791,11 +1791,19 @@ async def stream_vuln_scan(ip: str, templates: str = "", mac: str = ""):
         if mac:
             device = session.get(Device, mac.lower())
         else:
-            device = (
-                session.query(Device)
-                .filter((Device.primary_ip == ip) | (Device.ip_address == ip))
-                .first()
-            )
+            # Query primary_ip first — ip_address can be transiently flipped to a
+            # secondary address by the sniffer, causing a missed lookup at scan time.
+            device = session.query(Device).filter(Device.primary_ip == ip).first()
+            if not device:
+                device = session.query(Device).filter(Device.ip_address == ip).first()
+            if not device:
+                # Last resort: find via ip_history in case DHCP recently reassigned this IP
+                row = session.execute(
+                    text("SELECT mac_address FROM ip_history WHERE ip_address = :ip ORDER BY last_seen DESC LIMIT 1"),
+                    {"ip": ip}
+                ).fetchone()
+                if row:
+                    device = session.get(Device, row[0])
         if device and device.scan_results:
             for p in (device.scan_results.get("open_ports") or []):
                 if isinstance(p.get("port"), int):

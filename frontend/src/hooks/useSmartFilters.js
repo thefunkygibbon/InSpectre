@@ -47,6 +47,20 @@ export const SMART_FILTERS = [
     fn:          d => d.vuln_severity && !['clean', 'info'].includes(d.vuln_severity),
   },
   {
+    id:          'vuln_scanned',
+    label:       'Vuln scanned',
+    icon:        'ShieldCheck',
+    description: 'Devices that have had a vulnerability scan completed',
+    fn:          d => Boolean(d.vuln_last_scanned),
+  },
+  {
+    id:          'not_vuln_scanned',
+    label:       'Not vuln scanned',
+    icon:        'ShieldOff',
+    description: 'Devices that have never had a vulnerability scan run',
+    fn:          d => !d.vuln_last_scanned,
+  },
+  {
     id:          'blocked',
     label:       'Blocked',
     icon:        'Ban',
