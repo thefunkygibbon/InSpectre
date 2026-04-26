@@ -1,6 +1,6 @@
 import { useState, useEffect } from 'react'
 import {
-  ShieldAlert, ShieldCheck, RefreshCw,
+  ShieldAlert, ShieldCheck, RefreshCw, ScanLine,
   AlertTriangle, Info, Clock, ChevronDown, ChevronRight,
 } from 'lucide-react'
 import { api } from '../api'
@@ -82,6 +82,8 @@ export function SecurityDashboard({ onDeviceClick }) {
   const [loading,      setLoading]      = useState(true)
   const [error,        setError]        = useState(null)
   const [expandedVuln, setExpandedVuln] = useState({})
+  const [scanning,     setScanning]     = useState(false)
+  const [scanMsg,      setScanMsg]      = useState(null)
 
   async function load() {
     setLoading(true)
@@ -101,6 +103,19 @@ export function SecurityDashboard({ onDeviceClick }) {
   }
 
   useEffect(() => { load() }, [])
+
+  async function handleScanAll() {
+    setScanning(true)
+    setScanMsg(null)
+    try {
+      await api.scanAllVulns()
+      setScanMsg('Scan started — results will appear as devices complete.')
+    } catch (e) {
+      setScanMsg(`Error: ${e.message}`)
+    } finally {
+      setScanning(false)
+    }
+  }
 
   async function toggleVulnExpand(mac) {
     if (expandedVuln[mac]) {
@@ -138,10 +153,28 @@ export function SecurityDashboard({ onDeviceClick }) {
             </span>
             <h2 className="font-semibold" style={{ color: 'var(--color-text)' }}>Security Overview</h2>
           </div>
-          <button onClick={load} disabled={loading} className="btn-ghost p-2" title="Refresh data">
-            <RefreshCw size={15} className={loading ? 'animate-spin' : ''} />
-          </button>
+          <div className="flex items-center gap-2">
+            <button onClick={handleScanAll} disabled={scanning || loading}
+              className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold text-white disabled:opacity-50 transition-opacity"
+              style={{ background: 'var(--color-brand)' }}
+              title="Run vulnerability scan on all eligible devices">
+              <ScanLine size={13} className={scanning ? 'animate-pulse' : ''} />
+              {scanning ? 'Starting…' : 'Scan all devices'}
+            </button>
+            <button onClick={load} disabled={loading} className="btn-ghost p-2" title="Refresh data">
+              <RefreshCw size={15} className={loading ? 'animate-spin' : ''} />
+            </button>
+          </div>
         </div>
+
+        {scanMsg && (
+          <div className="mb-4 px-4 py-2.5 rounded-xl text-xs"
+            style={{ background: scanMsg.startsWith('Error') ? 'rgba(239,68,68,0.1)' : 'rgba(16,185,129,0.1)',
+                     color: scanMsg.startsWith('Error') ? '#f87171' : '#10b981',
+                     border: `1px solid ${scanMsg.startsWith('Error') ? 'rgba(239,68,68,0.2)' : 'rgba(16,185,129,0.2)'}` }}>
+            {scanMsg}
+          </div>
+        )}
 
         <div className="space-y-6">
 

@@ -4,7 +4,7 @@ import {
   Search, AlertCircle, Activity,
   LayoutGrid, List, Sun, Moon, ChevronDown,
   Bell, X, Layers, Star, ShieldAlert, Wrench, Ban, BarChart2,
-  ArrowLeft,
+  ArrowLeft, SlidersHorizontal,
 } from 'lucide-react'
 import { useDevices }          from './hooks/useDevices'
 import { useTheme }            from './hooks/useTheme'
@@ -228,7 +228,8 @@ export default function App() {
   const [drawerInitialTab, setDrawerInitialTab] = useState('overview')
   const [showSettings,     setShowSettings]     = useState(false)
   const [activePage,       setActivePage]       = useState(null) // null | 'tools' | 'security' | 'blocking' | 'timeline'
-  const [showAlertDrop, setShowAlertDrop] = useState(false)
+  const [showAlertDrop,    setShowAlertDrop]    = useState(false)
+  const [showFilters,      setShowFilters]      = useState(false)
 
   useEffect(() => {
     api.getSettings().then(s => {
@@ -347,9 +348,9 @@ export default function App() {
               ) : (
                 <>
                   <Logo size={30} />
-                  <div>
+                  <div className="hidden sm:block">
                     <span className="font-bold tracking-tight" style={{ color: 'var(--color-text)' }}>InSpectre</span>
-                    <span className="hidden sm:inline text-xs ml-2" style={{ color: 'var(--color-text-faint)' }}>Network Security Suite</span>
+                    <span className="hidden md:inline text-xs ml-2" style={{ color: 'var(--color-text-faint)' }}>Network Security Suite</span>
                   </div>
                 </>
               )}
@@ -546,18 +547,39 @@ export default function App() {
               </section>
 
               {/* Search / filter / sort / layout row */}
-              <section className="flex flex-col sm:flex-row gap-3 items-stretch sm:items-center">
-                <div className="relative flex-1">
+              <section className="flex flex-wrap gap-2 items-center">
+                <div className="relative" style={{ minWidth: '160px', flex: '1 1 160px', maxWidth: '340px' }}>
                   <Search size={15} className="absolute left-3 top-1/2 -translate-y-1/2 pointer-events-none"
                     style={{ color: 'var(--color-text-muted)' }} />
-                  <input className="input pl-9" placeholder="Search IP, MAC, hostname, vendor, tags…"
+                  <input className="input pl-9 w-full" placeholder="Search…"
                     value={search} onChange={e => setSearch(e.target.value)} />
                 </div>
 
+                {/* Filters toggle */}
+                <button
+                  onClick={() => setShowFilters(v => !v)}
+                  className="flex items-center gap-1.5 px-3 py-2 rounded-xl text-xs font-medium border transition-colors relative"
+                  style={showFilters || activeFilters.length > 0
+                    ? { background: 'var(--color-brand)', color: 'white', borderColor: 'transparent' }
+                    : { background: 'var(--color-surface-offset)', color: 'var(--color-text-muted)', borderColor: 'var(--color-border)' }}
+                  title="Toggle smart filters"
+                  aria-label="Toggle smart filters"
+                >
+                  <SlidersHorizontal size={13} />
+                  <span>Filters</span>
+                  {activeFilters.length > 0 && !showFilters && (
+                    <span className="ml-0.5 px-1.5 py-0.5 rounded-full text-[10px] font-bold"
+                      style={{ background: 'rgba(255,255,255,0.25)', color: 'white' }}>
+                      {activeFilters.length}
+                    </span>
+                  )}
+                </button>
+
+                {/* Sort — only in non-category mode */}
                 {!isCategoryMode && (
                   <div className="relative">
                     <select value={sort} onChange={e => setSort(e.target.value)}
-                      className="input pr-8 appearance-none cursor-pointer" aria-label="Sort devices">
+                      className="input pr-8 appearance-none cursor-pointer text-xs" aria-label="Sort devices">
                       {SORT_OPTIONS.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
                     </select>
                     <ChevronDown size={14} className="absolute right-3 top-1/2 -translate-y-1/2 pointer-events-none"
@@ -565,7 +587,7 @@ export default function App() {
                   </div>
                 )}
 
-                <div className="flex items-center gap-1 glass rounded-xl p-1">
+                <div className="flex items-center gap-1 glass rounded-xl p-1 ml-auto">
                   <button onClick={() => setLayout('grid')}
                     className="p-2 rounded-lg transition-all duration-150"
                     style={layout === 'grid' ? { background: 'var(--color-brand)', color: 'white' } : { color: 'var(--color-text-muted)' }}
@@ -584,19 +606,21 @@ export default function App() {
                 </div>
               </section>
 
-              {/* Smart filter bar */}
-              <section>
-                <SmartFilterBar
-                  devices={devices}
-                  activeFilters={activeFilters}
-                  onToggle={toggleFilter}
-                  onClear={clearFilters}
-                  savedViews={savedViews}
-                  onSaveView={saveView}
-                  onLoadView={loadView}
-                  onDeleteView={deleteView}
-                />
-              </section>
+              {/* Smart filter bar — collapsible */}
+              {showFilters && (
+                <section>
+                  <SmartFilterBar
+                    devices={devices}
+                    activeFilters={activeFilters}
+                    onToggle={toggleFilter}
+                    onClear={clearFilters}
+                    savedViews={savedViews}
+                    onSaveView={saveView}
+                    onLoadView={loadView}
+                    onDeleteView={deleteView}
+                  />
+                </section>
+              )}
 
               {/* Device list */}
               <section>
@@ -639,12 +663,17 @@ export default function App() {
                     ) : (
                       <div className="card overflow-hidden">
                         <div
-                          className="grid grid-cols-[1.5rem_2fr_1fr_1fr_1fr_6rem_2rem] gap-4 px-4 py-2.5 border-b
+                          className="grid grid-cols-[1.5rem_1fr_5rem_1.5rem] sm:grid-cols-[1.5rem_2fr_1fr_1fr_1fr_6rem_1.5rem] gap-3 sm:gap-4 px-4 py-2.5 border-b
                                      text-xs font-semibold uppercase tracking-wider"
                           style={{ borderColor: 'var(--color-border)', color: 'var(--color-text-muted)' }}
                         >
-                          <span /><span>Name / IP</span><span>MAC</span><span>Vendor</span>
-                          <span>Last Seen</span><span>Status</span><span />
+                          <span />
+                          <span>Name / IP</span>
+                          <span className="hidden sm:block">MAC</span>
+                          <span className="hidden sm:block">Vendor</span>
+                          <span className="hidden sm:block">Last Seen</span>
+                          <span>Status</span>
+                          <span />
                         </div>
                         {filtered.map((d, i) => (
                           <DeviceRow key={d.mac_address} device={d} onClick={() => openDevice(d)}
@@ -722,14 +751,15 @@ function SkeletonGrid({ layout }) {
     return (
       <div className="card overflow-hidden">
         {[...Array(6)].map((_, i) => (
-          <div key={i} className="grid grid-cols-[1.5rem_2fr_1fr_1fr_1fr_6rem] gap-4 px-4 py-3 border-b last:border-0"
+          <div key={i} className="grid grid-cols-[1.5rem_1fr_5rem_1.5rem] sm:grid-cols-[1.5rem_2fr_1fr_1fr_1fr_6rem_1.5rem] gap-3 sm:gap-4 px-4 py-3 border-b last:border-0 items-center"
             style={{ borderColor: 'var(--color-border)' }}>
-            <div className="skeleton w-2.5 h-2.5 rounded-full mt-1" />
+            <div className="skeleton w-2.5 h-2.5 rounded-full" />
             <div className="skeleton h-4 w-3/4" />
-            <div className="skeleton h-4 w-4/5" />
-            <div className="skeleton h-4 w-2/3" />
-            <div className="skeleton h-4 w-3/5" />
-            <div className="skeleton h-5 w-16 rounded-full" />
+            <div className="skeleton hidden sm:block h-4 w-4/5" />
+            <div className="skeleton hidden sm:block h-4 w-2/3" />
+            <div className="skeleton hidden sm:block h-4 w-3/5" />
+            <div className="skeleton h-5 w-14 rounded-full" />
+            <div />
           </div>
         ))}
       </div>

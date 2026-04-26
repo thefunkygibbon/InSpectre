@@ -111,6 +111,7 @@ export const api = {
   deleteVulnReport:     (mac, id)    => request('DELETE', `/devices/${mac}/vuln-reports/${id}`),
   getAllVulnReports:     (severity)   => request('GET',    `/vuln-reports${severity ? `?severity=${severity}` : ''}`),
   getVulnSummary:       ()           => request('GET',    '/vulns/summary'),
+  scanAllVulns:         ()           => request('POST',   '/vulns/scan-all'),
   getVulnTrend:         (days)       => request('GET',    `/vulns/trend${days ? `?days=${days}` : ''}`),
   getTopVulnDevices:    (limit)      => request('GET',    `/vulns/top-devices${limit ? `?limit=${limit}` : ''}`),
 

@@ -25,7 +25,8 @@ export function DeviceRow({ device, onClick, striped, onStarToggle, isVulnScanni
   return (
     <div
       onClick={onClick}
-      className={`grid grid-cols-[1.5rem_2fr_1fr_1fr_1fr_6rem_2rem] gap-4 px-4 py-3 border-b last:border-0
+      className={`grid grid-cols-[1.5rem_1fr_5rem_1.5rem] sm:grid-cols-[1.5rem_2fr_1fr_1fr_1fr_6rem_1.5rem]
+                  gap-3 sm:gap-4 px-4 py-3 border-b last:border-0
                   items-center cursor-pointer hover:bg-surface-offset transition-colors
                   ${striped ? 'bg-surface-offset/40' : ''}`}
       style={{ borderColor: 'var(--color-border)' }}
@@ -37,15 +38,15 @@ export function DeviceRow({ device, onClick, striped, onStarToggle, isVulnScanni
         <p className="text-xs font-mono truncate" style={{ color: 'var(--color-text-faint)' }}>{device.ip_address}</p>
       </div>
 
-      <span className="font-mono text-xs truncate" style={{ color: 'var(--color-text-muted)' }}>
+      <span className="hidden sm:block font-mono text-xs truncate" style={{ color: 'var(--color-text-muted)' }}>
         {device.mac_address}
       </span>
 
-      <span className="text-xs truncate" style={{ color: 'var(--color-text-muted)' }}>
+      <span className="hidden sm:block text-xs truncate" style={{ color: 'var(--color-text-muted)' }}>
         {cleanVendor(device.vendor_override || device.vendor)}
       </span>
 
-      <span className="text-xs" style={{ color: 'var(--color-text-faint)' }}>
+      <span className="hidden sm:block text-xs" style={{ color: 'var(--color-text-faint)' }}>
         {relativeTime(device.last_seen)}
       </span>
 
@@ -57,7 +58,7 @@ export function DeviceRow({ device, onClick, striped, onStarToggle, isVulnScanni
           {device.is_online ? 'Online' : 'Offline'}
         </span>
         {isVulnScanning && (
-          <span className="text-[10px] font-medium rounded-full px-2 py-0.5"
+          <span className="hidden sm:inline-flex text-[10px] font-medium rounded-full px-2 py-0.5"
             style={{ color: 'var(--color-brand)', background: 'color-mix(in srgb, var(--color-brand) 12%, transparent)', border: '1px solid color-mix(in srgb, var(--color-brand) 25%, transparent)' }}>
             Vuln Scan
           </span>

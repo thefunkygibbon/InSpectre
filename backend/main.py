@@ -1593,6 +1593,12 @@ def delete_suppression(suppression_id: int, db: Session = Depends(get_db)):
 # ---------------------------------------------------------------------------
 # Vuln trend + top devices (for dashboard)
 # ---------------------------------------------------------------------------
+@app.post("/vulns/scan-all")
+async def trigger_scan_all():
+    asyncio.ensure_future(_run_scheduled_vuln_scans())
+    return {"status": "started", "message": "Vulnerability scan initiated for all eligible devices"}
+
+
 @app.get("/vulns/trend")
 def get_vuln_trend(days: int = Query(default=30, le=90), db: Session = Depends(get_db)):
     try:
