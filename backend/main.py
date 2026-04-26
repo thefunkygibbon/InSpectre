@@ -12,7 +12,7 @@ import csv
 import io
 import socket
 import subprocess
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 import httpx
 
@@ -105,6 +105,21 @@ def _migrate(db: Session):
         """,
         "CREATE INDEX IF NOT EXISTS ix_alert_suppressions_mac  ON alert_suppressions(mac_address)",
         "CREATE INDEX IF NOT EXISTS ix_alert_suppressions_type ON alert_suppressions(event_type)",
+        # Block schedules — time-based internet blocking rules per device or network-wide
+        """
+        CREATE TABLE IF NOT EXISTS block_schedules (
+            id           SERIAL PRIMARY KEY,
+            mac_address  VARCHAR(17),
+            label        VARCHAR(100),
+            days_of_week VARCHAR(50) NOT NULL DEFAULT 'mon,tue,wed,thu,fri,sat,sun',
+            start_time   VARCHAR(5)  NOT NULL,
+            end_time     VARCHAR(5)  NOT NULL,
+            enabled      BOOLEAN     NOT NULL DEFAULT TRUE,
+            created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+        """,
+        "CREATE INDEX IF NOT EXISTS ix_block_schedules_mac ON block_schedules(mac_address)",
+        "ALTER TABLE devices ADD COLUMN IF NOT EXISTS is_schedule_blocked BOOLEAN NOT NULL DEFAULT FALSE",
     ]
     for sql in migrations:
         try:
@@ -145,6 +160,7 @@ DEFAULT_SETTINGS = {
     "ntfy_topic":              ("",       "ntfy topic name (leave blank to disable ntfy alerts)."),
     "gotify_url":              ("",       "Gotify server URL (leave blank to disable)."),
     "gotify_token":            ("",       "Gotify application token."),
+    "network_paused":          ("false",  "Whether internet access is paused for the whole network via ARP blocking."),
 }
 
 
@@ -476,6 +492,7 @@ async def on_startup():
         db.close()
     asyncio.ensure_future(_scheduled_vuln_scan_loop())
     asyncio.ensure_future(_alert_dispatch_loop())
+    asyncio.ensure_future(_block_schedule_loop())
 
 
 def get_db():
@@ -519,6 +536,21 @@ class NotifyPayload(BaseModel):
 
 class TestNotifyPayload(BaseModel):
     api_key: Optional[str] = None
+
+class BlockScheduleCreate(BaseModel):
+    mac_address:  Optional[str] = None
+    label:        Optional[str] = None
+    days_of_week: str  = "mon,tue,wed,thu,fri,sat,sun"
+    start_time:   str
+    end_time:     str
+    enabled:      bool = True
+
+class BlockScheduleUpdate(BaseModel):
+    label:        Optional[str]  = None
+    days_of_week: Optional[str]  = None
+    start_time:   Optional[str]  = None
+    end_time:     Optional[str]  = None
+    enabled:      Optional[bool] = None
 
 
 # ---------------------------------------------------------------------------
@@ -2397,3 +2429,349 @@ async def tools_email(domain: str = Query(...)):
             dkim[sel] = [r.strip('"') for r in recs]
     out["dkim"] = dkim
     return out
+
+
+# ---------------------------------------------------------------------------
+# Block schedules — CRUD
+# ---------------------------------------------------------------------------
+def _schedule_row_to_dict(row) -> dict:
+    return {
+        "id":           row[0],
+        "mac_address":  row[1],
+        "label":        row[2],
+        "days_of_week": row[3],
+        "start_time":   row[4],
+        "end_time":     row[5],
+        "enabled":      row[6],
+        "created_at":   row[7].isoformat() if row[7] else None,
+    }
+
+
+@app.get("/block-schedules")
+def list_block_schedules(db: Session = Depends(get_db)):
+    rows = db.execute(text(
+        "SELECT id, mac_address, label, days_of_week, start_time, end_time, enabled, created_at "
+        "FROM block_schedules ORDER BY created_at DESC"
+    )).fetchall()
+    return [_schedule_row_to_dict(r) for r in rows]
+
+
+@app.post("/block-schedules", status_code=201)
+def create_block_schedule(payload: BlockScheduleCreate, db: Session = Depends(get_db)):
+    if not payload.start_time or not payload.end_time:
+        raise HTTPException(400, "start_time and end_time are required")
+    row = db.execute(text(
+        "INSERT INTO block_schedules (mac_address, label, days_of_week, start_time, end_time, enabled) "
+        "VALUES (:mac, :label, :days, :start, :end, :enabled) RETURNING id, mac_address, label, days_of_week, start_time, end_time, enabled, created_at"
+    ), {
+        "mac":     payload.mac_address,
+        "label":   payload.label or "",
+        "days":    payload.days_of_week,
+        "start":   payload.start_time,
+        "end":     payload.end_time,
+        "enabled": payload.enabled,
+    }).fetchone()
+    db.commit()
+    return _schedule_row_to_dict(row)
+
+
+@app.patch("/block-schedules/{schedule_id}")
+def update_block_schedule(schedule_id: int, payload: BlockScheduleUpdate, db: Session = Depends(get_db)):
+    existing = db.execute(text(
+        "SELECT id FROM block_schedules WHERE id = :id"
+    ), {"id": schedule_id}).fetchone()
+    if not existing:
+        raise HTTPException(404, "Schedule not found")
+    updates = {}
+    if payload.label        is not None: updates["label"]        = payload.label
+    if payload.days_of_week is not None: updates["days_of_week"] = payload.days_of_week
+    if payload.start_time   is not None: updates["start_time"]   = payload.start_time
+    if payload.end_time     is not None: updates["end_time"]     = payload.end_time
+    if payload.enabled      is not None: updates["enabled"]      = payload.enabled
+    if updates:
+        set_clause = ", ".join(f"{k} = :{k}" for k in updates)
+        updates["id"] = schedule_id
+        db.execute(text(f"UPDATE block_schedules SET {set_clause} WHERE id = :id"), updates)
+        db.commit()
+    row = db.execute(text(
+        "SELECT id, mac_address, label, days_of_week, start_time, end_time, enabled, created_at "
+        "FROM block_schedules WHERE id = :id"
+    ), {"id": schedule_id}).fetchone()
+    return _schedule_row_to_dict(row)
+
+
+@app.delete("/block-schedules/{schedule_id}", status_code=204)
+def delete_block_schedule(schedule_id: int, db: Session = Depends(get_db)):
+    db.execute(text("DELETE FROM block_schedules WHERE id = :id"), {"id": schedule_id})
+    db.commit()
+
+
+# ---------------------------------------------------------------------------
+# Network pause / resume (ARP-blocks all non-ignored devices)
+# ---------------------------------------------------------------------------
+@app.get("/network/status")
+def network_status(db: Session = Depends(get_db)):
+    setting = db.get(Setting, "network_paused")
+    paused = (setting.value if setting else "false") == "true"
+    blocked_count = db.execute(text("SELECT COUNT(*) FROM devices WHERE is_blocked = TRUE")).scalar()
+    return {"paused": paused, "blocked_count": int(blocked_count or 0)}
+
+
+@app.post("/network/pause")
+async def network_pause(db: Session = Depends(get_db)):
+    devices = db.execute(text(
+        "SELECT mac_address, ip_address FROM devices WHERE is_ignored = FALSE AND is_blocked = FALSE AND ip_address IS NOT NULL"
+    )).fetchall()
+    errors = []
+    async def _block_one(mac: str, ip: str):
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                await client.post(f"{PROBE_URL}/block/{mac.lower()}")
+        except Exception as e:
+            errors.append(str(e))
+    await asyncio.gather(*[_block_one(r[0], r[1]) for r in devices])
+    db.execute(text("UPDATE devices SET is_blocked = TRUE WHERE is_ignored = FALSE AND ip_address IS NOT NULL"))
+    setting = db.get(Setting, "network_paused")
+    if setting:
+        setting.value = "true"
+    else:
+        db.execute(text("INSERT INTO settings (key, value) VALUES ('network_paused', 'true')"))
+    db.commit()
+    return {"paused": True, "blocked": len(devices), "errors": errors}
+
+
+@app.post("/network/resume")
+async def network_resume(db: Session = Depends(get_db)):
+    devices = db.execute(text(
+        "SELECT mac_address, ip_address FROM devices WHERE is_blocked = TRUE AND ip_address IS NOT NULL"
+    )).fetchall()
+    errors = []
+    async def _unblock_one(mac: str):
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                await client.delete(f"{PROBE_URL}/block/{mac.lower()}")
+        except Exception as e:
+            errors.append(str(e))
+    await asyncio.gather(*[_unblock_one(r[0]) for r in devices])
+    db.execute(text("UPDATE devices SET is_blocked = FALSE, is_schedule_blocked = FALSE WHERE is_blocked = TRUE"))
+    setting = db.get(Setting, "network_paused")
+    if setting:
+        setting.value = "false"
+    else:
+        db.execute(text("INSERT INTO settings (key, value) VALUES ('network_paused', 'false')"))
+    db.commit()
+    return {"paused": False, "unblocked": len(devices), "errors": errors}
+
+
+# ---------------------------------------------------------------------------
+# Device online/offline timeline
+# ---------------------------------------------------------------------------
+@app.get("/timeline")
+def get_timeline(days: int = Query(7, ge=1, le=365), db: Session = Depends(get_db)):
+    now = datetime.now(timezone.utc)
+    window_start = now - timedelta(days=days)
+
+    # Fetch all online/offline/joined events for all devices in the window
+    # plus the most recent event before the window to know starting state
+    rows = db.execute(text("""
+        SELECT de.mac_address, de.type, de.created_at,
+               COALESCE(d.custom_name, d.hostname, d.ip_address, de.mac_address) AS display_name,
+               d.ip_address, d.is_online
+        FROM device_events de
+        JOIN devices d ON d.mac_address = de.mac_address
+        WHERE de.type IN ('online', 'offline', 'joined')
+          AND de.created_at >= :window_start
+          AND d.is_ignored = FALSE
+        ORDER BY de.mac_address, de.created_at ASC
+    """), {"window_start": window_start}).fetchall()
+
+    # Also get the last event before window for each device (to know initial state)
+    prior_rows = db.execute(text("""
+        SELECT DISTINCT ON (de.mac_address)
+               de.mac_address, de.type, de.created_at
+        FROM device_events de
+        JOIN devices d ON d.mac_address = de.mac_address
+        WHERE de.type IN ('online', 'offline', 'joined')
+          AND de.created_at < :window_start
+          AND d.is_ignored = FALSE
+        ORDER BY de.mac_address, de.created_at DESC
+    """), {"window_start": window_start}).fetchall()
+
+    # Get all relevant devices (those with events in window or active devices)
+    device_info = db.execute(text("""
+        SELECT mac_address,
+               COALESCE(custom_name, hostname, ip_address, mac_address) AS display_name,
+               ip_address, is_online
+        FROM devices WHERE is_ignored = FALSE
+        ORDER BY display_name
+    """)).fetchall()
+
+    prior_state: dict = {}
+    for r in prior_rows:
+        mac, etype, ts = r[0], r[1], r[2]
+        prior_state[mac] = "online" if etype in ("online", "joined") else "offline"
+
+    # Group events by device
+    events_by_mac: dict = {}
+    for r in rows:
+        mac = r[0]
+        events_by_mac.setdefault(mac, []).append({
+            "type": r[1], "ts": r[2]
+        })
+
+    # Only include devices that have events in window or are currently known
+    seen_macs = set(events_by_mac.keys()) | set(prior_state.keys())
+    device_map = {r[0]: {"name": r[1], "ip": r[2], "is_online": r[3]} for r in device_info}
+
+    result_devices = []
+    for mac, info in device_map.items():
+        if mac not in seen_macs:
+            continue
+
+        evts = events_by_mac.get(mac, [])
+        initial = prior_state.get(mac, "unknown")
+
+        # Build segments
+        segments = []
+        seg_start = window_start
+        seg_status = initial
+
+        for ev in evts:
+            seg_end = ev["ts"]
+            if seg_end > seg_start:
+                segments.append({
+                    "from": seg_start.isoformat(),
+                    "to":   seg_end.isoformat(),
+                    "status": seg_status,
+                })
+            seg_start = seg_end
+            seg_status = "online" if ev["type"] in ("online", "joined") else "offline"
+
+        # Final segment up to now
+        segments.append({
+            "from": seg_start.isoformat(),
+            "to":   now.isoformat(),
+            "status": seg_status,
+        })
+
+        result_devices.append({
+            "mac":        mac,
+            "name":       info["name"],
+            "ip":         info["ip"],
+            "is_online":  info["is_online"],
+            "segments":   segments,
+        })
+
+    # Sort: online first, then by name
+    result_devices.sort(key=lambda d: (0 if d["is_online"] else 1, d["name"] or ""))
+
+    return {
+        "window_start": window_start.isoformat(),
+        "window_end":   now.isoformat(),
+        "days":         days,
+        "devices":      result_devices,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Block schedule enforcement background loop
+# ---------------------------------------------------------------------------
+_DAY_ABBREVS = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
+
+
+def _schedule_active_now(days_of_week: str, start_time: str, end_time: str) -> bool:
+    """Return True if current local time falls within the schedule window."""
+    now_local = datetime.now()
+    current_day = _DAY_ABBREVS[now_local.weekday()]
+    allowed_days = [d.strip().lower() for d in days_of_week.split(",")]
+    if current_day not in allowed_days:
+        return False
+    try:
+        sh, sm = map(int, start_time.split(":"))
+        eh, em = map(int, end_time.split(":"))
+        start_mins = sh * 60 + sm
+        end_mins   = eh * 60 + em
+        now_mins   = now_local.hour * 60 + now_local.minute
+        if end_mins > start_mins:
+            return start_mins <= now_mins < end_mins
+        else:
+            # overnight schedule
+            return now_mins >= start_mins or now_mins < end_mins
+    except Exception:
+        return False
+
+
+async def _block_schedule_loop():
+    await asyncio.sleep(15)  # wait for startup to settle
+    while True:
+        try:
+            db = SessionLocal()
+            try:
+                schedules = db.execute(text(
+                    "SELECT id, mac_address, days_of_week, start_time, end_time FROM block_schedules WHERE enabled = TRUE"
+                )).fetchall()
+
+                # Build set of (mac_or_None, should_be_blocked) from all schedules
+                # mac_address=None means network-wide
+                device_should_block: dict = {}  # mac -> bool (True = schedule says block)
+
+                for sched in schedules:
+                    _, mac, days, start, end = sched
+                    active = _schedule_active_now(days, start, end)
+                    if mac:
+                        # Per-device schedule
+                        if mac not in device_should_block:
+                            device_should_block[mac] = False
+                        if active:
+                            device_should_block[mac] = True
+                    else:
+                        # Network-wide: apply to all non-ignored devices
+                        all_macs = db.execute(text(
+                            "SELECT mac_address FROM devices WHERE is_ignored = FALSE"
+                        )).scalars().all()
+                        for m in all_macs:
+                            if m not in device_should_block:
+                                device_should_block[m] = False
+                            if active:
+                                device_should_block[m] = True
+
+                # Apply changes
+                for mac, should_block in device_should_block.items():
+                    dev = db.execute(text(
+                        "SELECT is_blocked, is_schedule_blocked, ip_address FROM devices WHERE mac_address = :mac"
+                    ), {"mac": mac}).fetchone()
+                    if not dev:
+                        continue
+                    is_blocked, is_sched_blocked, ip = dev
+
+                    if should_block and not is_sched_blocked:
+                        # Need to block
+                        try:
+                            async with httpx.AsyncClient(timeout=8.0) as client:
+                                await client.post(f"{PROBE_URL}/block/{mac.lower()}")
+                        except Exception:
+                            pass
+                        db.execute(text(
+                            "UPDATE devices SET is_blocked = TRUE, is_schedule_blocked = TRUE WHERE mac_address = :mac"
+                        ), {"mac": mac})
+                        _add_event(db, mac, "blocked", {"ip": ip, "reason": "schedule"})
+
+                    elif not should_block and is_sched_blocked:
+                        # Schedule says unblock (only if blocked by schedule, not manually)
+                        try:
+                            async with httpx.AsyncClient(timeout=8.0) as client:
+                                await client.delete(f"{PROBE_URL}/block/{mac.lower()}")
+                        except Exception:
+                            pass
+                        db.execute(text(
+                            "UPDATE devices SET is_blocked = FALSE, is_schedule_blocked = FALSE WHERE mac_address = :mac"
+                        ), {"mac": mac})
+                        _add_event(db, mac, "unblocked", {"ip": ip, "reason": "schedule_end"})
+
+                db.commit()
+            finally:
+                db.close()
+        except Exception as exc:
+            print(f"[block_schedule_loop] error: {exc}", flush=True)
+
+        await asyncio.sleep(60)

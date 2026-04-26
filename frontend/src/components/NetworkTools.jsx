@@ -1,5 +1,5 @@
 import { useState, useCallback } from 'react'
-import { X, Wifi, Globe, Shield, Server, Mail, ChevronRight, Loader } from 'lucide-react'
+import { Wifi, Globe, Shield, Server, Mail, ChevronRight, Loader, Menu, X } from 'lucide-react'
 import { useStreamAction } from '../hooks/useStreamAction'
 import { StreamOutput } from './StreamOutput'
 import { api } from '../api'
@@ -93,8 +93,8 @@ function PingTool() {
   }
   return (
     <ToolCard title="Ping">
-      <form onSubmit={handleSubmit} className="flex gap-2">
-        <input className="input flex-1 text-xs" placeholder="Host or IP address"
+      <form onSubmit={handleSubmit} className="flex flex-wrap gap-2">
+        <input className="input flex-1 text-xs min-w-0" placeholder="Host or IP address"
           value={host} onChange={e => setHost(e.target.value)} />
         <button type="submit" disabled={stream.running}
           className="px-3 py-1.5 rounded-lg text-xs font-semibold text-white disabled:opacity-50"
@@ -125,8 +125,8 @@ function TracerouteTool() {
   }
   return (
     <ToolCard title="Traceroute">
-      <form onSubmit={handleSubmit} className="flex gap-2">
-        <input className="input flex-1 text-xs" placeholder="Host or IP address"
+      <form onSubmit={handleSubmit} className="flex flex-wrap gap-2">
+        <input className="input flex-1 text-xs min-w-0" placeholder="Host or IP address"
           value={host} onChange={e => setHost(e.target.value)} />
         <button type="submit" disabled={stream.running}
           className="px-3 py-1.5 rounded-lg text-xs font-semibold text-white disabled:opacity-50"
@@ -159,13 +159,13 @@ function PortScanTool() {
   return (
     <ToolCard title="Port Scanner">
       <form onSubmit={handleSubmit} className="space-y-2">
-        <div className="flex gap-2">
-          <input className="input flex-1 text-xs" placeholder="Host or IP address"
+        <div className="flex flex-wrap gap-2">
+          <input className="input flex-1 text-xs min-w-0" placeholder="Host or IP address"
             value={host} onChange={e => setHost(e.target.value)} />
-          <input className="input w-32 text-xs font-mono" placeholder="Ports (e.g. 1-1024)"
+          <input className="input w-full sm:w-32 text-xs font-mono" placeholder="Ports (e.g. 1-1024)"
             value={ports} onChange={e => setPorts(e.target.value)} />
         </div>
-        <div className="flex gap-2 items-center">
+        <div className="flex gap-2 items-center flex-wrap">
           <button type="submit" disabled={stream.running}
             className="px-3 py-1.5 rounded-lg text-xs font-semibold text-white disabled:opacity-50"
             style={{ background: 'var(--color-brand)' }}>
@@ -197,8 +197,8 @@ function ReverseDnsTool() {
   }
   return (
     <ToolCard title="Reverse DNS (PTR)">
-      <form onSubmit={handleSubmit} className="flex gap-2">
-        <input className="input flex-1 text-xs font-mono" placeholder="IP address"
+      <form onSubmit={handleSubmit} className="flex flex-wrap gap-2">
+        <input className="input flex-1 text-xs font-mono min-w-0" placeholder="IP address"
           value={ip} onChange={e => setIp(e.target.value)} />
         <SubmitBtn loading={loading}>Lookup</SubmitBtn>
       </form>
@@ -231,8 +231,8 @@ function DnsLookupTool() {
   return (
     <ToolCard title="DNS Record Lookup">
       <form onSubmit={handleSubmit} className="flex gap-2 flex-wrap">
-        <input className="input flex-1 text-xs" placeholder="Domain or hostname"
-          value={host} onChange={e => setHost(e.target.value)} style={{ minWidth: 180 }} />
+        <input className="input flex-1 text-xs min-w-0" placeholder="Domain or hostname"
+          value={host} onChange={e => setHost(e.target.value)} style={{ minWidth: 140 }} />
         <select className="input w-24 text-xs" value={type} onChange={e => setType(e.target.value)}>
           {DNS_TYPES.map(t => <option key={t}>{t}</option>)}
         </select>
@@ -240,7 +240,7 @@ function DnsLookupTool() {
       </form>
       {result && (
         <div className="mt-3">
-          <div className="flex items-center gap-2 mb-2">
+          <div className="flex items-center gap-2 mb-2 flex-wrap">
             <span className="text-xs font-mono text-[#8b949e]">{result.host}</span>
             <span className="px-1.5 py-0.5 rounded text-[10px] font-semibold bg-[#161b22] text-[#8b949e]">{result.type}</span>
             {result.ttl != null && <span className="text-[10px] text-[#8b949e]">TTL {result.ttl}s</span>}
@@ -268,8 +268,8 @@ function DnsPropagationTool() {
   return (
     <ToolCard title="DNS Propagation Checker">
       <form onSubmit={handleSubmit} className="flex gap-2 flex-wrap">
-        <input className="input flex-1 text-xs" placeholder="Domain name"
-          value={host} onChange={e => setHost(e.target.value)} style={{ minWidth: 180 }} />
+        <input className="input flex-1 text-xs min-w-0" placeholder="Domain name"
+          value={host} onChange={e => setHost(e.target.value)} style={{ minWidth: 140 }} />
         <select className="input w-24 text-xs" value={type} onChange={e => setType(e.target.value)}>
           {propTypes.map(t => <option key={t}>{t}</option>)}
         </select>
@@ -312,14 +312,14 @@ function HttpHeadersTool() {
   ]
   return (
     <ToolCard title="HTTP Header Checker">
-      <form onSubmit={handleSubmit} className="flex gap-2">
-        <input className="input flex-1 text-xs font-mono" placeholder="https://example.com"
+      <form onSubmit={handleSubmit} className="flex flex-wrap gap-2">
+        <input className="input flex-1 text-xs font-mono min-w-0" placeholder="https://example.com"
           value={url} onChange={e => setUrl(e.target.value)} />
         <SubmitBtn loading={loading}>Check</SubmitBtn>
       </form>
       {result && (
         <div className="mt-3 space-y-3">
-          <div className="flex items-center gap-2">
+          <div className="flex items-center gap-2 flex-wrap">
             <span className={`px-2 py-0.5 rounded text-xs font-mono font-semibold ${
               result.status < 300 ? 'bg-green-500/15 text-green-400' :
               result.status < 400 ? 'bg-yellow-500/15 text-yellow-400' : 'bg-red-500/15 text-red-400'
@@ -330,7 +330,6 @@ function HttpHeadersTool() {
               <span className="text-xs text-[#8b949e] font-mono truncate max-w-xs">→ {result.redirect}</span>
             )}
           </div>
-
           <div>
             <p className="text-[10px] uppercase tracking-wider text-[#8b949e] mb-1">Security Headers</p>
             <div className="space-y-0.5">
@@ -339,7 +338,7 @@ function HttpHeadersTool() {
                 return (
                   <div key={h} className="flex items-start gap-2 text-xs py-1 px-2 rounded bg-[#161b22]">
                     <span className={`mt-0.5 w-1.5 h-1.5 rounded-full shrink-0 ${val ? 'bg-green-500' : 'bg-red-500/60'}`} />
-                    <span className="font-mono text-[#8b949e] w-56 shrink-0 truncate">{h}</span>
+                    <span className="font-mono text-[#8b949e] w-48 shrink-0 truncate text-[10px]">{h}</span>
                     {val ? <span className="text-[#c9d1d9] font-mono text-[10px] break-all">{val}</span>
                           : <span className="text-[#8b949e] italic text-[10px]">not set</span>}
                   </div>
@@ -347,13 +346,12 @@ function HttpHeadersTool() {
               })}
             </div>
           </div>
-
           <details className="text-xs">
             <summary className="cursor-pointer text-[#8b949e] hover:text-[#c9d1d9]">All headers ({Object.keys(result.headers).length})</summary>
             <div className="mt-2 space-y-0">
               {Object.entries(result.headers).map(([k, v]) => (
                 <div key={k} className="flex gap-2 py-0.5 border-b border-[#21262d] last:border-0">
-                  <span className="w-48 shrink-0 font-mono text-[10px] text-[#8b949e] truncate">{k}</span>
+                  <span className="w-40 shrink-0 font-mono text-[10px] text-[#8b949e] truncate">{k}</span>
                   <span className="font-mono text-[10px] text-[#c9d1d9] break-all">{v}</span>
                 </div>
               ))}
@@ -375,19 +373,15 @@ function SslTool() {
     if (!host.trim()) return
     run(() => api.toolsSsl(host.trim(), parseInt(port) || 443))
   }
-
   function certAge(notAfter) {
     if (!notAfter) return null
     const d = new Date(notAfter)
-    const now = new Date()
-    const days = Math.round((d - now) / 86400000)
-    return days
+    return Math.round((d - new Date()) / 86400000)
   }
-
   return (
     <ToolCard title="SSL/TLS Certificate">
-      <form onSubmit={handleSubmit} className="flex gap-2">
-        <input className="input flex-1 text-xs" placeholder="Hostname (no https://)"
+      <form onSubmit={handleSubmit} className="flex flex-wrap gap-2">
+        <input className="input flex-1 text-xs min-w-0" placeholder="Hostname (no https://)"
           value={host} onChange={e => setHost(e.target.value)} />
         <input className="input w-20 text-xs font-mono" placeholder="Port"
           value={port} onChange={e => setPort(e.target.value)} />
@@ -395,7 +389,7 @@ function SslTool() {
       </form>
       {result && (
         <div className="mt-3 space-y-2">
-          <div className="flex items-center gap-2">
+          <div className="flex items-center gap-2 flex-wrap">
             <span className={`px-2 py-0.5 rounded text-xs font-semibold ${result.valid ? 'bg-green-500/15 text-green-400' : 'bg-red-500/15 text-red-400'}`}>
               {result.valid ? 'Valid' : 'Invalid'}
             </span>
@@ -442,8 +436,8 @@ function GeoTool() {
   return (
     <ToolCard title="IP Geolocation">
       <p className="text-[10px] text-[#8b949e] mb-2">Uses ip-api.com (free, no key required)</p>
-      <form onSubmit={handleSubmit} className="flex gap-2">
-        <input className="input flex-1 text-xs font-mono" placeholder="IP address"
+      <form onSubmit={handleSubmit} className="flex flex-wrap gap-2">
+        <input className="input flex-1 text-xs font-mono min-w-0" placeholder="IP address"
           value={ip} onChange={e => setIp(e.target.value)} />
         <SubmitBtn loading={loading}>Lookup</SubmitBtn>
       </form>
@@ -479,8 +473,8 @@ function WhoisTool() {
   }
   return (
     <ToolCard title="WHOIS Lookup">
-      <form onSubmit={handleSubmit} className="flex gap-2">
-        <input className="input flex-1 text-xs" placeholder="Domain or IP address"
+      <form onSubmit={handleSubmit} className="flex flex-wrap gap-2">
+        <input className="input flex-1 text-xs min-w-0" placeholder="Domain or IP address"
           value={host} onChange={e => setHost(e.target.value)} />
         <SubmitBtn loading={loading}>Lookup</SubmitBtn>
       </form>
@@ -507,7 +501,6 @@ function EmailTool() {
     if (!domain.trim()) return
     run(() => api.toolsEmail(domain.trim()))
   }
-
   function spfStatus(records) {
     if (!records?.length) return { color: '#f87171', label: 'Missing' }
     return { color: '#22c55e', label: 'Present' }
@@ -515,16 +508,15 @@ function EmailTool() {
   function dmarcStatus(records) {
     if (!records?.length) return { color: '#f87171', label: 'Missing' }
     const r = records[0] || ''
-    if (r.includes('p=none'))     return { color: '#fbbf24', label: 'None (monitoring only)' }
+    if (r.includes('p=none'))       return { color: '#fbbf24', label: 'None (monitoring only)' }
     if (r.includes('p=quarantine')) return { color: '#f59e0b', label: 'Quarantine' }
-    if (r.includes('p=reject'))   return { color: '#22c55e', label: 'Reject' }
+    if (r.includes('p=reject'))     return { color: '#22c55e', label: 'Reject' }
     return { color: '#fbbf24', label: 'Present' }
   }
-
   return (
     <ToolCard title="Email Server Analysis">
-      <form onSubmit={handleSubmit} className="flex gap-2">
-        <input className="input flex-1 text-xs" placeholder="Domain (e.g. example.com)"
+      <form onSubmit={handleSubmit} className="flex flex-wrap gap-2">
+        <input className="input flex-1 text-xs min-w-0" placeholder="Domain (e.g. example.com)"
           value={domain} onChange={e => setDomain(e.target.value)} />
         <SubmitBtn loading={loading}>Analyse</SubmitBtn>
       </form>
@@ -534,8 +526,7 @@ function EmailTool() {
             <p className="text-[10px] uppercase tracking-wider text-[#8b949e] mb-1.5">MX Records</p>
             <RecordList records={result.mx} />
           </div>
-
-          <div className="grid grid-cols-2 gap-3">
+          <div className="grid grid-cols-2 sm:grid-cols-3 gap-3">
             {[
               { name: 'SPF',   ...spfStatus(result.spf) },
               { name: 'DMARC', ...dmarcStatus(result.dmarc) },
@@ -549,32 +540,28 @@ function EmailTool() {
               <div key={s.name} className="flex items-center gap-2 px-3 py-2 rounded-lg bg-[#161b22]">
                 <span className="w-2 h-2 rounded-full shrink-0" style={{ background: s.color }} />
                 <span className="text-xs text-[#8b949e] w-14 shrink-0">{s.name}</span>
-                <span className="text-xs font-semibold" style={{ color: s.color }}>{s.label}</span>
+                <span className="text-xs font-semibold truncate" style={{ color: s.color }}>{s.label}</span>
               </div>
             ))}
           </div>
-
           {result.spf?.length > 0 && (
             <div>
               <p className="text-[10px] uppercase tracking-wider text-[#8b949e] mb-1">SPF Record</p>
               <RecordList records={result.spf} />
             </div>
           )}
-
           {result.dmarc?.length > 0 && (
             <div>
               <p className="text-[10px] uppercase tracking-wider text-[#8b949e] mb-1">DMARC Record</p>
               <RecordList records={result.dmarc} />
             </div>
           )}
-
           {Object.entries(result.dkim || {}).map(([sel, recs]) => (
             <div key={sel}>
               <p className="text-[10px] uppercase tracking-wider text-[#8b949e] mb-1">DKIM ({sel})</p>
               <RecordList records={recs} />
             </div>
           ))}
-
           {result.nameservers?.length > 0 && (
             <div>
               <p className="text-[10px] uppercase tracking-wider text-[#8b949e] mb-1">Nameservers</p>
@@ -589,7 +576,7 @@ function EmailTool() {
 }
 
 // ---------------------------------------------------------------------------
-// Main panel
+// Main page component
 // ---------------------------------------------------------------------------
 const SECTIONS = [
   { id: 'ip',    label: 'IP Tools',       Icon: Wifi,   desc: 'Ping · Traceroute · Port scan · Reverse DNS' },
@@ -599,91 +586,105 @@ const SECTIONS = [
   { id: 'email', label: 'Email Tools',    Icon: Mail,   desc: 'MX · SPF · DMARC · DKIM' },
 ]
 
-export function NetworkTools({ onClose }) {
-  const [section, setSection] = useState('ip')
+export function NetworkTools() {
+  const [section,      setSection]      = useState('ip')
+  const [sidebarOpen,  setSidebarOpen]  = useState(false)
+
+  const activeSection = SECTIONS.find(s => s.id === section)
+
+  function selectSection(id) {
+    setSection(id)
+    setSidebarOpen(false)
+  }
 
   return (
-    <div className="fixed inset-0 z-50 flex" style={{ background: 'rgba(0,0,0,0.7)' }}>
-      <div className="flex flex-1 m-0 sm:m-4 rounded-0 sm:rounded-2xl overflow-hidden border border-[#30363d]"
-        style={{ background: 'var(--color-surface)', maxHeight: '100vh' }}>
+    <div className="flex gap-0 sm:gap-6 min-h-[60vh]">
 
-        {/* Sidebar */}
-        <div className="w-52 shrink-0 border-r border-[#30363d] flex flex-col bg-[#0d1117]">
-          <div className="px-4 py-4 border-b border-[#21262d]">
-            <p className="text-sm font-semibold" style={{ color: 'var(--color-text)' }}>Network Tools</p>
-            <p className="text-[10px] mt-0.5" style={{ color: 'var(--color-text-faint)' }}>Diagnostics & analysis</p>
+      {/* Mobile nav toggle */}
+      <div className="sm:hidden mb-4 flex items-center gap-3">
+        <button onClick={() => setSidebarOpen(v => !v)}
+          className="btn-ghost p-2 flex items-center gap-2 text-xs"
+          aria-label="Toggle tool categories">
+          <Menu size={16} />
+          <span>{activeSection?.label}</span>
+        </button>
+      </div>
+
+      {/* Sidebar — hidden on mobile unless open */}
+      <div className={`
+        sm:block w-48 shrink-0
+        ${sidebarOpen ? 'fixed inset-0 z-40 flex items-start pt-16 bg-black/60' : 'hidden sm:block'}
+      `}
+        onClick={e => { if (e.target === e.currentTarget) setSidebarOpen(false) }}>
+        <div className={`
+          ${sidebarOpen ? 'w-56 rounded-xl mx-4 shadow-2xl' : 'w-48'}
+          border rounded-xl overflow-hidden
+        `} style={{ background: '#0d1117', borderColor: '#30363d' }}>
+          <div className="px-4 py-3 border-b border-[#21262d] flex items-center justify-between">
+            <div>
+              <p className="text-xs font-semibold" style={{ color: 'var(--color-text)' }}>Network Tools</p>
+              <p className="text-[10px] mt-0.5 text-[#8b949e]">Diagnostics & analysis</p>
+            </div>
+            {sidebarOpen && (
+              <button onClick={() => setSidebarOpen(false)} className="p-1 text-[#8b949e]"><X size={14} /></button>
+            )}
           </div>
-          <nav className="flex-1 overflow-y-auto p-2 space-y-0.5">
+          <nav className="p-2 space-y-0.5">
             {SECTIONS.map(s => (
               <button key={s.id}
-                onClick={() => setSection(s.id)}
+                onClick={() => selectSection(s.id)}
                 className="w-full flex items-center gap-2.5 px-3 py-2.5 rounded-lg text-left transition-colors"
                 style={section === s.id
                   ? { background: 'var(--color-brand)', color: 'white' }
-                  : { color: 'var(--color-text-muted)' }}>
+                  : { color: '#8b949e' }}>
                 <s.Icon size={14} className="shrink-0" />
                 <span className="text-xs font-medium">{s.label}</span>
               </button>
             ))}
           </nav>
-          <div className="p-3 border-t border-[#21262d]">
-            <button onClick={onClose}
-              className="w-full flex items-center justify-center gap-2 py-2 rounded-lg text-xs text-[#8b949e] hover:text-white border border-[#30363d] transition-colors">
-              <X size={12} /> Close
-            </button>
-          </div>
+        </div>
+      </div>
+
+      {/* Content area */}
+      <div className="flex-1 min-w-0">
+        <div className="mb-4 hidden sm:block">
+          <p className="text-sm font-semibold" style={{ color: 'var(--color-text)' }}>
+            {activeSection?.label}
+          </p>
+          <p className="text-[10px] mt-0.5" style={{ color: 'var(--color-text-faint)' }}>
+            {activeSection?.desc}
+          </p>
         </div>
 
-        {/* Content */}
-        <div className="flex-1 overflow-y-auto">
-          {/* Header */}
-          <div className="sticky top-0 z-10 px-6 py-4 border-b border-[#30363d] flex items-center justify-between"
-            style={{ background: 'var(--color-surface)' }}>
-            <div>
-              <p className="text-sm font-semibold" style={{ color: 'var(--color-text)' }}>
-                {SECTIONS.find(s => s.id === section)?.label}
-              </p>
-              <p className="text-[10px] mt-0.5" style={{ color: 'var(--color-text-faint)' }}>
-                {SECTIONS.find(s => s.id === section)?.desc}
-              </p>
-            </div>
-            <button onClick={onClose} className="btn-ghost p-2" aria-label="Close">
-              <X size={16} />
-            </button>
-          </div>
-
-          <div className="p-6">
-            {section === 'ip' && (
-              <>
-                <PingTool />
-                <TracerouteTool />
-                <PortScanTool />
-                <ReverseDnsTool />
-              </>
-            )}
-            {section === 'dns' && (
-              <>
-                <DnsLookupTool />
-                <DnsPropagationTool />
-              </>
-            )}
-            {section === 'web' && (
-              <>
-                <HttpHeadersTool />
-                <SslTool />
-              </>
-            )}
-            {section === 'infra' && (
-              <>
-                <GeoTool />
-                <WhoisTool />
-              </>
-            )}
-            {section === 'email' && (
-              <EmailTool />
-            )}
-          </div>
-        </div>
+        {section === 'ip' && (
+          <>
+            <PingTool />
+            <TracerouteTool />
+            <PortScanTool />
+            <ReverseDnsTool />
+          </>
+        )}
+        {section === 'dns' && (
+          <>
+            <DnsLookupTool />
+            <DnsPropagationTool />
+          </>
+        )}
+        {section === 'web' && (
+          <>
+            <HttpHeadersTool />
+            <SslTool />
+          </>
+        )}
+        {section === 'infra' && (
+          <>
+            <GeoTool />
+            <WhoisTool />
+          </>
+        )}
+        {section === 'email' && (
+          <EmailTool />
+        )}
       </div>
     </div>
   )

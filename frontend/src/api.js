@@ -124,6 +124,20 @@ export const api = {
   toolsWhois:         (host)        => request('GET', `/tools/whois?host=${encodeURIComponent(host)}`),
   toolsEmail:         (domain)      => request('GET', `/tools/email?domain=${encodeURIComponent(domain)}`),
 
+  // Block schedules
+  getBlockSchedules:    ()          => request('GET',    '/block-schedules'),
+  createBlockSchedule:  (body)      => request('POST',   '/block-schedules', body),
+  updateBlockSchedule:  (id, body)  => request('PATCH',  `/block-schedules/${id}`, body),
+  deleteBlockSchedule:  (id)        => request('DELETE', `/block-schedules/${id}`),
+
+  // Network pause / resume
+  getNetworkStatus: ()  => request('GET',  '/network/status'),
+  networkPause:     ()  => request('POST', '/network/pause'),
+  networkResume:    ()  => request('POST', '/network/resume'),
+
+  // Timeline
+  getTimeline: (days) => request('GET', `/timeline${days ? `?days=${days}` : ''}`),
+
   // Zones
   getZones:     ()     => request('GET',  '/zones'),
   assignZone:   (body) => request('POST', '/zones/assign', body),

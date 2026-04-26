@@ -1,6 +1,6 @@
 import { useState, useEffect } from 'react'
 import {
-  ShieldAlert, ShieldCheck, X, RefreshCw,
+  ShieldAlert, ShieldCheck, RefreshCw,
   AlertTriangle, Info, Clock, ChevronDown, ChevronRight,
 } from 'lucide-react'
 import { api } from '../api'
@@ -76,7 +76,7 @@ function fmtRelative(iso) {
   return `${Math.floor(h / 24)}d ago`
 }
 
-export function SecurityDashboard({ onClose, onDeviceClick }) {
+export function SecurityDashboard({ onDeviceClick }) {
   const [data,         setData]         = useState(null)
   const [trend,        setTrend]        = useState(null)
   const [loading,      setLoading]      = useState(true)
@@ -128,22 +128,9 @@ export function SecurityDashboard({ onClose, onDeviceClick }) {
   const nClean  = sevCounts.clean || 0
 
   return (
-    <>
-      {/* Backdrop */}
-      <div
-        className="fixed inset-0 z-40 animate-fade-in"
-        style={{ background: 'rgba(0,0,0,0.6)', backdropFilter: 'blur(4px)' }}
-        onClick={onClose}
-      />
-
-      {/* Panel */}
-      <aside
-        className="fixed right-0 top-0 h-full w-full max-w-md z-50 flex flex-col shadow-2xl animate-slide-in"
-        style={{ background: 'var(--color-surface)', borderLeft: '1px solid var(--color-border)' }}
-      >
+    <div className="max-w-3xl mx-auto">
         {/* Header */}
-        <div className="flex items-center justify-between px-6 py-5"
-          style={{ borderBottom: '1px solid var(--color-border)' }}>
+        <div className="flex items-center justify-between mb-6">
           <div className="flex items-center gap-3">
             <span className="w-8 h-8 rounded-lg flex items-center justify-center"
               style={{ background: 'rgba(239,68,68,0.12)' }}>
@@ -151,18 +138,12 @@ export function SecurityDashboard({ onClose, onDeviceClick }) {
             </span>
             <h2 className="font-semibold" style={{ color: 'var(--color-text)' }}>Security Overview</h2>
           </div>
-          <div className="flex items-center gap-2">
-            <button onClick={load} disabled={loading} className="btn-ghost p-2" title="Refresh">
-              <RefreshCw size={15} className={loading ? 'animate-spin' : ''} />
-            </button>
-            <button onClick={onClose} className="btn-ghost p-2" aria-label="Close">
-              <X size={18} />
-            </button>
-          </div>
+          <button onClick={load} disabled={loading} className="btn-ghost p-2" title="Refresh data">
+            <RefreshCw size={15} className={loading ? 'animate-spin' : ''} />
+          </button>
         </div>
 
-        {/* Body */}
-        <div className="flex-1 overflow-y-auto px-6 py-5 space-y-6">
+        <div className="space-y-6">
 
           {error && (
             <div className="card p-4 text-sm" style={{ color: 'var(--color-error)' }}>
@@ -359,7 +340,6 @@ export function SecurityDashboard({ onClose, onDeviceClick }) {
             </>
           )}
         </div>
-      </aside>
-    </>
+    </div>
   )
 }
