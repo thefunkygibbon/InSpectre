@@ -2,101 +2,91 @@
 
 **Know every device on your network.**
 
-InSpectre is a self-hosted network monitoring dashboard that automatically discovers, tracks, and analyses every device connected to your LAN. It runs entirely on your own hardware — no cloud, no subscriptions, no data leaving your network.
+InSpectre is a self-hosted network monitoring and vulnerability assessment suite that automatically discovers, tracks, fingerprints, and scans every device connected to your LAN. It runs entirely on your own hardware — no cloud, no subscriptions, no data leaving your network.
 
 ---
 
-## What it does
+## Features
 
-- **Discovers devices automatically** — finds devices within seconds of them joining the network using a combination of active ARP scanning and passive packet sniffing
-- **Tracks history** — records when each device first appeared, every IP address it has ever held, and a full timeline of events (joined, online, offline, IP changes, scans)
-- **Identifies devices** — resolves hostnames, looks up manufacturer (vendor) from MAC address, detects OS and open ports via Nmap, and builds a local fingerprint database to automatically classify device types
-- **Runs diagnostics** — ping and traceroute streamed live to the dashboard; deep port and vulnerability scans on demand
-- **Blocks devices** — cut a device off from the internet with one click using ARP spoofing; unblock it just as easily
-- **Alerts you** — toast notifications when new devices appear or known devices go offline, with a notification bell in the header
+- **Automatic device discovery** — finds devices within seconds of them joining the network using active ARP sweeps and a passive ARP sniffer running in parallel
+- **History & timeline** — records first seen, every IP address a device has ever held, and a full chronological event log (joined, online, offline, IP changes, port changes, scans)
+- **Device identification** — resolves hostnames via DNS/mDNS/NetBIOS, looks up vendor from MAC OUI, detects OS and open ports via Nmap, and fingerprints services with Nerva
+- **Vulnerability scanning** — targeted Nuclei-based scanning with per-service template routing; HTTP endpoints get web templates, SSH/RDP/Redis/etc. get relevant network templates, and identified products get matched CVE templates
+- **Network diagnostics** — ping and traceroute streamed live to the dashboard; on-demand port re-scans
+- **Device blocking** — cut a device off from the internet with one click using ARP spoofing; unblock just as easily
+- **Alerts** — toast and browser notifications when new devices appear or watched devices go offline; optional Pushbullet integration
+- **Smart filtering** — filter the device list by vuln status, scan state, open ports, tags, watched status, and more; save filter combinations as named views
 
 ---
 
 ## Dashboard
 
-The dashboard gives you a full picture of your network at a glance.
+### Layout Views
 
-**Three layout views**
-- Grid — device cards with status, vendor, hostname, and open ports at a glance
-- List — compact table for dense networks
-- Category — devices grouped by type (router, phone, smart TV, NAS, IoT, etc.)
+| View | Description |
+|---|---|
+| Grid | Device cards with status, vendor, hostname, ports, and vuln severity at a glance |
+| List | Compact table for dense networks |
+| Category | Devices grouped automatically by device type (router, phone, TV, NAS, IoT, etc.) |
 
-**Filter and search**
-- Full-text search across IP, hostname, vendor, name, tags, and location
-- Clickable stat cards (Total / Online / Offline / Watched) act as instant filters
-- Smart filter bar for contextual quick-filters ("has open ports", "not yet scanned", "has notes", etc.)
+### Search & Filtering
 
-**Device drawer**
-Click any device to open a detail panel with:
-- Live status, scan status, and any active block or vulnerability flags
-- Actions: Ping, Traceroute, Re-scan ports, Vulnerability scan, Block / Unblock internet access
-- Full network details: IP, MAC, vendor, hostname, open ports, OS detection
-- IP address history
-- Device identity editor — set a custom vendor name and device type; corrections are saved to the local fingerprint database
-- Timeline tab — full chronological event log
-- Notes & Tags tab — free-text notes, location/room field, tag chips
+- Full-text search across IP, MAC, hostname, vendor, custom name, tags, location, and zone
+- Stat cards (Total / Online / Offline / Watched) act as instant one-click filters
+- **Smart filter bar** — combinable quick-filters with AND logic:
+  - Watched, Unknown type, Open ports, Not scanned, Vulnerable
+  - **Vuln scanned** / **Not vuln scanned** — filter by whether a vulnerability scan has ever completed
+  - Blocked, Has notes, Tagged, Ignored
+  - Save any active combination as a named view for quick recall
 
-**Watched devices**
-Star any device to mark it as watched. Watched devices get a dedicated stat card, a sort option, and highlighted offline alerts.
+### Device Drawer
+
+Click any device to open a full detail panel:
+
+- **Overview** — live status, scan state, vuln severity badge, block status, vendor, hostname, OS, open ports with service names
+- **Actions** — Ping, Traceroute, Re-scan ports, Run vulnerability scan, Block / Unblock internet
+- **Vulnerability scan** — live streaming output showing each scan phase; findings listed by severity (critical → low); results persisted and shown on next open
+- **IP History** — every IP address the device has held with first/last seen timestamps
+- **Timeline** — full event log (online/offline events, port changes, scans, blocks)
+- **Identity editor** — set custom name, vendor, and device type; corrections feed the local fingerprint database
+- **Notes & Tags** — free-text notes, location/room field, tag chips, zone assignment
+
+### Watched Devices
+
+Star any device to mark it as watched. Watched devices get a dedicated stat card, a sort option (Watched first), and elevated offline alert styling.
+
+---
+
+## Security Dashboard
+
+A separate Security Dashboard panel gives a network-wide vulnerability overview — findings grouped by severity, devices sorted by risk, and quick-jump links into individual device drawers.
+
+---
+
+## Vulnerability Scanning
+
+Scans are powered by [Nuclei](https://github.com/projectdiscovery/nuclei) with a targeted routing strategy:
+
+1. **Open ports** — taken from the prior deep scan (no blind TCP sweep needed when port data exists)
+2. **Service fingerprinting** — nmap `-sV` runs only on ports without existing service data
+3. **Scan plan** — each port is routed to the minimal relevant template set:
+   - HTTP/HTTPS ports → `http/misconfiguration`, `http/default-logins`, `http/exposed-panels`, `http/exposures`, `http/vulnerabilities`, `ssl/`
+   - Identified products (nginx, Apache, Grafana, etc.) → matched `http/cves` templates filtered by product tag
+   - Network services (SSH, FTP, Redis, RDP, MQTT, SMB, etc.) → `network/cves`, `network/default-logins`, `network/exposed-service` filtered by service tag
+4. **Results** — findings stored in `vuln_reports` table; device row updated with `vuln_severity` and `vuln_last_scanned`
+
+Nuclei templates are auto-updated on a configurable interval (default: 24h).
 
 ---
 
 ## Quick Start
 
-InSpectre runs via Docker Compose. You need Docker and Docker Compose installed.
+Requires Docker and Docker Compose.
 
 ```bash
 git clone https://github.com/thefunkygibbon/InSpectre.git
 cd InSpectre
 
-# Edit docker-compose.yml and set your network details (see Configuration below)
+# Edit docker-compose.yml — set IP_RANGE, INTERFACE, and LAN_DNS_SERVER for your network
 
 docker compose up -d
-```
-
-Open **http://\<your-server-ip\>:5173** in your browser.
-
----
-
-## Configuration
-
-Edit the environment variables in `docker-compose.yml` before starting:
-
-| Variable | Default | Description |
-|---|---|---|
-| `IP_RANGE` | `192.168.0.0/24` | The network range to scan (CIDR notation) |
-| `INTERFACE` | `eth0` | Network interface to listen on |
-| `LAN_DNS_SERVER` | *(auto-detected)* | Your router's IP — used for hostname resolution. Set this explicitly for best results |
-| `SCAN_INTERVAL` | `60` | Seconds between network sweeps |
-| `OFFLINE_MISS_THRESHOLD` | `3` | Missed sweeps before a device is marked offline |
-
-All other settings (Nmap arguments, scan workers, OS confidence threshold, notification toggle) can be adjusted live from the **Settings** panel inside the dashboard without restarting.
-
----
-
-## Requirements
-
-- Docker and Docker Compose
-- A Linux host with access to the network interface you want to monitor (the probe container needs `NET_RAW` capability for ARP scanning and device blocking — this is granted automatically by the Compose file)
-- The host machine should be on the same LAN segment as the devices you want to monitor
-
----
-
-## Roadmap
-
-| Feature | Status |
-|---|---|
-| Device discovery, history & timeline | ✅ |
-| Device identity, fingerprinting & classification | ✅ |
-| Vulnerability scanning (Nmap NSE) | ✅ |
-| Block internet access (ARP spoofing) | ✅ |
-| Alerting webhooks (Discord, email, Gotify) | Planned |
-
----
-
-*InSpectre v1.0.0 — developed by [thefunkygibbon](mailto:inspectre@thefunkygibbon.net)*
