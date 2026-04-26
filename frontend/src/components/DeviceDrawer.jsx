@@ -12,6 +12,7 @@ import { StarButton }     from './StarButton'
 import { DeviceNotes }    from './DeviceNotes'
 import { DeviceTimeline } from './DeviceTimeline'
 import { VulnPanel }      from './VulnPanel'
+import { TrafficPanel }   from './TrafficPanel'
 import { StreamOutput }   from './StreamOutput'
 import { api }            from '../api'
 import { useStreamAction }  from '../hooks/useStreamAction'
@@ -62,6 +63,7 @@ function zoneStyle(zone) {
 const TABS = [
   { id: 'overview',  label: 'Overview'         },
   { id: 'vulns',     label: 'Vulnerabilities'  },
+  { id: 'traffic',   label: 'Traffic'          },
   { id: 'timeline',  label: 'Timeline'         },
   { id: 'admin',     label: 'Admin'            },
 ]
@@ -685,6 +687,10 @@ export function DeviceDrawer({ device, onClose, onRename, onResolveName, onRefre
                 }).catch(() => {})
               }}
             />
+          )}
+
+          {activeTab === 'traffic' && (
+            <TrafficPanel device={localDevice} />
           )}
 
           {activeTab === 'timeline' && (

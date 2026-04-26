@@ -1,5 +1,5 @@
 from datetime import datetime, timezone
-from sqlalchemy import Boolean, Column, DateTime, Float, ForeignKey, Integer, JSON, String, Text
+from sqlalchemy import BigInteger, Boolean, Column, DateTime, Float, ForeignKey, Integer, JSON, String, Text
 from sqlalchemy.orm import declarative_base, relationship
 
 Base = declarative_base()
@@ -118,6 +118,35 @@ class Setting(Base):
         default=lambda: datetime.now(timezone.utc),
         onupdate=lambda: datetime.now(timezone.utc),
     )
+
+
+class TrafficStat(Base):
+    """
+    5-minute traffic stat buckets flushed from probe monitor sessions.
+    One row per device per 5-min window.
+    """
+    __tablename__ = "traffic_stats"
+
+    id          = Column(Integer,  primary_key=True, autoincrement=True)
+    mac_address = Column(String,   nullable=False,   index=True)
+    ip_address  = Column(String,   nullable=True)
+    bucket_ts   = Column(DateTime(timezone=True), nullable=False, index=True)
+    bytes_in    = Column(BigInteger, nullable=False, default=0)
+    bytes_out   = Column(BigInteger, nullable=False, default=0)
+    packets_in  = Column(Integer,  nullable=False, default=0)
+    packets_out = Column(Integer,  nullable=False, default=0)
+    lan_bytes   = Column(BigInteger, nullable=False, default=0)
+    wan_bytes   = Column(BigInteger, nullable=False, default=0)
+    # JSON columns for top-N lists
+    dns_queries   = Column(JSON, nullable=True)
+    tls_sni       = Column(JSON, nullable=True)
+    http_hosts    = Column(JSON, nullable=True)
+    top_ips       = Column(JSON, nullable=True)
+    top_ports     = Column(JSON, nullable=True)
+    top_countries = Column(JSON, nullable=True)
+    protocols     = Column(JSON, nullable=True)
+    unusual_ports = Column(JSON, nullable=True)
+    created_at    = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
 
 
 class FingerprintEntry(Base):

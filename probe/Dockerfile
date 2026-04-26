@@ -42,6 +42,21 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 COPY main.py .
 COPY vuln_scanner.py .
+COPY traffic_monitor.py .
 COPY mac-vendors-export.csv .
+
+# Download GeoLite2-Country database if MAXMIND_LICENSE_KEY is provided at build time.
+# Without it, GeoIP lookups are silently skipped.
+ARG MAXMIND_LICENSE_KEY=""
+RUN if [ -n "$MAXMIND_LICENSE_KEY" ]; then \
+      mkdir -p /opt/geoip && \
+      wget -q "https://download.maxmind.com/app/geoip_download?edition_id=GeoLite2-Country&license_key=${MAXMIND_LICENSE_KEY}&suffix=tar.gz" \
+           -O /tmp/geolite2.tar.gz && \
+      tar -xzf /tmp/geolite2.tar.gz -C /tmp/ && \
+      mv /tmp/GeoLite2-Country_*/GeoLite2-Country.mmdb /opt/geoip/ && \
+      rm -rf /tmp/geolite2.tar.gz /tmp/GeoLite2-Country_*; \
+    else \
+      echo "[INFO] MAXMIND_LICENSE_KEY not set — GeoIP skipped"; \
+    fi
 
 CMD ["python", "main.py"]

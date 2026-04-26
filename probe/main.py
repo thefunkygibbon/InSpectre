@@ -3,8 +3,10 @@ import csv
 import json
 import os
 import queue
+import signal
 import socket
 import subprocess
+import sys
 import threading
 import time
 from datetime import datetime, timezone
@@ -21,6 +23,7 @@ from sqlalchemy import (
 )
 from sqlalchemy.dialects.postgresql import JSONB, insert as pg_insert
 from sqlalchemy.orm import declarative_base, sessionmaker
+import traffic_monitor as _tm
 
 # ---------------------------------------------------------------------------
 # Version
@@ -1935,6 +1938,109 @@ def probe_list_blocked():
         }
 
 
+# ---------------------------------------------------------------------------
+# Traffic monitoring endpoints
+# ---------------------------------------------------------------------------
+
+@probe_api.post("/traffic/start/{ip}")
+def probe_traffic_start(ip: str):
+    if not _is_valid_ip(ip):
+        raise HTTPException(422, "Invalid IP address")
+
+    # Refuse if device is currently being blocked (ARP drop rules conflict)
+    with _blocked_lock:
+        blocked_by_mac = next(
+            (m for m, e in _blocked_devices.items() if e["target_ip"] == ip),
+            None,
+        )
+    if blocked_by_mac:
+        raise HTTPException(409, f"Device {ip} is currently blocked — unblock first")
+
+    session = _tm.get_session_by_ip(ip)
+    if session:
+        return {"ok": True, "already_monitoring": True, "mac": session.mac}
+
+    # Look up MAC for this IP
+    session_db = Session()
+    try:
+        from sqlalchemy import text as _text
+        row = session_db.execute(
+            _text("SELECT mac_address FROM devices WHERE ip_address = :ip LIMIT 1"),
+            {"ip": ip},
+        ).fetchone()
+        mac = row[0] if row else None
+    finally:
+        session_db.close()
+
+    if not mac:
+        # Try ARP resolution
+        mac = _get_mac_for_ip(ip)
+    if not mac:
+        raise HTTPException(404, f"Could not resolve MAC for {ip}")
+
+    gateway_ip = _get_default_gateway()
+    if not gateway_ip:
+        raise HTTPException(500, "Could not detect default gateway")
+    gateway_mac = _get_mac_for_ip(gateway_ip)
+    if not gateway_mac:
+        raise HTTPException(500, f"Could not resolve gateway MAC for {gateway_ip}")
+
+    _tm.start_monitor(
+        target_ip=ip,
+        target_mac=mac,
+        gateway_ip=gateway_ip,
+        gateway_mac=gateway_mac,
+        iface=INTERFACE,
+    )
+    return {"ok": True, "mac": mac, "target_ip": ip, "gateway_ip": gateway_ip}
+
+
+@probe_api.delete("/traffic/stop/{ip}")
+def probe_traffic_stop(ip: str):
+    stopped = _tm.stop_monitor_by_ip(ip)
+    return {"ok": True, "was_monitoring": stopped}
+
+
+@probe_api.get("/traffic/stats")
+def probe_traffic_stats_all():
+    return {"sessions": _tm.list_sessions_with_stats()}
+
+
+@probe_api.get("/traffic/stats/{mac}")
+def probe_traffic_stats(mac: str):
+    session = _tm.get_session(mac)
+    if not session:
+        raise HTTPException(404, "No active monitor for this device")
+    return session.get_stats()
+
+
+@probe_api.get("/traffic/stream/{mac}")
+def probe_traffic_stream(mac: str):
+    session = _tm.get_session(mac)
+    if not session:
+        raise HTTPException(404, "No active monitor for this device")
+
+    def _generate():
+        while True:
+            stats = session.get_stats()
+            yield f"data: {json.dumps(stats)}\n\n"
+            stop = session._stop_event.wait(timeout=3)
+            if stop:
+                break
+
+    return StreamingResponse(_generate(), media_type="text/event-stream")
+
+
+@probe_api.get("/network/info")
+def probe_network_info():
+    gateway_ip = _get_default_gateway()
+    return {
+        "interface":   INTERFACE,
+        "ip_range":    IP_RANGE,
+        "gateway_ip":  gateway_ip,
+    }
+
+
 def start_probe_api() -> None:
     print(f"[*] Probe API v{VERSION} listening on :{PROBE_API_PORT}", flush=True)
     uvicorn.run(
@@ -1998,7 +2104,23 @@ def _startup_nerva_backfill() -> None:
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
+def _graceful_shutdown(signum, frame) -> None:
+    """
+    SIGTERM / SIGINT handler.  Stop all active traffic monitor sessions and
+    wait for their ARP restore threads to complete before exiting so that
+    monitored devices are not left with poisoned ARP caches.
+    Docker sends SIGTERM and waits 10 s before SIGKILL — our restore takes ~1 s.
+    """
+    print("[*] Received shutdown signal — restoring ARP tables for all active monitors...", flush=True)
+    _tm.stop_all_and_wait(timeout=5.0)
+    print("[*] All traffic monitors cleaned up — exiting.", flush=True)
+    sys.exit(0)
+
+
 def main() -> None:
+    signal.signal(signal.SIGTERM, _graceful_shutdown)
+    signal.signal(signal.SIGINT,  _graceful_shutdown)
+
     print(f"[*] InSpectre Probe v{VERSION} starting...", flush=True)
     _load_mac_vendor_db()
     wait_for_db()

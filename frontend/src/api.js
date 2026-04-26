@@ -154,6 +154,16 @@ export const api = {
   getSuppressions:    (mac)  => request('GET',    `/suppressions${mac ? `?mac=${mac}` : ''}`),
   createSuppression:  (body) => request('POST',   '/suppressions', body),
   deleteSuppression:  (id)   => request('DELETE', `/suppressions/${id}`),
+
+  // Traffic monitoring
+  trafficStart:       (mac)        => request('POST',   `/traffic/start/${mac}`),
+  trafficStop:        (mac)        => request('DELETE', `/traffic/stop/${mac}`),
+  trafficActive:      ()           => request('GET',    '/traffic/active'),
+  trafficLive:        (mac)        => request('GET',    `/traffic/live/${mac}`),
+  trafficHistory:     (mac, days)  => request('GET',    `/traffic/history/${mac}${days ? `?days=${days}` : ''}`),
+  trafficTopDomains:  (mac, days)  => request('GET',    `/traffic/top-domains/${mac}${days ? `?days=${days}` : ''}`),
+  trafficSummary:     ()           => request('GET',    '/traffic/summary'),
+  trafficStream:      (mac, onLine, signal) => streamSSE(`/traffic/stream/${mac}`, onLine, signal),
 }
 
 export { streamSSE }

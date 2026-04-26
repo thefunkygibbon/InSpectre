@@ -16,7 +16,7 @@ from datetime import datetime, timezone, timedelta
 
 import httpx
 
-from models import Base, Device, DeviceEvent, FingerprintEntry, Setting, VulnReport
+from models import Base, Device, DeviceEvent, FingerprintEntry, Setting, TrafficStat, VulnReport
 
 DATABASE_URL = os.environ.get("DATABASE_URL", "postgresql://admin:password123@db:5432/inspectre")
 # PROBE_API_URL is the name used in docker-compose; PROBE_URL is the legacy fallback.
@@ -120,6 +120,32 @@ def _migrate(db: Session):
         """,
         "CREATE INDEX IF NOT EXISTS ix_block_schedules_mac ON block_schedules(mac_address)",
         "ALTER TABLE devices ADD COLUMN IF NOT EXISTS is_schedule_blocked BOOLEAN NOT NULL DEFAULT FALSE",
+        # Phase 6 — traffic monitoring stat buckets
+        """
+        CREATE TABLE IF NOT EXISTS traffic_stats (
+            id            SERIAL PRIMARY KEY,
+            mac_address   VARCHAR NOT NULL,
+            ip_address    VARCHAR,
+            bucket_ts     TIMESTAMPTZ NOT NULL,
+            bytes_in      BIGINT NOT NULL DEFAULT 0,
+            bytes_out     BIGINT NOT NULL DEFAULT 0,
+            packets_in    INTEGER NOT NULL DEFAULT 0,
+            packets_out   INTEGER NOT NULL DEFAULT 0,
+            lan_bytes     BIGINT NOT NULL DEFAULT 0,
+            wan_bytes     BIGINT NOT NULL DEFAULT 0,
+            dns_queries   JSONB,
+            tls_sni       JSONB,
+            http_hosts    JSONB,
+            top_ips       JSONB,
+            top_ports     JSONB,
+            top_countries JSONB,
+            protocols     JSONB,
+            unusual_ports JSONB,
+            created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+        """,
+        "CREATE INDEX IF NOT EXISTS ix_traffic_stats_mac    ON traffic_stats(mac_address)",
+        "CREATE INDEX IF NOT EXISTS ix_traffic_stats_bucket ON traffic_stats(bucket_ts)",
     ]
     for sql in migrations:
         try:
@@ -161,6 +187,11 @@ DEFAULT_SETTINGS = {
     "gotify_url":              ("",       "Gotify server URL (leave blank to disable)."),
     "gotify_token":            ("",       "Gotify application token."),
     "network_paused":          ("false",  "Whether internet access is paused for the whole network via ARP blocking."),
+    # Phase 6 — traffic monitoring
+    "traffic_enabled":         ("true",   "Enable per-device traffic monitoring feature."),
+    "traffic_retention_days":  ("30",     "Number of days to retain traffic_stats rows before deletion."),
+    "traffic_max_sessions":    ("10",     "Maximum number of concurrent traffic monitor sessions."),
+    "traffic_geoip_path":      ("/opt/geoip/GeoLite2-Country.mmdb", "Path to MaxMind GeoLite2-Country mmdb file on the probe."),
 }
 
 
@@ -482,6 +513,90 @@ app.add_middleware(
 )
 
 
+# ---------------------------------------------------------------------------
+# Traffic stats flush loop — polls probe every 5 min and writes to DB
+# ---------------------------------------------------------------------------
+async def _traffic_flush_loop():
+    await asyncio.sleep(60)  # startup grace
+    while True:
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                resp = await client.get(f"{PROBE_URL}/traffic/stats")
+                if resp.status_code == 200:
+                    data = resp.json()
+                    sessions = data.get("sessions", [])
+                    if sessions:
+                        db = SessionLocal()
+                        try:
+                            _flush_traffic_sessions(db, sessions)
+                        finally:
+                            db.close()
+        except httpx.ConnectError:
+            pass
+        except Exception as exc:
+            print(f"[traffic_flush] error: {exc}", flush=True)
+
+        # Daily retention cleanup
+        try:
+            db = SessionLocal()
+            try:
+                ret_s = db.get(Setting, "traffic_retention_days")
+                days  = int(ret_s.value) if ret_s else 30
+                cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+                db.execute(text("DELETE FROM traffic_stats WHERE created_at < :cutoff"), {"cutoff": cutoff})
+                db.commit()
+            finally:
+                db.close()
+        except Exception as exc:
+            print(f"[traffic_flush] retention cleanup error: {exc}", flush=True)
+
+        await asyncio.sleep(300)  # 5-minute poll
+
+
+def _flush_traffic_sessions(db, sessions: list) -> None:
+    for s in sessions:
+        mac = s.get("mac", "").lower()
+        ip  = s.get("target_ip")
+        if not mac:
+            continue
+        # Flush completed historical buckets
+        for bucket in s.get("history", []):
+            ts_str = bucket.get("ts")
+            if not ts_str:
+                continue
+            try:
+                ts = datetime.fromisoformat(ts_str)
+            except Exception:
+                continue
+            existing = db.execute(
+                text("SELECT id FROM traffic_stats WHERE mac_address=:mac AND bucket_ts=:ts LIMIT 1"),
+                {"mac": mac, "ts": ts},
+            ).fetchone()
+            if existing:
+                continue
+            row = TrafficStat(
+                mac_address   = mac,
+                ip_address    = ip,
+                bucket_ts     = ts,
+                bytes_in      = bucket.get("bytes_in", 0),
+                bytes_out     = bucket.get("bytes_out", 0),
+                packets_in    = bucket.get("packets_in", 0),
+                packets_out   = bucket.get("packets_out", 0),
+                lan_bytes     = bucket.get("lan_bytes", 0),
+                wan_bytes     = bucket.get("wan_bytes", 0),
+                dns_queries   = bucket.get("dns_queries"),
+                tls_sni       = bucket.get("tls_sni"),
+                http_hosts    = bucket.get("http_hosts"),
+                top_ips       = bucket.get("top_ips"),
+                top_ports     = bucket.get("top_ports"),
+                top_countries = bucket.get("top_countries"),
+                protocols     = bucket.get("protocols"),
+                unusual_ports = bucket.get("unusual_ports"),
+            )
+            db.add(row)
+    db.commit()
+
+
 @app.on_event("startup")
 async def on_startup():
     db = SessionLocal()
@@ -493,6 +608,7 @@ async def on_startup():
     asyncio.ensure_future(_scheduled_vuln_scan_loop())
     asyncio.ensure_future(_alert_dispatch_loop())
     asyncio.ensure_future(_block_schedule_loop())
+    asyncio.ensure_future(_traffic_flush_loop())
 
 
 def get_db():
@@ -2781,3 +2897,192 @@ async def _block_schedule_loop():
             print(f"[block_schedule_loop] error: {exc}", flush=True)
 
         await asyncio.sleep(60)
+
+
+# ---------------------------------------------------------------------------
+# Traffic monitoring API
+# ---------------------------------------------------------------------------
+
+@app.post("/traffic/start/{mac}")
+async def traffic_start(mac: str, db: Session = Depends(get_db)):
+    mac = mac.lower()
+    device = db.get(Device, mac)
+    if not device:
+        raise HTTPException(404, "Device not found")
+    ip = device.ip_address
+    if not ip:
+        raise HTTPException(422, "Device has no IP address")
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.post(f"{PROBE_URL}/traffic/start/{ip}")
+        if resp.status_code == 409:
+            raise HTTPException(409, resp.json().get("detail", "Conflict"))
+        if resp.status_code not in (200, 201):
+            raise HTTPException(502, f"Probe returned {resp.status_code}")
+        return resp.json()
+    except HTTPException:
+        raise
+    except httpx.ConnectError:
+        raise HTTPException(503, "Cannot reach probe")
+
+
+@app.delete("/traffic/stop/{mac}")
+async def traffic_stop(mac: str, db: Session = Depends(get_db)):
+    mac = mac.lower()
+    device = db.get(Device, mac)
+    if not device:
+        raise HTTPException(404, "Device not found")
+    ip = device.ip_address
+    if not ip:
+        return {"ok": True, "was_monitoring": False}
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.delete(f"{PROBE_URL}/traffic/stop/{ip}")
+        if resp.status_code not in (200, 204):
+            raise HTTPException(502, f"Probe returned {resp.status_code}")
+        return resp.json()
+    except HTTPException:
+        raise
+    except httpx.ConnectError:
+        raise HTTPException(503, "Cannot reach probe")
+
+
+@app.get("/traffic/active")
+async def traffic_active():
+    try:
+        async with httpx.AsyncClient(timeout=8.0) as client:
+            resp = await client.get(f"{PROBE_URL}/traffic/stats")
+        if resp.status_code != 200:
+            return {"sessions": []}
+        return resp.json()
+    except Exception:
+        return {"sessions": []}
+
+
+@app.get("/traffic/live/{mac}")
+async def traffic_live(mac: str, db: Session = Depends(get_db)):
+    mac = mac.lower()
+    device = db.get(Device, mac)
+    if not device:
+        raise HTTPException(404, "Device not found")
+    try:
+        async with httpx.AsyncClient(timeout=8.0) as client:
+            resp = await client.get(f"{PROBE_URL}/traffic/stats/{mac}")
+        if resp.status_code == 404:
+            raise HTTPException(404, "No active monitor for this device")
+        if resp.status_code != 200:
+            raise HTTPException(502, f"Probe returned {resp.status_code}")
+        return resp.json()
+    except HTTPException:
+        raise
+    except httpx.ConnectError:
+        raise HTTPException(503, "Cannot reach probe")
+
+
+@app.get("/traffic/history/{mac}")
+async def traffic_history(mac: str, days: int = 7, db: Session = Depends(get_db)):
+    mac = mac.lower()
+    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+    rows = db.execute(
+        text("""
+            SELECT bucket_ts, bytes_in, bytes_out, packets_in, packets_out,
+                   lan_bytes, wan_bytes, dns_queries, tls_sni, http_hosts,
+                   top_ips, top_ports, top_countries, protocols, unusual_ports
+            FROM traffic_stats
+            WHERE mac_address = :mac AND bucket_ts >= :cutoff
+            ORDER BY bucket_ts ASC
+        """),
+        {"mac": mac, "cutoff": cutoff},
+    ).fetchall()
+    keys = ["ts", "bytes_in", "bytes_out", "packets_in", "packets_out",
+            "lan_bytes", "wan_bytes", "dns_queries", "tls_sni", "http_hosts",
+            "top_ips", "top_ports", "top_countries", "protocols", "unusual_ports"]
+    return {"mac": mac, "history": [dict(zip(keys, r)) for r in rows]}
+
+
+@app.get("/traffic/top-domains/{mac}")
+async def traffic_top_domains(mac: str, days: int = 7, limit: int = 20, db: Session = Depends(get_db)):
+    mac = mac.lower()
+    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+    rows = db.execute(
+        text("""
+            SELECT tls_sni, http_hosts, dns_queries
+            FROM traffic_stats
+            WHERE mac_address = :mac AND bucket_ts >= :cutoff
+        """),
+        {"mac": mac, "cutoff": cutoff},
+    ).fetchall()
+    agg: dict = {}
+    for row in rows:
+        for col in row:
+            if not col:
+                continue
+            for item in col:
+                k = item.get("k") if isinstance(item, dict) else None
+                v = item.get("v", 1) if isinstance(item, dict) else 1
+                if k:
+                    agg[k] = agg.get(k, 0) + v
+    top = sorted(agg.items(), key=lambda x: x[1], reverse=True)[:limit]
+    return {"mac": mac, "top_domains": [{"domain": k, "count": v} for k, v in top]}
+
+
+@app.get("/traffic/summary")
+async def traffic_summary(db: Session = Depends(get_db)):
+    cutoff = datetime.now(timezone.utc) - timedelta(days=1)
+    row = db.execute(
+        text("""
+            SELECT
+                COUNT(DISTINCT mac_address) AS devices_monitored,
+                COALESCE(SUM(bytes_in + bytes_out), 0) AS total_bytes,
+                COALESCE(SUM(bytes_in), 0) AS total_bytes_in,
+                COALESCE(SUM(bytes_out), 0) AS total_bytes_out,
+                COALESCE(SUM(wan_bytes), 0) AS total_wan_bytes,
+                COALESCE(SUM(lan_bytes), 0) AS total_lan_bytes
+            FROM traffic_stats
+            WHERE bucket_ts >= :cutoff
+        """),
+        {"cutoff": cutoff},
+    ).fetchone()
+    try:
+        active_resp = await (httpx.AsyncClient(timeout=5.0).__aenter__())
+    except Exception:
+        active_resp = None
+
+    active_count = 0
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            r = await client.get(f"{PROBE_URL}/traffic/stats")
+            if r.status_code == 200:
+                active_count = len(r.json().get("sessions", []))
+    except Exception:
+        pass
+
+    return {
+        "active_sessions":   active_count,
+        "devices_monitored": row[0] if row else 0,
+        "total_bytes":       row[1] if row else 0,
+        "total_bytes_in":    row[2] if row else 0,
+        "total_bytes_out":   row[3] if row else 0,
+        "total_wan_bytes":   row[4] if row else 0,
+        "total_lan_bytes":   row[5] if row else 0,
+    }
+
+
+@app.get("/traffic/stream/{mac}")
+async def traffic_stream(mac: str):
+    """Proxy the probe's SSE stream for a device traffic monitor."""
+    mac = mac.lower()
+
+    async def _generate():
+        try:
+            async with httpx.AsyncClient(timeout=None) as client:
+                async with client.stream("GET", f"{PROBE_URL}/traffic/stream/{mac}") as resp:
+                    if resp.status_code != 200:
+                        yield f"data: {{\"error\": \"probe {resp.status_code}\"}}\n\n"
+                        return
+                    async for line in resp.aiter_lines():
+                        yield line + "\n"
+        except Exception as exc:
+            yield f"data: {{\"error\": \"{exc}\"}}\n\n"
+
+    return StreamingResponse(_generate(), media_type="text/event-stream")

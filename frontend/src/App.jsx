@@ -6,6 +6,7 @@ import {
   Bell, X, Layers, Star, ShieldAlert, Wrench, Ban, BarChart2,
   ArrowLeft, SlidersHorizontal,
 } from 'lucide-react'
+import { TrafficPage } from './components/TrafficPage'
 import { useDevices }          from './hooks/useDevices'
 import { useTheme }            from './hooks/useTheme'
 import { useSmartFilters }     from './hooks/useSmartFilters'
@@ -41,10 +42,11 @@ const TOAST_DURATION = 7000
 
 // Page definitions for the nav
 const PAGES = [
-  { id: 'tools',    label: 'Network Tools',    Icon: Wrench,     title: 'Network Tools' },
+  { id: 'tools',    label: 'Network Tools',       Icon: Wrench,     title: 'Network Tools' },
   { id: 'security', label: 'Vulnerability Report', Icon: ShieldAlert, title: 'Vulnerability Report' },
-  { id: 'blocking', label: 'Device Blocking',  Icon: Ban,        title: 'Device Blocking' },
-  { id: 'timeline', label: 'Device Timeline',  Icon: BarChart2,  title: 'Device Timeline' },
+  { id: 'blocking', label: 'Device Blocking',      Icon: Ban,        title: 'Device Blocking' },
+  { id: 'timeline', label: 'Device Timeline',      Icon: BarChart2,  title: 'Device Timeline' },
+  { id: 'traffic',  label: 'Traffic Monitor',      Icon: Activity,   title: 'Traffic Monitor' },
 ]
 
 function ipToNum(ip) {
@@ -527,6 +529,10 @@ export default function App() {
 
           {activePage === 'timeline' && (
             <NetworkTimeline />
+          )}
+
+          {activePage === 'traffic' && (
+            <TrafficPage />
           )}
 
           {/* ── Main dashboard ── */}
