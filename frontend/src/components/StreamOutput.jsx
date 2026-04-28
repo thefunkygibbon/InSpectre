@@ -93,16 +93,19 @@ function latencyColor(ms) {
 
 function PingView({ lines, running }) {
   const { packets, tx, rx, loss, rttMin, rttAvg, rttMax } = parsePing(lines)
-  const maxMs = Math.max(...packets.map(p => p.ms), 1)
+  const BAR_MAX_H = 56
+  const visible = packets.slice(-40)
+  // Log scale so a 200ms outlier doesn't crush 1-5ms bars to invisibility
+  const maxLog = Math.max(...visible.map(p => Math.log1p(p.ms)), 1)
 
   return (
     <div className="space-y-3">
       {/* spark bars */}
       {packets.length > 0 && (
         <div>
-          <div className="flex items-end gap-[3px]" style={{ height: 32 }}>
-            {packets.slice(-40).map((p, i) => {
-              const h = Math.max(3, Math.round((p.ms / maxMs) * 30))
+          <div className="flex items-end gap-[3px]" style={{ height: BAR_MAX_H + 4 }}>
+            {visible.map((p, i) => {
+              const h = Math.max(4, Math.round((Math.log1p(p.ms) / maxLog) * BAR_MAX_H))
               return (
                 <div key={i} title={`seq ${p.seq}: ${p.ms} ms`}
                   style={{ width: 6, height: h, background: latencyColor(p.ms), borderRadius: 2, flexShrink: 0 }} />
@@ -232,54 +235,133 @@ function TracerouteView({ lines, running }) {
 }
 
 // ---------------------------------------------------------------------------
-// Vuln scan view
+// Vuln scan view — progress bar + findings summary
 // ---------------------------------------------------------------------------
-const INFO_PREFIXES  = ['[INFO]']
-const WARN_PREFIXES  = ['[WARN]']
-const ERR_PREFIXES   = ['[ERROR]']
-const RESULT_PREFIX  = 'RESULT:'
-
-function lineStyle(l) {
-  if (ERR_PREFIXES.some(p  => l.startsWith(p))) return { color: '#f87171' }
-  if (WARN_PREFIXES.some(p => l.startsWith(p))) return { color: '#fbbf24' }
-  if (l.startsWith(RESULT_PREFIX))              return { color: '#34d399', fontWeight: 600 }
-  if (INFO_PREFIXES.some(p => l.startsWith(p))) return { color: '#8b949e' }
-  return { color: '#c9d1d9' }
+const SEV_STYLE = {
+  critical: { bg: 'rgba(239,68,68,0.18)',   color: '#f87171' },
+  high:     { bg: 'rgba(249,115,22,0.18)',  color: '#fb923c' },
+  medium:   { bg: 'rgba(245,158,11,0.18)',  color: '#fbbf24' },
+  low:      { bg: 'rgba(59,130,246,0.18)',  color: '#60a5fa' },
+  info:     { bg: 'rgba(139,92,246,0.18)',  color: '#a78bfa' },
 }
 
-function lineText(l) {
-  if (l.startsWith(RESULT_PREFIX)) {
-    try {
-      const obj = JSON.parse(l.slice(RESULT_PREFIX.length))
-      const sev = obj.severity || 'clean'
-      const n   = obj.vuln_count || 0
-      return `✓ Scan complete — ${n === 0 ? 'no findings' : `${n} finding${n !== 1 ? 's' : ''}`} (${sev})`
-    } catch { return l }
+function parseVulnStream(lines) {
+  let totalPhases      = 1
+  let currentPhase     = 0
+  let currentPhaseName = ''
+  let currentPercent   = 0
+  let lastRps          = null
+  const findings       = []
+  let done             = false
+  let doneResult       = null
+
+  for (const l of lines) {
+    // Total phases from scan plan line
+    const planM = l.match(/\[INFO\] Scan plan: (\d+) phase/)
+    if (planM) totalPhases = Math.max(1, parseInt(planM[1]))
+
+    // Phase start: "[INFO] → label"
+    if (l.startsWith('[INFO] → ')) {
+      currentPhase++
+      currentPhaseName = l.slice('[INFO] → '.length)
+      currentPercent   = 0
+    }
+
+    // Nuclei stats JSON (emitted as "[NUCLEI] {...}")
+    if (l.startsWith('[NUCLEI] {')) {
+      try {
+        const s = JSON.parse(l.slice('[NUCLEI] '.length))
+        if (s.percent !== undefined) currentPercent = parseInt(s.percent) || 0
+        if (s.rps)                   lastRps        = s.rps
+      } catch { /* ignore malformed lines */ }
+    }
+
+    // Findings emitted after all phases: "[SEVERITY] name — matched_at"
+    const findM = l.match(/^\[(CRITICAL|HIGH|MEDIUM|LOW|INFO)\] (.+?) — (.+)$/)
+    if (findM) findings.push({ sev: findM[1].toLowerCase(), name: findM[2] })
+
+    // Completion
+    if (l.startsWith('RESULT:')) {
+      done = true
+      try { doneResult = JSON.parse(l.slice('RESULT:'.length)) } catch { /* ignore */ }
+    }
   }
-  // Shorten long [INFO] Command: nmap ... lines
-  if (l.startsWith('[INFO] Command:')) return '[INFO] Command: ' + l.slice('[INFO] Command: '.length).replace(/,/g, ', ').slice(0, 80) + '…'
-  // Shorten [INFO] Scripts: line
-  if (l.startsWith('[INFO] Scripts:')) {
-    const scripts = l.slice('[INFO] Scripts: '.length).split(',')
-    return `[INFO] Scripts: ${scripts.length} script${scripts.length !== 1 ? 's' : ''}`
-  }
-  return l
+
+  const overallPercent = done ? 100
+    : currentPhase === 0   ? 0
+    : Math.min(99, Math.round(((currentPhase - 1) * 100 + currentPercent) / totalPhases))
+
+  return { totalPhases, currentPhase, currentPhaseName, overallPercent, lastRps, findings, done, doneResult }
 }
 
-function VulnStreamView({ lines, running }) {
-  const filtered = lines.filter(l => l.trim() && l !== '--- done ---')
-  if (!filtered.length && running) {
+function VulnProgressView({ lines, running }) {
+  if (!lines.length && running) {
     return <p className="text-[10px] text-[#8b949e] animate-pulse">Initialising scan…</p>
   }
+  if (!lines.length) return null
+
+  const { totalPhases, currentPhase, currentPhaseName, overallPercent,
+          lastRps, findings, done, doneResult } = parseVulnStream(lines)
+
   return (
-    <div className="space-y-0.5">
-      {filtered.map((l, i) => (
-        <div key={i} className="font-mono leading-relaxed break-words"
-          style={{ fontSize: '10px', ...lineStyle(l) }}>
-          {lineText(l)}
+    <div className="space-y-2.5">
+
+      {/* Progress bar */}
+      <div className="space-y-1">
+        <div className="flex items-center justify-between text-[10px]">
+          <span className="truncate mr-2" style={{ color: '#c9d1d9' }}>
+            {done        ? 'Scan complete'
+             : currentPhase > 0 ? currentPhaseName
+             : 'Preparing scan…'}
+          </span>
+          <span className="font-mono shrink-0" style={{ color: '#8b949e' }}>{overallPercent}%</span>
         </div>
-      ))}
-      {running && <span className="inline-block animate-pulse text-green-400" style={{ fontSize: 10 }}>▌</span>}
+        <div className="h-1.5 rounded-full overflow-hidden" style={{ background: '#21262d' }}>
+          <div
+            className="h-full rounded-full transition-all duration-700"
+            style={{
+              width:      `${overallPercent}%`,
+              background: done ? '#22c55e' : 'var(--color-brand)',
+            }}
+          />
+        </div>
+        {(totalPhases > 1 || lastRps) && (
+          <div className="flex justify-between text-[9px]" style={{ color: '#8b949e' }}>
+            {totalPhases > 1 && currentPhase > 0
+              ? <span>Phase {Math.min(currentPhase, totalPhases)} / {totalPhases}</span>
+              : <span />}
+            {lastRps && running && <span>{lastRps} req/s</span>}
+          </div>
+        )}
+      </div>
+
+      {/* Findings list */}
+      {findings.length > 0 && (
+        <div className="space-y-1">
+          <p className="text-[9px] font-semibold uppercase tracking-wider" style={{ color: '#8b949e' }}>
+            {findings.length} finding{findings.length !== 1 ? 's' : ''}
+          </p>
+          {findings.map((f, i) => {
+            const sc = SEV_STYLE[f.sev] || SEV_STYLE.info
+            return (
+              <div key={i} className="flex items-center gap-1.5">
+                <span className="px-1 py-0.5 rounded text-[9px] font-bold uppercase shrink-0"
+                  style={{ background: sc.bg, color: sc.color }}>
+                  {f.sev.slice(0, 4)}
+                </span>
+                <span className="text-[10px] truncate" style={{ color: '#c9d1d9' }}>{f.name}</span>
+              </div>
+            )
+          })}
+        </div>
+      )}
+
+      {/* Done summary (no findings) */}
+      {done && findings.length === 0 && (
+        <p className="text-[10px] font-medium" style={{ color: '#22c55e' }}>
+          ✓ No vulnerabilities found
+        </p>
+      )}
     </div>
   )
 }
@@ -287,6 +369,13 @@ function VulnStreamView({ lines, running }) {
 // ---------------------------------------------------------------------------
 // Generic fallback (rescan status messages, etc.)
 // ---------------------------------------------------------------------------
+function lineStyle(l) {
+  if (l.startsWith('[ERROR]') || l.startsWith('ERROR:')) return { color: '#f87171' }
+  if (l.startsWith('[WARN]'))                             return { color: '#fbbf24' }
+  if (l.startsWith('[INFO]'))                             return { color: '#8b949e' }
+  return { color: '#c9d1d9' }
+}
+
 function GenericView({ lines, running }) {
   return (
     <div className="space-y-0.5">
@@ -311,7 +400,7 @@ export function StreamOutput({ lines = [], running = false, onStop, mode = 'gene
     switch (mode) {
       case 'ping':       return <PingView       lines={lines} running={running} />
       case 'traceroute': return <TracerouteView lines={lines} running={running} />
-      case 'vuln':       return <VulnStreamView lines={lines} running={running} />
+      case 'vuln':       return <VulnProgressView lines={lines} running={running} />
       default:           return <GenericView    lines={lines} running={running} />
     }
   })()

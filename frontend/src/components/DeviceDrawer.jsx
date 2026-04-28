@@ -1,20 +1,22 @@
 import { useState, useEffect, useRef } from 'react'
 import {
-  X, Wifi, WifiOff, Cpu, Globe, Clock, Terminal,
+  X, Wifi, WifiOff, Globe, Clock, Terminal,
   ShieldCheck, ScanLine, RefreshCw, ExternalLink,
-  Activity, GitBranch, Bug, RotateCcw, Ban, History,
+  Activity, GitBranch, RotateCcw, Ban, History,
   ChevronDown, ChevronRight, Square, Tag, CheckCircle2,
   FileText, Star as StarIcon, ShieldAlert, EyeOff, Eye, Layers,
-  AlertTriangle,
+  AlertTriangle, Network, Loader2, GitMerge, Radio, BellOff, Plus, Trash2,
+  TrendingUp, TrendingDown,
 } from 'lucide-react'
 import { OnlineDot }      from './OnlineDot'
 import { StarButton }     from './StarButton'
 import { DeviceNotes }    from './DeviceNotes'
 import { DeviceTimeline } from './DeviceTimeline'
 import { VulnPanel }      from './VulnPanel'
+import { TrafficPanel }   from './TrafficPanel'
 import { StreamOutput }   from './StreamOutput'
 import { api }            from '../api'
-import { useStreamAction } from '../hooks/useStreamAction'
+import { useStreamAction }  from '../hooks/useStreamAction'
 import { CATEGORIES, OVERRIDE_OPTIONS } from '../deviceCategories'
 
 function fmt(iso) {
@@ -60,10 +62,11 @@ function zoneStyle(zone) {
 }
 
 const TABS = [
-  { id: 'overview',  label: 'Overview' },
-  { id: 'vulns',     label: 'Vulnerabilities' },
-  { id: 'timeline',  label: 'Timeline' },
-  { id: 'notes',     label: 'Notes & Tags' },
+  { id: 'overview',  label: 'Overview'  },
+  { id: 'vulns',     label: 'Vulns'     },
+  { id: 'traffic',   label: 'Traffic'   },
+  { id: 'timeline',  label: 'Timeline'  },
+  { id: 'admin',     label: 'Admin'     },
 ]
 
 function Collapsible({ title, icon: Icon, defaultOpen = false, children }) {
@@ -203,10 +206,98 @@ function IdentityForm({ device, onSaved }) {
   )
 }
 
+// Service label display helper (maps Nerva scheme names to readable labels)
+const SERVICE_LABELS = {
+  http: 'HTTP',         https: 'HTTPS',         ssh: 'SSH',
+  ftp: 'FTP',           telnet: 'Telnet',        smtp: 'SMTP',
+  pop3: 'POP3',         imap: 'IMAP',            imaps: 'IMAPS',
+  mysql: 'MySQL',       postgresql: 'PostgreSQL', mssql: 'MSSQL',
+  redis: 'Redis',       mongodb: 'MongoDB',       elasticsearch: 'Elasticsearch',
+  mqtt: 'MQTT',         mqtts: 'MQTT/TLS',       smb: 'SMB',
+  rdp: 'RDP',           vnc: 'VNC',              ldap: 'LDAP',
+  ldaps: 'LDAPS',       ftps: 'FTPS',
+  dns: 'DNS',           ntp: 'NTP',              amqp: 'AMQP',
+  amqps: 'AMQPS',       cassandra: 'Cassandra',   memcached: 'Memcached',
+  ws: 'WebSocket',      wss: 'WebSocket/TLS',
+}
+function svcLabel(scheme) {
+  return SERVICE_LABELS[scheme] || scheme
+}
+
+// Pipeline stage indicator
+const PIPELINE_STEPS = [
+  { key: 'discovered',  label: 'Discovered'  },
+  { key: 'ports',       label: 'Ports'       },
+  { key: 'services',    label: 'Services'    },
+  { key: 'vulns',       label: 'Vuln scan'   },
+]
+
+function ScanPipeline({ device, vulnScanning }) {
+  const { deep_scanned, pipeline_stage, vuln_last_scanned, is_online } = device
+
+  function stepStatus(key) {
+    if (key === 'discovered') return 'done'
+    if (key === 'ports') {
+      if (deep_scanned) return 'done'
+      return is_online ? 'running' : 'pending'
+    }
+    if (key === 'services') {
+      if (pipeline_stage === 'services_done') return 'done'
+      if (deep_scanned) return 'running'
+      return 'pending'
+    }
+    if (key === 'vulns') {
+      if (vulnScanning) return 'running'
+      if (vuln_last_scanned) return 'done'
+      return 'pending'
+    }
+    return 'pending'
+  }
+
+  return (
+    <div className="card p-3">
+      <div className="flex items-center gap-2 mb-2.5">
+        <Network size={13} className="text-brand" />
+        <span className="text-[11px] font-semibold text-text-muted uppercase tracking-wider">Scan Pipeline</span>
+      </div>
+      <div className="flex items-center gap-0">
+        {PIPELINE_STEPS.map((step, i) => {
+          const status = stepStatus(step.key)
+          const isLast = i === PIPELINE_STEPS.length - 1
+          return (
+            <div key={step.key} className="flex items-center flex-1 min-w-0">
+              <div className="flex flex-col items-center flex-1 min-w-0">
+                <div className={`w-5 h-5 rounded-full flex items-center justify-center shrink-0 mb-1
+                  ${status === 'done'    ? 'bg-green-500/20 border border-green-500/50'
+                  : status === 'running' ? 'bg-brand/20 border border-brand/50'
+                  : 'bg-surface-offset border border-border'}`}>
+                  {status === 'done' && <CheckCircle2 size={10} className="text-green-400" />}
+                  {status === 'running' && <Loader2 size={10} className="text-brand animate-spin" />}
+                  {status === 'pending' && <span className="w-1.5 h-1.5 rounded-full bg-text-faint" />}
+                </div>
+                <span className={`text-[9px] font-medium leading-none text-center truncate w-full px-0.5
+                  ${status === 'done' ? 'text-green-400'
+                  : status === 'running' ? 'text-brand'
+                  : 'text-text-faint'}`}>
+                  {step.label}
+                </span>
+              </div>
+              {!isLast && (
+                <div className={`h-px flex-1 mx-0.5 -mt-3
+                  ${status === 'done' ? 'bg-green-500/40' : 'bg-border'}`} />
+              )}
+            </div>
+          )
+        })}
+      </div>
+    </div>
+  )
+}
+
 // ---------------------------------------------------------------------------
 // Main component
 // ---------------------------------------------------------------------------
-export function DeviceDrawer({ device, onClose, onRename, onResolveName, onRefresh, onStarToggle, onMetadataUpdate }) {
+export function DeviceDrawer({ device, onClose, onRename, onResolveName, onRefresh, onStarToggle, onMetadataUpdate, onZoneChange, vulnScanState, onVulnScanChange, initialTab }) {
   if (!device) return null
 
   const [localDevice,  setLocalDevice]  = useState(device)
@@ -214,9 +305,31 @@ export function DeviceDrawer({ device, onClose, onRename, onResolveName, onRefre
   const [rescanning,   setRescanning]   = useState(false)
   const [activeAction, setActiveAction] = useState(null)  // 'ping' | 'traceroute' | 'rescan'
   const [staticLines,  setStaticLines]  = useState([])
-  const [activeTab,    setActiveTab]    = useState('overview')
+  const [activeTab,    setActiveTab]    = useState(initialTab || 'overview')
   const [blocking,     setBlocking]     = useState(false)
   const [ignoring,     setIgnoring]     = useState(false)
+  const [deleting,     setDeleting]     = useState(false)
+
+  // Vuln scan state is owned by the parent (App.jsx) so it survives drawer close/reopen.
+  // Proxy setters propagate functional updaters so rapid SSE lines don't get lost to stale closures.
+  const vulnLines    = vulnScanState?.lines    ?? []
+  const vulnScanning = vulnScanState?.scanning ?? false
+  function setVulnLines(updater) {
+    if (!onVulnScanChange) return
+    if (typeof updater === 'function') {
+      onVulnScanChange(s => ({ lines: updater(s.lines) }))
+    } else {
+      onVulnScanChange({ lines: updater })
+    }
+  }
+  function setVulnScanning(updater) {
+    if (!onVulnScanChange) return
+    if (typeof updater === 'function') {
+      onVulnScanChange(s => ({ scanning: updater(s.scanning) }))
+    } else {
+      onVulnScanChange({ scanning: updater })
+    }
+  }
 
   useEffect(() => { setLocalDevice(device) }, [device])
 
@@ -238,7 +351,7 @@ export function DeviceDrawer({ device, onClose, onRename, onResolveName, onRefre
   }
 
   async function handleRescan() {
-    setRescanning(true); setActiveAction('rescan'); stream.stop(); setStaticLines([])
+    setRescanning(true); setActiveAction('rescan'); stream.stop(); stream.clear(); setStaticLines([])
     try {
       await api.rescanDevice(mac)
       setStaticLines(['[INFO] Deep scan queued — results will update shortly.'])
@@ -333,7 +446,7 @@ export function DeviceDrawer({ device, onClose, onRename, onResolveName, onRefre
         </div>
 
         {/* Tab bar */}
-        <div className="flex border-b border-border px-6 gap-1" style={{ background: 'var(--color-surface)' }}>
+        <div className="flex border-b border-border px-4 gap-0 overflow-x-auto scrollbar-none" style={{ background: 'var(--color-surface)' }}>
           {TABS.map(tab => {
             const isVuln   = tab.id === 'vulns'
             const isActive = activeTab === tab.id
@@ -341,7 +454,7 @@ export function DeviceDrawer({ device, onClose, onRename, onResolveName, onRefre
               <button
                 key={tab.id}
                 onClick={() => setActiveTab(tab.id)}
-                className="px-3 py-3 text-xs font-medium border-b-2 transition-colors flex items-center gap-1.5"
+                className="px-3 py-3 text-xs font-medium border-b-2 transition-colors flex items-center gap-1.5 whitespace-nowrap shrink-0"
                 style={isActive
                   ? { borderColor: 'var(--color-brand)', color: 'var(--color-brand)' }
                   : { borderColor: 'transparent', color: 'var(--color-text-muted)' }}
@@ -360,6 +473,21 @@ export function DeviceDrawer({ device, onClose, onRename, onResolveName, onRefre
 
           {activeTab === 'overview' && (
             <>
+              {/* Scan pipeline progress */}
+              <ScanPipeline device={localDevice} vulnScanning={vulnScanning} />
+
+              {/* Virtual interface notice */}
+              {localDevice.is_virtual_interface && (
+                <div className="flex items-start gap-2 px-3 py-2.5 rounded-lg"
+                  style={{ background: 'rgba(99,102,241,0.1)', border: '1px solid rgba(99,102,241,0.25)' }}>
+                  <GitMerge size={13} className="mt-0.5 shrink-0" style={{ color: '#818cf8' }} />
+                  <p className="text-[11px] leading-snug" style={{ color: '#a5b4fc' }}>
+                    Virtual interface (macvlan / container) — shares IPs with the physical NIC on
+                    this host. Scan data may differ from the primary device entry.
+                  </p>
+                </div>
+              )}
+
               {/* Status badges */}
               <div className="flex gap-2 flex-wrap">
                 {localDevice.is_online
@@ -404,7 +532,7 @@ export function DeviceDrawer({ device, onClose, onRename, onResolveName, onRefre
               </div>
 
               {/* Actions */}
-              <Section title="Actions" icon={Activity}>
+              <Collapsible title="Actions" icon={Activity} defaultOpen={true}>
                 <div className="grid grid-cols-2 gap-2 pt-1">
                   {pingRunning
                     ? <StopBtn label="Stop Ping"  onClick={handlePing} />
@@ -445,17 +573,16 @@ export function DeviceDrawer({ device, onClose, onRename, onResolveName, onRefre
                     ? <><Eye size={12} /> Un-ignore device</>
                     : <><EyeOff size={12} /> Ignore device</>}
                 </button>
-                {/* Structured stream output */}
                 <StreamOutput
                   lines={termLines}
                   running={termRunning}
                   onStop={stream.stop}
                   mode={streamMode}
                 />
-              </Section>
+              </Collapsible>
 
               {/* Network */}
-              <Section title="Network" icon={Globe}>
+              <Collapsible title="Network" icon={Globe} defaultOpen={true}>
                 <Row label="IP Address"  value={localDevice.ip_address} mono />
                 <Row label="MAC Address" value={mac} mono />
                 <Row label="Vendor"      value={localDevice.vendor_override || localDevice.vendor || 'Unknown'} />
@@ -474,21 +601,13 @@ export function DeviceDrawer({ device, onClose, onRename, onResolveName, onRefre
                 />
                 {localDevice.custom_name && <Row label="Custom name" value={localDevice.custom_name} />}
                 {localDevice.location    && <Row label="Location"    value={localDevice.location} />}
-                {localDevice.zone        && <Row label="Zone"        value={localDevice.zone} />}
+                <ZoneEditor mac={mac} currentZone={localDevice.zone} onChanged={zone => {
+                  setLocalDevice(prev => ({ ...prev, zone }))
+                  if (onZoneChange) onZoneChange(zone)
+                }} />
                 {localDevice.miss_count  !== undefined && <Row label="Miss count" value={localDevice.miss_count} />}
-                {scan?.mdns_services?.length > 0 && (
-                  <Row label="mDNS services" value={
-                    <div className="flex flex-wrap gap-1 justify-end">
-                      {scan.mdns_services.map(s => (
-                        <span key={s} className="text-[10px] px-1.5 py-0.5 rounded font-mono"
-                          style={{ background: 'var(--color-surface-offset)', color: 'var(--color-text-muted)', border: '1px solid var(--color-border)' }}>
-                          {s}
-                        </span>
-                      ))}
-                    </div>
-                  } />
-                )}
-              </Section>
+                <MdnsRow mac={mac} scan={scan} onRefreshed={updated => setLocalDevice(prev => ({ ...prev, scan_results: { ...(prev.scan_results || {}), mdns_services: updated } }))} />
+              </Collapsible>
 
               {/* IP History */}
               <Collapsible title="IP History" icon={History} defaultOpen={false}>
@@ -496,36 +615,50 @@ export function DeviceDrawer({ device, onClose, onRename, onResolveName, onRefre
               </Collapsible>
 
               {/* Timeline summary */}
-              <Section title="Timeline" icon={Clock}>
+              <Collapsible title="Timeline" icon={Clock} defaultOpen={true}>
                 <Row label="First seen" value={fmt(localDevice.first_seen)} />
                 <Row label="Last seen"  value={fmt(localDevice.last_seen)} />
                 {scan?.scanned_at && <Row label="Scanned at" value={fmt(scan.scanned_at)} />}
-              </Section>
-
-              {/* OS Detection */}
-              {scan && (
-                <Section title="OS Detection" icon={Cpu}>
-                  {scan.os_matches?.length > 0 ? (
-                    scan.os_matches.map((m, i) => (
-                      <div key={i} className="flex items-center justify-between py-1.5 border-b border-border last:border-0">
-                        <span className="text-sm text-text">{m.name}</span>
-                        <span className="text-xs font-medium text-brand tabular-nums">{m.accuracy}%</span>
-                      </div>
-                    ))
-                  ) : (
-                    <p className="text-sm text-text-muted italic">No confident OS match found</p>
-                  )}
-                </Section>
-              )}
+              </Collapsible>
 
               {/* Open Ports */}
-              {scan?.open_ports?.length > 0 && (
-                <Section title={`Open Ports (${scan.open_ports.length})`} icon={Terminal}>
+              {scan?.open_ports?.length > 0 && (() => {
+                // Summarise vuln severity counts from the latest report if available
+                const sevCounts = {}
+                const latestFindings = localDevice.latest_vuln_findings || []
+                for (const f of latestFindings) {
+                  if (['critical','high','medium'].includes(f.severity)) {
+                    sevCounts[f.severity] = (sevCounts[f.severity] || 0) + 1
+                  }
+                }
+                const sevBadges = Object.entries(sevCounts).map(([sev, n]) => {
+                  const colors = { critical: '#ef4444', high: '#f97316', medium: '#f59e0b' }
+                  return (
+                    <span key={sev} className="text-[9px] font-semibold px-1 rounded"
+                      style={{ background: `${colors[sev]}20`, color: colors[sev] }}>
+                      {n} {sev[0].toUpperCase()}
+                    </span>
+                  )
+                })
+                const portTitle = (
+                  <span className="flex items-center gap-1.5">
+                    Open Ports ({scan.open_ports.length})
+                    {sevBadges.length > 0 && (
+                      <span className="flex items-center gap-1 ml-1">{sevBadges}</span>
+                    )}
+                  </span>
+                )
+                return (
+                <Collapsible title={portTitle} icon={Terminal} defaultOpen={true}>
                   {scan.open_ports.map((p, i) => {
-                    const web       = isWebPort(p.port)
-                    const url       = web ? portUrl(localDevice.ip_address, p.port) : null
-                    const dangerous = DANGEROUS_PORTS.has(p.port)
-                    const svcLabel  = p.service || PORT_DESCRIPTIONS[p.port] || ''
+                    const web        = isWebPort(p.port)
+                    const url        = web ? portUrl(localDevice.ip_address, p.port) : null
+                    const dangerous  = DANGEROUS_PORTS.has(p.port)
+                    const nervaSvc   = (localDevice.services || []).find(s => s.port === p.port)
+                    const label      = nervaSvc
+                      ? svcLabel(nervaSvc.service)
+                      : (p.service || PORT_DESCRIPTIONS[p.port] || '')
+                    const hasTls     = nervaSvc?.tls
                     return (
                       <div key={i} className="py-2 border-b border-border last:border-0 space-y-0.5">
                         <div className="flex items-center gap-3">
@@ -542,12 +675,20 @@ export function DeviceDrawer({ device, onClose, onRename, onResolveName, onRefre
                               {p.port}/{p.proto}
                             </span>
                           )}
-                          <span className="text-sm text-text flex-1 truncate">{svcLabel}</span>
-                          {(p.product || p.version) && (
-                            <span className="text-xs text-text-muted shrink-0 truncate max-w-[140px]">
-                              {[p.product, p.version].filter(Boolean).join(' ')}
-                            </span>
-                          )}
+                          <span className="text-sm text-text flex-1 truncate">{label}</span>
+                          <div className="flex items-center gap-1.5 shrink-0">
+                            {hasTls && (
+                              <span className="text-[9px] px-1 py-0.5 rounded font-medium"
+                                style={{ background: 'rgba(34,197,94,0.1)', color: '#22c55e', border: '1px solid rgba(34,197,94,0.25)' }}>
+                                TLS
+                              </span>
+                            )}
+                            {(p.product || p.version) && (
+                              <span className="text-xs text-text-muted truncate max-w-[110px]">
+                                {[p.product, p.version].filter(Boolean).join(' ')}
+                              </span>
+                            )}
+                          </div>
                         </div>
                         {p.cpe && (
                           <p className="font-mono text-[10px] text-text-faint pl-20 truncate" title={p.cpe}>{p.cpe}</p>
@@ -555,30 +696,30 @@ export function DeviceDrawer({ device, onClose, onRename, onResolveName, onRefre
                       </div>
                     )
                   })}
-                </Section>
+                </Collapsible>
+                )
+              })()}
+
+              {/* Port Baseline */}
+              {localDevice.baseline_ports != null && (
+                <Collapsible title="Port Baseline" icon={GitBranch} defaultOpen={false}>
+                  <PortBaselineSection device={localDevice} onReset={() => {
+                    api.resetBaseline(mac).then(() => {
+                      setLocalDevice(prev => ({ ...prev, baseline_ports: null, baseline_scan_count: 0 }))
+                    }).catch(() => {})
+                  }} />
+                </Collapsible>
               )}
-
-              {/* Identity */}
-              <Section title="Device Identity" icon={Tag}>
-                <IdentityForm
-                  device={localDevice}
-                  onSaved={updated => {
-                    setLocalDevice(updated)
-                    if (onRefresh) onRefresh()
-                  }}
-                />
-              </Section>
-
-              {/* Rename */}
-              <Section title="Rename Device" icon={null}>
-                <RenameForm device={localDevice} onRename={onRename} />
-              </Section>
             </>
           )}
 
           {activeTab === 'vulns' && (
             <VulnPanel
               device={localDevice}
+              lines={vulnLines}
+              setLines={setVulnLines}
+              scanning={vulnScanning}
+              setScanning={setVulnScanning}
               onScanComplete={() => {
                 api.getDevice(mac).then(updated => {
                   setLocalDevice(updated)
@@ -586,6 +727,10 @@ export function DeviceDrawer({ device, onClose, onRename, onResolveName, onRefre
                 }).catch(() => {})
               }}
             />
+          )}
+
+          {activeTab === 'traffic' && (
+            <TrafficPanel device={localDevice} />
           )}
 
           {activeTab === 'timeline' && (
@@ -598,20 +743,71 @@ export function DeviceDrawer({ device, onClose, onRename, onResolveName, onRefre
             </>
           )}
 
-          {activeTab === 'notes' && (
-            <>
-              <div className="flex items-center gap-2 mb-4">
-                <FileText size={14} className="text-brand" />
-                <h3 className="text-xs font-semibold text-text-muted uppercase tracking-wider">Notes, Tags & Location</h3>
+          {activeTab === 'admin' && (
+            <div className="space-y-6">
+              <Collapsible title="Notes, Tags & Location" icon={FileText} defaultOpen={true}>
+                <DeviceNotes
+                  device={localDevice}
+                  onSaved={updated => {
+                    setLocalDevice(prev => ({ ...prev, ...updated }))
+                    if (onMetadataUpdate) onMetadataUpdate(mac, updated)
+                  }}
+                />
+              </Collapsible>
+
+              <Collapsible title="Device Identity" icon={Tag} defaultOpen={true}>
+                <IdentityForm
+                  device={localDevice}
+                  onSaved={updated => {
+                    setLocalDevice(updated)
+                    if (onRefresh) onRefresh()
+                  }}
+                />
+              </Collapsible>
+
+              <Collapsible title="Rename Device" icon={RotateCcw} defaultOpen={true}>
+                <RenameForm device={localDevice} onRename={onRename} />
+              </Collapsible>
+
+              <Collapsible title="Alert Suppressions" icon={BellOff} defaultOpen={false}>
+                <SuppressionManager mac={mac} />
+              </Collapsible>
+
+              {/* Danger zone */}
+              <div className="rounded-xl border border-red-500/30 overflow-hidden">
+                <div className="px-4 py-2.5 border-b border-red-500/20"
+                  style={{ background: 'rgba(239,68,68,0.06)' }}>
+                  <span className="text-xs font-semibold uppercase tracking-wider text-red-400">Danger Zone</span>
+                </div>
+                <div className="p-4 space-y-3">
+                  <p className="text-xs" style={{ color: 'var(--color-text-muted)' }}>
+                    Permanently delete this device and all associated data (events, scan reports,
+                    traffic stats, alerts). The device will be re-discovered automatically if it
+                    becomes active again on the network.
+                  </p>
+                  <button
+                    disabled={deleting}
+                    onClick={async () => {
+                      if (!window.confirm(`Delete ${localDevice.custom_name || localDevice.hostname || mac} and all its data? This cannot be undone.`)) return
+                      setDeleting(true)
+                      try {
+                        await api.deleteDevice(mac)
+                        onClose()
+                        if (onRefresh) onRefresh()
+                      } catch (e) {
+                        alert('Delete failed: ' + e.message)
+                        setDeleting(false)
+                      }
+                    }}
+                    className="flex items-center gap-2 px-3 py-2 rounded-lg border text-xs font-medium
+                               transition-colors duration-150 border-red-500/40 bg-red-500/10 text-red-400
+                               hover:bg-red-500/20 disabled:opacity-50 disabled:cursor-not-allowed">
+                    <Trash2 size={13} />
+                    {deleting ? 'Deleting…' : 'Delete Device'}
+                  </button>
+                </div>
               </div>
-              <DeviceNotes
-                device={localDevice}
-                onSaved={updated => {
-                  setLocalDevice(prev => ({ ...prev, ...updated }))
-                  if (onMetadataUpdate) onMetadataUpdate(mac, updated)
-                }}
-              />
-            </>
+            </div>
           )}
 
         </div>
@@ -691,5 +887,297 @@ function RenameForm({ device, onRename }) {
         {saving ? '…' : 'Save'}
       </button>
     </form>
+  )
+}
+
+function ZoneEditor({ mac, currentZone, onChanged }) {
+  const [editing,   setEditing]   = useState(false)
+  const [value,     setValue]     = useState(currentZone || '')
+  const [zones,     setZones]     = useState([])
+  const [saving,    setSaving]    = useState(false)
+
+  useEffect(() => {
+    api.getDeviceZones().then(setZones).catch(() => {})
+  }, [])
+
+  const [saveError, setSaveError] = useState(null)
+
+  async function handleSave(e) {
+    e.preventDefault()
+    setSaving(true)
+    setSaveError(null)
+    const zoneVal = (value.trim() === '' || value.trim() === '-NONE-') ? null : value.trim()
+    try {
+      await api.assignZone({ mac_addresses: [mac], zone: zoneVal })
+      onChanged(zoneVal)
+      setEditing(false)
+    } catch (err) {
+      setSaveError(err.message || 'Save failed')
+    } finally { setSaving(false) }
+  }
+
+  const displayZone = currentZone || 'Unassigned'
+  if (!editing) {
+    return (
+      <div className="flex items-center justify-between py-1.5 gap-4 border-b border-border last:border-0">
+        <span className="text-xs text-text-muted shrink-0">Zone</span>
+        <span className="flex items-center gap-2 text-sm text-text">
+          <span className={currentZone ? 'text-text' : 'text-text-faint italic'}>{displayZone}</span>
+          <button onClick={() => { setValue(currentZone || ''); setEditing(true) }}
+            className="text-brand hover:text-brand opacity-60 hover:opacity-100 transition-opacity" title="Edit zone">
+            <Tag size={11} />
+          </button>
+        </span>
+      </div>
+    )
+  }
+
+  return (
+    <div className="flex flex-col py-1.5 gap-1 border-b border-border last:border-0">
+      <div className="flex items-center justify-between gap-4">
+        <span className="text-xs text-text-muted shrink-0">Zone</span>
+        <form onSubmit={handleSave} className="flex gap-1 items-center">
+          <input
+            list="zone-list"
+            className="input py-0.5 px-2 text-xs h-6 w-32"
+            value={value}
+            onChange={e => { setValue(e.target.value); setSaveError(null) }}
+            placeholder="Zone name or leave blank…"
+            autoFocus
+          />
+          <datalist id="zone-list">
+            <option value="-NONE-" />
+            {zones.map(z => <option key={z} value={z} />)}
+          </datalist>
+          <button type="submit" disabled={saving}
+            className="text-xs px-2 py-0.5 rounded" style={{ background: 'var(--color-brand)', color: '#fff' }}>
+            {saving ? '…' : 'Set'}
+          </button>
+          <button type="button" onClick={() => { setEditing(false); setSaveError(null) }}
+            className="text-xs px-1 py-0.5 rounded opacity-60 hover:opacity-100" style={{ color: 'var(--color-text-faint)' }}>
+            <X size={10} />
+          </button>
+        </form>
+      </div>
+      {saveError && <p className="text-[10px] text-red-400 text-right">{saveError}</p>}
+    </div>
+  )
+}
+
+function MdnsRow({ mac, scan, onRefreshed }) {
+  const [refreshing, setRefreshing] = useState(false)
+  const services = scan?.mdns_services || []
+
+  async function handleRefresh() {
+    setRefreshing(true)
+    try {
+      const result = await api.refreshMdns(mac)
+      onRefreshed(result.mdns_services || [])
+    } catch {}
+    finally { setRefreshing(false) }
+  }
+
+  return (
+    <div className="flex items-start justify-between py-1.5 gap-4 border-b border-border last:border-0">
+      <span className="text-xs text-text-muted shrink-0 mt-0.5">mDNS services</span>
+      <div className="flex flex-col items-end gap-1">
+        {services.length > 0 ? (
+          <div className="flex flex-wrap gap-1 justify-end">
+            {services.map(s => (
+              <span key={s} className="text-[10px] px-1.5 py-0.5 rounded font-mono"
+                style={{ background: 'var(--color-surface-offset)', color: 'var(--color-text-muted)', border: '1px solid var(--color-border)' }}>
+                {s}
+              </span>
+            ))}
+          </div>
+        ) : (
+          <span className="text-xs text-text-faint italic">None discovered</span>
+        )}
+        <button onClick={handleRefresh} disabled={refreshing}
+          className="flex items-center gap-1 text-[10px] opacity-60 hover:opacity-100 transition-opacity"
+          style={{ color: 'var(--color-brand)' }}>
+          <Radio size={9} className={refreshing ? 'animate-pulse' : ''} />
+          {refreshing ? 'Scanning…' : 'Refresh mDNS'}
+        </button>
+      </div>
+    </div>
+  )
+}
+
+function PortBaselineSection({ device, onReset }) {
+  const baseline = device.baseline_ports || []
+  const current  = (device.scan_results?.open_ports || []).map(p => p.port)
+  const newPorts    = current.filter(p => !baseline.includes(p))
+  const closedPorts = baseline.filter(p => !current.includes(p))
+  const hasDrift    = newPorts.length > 0 || closedPorts.length > 0
+
+  return (
+    <div className="space-y-3">
+      <div className="flex items-center justify-between">
+        <span className="text-xs text-text-muted">
+          Confirmed baseline · {baseline.length} port{baseline.length !== 1 ? 's' : ''}
+        </span>
+        <button onClick={onReset}
+          className="flex items-center gap-1 text-[10px] opacity-60 hover:opacity-100 transition-opacity"
+          style={{ color: 'var(--color-text-muted)' }}>
+          <RotateCcw size={9} />
+          Reset
+        </button>
+      </div>
+      {baseline.length > 0 && (
+        <div className="flex flex-wrap gap-1">
+          {baseline.map(p => {
+            const isNew    = newPorts.includes(p)
+            const isClosed = closedPorts.includes(p)
+            return (
+              <span key={p} className="font-mono text-[10px] px-1.5 py-0.5 rounded"
+                style={isClosed
+                  ? { background: 'rgba(245,158,11,0.15)', color: '#f59e0b', border: '1px solid rgba(245,158,11,0.3)' }
+                  : { background: 'var(--color-surface-offset)', color: 'var(--color-text-muted)', border: '1px solid var(--color-border)' }}>
+                {p}
+              </span>
+            )
+          })}
+          {newPorts.map(p => (
+            <span key={`new-${p}`} className="font-mono text-[10px] px-1.5 py-0.5 rounded"
+              style={{ background: 'rgba(239,68,68,0.15)', color: '#ef4444', border: '1px solid rgba(239,68,68,0.3)' }}>
+              +{p}
+            </span>
+          ))}
+        </div>
+      )}
+      {hasDrift && (
+        <div className="flex flex-wrap gap-2 text-[11px]">
+          {newPorts.length > 0 && (
+            <span className="flex items-center gap-1" style={{ color: '#ef4444' }}>
+              <TrendingUp size={10} />
+              {newPorts.length} new port{newPorts.length !== 1 ? 's' : ''}: {newPorts.join(', ')}
+            </span>
+          )}
+          {closedPorts.length > 0 && (
+            <span className="flex items-center gap-1" style={{ color: '#f59e0b' }}>
+              <TrendingDown size={10} />
+              {closedPorts.length} closed: {closedPorts.join(', ')}
+            </span>
+          )}
+        </div>
+      )}
+      {!hasDrift && baseline.length > 0 && (
+        <p className="text-[11px]" style={{ color: 'var(--color-text-faint)' }}>No drift from baseline</p>
+      )}
+    </div>
+  )
+}
+
+const SUPPRESSION_EVENT_TYPES = [
+  { value: '', label: 'All events (global suppress)' },
+  { value: 'joined',      label: 'New device joined' },
+  { value: 'offline',     label: 'Device offline' },
+  { value: 'online',      label: 'Device online' },
+  { value: 'port_change', label: 'Port change' },
+  { value: 'vuln_scan_complete', label: 'Vuln scan complete' },
+]
+
+function SuppressionManager({ mac }) {
+  const [suppressions, setSuppressions] = useState(null)
+  const [adding,       setAdding]       = useState(false)
+  const [newType,      setNewType]      = useState('')
+  const [newReason,    setNewReason]    = useState('')
+  const [newExpiry,    setNewExpiry]    = useState('')
+  const [saving,       setSaving]       = useState(false)
+
+  async function load() {
+    try {
+      const list = await api.getSuppressions(mac)
+      setSuppressions(list)
+    } catch { setSuppressions([]) }
+  }
+
+  useEffect(() => { load() }, [mac])
+
+  async function handleAdd(e) {
+    e.preventDefault()
+    setSaving(true)
+    try {
+      await api.createSuppression({
+        mac_address: mac,
+        event_type:  newType || null,
+        reason:      newReason || null,
+        expires_at:  newExpiry || null,
+      })
+      setAdding(false); setNewType(''); setNewReason(''); setNewExpiry('')
+      await load()
+    } catch {}
+    finally { setSaving(false) }
+  }
+
+  async function handleDelete(id) {
+    await api.deleteSuppression(id)
+    await load()
+  }
+
+  if (suppressions === null) return <p className="text-xs text-text-faint">Loading…</p>
+
+  return (
+    <div className="space-y-2 pt-1">
+      {suppressions.length === 0 ? (
+        <p className="text-xs italic" style={{ color: 'var(--color-text-faint)' }}>No active suppressions.</p>
+      ) : (
+        <div className="space-y-1">
+          {suppressions.map(s => (
+            <div key={s.id} className="flex items-center justify-between gap-2 px-2 py-1.5 rounded-lg"
+              style={{ background: 'var(--color-surface-offset)', border: '1px solid var(--color-border)' }}>
+              <div className="flex-1 min-w-0">
+                <p className="text-xs font-medium" style={{ color: 'var(--color-text)' }}>
+                  {s.event_type ? SUPPRESSION_EVENT_TYPES.find(t => t.value === s.event_type)?.label || s.event_type : 'All events'}
+                </p>
+                {s.reason && <p className="text-[10px] truncate" style={{ color: 'var(--color-text-faint)' }}>{s.reason}</p>}
+                {s.expires_at && <p className="text-[10px]" style={{ color: 'var(--color-text-faint)' }}>Expires: {new Date(s.expires_at).toLocaleDateString()}</p>}
+              </div>
+              <button onClick={() => handleDelete(s.id)}
+                className="opacity-40 hover:opacity-100 transition-opacity shrink-0"
+                style={{ color: '#ef4444' }} aria-label="Delete suppression">
+                <Trash2 size={12} />
+              </button>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {!adding ? (
+        <button onClick={() => setAdding(true)}
+          className="flex items-center gap-1.5 text-xs px-2.5 py-1.5 rounded-lg border w-full justify-center transition-colors"
+          style={{ borderColor: 'var(--color-border)', color: 'var(--color-text-muted)' }}>
+          <Plus size={11} />Add suppression
+        </button>
+      ) : (
+        <form onSubmit={handleAdd} className="space-y-2 p-2 rounded-lg"
+          style={{ background: 'var(--color-surface-offset)', border: '1px solid var(--color-border)' }}>
+          <div>
+            <label className="block text-[10px] text-text-faint mb-1">Event type</label>
+            <select value={newType} onChange={e => setNewType(e.target.value)}
+              className="input w-full text-xs py-1">
+              {SUPPRESSION_EVENT_TYPES.map(t => <option key={t.value} value={t.value}>{t.label}</option>)}
+            </select>
+          </div>
+          <div>
+            <label className="block text-[10px] text-text-faint mb-1">Reason (optional)</label>
+            <input value={newReason} onChange={e => setNewReason(e.target.value)}
+              className="input w-full text-xs py-1" placeholder="Reason…" />
+          </div>
+          <div>
+            <label className="block text-[10px] text-text-faint mb-1">Expires (optional)</label>
+            <input type="datetime-local" value={newExpiry} onChange={e => setNewExpiry(e.target.value)}
+              className="input w-full text-xs py-1" />
+          </div>
+          <div className="flex gap-2">
+            <button type="submit" disabled={saving}
+              className="btn-primary text-xs py-1 flex-1">{saving ? 'Adding…' : 'Add'}</button>
+            <button type="button" onClick={() => setAdding(false)}
+              className="btn-ghost text-xs py-1">Cancel</button>
+          </div>
+        </form>
+      )}
+    </div>
   )
 }

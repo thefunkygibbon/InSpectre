@@ -2,13 +2,13 @@ import { useState } from 'react'
 import {
   Star, HelpCircle, Tag, Unlock, ScanLine,
   WifiOff, Tags, MapPin, ShieldAlert, Ban, FileText,
-  Bookmark, BookmarkCheck, X, Layers, ShieldCheck, Cpu, Users, EyeOff,
+  Bookmark, BookmarkCheck, X, Layers, ShieldCheck, ShieldOff, Cpu, Users, EyeOff,
 } from 'lucide-react'
 import { SMART_FILTERS } from '../hooks/useSmartFilters'
 
 const ICON_MAP = {
   Star, HelpCircle, Tag, Unlock, ScanLine, WifiOff, Tags, MapPin,
-  ShieldAlert, Ban, FileText, Layers, ShieldCheck, Cpu, Users, EyeOff,
+  ShieldAlert, Ban, FileText, Layers, ShieldCheck, ShieldOff, Cpu, Users, EyeOff,
 }
 
 export function SmartFilterBar({ devices, activeFilters, onToggle, onClear, savedViews, onSaveView, onLoadView, onDeleteView }) {
@@ -62,34 +62,38 @@ export function SmartFilterBar({ devices, activeFilters, onToggle, onClear, save
       {/* Filter chips row */}
       <div className="flex flex-wrap gap-2 items-center">
         {SMART_FILTERS.map(f => {
-          const active  = activeFilters.includes(f.id)
-          const count   = countFor(f)
-          const Icon    = ICON_MAP[f.icon] || HelpCircle
+          const state = activeFilters[f.id] || null   // null | 'include' | 'exclude'
+          const count = countFor(f)
+          const Icon  = ICON_MAP[f.icon] || HelpCircle
+
+          const buttonStyle =
+            state === 'include'
+              ? { background: 'rgba(34,197,94,0.18)', color: '#16a34a', border: '1px solid rgba(34,197,94,0.45)' }
+              : state === 'exclude'
+              ? { background: 'rgba(239,68,68,0.15)', color: '#dc2626', border: '1px solid rgba(239,68,68,0.4)' }
+              : { background: 'var(--color-surface-offset)', color: 'var(--color-text-muted)', border: '1px solid transparent' }
+
+          const badgeStyle =
+            state === 'include'
+              ? { background: 'rgba(34,197,94,0.25)', color: '#16a34a' }
+              : state === 'exclude'
+              ? { background: 'rgba(239,68,68,0.2)', color: '#dc2626' }
+              : { background: 'var(--color-surface-dynamic)', color: 'var(--color-text-muted)' }
+
           return (
             <button
               key={f.id}
-              title={f.description}
+              title={`${f.description} — click to include, again to exclude, again to clear`}
               onClick={() => onToggle(f.id)}
-              className={[
-                'flex items-center gap-1.5 px-3 py-1.5 rounded-full text-xs font-medium border transition-all',
-                active
-                  ? 'border-transparent text-white'
-                  : 'border-transparent hover:border-current',
-              ].join(' ')}
-              style={active
-                ? { background: 'var(--color-primary)', color: '#fff' }
-                : { background: 'var(--color-surface-offset)', color: 'var(--color-text-muted)' }
-              }
+              className="flex items-center gap-1.5 px-3 py-1.5 rounded-full text-xs font-medium transition-all hover:opacity-90"
+              style={buttonStyle}
             >
               <Icon size={12} />
               {f.label}
               {count > 0 && (
                 <span
                   className="ml-0.5 px-1.5 py-0.5 rounded-full text-[10px] font-semibold"
-                  style={active
-                    ? { background: 'rgba(255,255,255,0.25)', color: '#fff' }
-                    : { background: 'var(--color-surface-dynamic)', color: 'var(--color-text-muted)' }
-                  }
+                  style={badgeStyle}
                 >
                   {count}
                 </span>
@@ -98,7 +102,7 @@ export function SmartFilterBar({ devices, activeFilters, onToggle, onClear, save
           )
         })}
 
-        {activeFilters.length > 0 && (
+        {Object.keys(activeFilters).length > 0 && (
           <button
             onClick={onClear}
             className="text-xs px-2 py-1 rounded-full"
@@ -109,7 +113,7 @@ export function SmartFilterBar({ devices, activeFilters, onToggle, onClear, save
         )}
 
         {/* Save view button */}
-        {activeFilters.length > 0 && onSaveView && !saveMode && (
+        {Object.keys(activeFilters).length > 0 && onSaveView && !saveMode && (
           <button
             onClick={() => setSaveMode(true)}
             className="flex items-center gap-1 text-xs px-2.5 py-1 rounded-full border transition-all"

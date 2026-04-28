@@ -6,6 +6,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         traceroute \
         iproute2 \
         nmap \
+        whois \
+        dnsutils \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app

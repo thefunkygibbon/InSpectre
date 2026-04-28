@@ -34,17 +34,31 @@ async function streamSSE(path, onLine, signal) {
 
 export const api = {
   // Devices
-  getDevices:      (includeIgnored = true) => request('GET', `/devices${includeIgnored ? '' : '?include_ignored=false'}`),
+  getDevices:      (params = {}) => {
+    const p = new URLSearchParams()
+    Object.entries(params).forEach(([k, v]) => { if (v !== undefined && v !== null && v !== '') p.set(k, v) })
+    const qs = p.toString()
+    return request('GET', `/devices${qs ? '?' + qs : ''}`)
+  },
   getDevice:       (mac)        => request('GET',   `/devices/${mac}`),
   updateDevice:    (mac, body)  => request('PATCH', `/devices/${mac}`, body),
   updateIdentity:  (mac, body)  => request('PATCH', `/devices/${mac}/identity`, body),
   updateMetadata:  (mac, body)  => request('PATCH', `/devices/${mac}/metadata`, body),
   resolveName:     (mac)        => request('POST',  `/devices/${mac}/resolve-name`),
   rescanDevice:    (mac)        => request('POST',  `/devices/${mac}/rescan`),
+  resetBaseline:   (mac)        => request('POST',  `/devices/${mac}/reset-baseline`),
   getScanResults:  (mac)        => request('GET',   `/devices/${mac}/scan`),
   getIpHistory:    (mac)        => request('GET',   `/devices/${mac}/ip-history`),
-  getDeviceEvents: (mac, limit) => request('GET',   `/devices/${mac}/events${limit ? `?limit=${limit}` : ''}`),
-  getStats:        ()           => request('GET',   '/stats'),
+  getDeviceEvents: (mac, limit, type) => {
+    const p = new URLSearchParams()
+    if (limit) p.set('limit', limit)
+    if (type)  p.set('type', type)
+    return request('GET', `/devices/${mac}/events${p.toString() ? '?' + p : ''}`)
+  },
+  getDeviceServices: (mac)      => request('GET',  `/devices/${mac}/services`),
+  refreshMdns:       (mac)      => request('POST', `/devices/${mac}/mdns-refresh`),
+  getDeviceZones:    ()         => request('GET',  '/devices/meta/zones'),
+  getStats:          ()         => request('GET',  '/stats'),
 
   // Global events feed
   getAllEvents:    (limit, type) => {
@@ -98,6 +112,89 @@ export const api = {
   deleteVulnReport:     (mac, id)    => request('DELETE', `/devices/${mac}/vuln-reports/${id}`),
   getAllVulnReports:     (severity)   => request('GET',    `/vuln-reports${severity ? `?severity=${severity}` : ''}`),
   getVulnSummary:       ()           => request('GET',    '/vulns/summary'),
+  scanAllVulns:         ()           => request('POST',   '/vulns/scan-all'),
+  getVulnTrend:         (days)       => request('GET',    `/vulns/trend${days ? `?days=${days}` : ''}`),
+  getTopVulnDevices:    (limit)      => request('GET',    `/vulns/top-devices${limit ? `?limit=${limit}` : ''}`),
+
+  // Network Tools (one-shot)
+  toolsDns:           (host, type)  => request('GET', `/tools/dns?host=${encodeURIComponent(host)}&type=${encodeURIComponent(type)}`),
+  toolsRdns:          (ip)          => request('GET', `/tools/rdns?ip=${encodeURIComponent(ip)}`),
+  toolsDnsPropagation:(host, type)  => request('GET', `/tools/dns-propagation?host=${encodeURIComponent(host)}&type=${encodeURIComponent(type)}`),
+  toolsHttpHeaders:   (url)         => request('GET', `/tools/http-headers?url=${encodeURIComponent(url)}`),
+  toolsSsl:           (host, port)  => request('GET', `/tools/ssl?host=${encodeURIComponent(host)}&port=${port || 443}`),
+  toolsGeo:           (ip)          => request('GET', `/tools/geo?ip=${encodeURIComponent(ip)}`),
+  toolsWhois:         (host)        => request('GET', `/tools/whois?host=${encodeURIComponent(host)}`),
+  toolsEmail:         (domain)      => request('GET', `/tools/email?domain=${encodeURIComponent(domain)}`),
+  toolsArpLookup:     (query)       => request('GET', `/tools/arp-lookup?query=${encodeURIComponent(query)}`),
+  toolsWakeOnLan:     (mac, bcast)  => request('POST', '/tools/wake-on-lan', { mac, broadcast: bcast || '255.255.255.255' }),
+  toolsDoh:           (host, type)  => request('GET', `/tools/doh?host=${encodeURIComponent(host)}&type=${encodeURIComponent(type)}`),
+  toolsDnssec:        (host)        => request('GET', `/tools/dnssec?host=${encodeURIComponent(host)}`),
+  toolsRdnsBulk:      (cidr)        => request('GET', `/tools/rdns-bulk?cidr=${encodeURIComponent(cidr)}`),
+  toolsRedirectChain: (url)         => request('GET', `/tools/redirect-chain?url=${encodeURIComponent(url)}`),
+  toolsHttpTiming:    (url)         => request('GET', `/tools/http-timing?url=${encodeURIComponent(url)}`),
+  toolsTlsVersions:   (host, port)  => request('GET', `/tools/tls-versions?host=${encodeURIComponent(host)}&port=${port || 443}`),
+  toolsBgp:           (query)       => request('GET', `/tools/bgp?query=${encodeURIComponent(query)}`),
+  toolsSmtpBanner:    (host, port)  => request('GET', `/tools/smtp-banner?host=${encodeURIComponent(host)}&port=${port || 25}`),
+  toolsBimi:          (domain)      => request('GET', `/tools/bimi?domain=${encodeURIComponent(domain)}`),
+  toolsDnsbl:         (ip)          => request('GET', `/tools/dnsbl?ip=${encodeURIComponent(ip)}`),
+
+  // Speed test
+  speedtestResults:   ()                => request('GET',    '/speedtest/results'),
+  deleteSpeedtest:    (id)              => request('DELETE', `/speedtest/results/${id}`),
+  speedtestServers:   ()                => request('GET',    '/tools/speedtest-servers'),
+
+  // Delete device
+  deleteDevice:       (mac)             => request('DELETE', `/devices/${mac}`),
+
+  // Backup / restore
+  exportBackup:       ()                => fetch(`${BASE}/export/backup`),
+  importRestore:      (file)            => {
+    const form = new FormData()
+    form.append('file', file)
+    return fetch(`${BASE}/import/restore`, { method: 'POST', body: form })
+      .then(r => { if (!r.ok) throw new Error(`Restore failed: ${r.status}`); return r.json() })
+  },
+
+  // Block schedules
+  getBlockSchedules:    ()          => request('GET',    '/block-schedules'),
+  createBlockSchedule:  (body)      => request('POST',   '/block-schedules', body),
+  updateBlockSchedule:  (id, body)  => request('PATCH',  `/block-schedules/${id}`, body),
+  deleteBlockSchedule:  (id)        => request('DELETE', `/block-schedules/${id}`),
+
+  // Network pause / resume
+  getNetworkStatus: ()  => request('GET',  '/network/status'),
+  networkPause:     ()  => request('POST', '/network/pause'),
+  networkResume:    ()  => request('POST', '/network/resume'),
+
+  // Timeline
+  getTimeline:       (days)      => request('GET', `/timeline${days ? `?days=${days}` : ''}`),
+  getDeviceTimeline: (mac, days) => request('GET', `/devices/${mac}/timeline${days ? `?days=${days}` : ''}`),
+
+  // Zones
+  getZones:     ()     => request('GET',  '/zones'),
+  assignZone:   (body) => request('POST', '/zones/assign', body),
+  renameZone:   (body) => request('POST', '/zones/rename', body),
+
+  // Saved views (server-side)
+  getSavedViews:    ()          => request('GET',    '/saved-views'),
+  createSavedView:  (body)      => request('POST',   '/saved-views', body),
+  updateSavedView:  (id, body)  => request('PUT',    `/saved-views/${id}`, body),
+  deleteSavedView:  (id)        => request('DELETE', `/saved-views/${id}`),
+
+  // Alert suppressions
+  getSuppressions:    (mac)  => request('GET',    `/suppressions${mac ? `?mac=${mac}` : ''}`),
+  createSuppression:  (body) => request('POST',   '/suppressions', body),
+  deleteSuppression:  (id)   => request('DELETE', `/suppressions/${id}`),
+
+  // Traffic monitoring
+  trafficStart:       (mac)        => request('POST',   `/traffic/start/${mac}`),
+  trafficStop:        (mac)        => request('DELETE', `/traffic/stop/${mac}`),
+  trafficActive:      ()           => request('GET',    '/traffic/active'),
+  trafficLive:        (mac)        => request('GET',    `/traffic/live/${mac}`),
+  trafficHistory:     (mac, days)  => request('GET',    `/traffic/history/${mac}${days ? `?days=${days}` : ''}`),
+  trafficTopDomains:  (mac, days)  => request('GET',    `/traffic/top-domains/${mac}${days ? `?days=${days}` : ''}`),
+  trafficSummary:     ()           => request('GET',    '/traffic/summary'),
+  trafficStream:      (mac, onLine, signal) => streamSSE(`/traffic/stream/${mac}`, onLine, signal),
 }
 
 export { streamSSE }

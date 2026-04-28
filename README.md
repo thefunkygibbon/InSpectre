@@ -2,101 +2,170 @@
 
 **Know every device on your network.**
 
-InSpectre is a self-hosted network monitoring dashboard that automatically discovers, tracks, and analyses every device connected to your LAN. It runs entirely on your own hardware — no cloud, no subscriptions, no data leaving your network.
+![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)
+![Docker](https://img.shields.io/badge/Docker-required-2496ED?logo=docker&logoColor=white)
+![Platform](https://img.shields.io/badge/platform-linux%2Famd64-lightgrey)
+
+InSpectre is a self-hosted home network monitor and security scanner that automatically discovers, tracks, fingerprints, and scans every device on your LAN. It runs entirely on your own hardware — no cloud, no subscriptions, no data leaving your network.
+
+Check the [Wiki](https://github.com/thefunkygibbon/InSpectre/blob/test/wiki.md) for full admin guide. 
+---
+
+> **Screenshot placeholder** — _add a screenshot of the main dashboard here_
 
 ---
 
-## What it does
+## Features
 
-- **Discovers devices automatically** — finds devices within seconds of them joining the network using a combination of active ARP scanning and passive packet sniffing
-- **Tracks history** — records when each device first appeared, every IP address it has ever held, and a full timeline of events (joined, online, offline, IP changes, scans)
-- **Identifies devices** — resolves hostnames, looks up manufacturer (vendor) from MAC address, detects OS and open ports via Nmap, and builds a local fingerprint database to automatically classify device types
-- **Runs diagnostics** — ping and traceroute streamed live to the dashboard; deep port and vulnerability scans on demand
-- **Blocks devices** — cut a device off from the internet with one click using ARP spoofing; unblock it just as easily
-- **Alerts you** — toast notifications when new devices appear or known devices go offline, with a notification bell in the header
+### Discovery & Monitoring
+- **Automatic device discovery** — active ARP sweeps + passive packet sniffer detect devices within seconds of them joining the network
+- **Network timeline** — visual online/offline history bar for all devices (7-day, 1-month, 1-year views)
+- **Per-device uptime bar** — 7-day presence history visible at a glance in every device drawer
+- **IP history** — every IP address a device has ever held, with timestamps
 
----
+### Device Management
+- **Custom metadata** — set a friendly name, device type, vendor override, location/room, tags, and zone per device
+- **Watched flag** — star important devices for elevated offline alerts and priority sorting
+- **Ignore flag** — hide known-benign devices from the main view
+- **Notes** — free-text notes attached to any device
 
-## Dashboard
+### Scanning & Security
+- **Port scanning** — nmap-based TCP port sweep with OS detection and service fingerprinting via Nerva
+- **Baseline tracking** — detects port drift and raises alerts when a device's open ports change
+- **Vulnerability scanning** — nuclei-based CVE scanning with per-service template routing; findings shown by severity (critical, high, medium, low)
+- **Scheduled scans** — configurable nightly scan window with per-device auto-scan triggers
+- **Security dashboard** — network-wide vulnerability overview grouped by severity; scan settings accessible via the settings cog on the page
 
-The dashboard gives you a full picture of your network at a glance.
+### Device Blocking
+- **Per-device blocking** — cut any device off from the internet with one click using ARP MITM
+- **Network pause** — block all devices simultaneously
+- **Block schedules** — time-based rules to automatically block devices on a recurring schedule
 
-**Three layout views**
-- Grid — device cards with status, vendor, hostname, and open ports at a glance
-- List — compact table for dense networks
-- Category — devices grouped by type (router, phone, smart TV, NAS, IoT, etc.)
+### Traffic Monitoring
+- **Per-device traffic analysis** — bytes, packets, domains contacted, countries, and unusual port activity
+- **Live speed test** — run a speedtest-cli speed test directly from the UI with optional scheduled auto-runs (every 30m / 1h / 6h / daily)
 
-**Filter and search**
-- Full-text search across IP, hostname, vendor, name, tags, and location
-- Clickable stat cards (Total / Online / Offline / Watched) act as instant filters
-- Smart filter bar for contextual quick-filters ("has open ports", "not yet scanned", "has notes", etc.)
+### Network Tools
+- **IP Tools** — Ping, Traceroute, Port Scan, Reverse DNS, ARP Lookup, Wake-on-LAN
+- **DNS Tools** — Record Lookup, DNS Propagation, DoH Tester, DNSSEC Validator, Reverse DNS Bulk
+- **Web Tools** — HTTP Headers, SSL/TLS Certificate, Redirect Chain, TLS Version Matrix, HTTP Timing
+- **Infrastructure** — IP Geolocation, WHOIS, BGP/ASN Lookup, Subnet Calculator
+- **Email Tools** — MX/SPF/DMARC/DKIM Checker, SMTP Banner Grab, BIMI Lookup, DNSBL Check
 
-**Device drawer**
-Click any device to open a detail panel with:
-- Live status, scan status, and any active block or vulnerability flags
-- Actions: Ping, Traceroute, Re-scan ports, Vulnerability scan, Block / Unblock internet access
-- Full network details: IP, MAC, vendor, hostname, open ports, OS detection
-- IP address history
-- Device identity editor — set a custom vendor name and device type; corrections are saved to the local fingerprint database
-- Timeline tab — full chronological event log
-- Notes & Tags tab — free-text notes, location/room field, tag chips
+### Alerts & Notifications
+- **Toast + browser notifications** — instant in-app and OS-level alerts
+- **Pushbullet** — push notifications to your phone
+- **ntfy** — self-hosted push notification support
+- **Gotify** — self-hosted Gotify server support
+- **Webhooks** — generic outbound webhook for any alerting system
 
-**Watched devices**
-Star any device to mark it as watched. Watched devices get a dedicated stat card, a sort option, and highlighted offline alerts.
+### Fingerprinting & Identity
+- **OUI lookup** — MAC vendor resolution from the IEEE OUI database
+- **Port pattern matching** — classify device type from open port signature
+- **Manual + community + auto fingerprints** — all stored locally, importable/exportable
 
 ---
 
 ## Quick Start
 
-InSpectre runs via Docker Compose. You need Docker and Docker Compose installed.
+### Requirements
+
+- Docker 24+
+- Docker Compose v2
+
+### Using `inspectre.sh` (recommended)
 
 ```bash
 git clone https://github.com/thefunkygibbon/InSpectre.git
 cd InSpectre
 
-# Edit docker-compose.yml and set your network details (see Configuration below)
+# Edit docker-compose.yml and set:
+#   IP_RANGE       e.g. 192.168.1.0/24
+#   INTERFACE      e.g. eth0
+#   LAN_DNS_SERVER e.g. 192.168.1.1
 
-docker compose up -d
+./inspectre.sh up
 ```
 
-Open **http://\<your-server-ip\>:5173** in your browser.
+Open **http://localhost:3000** in your browser.
+
+### Available helper commands
+
+```bash
+./inspectre.sh up               # start all containers
+./inspectre.sh down             # stop all containers
+./inspectre.sh rebuild          # full wipe and rebuild (deletes postgres_data/)
+./inspectre.sh rebuild keep-data  # rebuild but preserve the database
+./inspectre.sh logs             # tail logs from all containers
+```
+
+### Using Docker Compose directly
+
+```bash
+docker compose up -d
+```
 
 ---
 
 ## Configuration
 
-Edit the environment variables in `docker-compose.yml` before starting:
+Key environment variables are set in `docker-compose.yml`:
 
-| Variable | Default | Description |
+| Variable | Description | Example |
 |---|---|---|
-| `IP_RANGE` | `192.168.0.0/24` | The network range to scan (CIDR notation) |
-| `INTERFACE` | `eth0` | Network interface to listen on |
-| `LAN_DNS_SERVER` | *(auto-detected)* | Your router's IP — used for hostname resolution. Set this explicitly for best results |
-| `SCAN_INTERVAL` | `60` | Seconds between network sweeps |
-| `OFFLINE_MISS_THRESHOLD` | `3` | Missed sweeps before a device is marked offline |
+| `IP_RANGE` | CIDR range to scan | `192.168.1.0/24` |
+| `INTERFACE` | Network interface for the probe | `eth0` |
+| `LAN_DNS_SERVER` | DNS server for hostname resolution | `192.168.1.1` |
+| `DATABASE_URL` | PostgreSQL connection string (pre-set) | `postgresql://...` |
 
-All other settings (Nmap arguments, scan workers, OS confidence threshold, notification toggle) can be adjusted live from the **Settings** panel inside the dashboard without restarting.
-
----
-
-## Requirements
-
-- Docker and Docker Compose
-- A Linux host with access to the network interface you want to monitor (the probe container needs `NET_RAW` capability for ARP scanning and device blocking — this is granted automatically by the Compose file)
-- The host machine should be on the same LAN segment as the devices you want to monitor
+All other settings (scan interval, nmap arguments, alert channels, nightly scan window, etc.) are managed from the **Settings** panel inside the UI after first run — no restart required for most of them.
 
 ---
 
-## Roadmap
+## Architecture
 
-| Feature | Status |
-|---|---|
-| Device discovery, history & timeline | ✅ |
-| Device identity, fingerprinting & classification | ✅ |
-| Vulnerability scanning (Nmap NSE) | ✅ |
-| Block internet access (ARP spoofing) | ✅ |
-| Alerting webhooks (Discord, email, Gotify) | Planned |
+InSpectre runs as three Docker containers coordinated by Docker Compose:
+
+```
+                        ┌─────────────────────────────────────┐
+Browser                 │           Docker Compose             │
+   │                    │                                      │
+   │  HTTP :3000        │  ┌─────────────┐                    │
+   └───────────────────►│  │  frontend   │  nginx static +    │
+                        │  │  :3000      │  reverse proxy     │
+                        │  └──────┬──────┘                    │
+                        │         │ /api/*                    │
+                        │  ┌──────▼──────┐                    │
+                        │  │  backend    │  FastAPI REST API  │
+                        │  │  :8000      │  alert dispatch    │
+                        │  └──────┬──────┘  scheduled scans  │
+                        │         │ httpx                     │
+                        │  ┌──────▼──────┐                    │
+                        │  │   probe     │  ARP sweep         │
+                        │  │  :8666      │  packet sniffer    │
+                        │  │ host network│  nmap / nuclei     │
+                        │  │ privileged  │  ARP block/unblock │
+                        │  └──────┬──────┘                    │
+                        │         │                           │
+                        │  ┌──────▼──────┐                    │
+                        │  │ PostgreSQL  │                    │
+                        │  │    :5432    │                    │
+                        │  └─────────────┘                    │
+                        └─────────────────────────────────────┘
+```
+
+- **Frontend** — React 18 + Vite + Tailwind CSS single-page app, served by nginx. Polls `/api/devices` every 10 seconds.
+- **Backend** — FastAPI on port 8000. Handles all user-initiated API calls, proxies scan/diagnostic requests to the probe, runs the alert dispatch loop and scheduled vulnerability scans.
+- **Probe** — FastAPI on port 8666, runs on the host network with elevated privileges. The only container with raw network access. Performs ARP sweeps, passive sniffing, nmap scans, nuclei vulnerability scans, and ARP-based device blocking. Writes device data directly to PostgreSQL.
 
 ---
 
-*InSpectre v1.0.0 — developed by [thefunkygibbon](mailto:inspectre@thefunkygibbon.net)*
+## Contributing
+
+Contributions are welcome. Please open an issue to discuss a change before submitting a pull request. All development work targets the `InSpectre-test` branch — do not submit pull requests against `InSpectre-main`.
+
+---
+
+## License
+
+MIT — see [LICENSE](LICENSE) for details.

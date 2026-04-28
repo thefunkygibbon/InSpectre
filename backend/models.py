@@ -1,5 +1,5 @@
 from datetime import datetime, timezone
-from sqlalchemy import Boolean, Column, DateTime, Float, ForeignKey, Integer, JSON, String, Text
+from sqlalchemy import BigInteger, Boolean, Column, DateTime, Float, ForeignKey, Integer, JSON, String, Text
 from sqlalchemy.orm import declarative_base, relationship
 
 Base = declarative_base()
@@ -38,6 +38,12 @@ class Device(Base):
     zone                 = Column(String, nullable=True)
     is_ignored           = Column(Boolean, server_default='false', nullable=False)
 
+    # Phase 7: scan performance & port baseline
+    hostname_last_attempted = Column(DateTime(timezone=True), nullable=True)
+    deep_scan_last_run      = Column(DateTime(timezone=True), nullable=True)
+    baseline_ports          = Column(JSON, nullable=True)
+    baseline_scan_count     = Column(Integer, server_default='0', nullable=False)
+
     ip_history   = relationship("IPHistory",    back_populates="device",
                                 order_by="IPHistory.first_seen.desc()")
     events       = relationship("DeviceEvent",  back_populates="device",
@@ -74,8 +80,9 @@ class DeviceEvent(Base):
 
 class VulnReport(Base):
     """
-    Stores the result of a vulnerability scan (Nmap NSE vuln scripts) for a device.
+    Stores the result of a Nuclei vulnerability scan for a device.
     severity: 'critical' | 'high' | 'medium' | 'low' | 'info' | 'clean'
+    findings: list of dicts with keys template_id, name, severity, cvss, cves, description, etc.
     """
     __tablename__ = "vuln_reports"
     id           = Column(Integer, primary_key=True, autoincrement=True)
@@ -83,12 +90,12 @@ class VulnReport(Base):
                           nullable=False, index=True)
     ip_address   = Column(String, nullable=True)
     scanned_at   = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), index=True)
-    duration_s   = Column(Float,   nullable=True)   # seconds the scan took
-    severity     = Column(String,  nullable=False, default="clean")  # highest severity found
+    duration_s   = Column(Float,   nullable=True)
+    severity     = Column(String,  nullable=False, default="clean")
     vuln_count   = Column(Integer, nullable=False, default=0)
-    findings     = Column(JSON,    nullable=True)   # list of finding dicts
-    raw_output   = Column(Text,    nullable=True)   # full nmap stdout
-    nmap_args    = Column(String,  nullable=True)   # args used
+    findings     = Column(JSON,    nullable=True)   # list of Nuclei finding dicts
+    raw_output   = Column(Text,    nullable=True)   # raw Nuclei JSONL stdout
+    scan_args    = Column(String,  nullable=True)   # template tags / severity used
     device       = relationship("Device", back_populates="vuln_reports")
 
 
@@ -117,6 +124,35 @@ class Setting(Base):
         default=lambda: datetime.now(timezone.utc),
         onupdate=lambda: datetime.now(timezone.utc),
     )
+
+
+class TrafficStat(Base):
+    """
+    5-minute traffic stat buckets flushed from probe monitor sessions.
+    One row per device per 5-min window.
+    """
+    __tablename__ = "traffic_stats"
+
+    id          = Column(Integer,  primary_key=True, autoincrement=True)
+    mac_address = Column(String,   nullable=False,   index=True)
+    ip_address  = Column(String,   nullable=True)
+    bucket_ts   = Column(DateTime(timezone=True), nullable=False, index=True)
+    bytes_in    = Column(BigInteger, nullable=False, default=0)
+    bytes_out   = Column(BigInteger, nullable=False, default=0)
+    packets_in  = Column(Integer,  nullable=False, default=0)
+    packets_out = Column(Integer,  nullable=False, default=0)
+    lan_bytes   = Column(BigInteger, nullable=False, default=0)
+    wan_bytes   = Column(BigInteger, nullable=False, default=0)
+    # JSON columns for top-N lists
+    dns_queries   = Column(JSON, nullable=True)
+    tls_sni       = Column(JSON, nullable=True)
+    http_hosts    = Column(JSON, nullable=True)
+    top_ips       = Column(JSON, nullable=True)
+    top_ports     = Column(JSON, nullable=True)
+    top_countries = Column(JSON, nullable=True)
+    protocols     = Column(JSON, nullable=True)
+    unusual_ports = Column(JSON, nullable=True)
+    created_at    = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
 
 
 class FingerprintEntry(Base):

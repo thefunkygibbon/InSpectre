@@ -1,10 +1,12 @@
 import { useState, useMemo, useEffect, useCallback, useRef } from 'react'
 import {
-  Wifi, WifiOff, Monitor, ScanSearch, Settings,
-  RefreshCw, Search, AlertCircle, Activity,
+  Wifi, WifiOff, Monitor, Settings,
+  Search, AlertCircle, Activity,
   LayoutGrid, List, Sun, Moon, ChevronDown,
-  Bell, X, Layers, Star, ShieldAlert,
+  Bell, X, Layers, Star, ShieldAlert, Wrench, Ban, BarChart2,
+  ArrowLeft, SlidersHorizontal,
 } from 'lucide-react'
+import { TrafficPage } from './components/TrafficPage'
 import { useDevices }          from './hooks/useDevices'
 import { useTheme }            from './hooks/useTheme'
 import { useSmartFilters }     from './hooks/useSmartFilters'
@@ -16,10 +18,13 @@ import { DeviceRow }           from './components/DeviceRow'
 import { DeviceDrawer }        from './components/DeviceDrawer'
 import { SettingsPanel }       from './components/SettingsPanel'
 import { SecurityDashboard }   from './components/SecurityDashboard'
+import { NetworkTools }        from './components/NetworkTools'
+import { DeviceBlocking }      from './components/DeviceBlocking'
+import { NetworkTimeline }     from './components/NetworkTimeline'
 import { CategoryView }        from './components/CategoryView'
 import { SmartFilterBar }      from './components/SmartFilterBar'
 
-const APP_VERSION = '1.0.0'
+const APP_VERSION = '1.1.0'
 
 const SORT_OPTIONS = [
   { value: 'last_seen_desc', label: 'Last seen (newest)' },
@@ -34,6 +39,15 @@ const SORT_OPTIONS = [
 ]
 
 const TOAST_DURATION = 7000
+
+// Page definitions for the nav
+const PAGES = [
+  { id: 'tools',    label: 'Network Tools',       Icon: Wrench,     title: 'Network Tools' },
+  { id: 'security', label: 'Vulnerability Report', Icon: ShieldAlert, title: 'Vulnerability Report' },
+  { id: 'blocking', label: 'Device Blocking',      Icon: Ban,        title: 'Device Blocking' },
+  { id: 'timeline', label: 'Device Timeline',      Icon: BarChart2,  title: 'Device Timeline' },
+  { id: 'traffic',  label: 'Traffic Monitor',      Icon: Activity,   title: 'Traffic Monitor' },
+]
 
 function ipToNum(ip) {
   if (!ip) return 0
@@ -165,7 +179,6 @@ function NotificationToasts({ newAlerts, offlineAlerts, onDismissNew, onDismissO
 
 // ── Main App ────────────────────────────────────────────────────────────────────────────
 export default function App() {
-  // Notification state must be declared before useDevices so handleAlert can close over them
   const [notificationsEnabled,  setNotificationsEnabled]  = useState(true)
   const [browserNotifsEnabled,  setBrowserNotifsEnabled]  = useState(false)
   const [pushbulletConfigured,  setPushbulletConfigured]  = useState(false)
@@ -190,12 +203,21 @@ export default function App() {
   }, [browserNotifsEnabled, pushbulletConfigured])
 
   const {
-    devices, stats, loading, error, refresh, lastRefresh,
+    devices, stats, loading, error, refresh,
     newDeviceAlerts, offlineAlerts,
     dismissNewDevice, dismissOffline,
     dismissAllNew, dismissAllOffline,
     optimisticUpdate,
   } = useDevices(10000, { onAlert: handleAlert })
+
+  const [vulnScansByMac, setVulnScansByMac] = useState({})
+  function updateVulnScan(mac, patchOrFn) {
+    setVulnScansByMac(prev => {
+      const current = { lines: [], scanning: false, ...(prev[mac] || {}) }
+      const patch = typeof patchOrFn === 'function' ? patchOrFn(current) : patchOrFn
+      return { ...prev, [mac]: { ...current, ...patch } }
+    })
+  }
   const { theme, toggle: toggleTheme } = useTheme()
   const clock = useClock()
   const { activeFilters, toggleFilter, clearFilters, applyFilters, savedViews, saveView, loadView, deleteView } = useSmartFilters()
@@ -204,11 +226,12 @@ export default function App() {
   const [filter,        setFilter]        = useState('all')
   const [sort,          setSort]          = useState('last_seen_desc')
   const [layout,        setLayout]        = useState('grid')
-  const [selected,      setSelected]      = useState(null)
-  const [showSettings,  setShowSettings]  = useState(false)
-  const [showSecurity,  setShowSecurity]  = useState(false)
-  const [refreshing,    setRefreshing]    = useState(false)
-  const [showAlertDrop, setShowAlertDrop] = useState(false)
+  const [selected,         setSelected]         = useState(null)
+  const [drawerInitialTab, setDrawerInitialTab] = useState('overview')
+  const [showSettings,     setShowSettings]     = useState(false)
+  const [activePage,       setActivePage]       = useState(null) // null | 'tools' | 'security' | 'blocking' | 'timeline'
+  const [showAlertDrop,    setShowAlertDrop]    = useState(false)
+  const [showFilters,      setShowFilters]      = useState(false)
 
   useEffect(() => {
     api.getSettings().then(s => {
@@ -227,7 +250,8 @@ export default function App() {
     if (key === 'pushbullet_api_key')            setPushbulletConfigured((value || '').trim().length > 0)
   }
 
-  const totalAlerts = newDeviceAlerts.length
+  // Total alerts = new device + offline alerts
+  const totalAlerts = newDeviceAlerts.length + offlineAlerts.length
 
   function handleCardFilter(cardKey) {
     setFilter(prev => prev === cardKey ? 'all' : cardKey)
@@ -237,28 +261,30 @@ export default function App() {
     const mac = alert.mac || alert.mac_address
     if (!mac) return
     const device = devices.find(d => d.mac_address === mac)
-    if (device) setSelected(device)
+    if (device) openDevice(device)
   }
 
-  // Star toggle — optimistic update then persist
+  function openDevice(dev, tab = 'overview') {
+    setDrawerInitialTab(tab)
+    setSelected(dev)
+  }
+
   async function handleStarToggle(mac, value) {
     optimisticUpdate(mac, { is_important: value })
     try {
       const updated = await api.updateMetadata(mac, { is_important: value })
-      // sync selected drawer if open
       setSelected(prev => prev?.mac_address === mac ? { ...prev, ...updated } : prev)
     } catch (e) {
-      // revert on failure
       optimisticUpdate(mac, { is_important: !value })
     }
   }
 
   const filtered = useMemo(() => {
     let list = devices
-    // Hide ignored devices unless the 'ignored' smart filter is explicitly active
-    if (!activeFilters.includes('ignored')) {
+    if (activeFilters['ignored'] !== 'include') {
       list = list.filter(d => !d.is_ignored)
     }
+    list = list.filter(d => !d.is_virtual_interface)
     if (filter === 'online')    list = list.filter(d => d.is_online)
     if (filter === 'offline')   list = list.filter(d => !d.is_online)
     if (filter === 'scanned')   list = list.filter(d => d.deep_scanned)
@@ -277,16 +303,9 @@ export default function App() {
         (d.zone         || '').toLowerCase().includes(q)
       )
     }
-    // Apply smart filters (AND logic)
     list = applyFilters(list)
     return sortDevices(list, sort)
   }, [devices, filter, search, sort, applyFilters, activeFilters])
-
-  async function handleRefresh() {
-    setRefreshing(true)
-    await refresh()
-    setRefreshing(false)
-  }
 
   async function handleRename(mac, name) {
     await api.updateDevice(mac, { custom_name: name })
@@ -304,7 +323,8 @@ export default function App() {
 
   const isDark = theme === 'dark'
   const isCategoryMode = layout === 'category'
-  const hasActiveSmartFilters = activeFilters.length > 0
+  const hasActiveSmartFilters = Object.keys(activeFilters).length > 0
+  const activepageInfo = PAGES.find(p => p.id === activePage)
 
   return (
     <div className="min-h-screen bg-bg flex flex-col transition-colors duration-200">
@@ -315,28 +335,70 @@ export default function App() {
 
         {/* ── Navbar ── */}
         <header className="sticky top-0 z-30 border-b border-border bg-surface/80 backdrop-blur-xl">
-          <div className="max-w-[1400px] mx-auto px-4 sm:px-6 h-16 flex items-center justify-between gap-4">
-            <div className="flex items-center gap-3">
-              <Logo size={30} />
-              <div>
-                <span className="font-bold tracking-tight" style={{ color: 'var(--color-text)' }}>InSpectre</span>
-                <span className="hidden sm:inline text-xs ml-2" style={{ color: 'var(--color-text-faint)' }}>Network Security Suite</span>
-              </div>
+          <div className="max-w-[1400px] mx-auto px-4 sm:px-6 h-16 flex items-center gap-2 sm:gap-4">
+
+            {/* Logo + back button */}
+            <div className="flex items-center gap-3 shrink-0">
+              {activePage ? (
+                <button onClick={() => setActivePage(null)}
+                  className="btn-ghost p-2 flex items-center gap-1.5 text-xs font-medium"
+                  aria-label="Back to dashboard"
+                  title="Back to dashboard">
+                  <ArrowLeft size={15} />
+                  <span className="hidden sm:inline">Dashboard</span>
+                </button>
+              ) : (
+                <>
+                  <Logo size={30} />
+                  <div className="hidden sm:block">
+                    <span className="font-bold tracking-tight" style={{ color: 'var(--color-text)' }}>InSpectre</span>
+                    <span className="hidden md:inline text-xs ml-2" style={{ color: 'var(--color-text-faint)' }}>Network Security Suite</span>
+                  </div>
+                </>
+              )}
             </div>
 
-            <div className="flex items-center gap-1">
-              <div className="hidden md:flex items-center gap-2 mr-3">
-                <span className="live-ping" aria-hidden><span className="live-ping-dot" /></span>
-                <span className="text-xs font-mono" style={{ color: 'var(--color-text-faint)' }}>live &middot; {clock}</span>
+            {/* Page nav icons — left of clock */}
+            {!activePage && (
+              <div className="flex items-center gap-0.5 ml-2">
+                {PAGES.map(p => (
+                  <button key={p.id}
+                    onClick={() => setActivePage(p.id)}
+                    className="btn-ghost p-2 relative"
+                    aria-label={p.label}
+                    title={p.label}>
+                    <p.Icon size={16} />
+                  </button>
+                ))}
               </div>
+            )}
+
+            {/* Page title when on a page */}
+            {activePage && (
+              <span className="text-sm font-semibold truncate" style={{ color: 'var(--color-text)' }}>
+                {activepageInfo?.title}
+              </span>
+            )}
+
+            {/* Spacer */}
+            <div className="flex-1" />
+
+            {/* Live clock — center-right */}
+            <div className="hidden md:flex items-center gap-2">
+              <span className="live-ping" aria-hidden><span className="live-ping-dot" /></span>
+              <span className="text-xs font-mono" style={{ color: 'var(--color-text-faint)' }}>live &middot; {clock}</span>
+            </div>
+
+            {/* Right-side utility icons */}
+            <div className="flex items-center gap-0.5">
 
               {/* Bell / alerts */}
               <div className="relative">
                 <button
                   onClick={() => setShowAlertDrop(v => !v)}
                   className="btn-ghost p-2 relative"
-                  aria-label={`${totalAlerts} new device alert${totalAlerts !== 1 ? 's' : ''}`}
-                >
+                  aria-label={`${totalAlerts} alert${totalAlerts !== 1 ? 's' : ''}`}
+                  title="Alerts">
                   <Bell size={16} />
                   {totalAlerts > 0 && (
                     <span
@@ -353,199 +415,291 @@ export default function App() {
                   <>
                     <div className="fixed inset-0 z-30" onClick={() => setShowAlertDrop(false)} />
                     <div
-                      className="absolute right-0 top-full mt-2 w-80 rounded-xl shadow-xl z-40 p-4 space-y-3"
+                      className="fixed right-4 top-[4.5rem] w-80 max-w-[calc(100vw-2rem)] rounded-xl shadow-xl z-40 p-4 space-y-3"
                       style={{ background: 'var(--color-surface)', border: '1px solid var(--color-border)' }}
                     >
                       <div className="flex items-center justify-between">
                         <span className="text-xs font-semibold uppercase tracking-wider" style={{ color: 'var(--color-text-muted)' }}>Alerts</span>
                         {totalAlerts > 0 && (
-                          <button onClick={() => { dismissAllNew(); setShowAlertDrop(false) }}
+                          <button onClick={() => { dismissAllNew(); dismissAllOffline(); setShowAlertDrop(false) }}
                             className="text-xs opacity-60 hover:opacity-100" style={{ color: 'var(--color-brand)' }}>
                             Clear all
                           </button>
                         )}
                       </div>
-                      {newDeviceAlerts.length === 0 ? (
+
+                      {totalAlerts === 0 ? (
                         <p className="text-xs text-center py-4" style={{ color: 'var(--color-text-faint)' }}>No new alerts</p>
                       ) : (
-                        newDeviceAlerts.map(a => (
-                          <div key={a.id}
-                            className="flex items-start gap-2 p-2.5 rounded-lg cursor-pointer hover:opacity-80 transition-opacity"
-                            style={{ background: 'var(--color-surface-offset)' }}
-                            onClick={() => { handleToastDeviceClick(a); dismissNewDevice(a.id); setShowAlertDrop(false) }}
-                          >
-                            <Bell size={12} className="mt-0.5 shrink-0" style={{ color: 'var(--color-brand)' }} />
-                            <div className="flex-1 min-w-0">
-                              <p className="text-xs font-medium" style={{ color: 'var(--color-text)' }}>
-                                New device: <span className="font-mono" style={{ color: 'var(--color-brand)' }}>{a.ip}</span>
-                              </p>
-                              <p className="text-xs mt-0.5 truncate" style={{ color: 'var(--color-text-muted)', fontSize: '11px' }}>
-                                {a.hostname || a.vendor} &middot; {a.mac}
-                              </p>
+                        <>
+                          {newDeviceAlerts.map(a => (
+                            <div key={`new-${a.id}`}
+                              className="flex items-start gap-2 p-2.5 rounded-lg cursor-pointer hover:opacity-80 transition-opacity"
+                              style={{ background: 'var(--color-surface-offset)' }}
+                              onClick={() => { handleToastDeviceClick(a); dismissNewDevice(a.id); setShowAlertDrop(false) }}
+                            >
+                              <Bell size={12} className="mt-0.5 shrink-0" style={{ color: 'var(--color-brand)' }} />
+                              <div className="flex-1 min-w-0">
+                                <p className="text-xs font-medium" style={{ color: 'var(--color-text)' }}>
+                                  New device: <span className="font-mono" style={{ color: 'var(--color-brand)' }}>{a.ip}</span>
+                                </p>
+                                <p className="text-xs mt-0.5 truncate" style={{ color: 'var(--color-text-muted)', fontSize: '11px' }}>
+                                  {a.hostname || a.vendor} &middot; {a.mac}
+                                </p>
+                              </div>
+                              <button onClick={e => { e.stopPropagation(); dismissNewDevice(a.id) }} aria-label="Dismiss"
+                                className="opacity-40 hover:opacity-100 transition-opacity shrink-0 mt-0.5">
+                                <X size={11} />
+                              </button>
                             </div>
-                            <button onClick={e => { e.stopPropagation(); dismissNewDevice(a.id) }} aria-label="Dismiss"
-                              className="opacity-40 hover:opacity-100 transition-opacity shrink-0 mt-0.5">
-                              <X size={11} />
-                            </button>
-                          </div>
-                        ))
+                          ))}
+                          {offlineAlerts.map(a => (
+                            <div key={`off-${a.id}`}
+                              className="flex items-start gap-2 p-2.5 rounded-lg cursor-pointer hover:opacity-80 transition-opacity"
+                              style={{ background: a.is_important ? 'rgba(239,68,68,0.08)' : 'var(--color-surface-offset)',
+                                       border: a.is_important ? '1px solid rgba(239,68,68,0.2)' : 'none' }}
+                              onClick={() => { handleToastDeviceClick(a); dismissOffline(a.id); setShowAlertDrop(false) }}
+                            >
+                              <WifiOff size={12} className="mt-0.5 shrink-0" style={{ color: '#ef4444' }} />
+                              <div className="flex-1 min-w-0">
+                                <p className="text-xs font-medium flex items-center gap-1" style={{ color: '#ef4444' }}>
+                                  {a.is_important && <Star size={9} fill="currentColor" />}
+                                  {a.is_important ? 'Watched device offline' : 'Device offline'}
+                                </p>
+                                <p className="text-xs mt-0.5 truncate font-medium" style={{ color: 'var(--color-text)', fontSize: '11px' }}>
+                                  {a.name} <span className="font-mono font-normal" style={{ color: 'var(--color-text-muted)' }}>{a.ip}</span>
+                                </p>
+                              </div>
+                              <button onClick={e => { e.stopPropagation(); dismissOffline(a.id) }} aria-label="Dismiss"
+                                className="opacity-40 hover:opacity-100 transition-opacity shrink-0 mt-0.5">
+                                <X size={11} />
+                              </button>
+                            </div>
+                          ))}
+                        </>
                       )}
                     </div>
                   </>
                 )}
               </div>
 
-              <button onClick={handleRefresh} className="btn-ghost p-2" aria-label="Refresh">
-                <RefreshCw size={16} className={refreshing ? 'animate-spin' : ''} />
-              </button>
               <button onClick={toggleTheme} className="btn-ghost p-2"
-                aria-label={isDark ? 'Switch to light mode' : 'Switch to dark mode'}>
+                aria-label={isDark ? 'Switch to light mode' : 'Switch to dark mode'}
+                title={isDark ? 'Switch to light mode' : 'Switch to dark mode'}>
                 {isDark ? <Sun size={16} /> : <Moon size={16} />}
               </button>
-              <button onClick={() => setShowSecurity(true)} className="btn-ghost p-2" aria-label="Security overview">
-                <ShieldAlert size={16} />
-              </button>
-              <button onClick={() => setShowSettings(true)} className="btn-ghost p-2" aria-label="Settings">
+
+              <button onClick={() => setShowSettings(true)} className="btn-ghost p-2"
+                aria-label="Settings" title="Settings">
                 <Settings size={16} />
               </button>
             </div>
           </div>
         </header>
 
-        <main className="flex-1 max-w-[1400px] mx-auto w-full px-4 sm:px-6 py-8 space-y-8">
+        {/* ── Page content ── */}
+        <main className="flex-1 max-w-[1400px] mx-auto w-full px-4 sm:px-6 py-8">
 
-          {error && (
-            <div className="flex items-center gap-3 px-4 py-3 rounded-xl text-sm"
+          {error && !activePage && (
+            <div className="flex items-center gap-3 px-4 py-3 rounded-xl text-sm mb-8"
               style={{ background: 'rgb(239 68 68 / 0.1)', border: '1px solid rgb(239 68 68 / 0.2)', color: '#ef4444' }}>
               <AlertCircle size={16} className="shrink-0" />
               {error}
             </div>
           )}
 
-          {/* Stat cards */}
-          <section>
-            <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
-              <StatCard label="Total Devices" value={stats?.total_devices} icon={Monitor}   color="brand"
-                onClick={() => handleCardFilter('all')}    active={filter === 'all'} />
-              <StatCard label="Online"        value={stats?.online}        icon={Wifi}       color="emerald"
-                onClick={() => handleCardFilter('online')}  active={filter === 'online'} />
-              <StatCard label="Offline"       value={stats?.offline}       icon={WifiOff}    color="red"
-                onClick={() => handleCardFilter('offline')} active={filter === 'offline'} />
-              <StatCard label="Watched"       value={stats?.important}     icon={Star}       color="amber"
-                onClick={() => handleCardFilter('important')} active={filter === 'important'} />
-            </div>
-          </section>
+          {/* ── Full page views ── */}
+          {activePage === 'tools' && (
+            <NetworkTools />
+          )}
 
-          {/* Search / filter / sort / layout row */}
-          <section className="flex flex-col sm:flex-row gap-3 items-stretch sm:items-center">
-            <div className="relative flex-1">
-              <Search size={15} className="absolute left-3 top-1/2 -translate-y-1/2 pointer-events-none"
-                style={{ color: 'var(--color-text-muted)' }} />
-              <input className="input pl-9" placeholder="Search IP, MAC, hostname, vendor, tags…"
-                value={search} onChange={e => setSearch(e.target.value)} />
-            </div>
-
-            {!isCategoryMode && (
-              <div className="relative">
-                <select value={sort} onChange={e => setSort(e.target.value)}
-                  className="input pr-8 appearance-none cursor-pointer" aria-label="Sort devices">
-                  {SORT_OPTIONS.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
-                </select>
-                <ChevronDown size={14} className="absolute right-3 top-1/2 -translate-y-1/2 pointer-events-none"
-                  style={{ color: 'var(--color-text-muted)' }} />
-              </div>
-            )}
-
-            <div className="flex items-center gap-1 glass rounded-xl p-1">
-              <button onClick={() => setLayout('grid')}
-                className="p-2 rounded-lg transition-all duration-150"
-                style={layout === 'grid' ? { background: 'var(--color-brand)', color: 'white' } : { color: 'var(--color-text-muted)' }}
-                aria-label="Grid layout">
-                <LayoutGrid size={15} /></button>
-              <button onClick={() => setLayout('list')}
-                className="p-2 rounded-lg transition-all duration-150"
-                style={layout === 'list' ? { background: 'var(--color-brand)', color: 'white' } : { color: 'var(--color-text-muted)' }}
-                aria-label="List layout">
-                <List size={15} /></button>
-              <button onClick={() => setLayout('category')}
-                className="p-2 rounded-lg transition-all duration-150"
-                style={layout === 'category' ? { background: 'var(--color-brand)', color: 'white' } : { color: 'var(--color-text-muted)' }}
-                aria-label="Category view">
-                <Layers size={15} /></button>
-            </div>
-          </section>
-
-          {/* Smart filter bar */}
-          <section>
-            <SmartFilterBar
-              devices={devices}
-              activeFilters={activeFilters}
-              onToggle={toggleFilter}
-              onClear={clearFilters}
-              savedViews={savedViews}
-              onSaveView={saveView}
-              onLoadView={loadView}
-              onDeleteView={deleteView}
+          {activePage === 'security' && (
+            <SecurityDashboard
+              onDeviceClick={(mac, tab) => {
+                setActivePage(null)
+                const dev = devices.find(d => d.mac_address === mac)
+                if (dev) openDevice(dev, tab || 'overview')
+              }}
             />
-          </section>
+          )}
 
-          {/* Device list */}
-          <section>
-            {loading ? (
-              <SkeletonGrid layout={layout === 'category' ? 'grid' : layout} />
-            ) : filtered.length === 0 ? (
-              <EmptyState search={search} filter={filter} hasSmartFilters={hasActiveSmartFilters} onClearSmartFilters={clearFilters} />
-            ) : isCategoryMode ? (
-              <>
-                <p className="text-xs mb-4" style={{ color: 'var(--color-text-faint)' }}>
-                  Showing {filtered.length} of {devices.length} device{devices.length !== 1 ? 's' : ''} &middot; grouped by device type
-                </p>
-                <CategoryView devices={filtered} layout="grid" onDeviceClick={setSelected} />
-              </>
-            ) : (
-              <>
-                <p className="text-xs mb-4" style={{ color: 'var(--color-text-faint)' }}>
-                  Showing {filtered.length} of {devices.length} device{devices.length !== 1 ? 's' : ''}
-                  {filter !== 'all' && (
-                    <span className="ml-2 px-2 py-0.5 rounded-full text-[10px] font-semibold uppercase"
-                      style={{ background: 'var(--color-brand)', color: 'white' }}>{filter}</span>
-                  )}
-                  {hasActiveSmartFilters && (
-                    <span className="ml-2 px-2 py-0.5 rounded-full text-[10px] font-semibold"
-                      style={{ background: 'var(--color-surface-offset)', color: 'var(--color-text-muted)' }}>
-                      + smart filters
+          {activePage === 'blocking' && (
+            <DeviceBlocking devices={devices} onDeviceClick={dev => {
+              setActivePage(null)
+              openDevice(typeof dev === 'object' ? dev : devices.find(d => d.mac_address === dev))
+            }} />
+          )}
+
+          {activePage === 'timeline' && (
+            <NetworkTimeline onDeviceClick={mac => {
+              setActivePage(null)
+              const dev = devices.find(d => d.mac_address === mac)
+              if (dev) openDevice(dev)
+            }} />
+          )}
+
+          {activePage === 'traffic' && (
+            <TrafficPage />
+          )}
+
+          {/* ── Main dashboard ── */}
+          {!activePage && (
+            <div className="space-y-8">
+              {/* Stat cards */}
+              <section>
+                <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
+                  <StatCard label="Total Devices" value={stats?.total_devices} icon={Monitor}   color="brand"
+                    onClick={() => handleCardFilter('all')}    active={filter === 'all'} />
+                  <StatCard label="Online"        value={stats?.online}        icon={Wifi}       color="emerald"
+                    onClick={() => handleCardFilter('online')}  active={filter === 'online'} />
+                  <StatCard label="Offline"       value={stats?.offline}       icon={WifiOff}    color="red"
+                    onClick={() => handleCardFilter('offline')} active={filter === 'offline'} />
+                  <StatCard label="Watched"       value={stats?.important}     icon={Star}       color="amber"
+                    onClick={() => handleCardFilter('important')} active={filter === 'important'} />
+                </div>
+              </section>
+
+              {/* Search / filter / sort / layout row */}
+              <section className="flex flex-wrap gap-2 items-center">
+                <div className="relative" style={{ minWidth: '160px', flex: '1 1 160px', maxWidth: '340px' }}>
+                  <Search size={15} className="absolute left-3 top-1/2 -translate-y-1/2 pointer-events-none"
+                    style={{ color: 'var(--color-text-muted)' }} />
+                  <input className="input pl-9 w-full" placeholder="Search…"
+                    value={search} onChange={e => setSearch(e.target.value)} />
+                </div>
+
+                {/* Filters toggle */}
+                <button
+                  onClick={() => setShowFilters(v => !v)}
+                  className="flex items-center gap-1.5 px-3 py-2 rounded-xl text-xs font-medium border transition-colors relative"
+                  style={showFilters || Object.keys(activeFilters).length > 0
+                    ? { background: 'var(--color-brand)', color: 'white', borderColor: 'transparent' }
+                    : { background: 'var(--color-surface-offset)', color: 'var(--color-text-muted)', borderColor: 'var(--color-border)' }}
+                  title="Toggle smart filters"
+                  aria-label="Toggle smart filters"
+                >
+                  <SlidersHorizontal size={13} />
+                  <span>Filters</span>
+                  {Object.keys(activeFilters).length > 0 && !showFilters && (
+                    <span className="ml-0.5 px-1.5 py-0.5 rounded-full text-[10px] font-bold"
+                      style={{ background: 'rgba(255,255,255,0.25)', color: 'white' }}>
+                      {Object.keys(activeFilters).length}
                     </span>
                   )}
-                </p>
-                {layout === 'grid' ? (
-                  <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-4">
-                    {filtered.map(d => (
-                      <DeviceCard key={d.mac_address} device={d}
-                        onClick={() => setSelected(d)}
-                        onStarToggle={handleStarToggle}
-                      />
-                    ))}
-                  </div>
-                ) : (
-                  <div className="card overflow-hidden">
-                    <div
-                      className="grid grid-cols-[1.5rem_2fr_1fr_1fr_1fr_6rem_2rem] gap-4 px-4 py-2.5 border-b
-                                 text-xs font-semibold uppercase tracking-wider"
-                      style={{ borderColor: 'var(--color-border)', color: 'var(--color-text-muted)' }}
-                    >
-                      <span /><span>Name / IP</span><span>MAC</span><span>Vendor</span>
-                      <span>Last Seen</span><span>Status</span><span />
-                    </div>
-                    {filtered.map((d, i) => (
-                      <DeviceRow key={d.mac_address} device={d} onClick={() => setSelected(d)}
-                        striped={i % 2 === 1} onStarToggle={handleStarToggle} />
-                    ))}
+                </button>
+
+                {/* Sort — only in non-category mode */}
+                {!isCategoryMode && (
+                  <div className="relative">
+                    <select value={sort} onChange={e => setSort(e.target.value)}
+                      className="input pr-8 appearance-none cursor-pointer text-xs" aria-label="Sort devices">
+                      {SORT_OPTIONS.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
+                    </select>
+                    <ChevronDown size={14} className="absolute right-3 top-1/2 -translate-y-1/2 pointer-events-none"
+                      style={{ color: 'var(--color-text-muted)' }} />
                   </div>
                 )}
-              </>
-            )}
-          </section>
 
+                <div className="flex items-center gap-1 glass rounded-xl p-1 ml-auto">
+                  <button onClick={() => setLayout('grid')}
+                    className="p-2 rounded-lg transition-all duration-150"
+                    style={layout === 'grid' ? { background: 'var(--color-brand)', color: 'white' } : { color: 'var(--color-text-muted)' }}
+                    aria-label="Grid layout" title="Grid layout">
+                    <LayoutGrid size={15} /></button>
+                  <button onClick={() => setLayout('list')}
+                    className="p-2 rounded-lg transition-all duration-150"
+                    style={layout === 'list' ? { background: 'var(--color-brand)', color: 'white' } : { color: 'var(--color-text-muted)' }}
+                    aria-label="List layout" title="List layout">
+                    <List size={15} /></button>
+                  <button onClick={() => setLayout('category')}
+                    className="p-2 rounded-lg transition-all duration-150"
+                    style={layout === 'category' ? { background: 'var(--color-brand)', color: 'white' } : { color: 'var(--color-text-muted)' }}
+                    aria-label="Category view" title="Category view">
+                    <Layers size={15} /></button>
+                </div>
+              </section>
+
+              {/* Smart filter bar — collapsible */}
+              {showFilters && (
+                <section>
+                  <SmartFilterBar
+                    devices={devices}
+                    activeFilters={activeFilters}
+                    onToggle={toggleFilter}
+                    onClear={clearFilters}
+                    savedViews={savedViews}
+                    onSaveView={saveView}
+                    onLoadView={loadView}
+                    onDeleteView={deleteView}
+                  />
+                </section>
+              )}
+
+              {/* Device list */}
+              <section>
+                {loading ? (
+                  <SkeletonGrid layout={layout === 'category' ? 'grid' : layout} />
+                ) : filtered.length === 0 ? (
+                  <EmptyState search={search} filter={filter} hasSmartFilters={hasActiveSmartFilters} onClearSmartFilters={clearFilters} />
+                ) : isCategoryMode ? (
+                  <>
+                    <p className="text-xs mb-4" style={{ color: 'var(--color-text-faint)' }}>
+                      Showing {filtered.length} of {devices.length} device{devices.length !== 1 ? 's' : ''} &middot; grouped by device type
+                    </p>
+                    <CategoryView devices={filtered} layout="grid" onDeviceClick={openDevice} />
+                  </>
+                ) : (
+                  <>
+                    <p className="text-xs mb-4" style={{ color: 'var(--color-text-faint)' }}>
+                      Showing {filtered.length} of {devices.length} device{devices.length !== 1 ? 's' : ''}
+                      {filter !== 'all' && (
+                        <span className="ml-2 px-2 py-0.5 rounded-full text-[10px] font-semibold uppercase"
+                          style={{ background: 'var(--color-brand)', color: 'white' }}>{filter}</span>
+                      )}
+                      {hasActiveSmartFilters && (
+                        <span className="ml-2 px-2 py-0.5 rounded-full text-[10px] font-semibold"
+                          style={{ background: 'var(--color-surface-offset)', color: 'var(--color-text-muted)' }}>
+                          + smart filters
+                        </span>
+                      )}
+                    </p>
+                    {layout === 'grid' ? (
+                      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-4">
+                        {filtered.map(d => (
+                          <DeviceCard key={d.mac_address} device={d}
+                            onClick={() => openDevice(d)}
+                            onStarToggle={handleStarToggle}
+                            isVulnScanning={vulnScansByMac[d.mac_address]?.scanning || false}
+                          />
+                        ))}
+                      </div>
+                    ) : (
+                      <div className="card overflow-hidden">
+                        <div
+                          className="grid grid-cols-[1.5rem_1fr_5rem_1.5rem] sm:grid-cols-[1.5rem_2fr_1fr_1fr_1fr_6rem_1.5rem] gap-3 sm:gap-4 px-4 py-2.5 border-b
+                                     text-xs font-semibold uppercase tracking-wider"
+                          style={{ borderColor: 'var(--color-border)', color: 'var(--color-text-muted)' }}
+                        >
+                          <span />
+                          <span>Name / IP</span>
+                          <span className="hidden sm:block">MAC</span>
+                          <span className="hidden sm:block">Vendor</span>
+                          <span className="hidden sm:block">Last Seen</span>
+                          <span>Status</span>
+                          <span />
+                        </div>
+                        {filtered.map((d, i) => (
+                          <DeviceRow key={d.mac_address} device={d} onClick={() => openDevice(d)}
+                            striped={i % 2 === 1} onStarToggle={handleStarToggle}
+                            isVulnScanning={vulnScansByMac[d.mac_address]?.scanning || false} />
+                        ))}
+                      </div>
+                    )}
+                  </>
+                )}
+              </section>
+            </div>
+          )}
         </main>
 
         <footer className="border-t py-4" style={{ borderColor: 'var(--color-border)' }}>
@@ -580,30 +734,26 @@ export default function App() {
 
       {selected && (
         <DeviceDrawer
+          key={selected.mac_address}
           device={selected}
           onClose={() => setSelected(null)}
           onRename={handleRename}
           onResolveName={handleResolveName}
+          onRefresh={refresh}
           onStarToggle={handleStarToggle}
           onMetadataUpdate={async (mac, patch) => {
             const updated = await api.updateMetadata(mac, patch)
             setSelected(prev => prev?.mac_address === mac ? { ...prev, ...updated } : prev)
             await refresh()
           }}
+          onZoneChange={(zone) => setSelected(prev => prev?.mac_address === selected.mac_address ? { ...prev, zone } : prev)}
+          vulnScanState={vulnScansByMac[selected.mac_address] || { lines: [], scanning: false }}
+          onVulnScanChange={(patchOrFn) => updateVulnScan(selected.mac_address, patchOrFn)}
+          initialTab={drawerInitialTab}
         />
       )}
       {showSettings && (
         <SettingsPanel onClose={() => setShowSettings(false)} onSettingChange={handleSettingChange} />
-      )}
-      {showSecurity && (
-        <SecurityDashboard
-          onClose={() => setShowSecurity(false)}
-          onDeviceClick={(mac) => {
-            setShowSecurity(false)
-            const dev = devices.find(d => d.mac_address === mac)
-            if (dev) setSelected(dev)
-          }}
-        />
       )}
     </div>
   )
@@ -614,14 +764,15 @@ function SkeletonGrid({ layout }) {
     return (
       <div className="card overflow-hidden">
         {[...Array(6)].map((_, i) => (
-          <div key={i} className="grid grid-cols-[1.5rem_2fr_1fr_1fr_1fr_6rem] gap-4 px-4 py-3 border-b last:border-0"
+          <div key={i} className="grid grid-cols-[1.5rem_1fr_5rem_1.5rem] sm:grid-cols-[1.5rem_2fr_1fr_1fr_1fr_6rem_1.5rem] gap-3 sm:gap-4 px-4 py-3 border-b last:border-0 items-center"
             style={{ borderColor: 'var(--color-border)' }}>
-            <div className="skeleton w-2.5 h-2.5 rounded-full mt-1" />
+            <div className="skeleton w-2.5 h-2.5 rounded-full" />
             <div className="skeleton h-4 w-3/4" />
-            <div className="skeleton h-4 w-4/5" />
-            <div className="skeleton h-4 w-2/3" />
-            <div className="skeleton h-4 w-3/5" />
-            <div className="skeleton h-5 w-16 rounded-full" />
+            <div className="skeleton hidden sm:block h-4 w-4/5" />
+            <div className="skeleton hidden sm:block h-4 w-2/3" />
+            <div className="skeleton hidden sm:block h-4 w-3/5" />
+            <div className="skeleton h-5 w-14 rounded-full" />
+            <div />
           </div>
         ))}
       </div>
