@@ -8,6 +8,7 @@
 
 InSpectre is a self-hosted home network monitor and security scanner that automatically discovers, tracks, fingerprints, and scans every device on your LAN. It runs entirely on your own hardware — no cloud, no subscriptions, no data leaving your network.
 
+Check the [Wiki](https://github.com/thefunkygibbon/InSpectre/blob/test/wiki.md) for full admin guide. 
 ---
 
 > **Screenshot placeholder** — _add a screenshot of the main dashboard here_
