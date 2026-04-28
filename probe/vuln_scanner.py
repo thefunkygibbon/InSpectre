@@ -575,6 +575,7 @@ async def run_vuln_scan(
         ]
 
         stdout_chunks: list[str] = []
+        stderr_lines: list[str] = []
 
         try:
             devnull_in = open(os.devnull, "rb")
@@ -600,6 +601,7 @@ async def run_vuln_scan(
                 line = raw.decode(errors="replace").rstrip()
                 if not line or _NOISE_RE.search(line):
                     continue
+                stderr_lines.append(line)
                 yield f"[NUCLEI] {line}"
 
             await stdout_task
@@ -622,7 +624,13 @@ async def run_vuln_scan(
             continue
 
         raw_text = "".join(stdout_chunks)
-        all_raw.append(raw_text)
+        # Combine stderr progress lines + stdout JSONL findings for a useful raw log
+        parts = []
+        if stderr_lines:
+            parts.append("\n".join(stderr_lines))
+        if raw_text.strip():
+            parts.append("--- findings (jsonl) ---\n" + raw_text.strip())
+        all_raw.append("\n\n".join(parts) if parts else "(no output)")
         for line in raw_text.splitlines():
             f = _parse_nuclei_finding(line)
             if f:

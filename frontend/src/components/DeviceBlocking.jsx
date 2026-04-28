@@ -1,7 +1,7 @@
-import { useState, useEffect, useCallback } from 'react'
+import { useState, useEffect, useCallback, useMemo } from 'react'
 import {
-  Ban, ShieldOff, ShieldCheck, Plus, Trash2, ToggleLeft, ToggleRight,
-  Loader, AlertTriangle, Clock, Wifi, WifiOff, Calendar,
+  ShieldOff, ShieldCheck, Plus, Trash2, ToggleLeft, ToggleRight,
+  Loader, AlertTriangle, Clock, Wifi, WifiOff, Calendar, Pencil, Tag,
 } from 'lucide-react'
 import { api } from '../api'
 
@@ -34,7 +34,6 @@ function DaysSelector({ value, onChange }) {
     const next = selected.includes(day)
       ? selected.filter(d => d !== day)
       : [...selected, day]
-    // preserve order
     onChange(DAYS.map(d => d.key).filter(k => next.includes(k)).join(','))
   }
   return (
@@ -53,32 +52,72 @@ function DaysSelector({ value, onChange }) {
   )
 }
 
-function AddScheduleForm({ devices, onCreated, onCancel }) {
-  const [mac, setMac]       = useState('')
-  const [label, setLabel]   = useState('')
-  const [days, setDays]     = useState('mon,tue,wed,thu,fri,sat,sun')
-  const [start, setStart]   = useState('22:00')
-  const [end, setEnd]       = useState('07:00')
-  const [saving, setSaving] = useState(false)
-  const [error, setError]   = useState(null)
+function DeviceChecklist({ devices, selected, onChange }) {
+  function toggle(mac) {
+    onChange(selected.includes(mac)
+      ? selected.filter(m => m !== mac)
+      : [...selected, mac])
+  }
+  if (!devices.length) {
+    return <p className="text-xs" style={{ color: 'var(--color-text-faint)' }}>No devices found.</p>
+  }
+  return (
+    <div className="max-h-48 overflow-y-auto rounded-lg border divide-y"
+      style={{ borderColor: 'var(--color-border)', divideColor: 'var(--color-border)' }}>
+      {devices.map(d => (
+        <label key={d.mac_address}
+          className="flex items-center gap-2.5 px-3 py-2 cursor-pointer hover:bg-[var(--color-surface-offset)] transition-colors">
+          <input type="checkbox" checked={selected.includes(d.mac_address)}
+            onChange={() => toggle(d.mac_address)}
+            className="rounded border-[var(--color-border)]" />
+          <span className="w-2 h-2 rounded-full shrink-0"
+            style={{ background: d.is_online ? '#10b981' : '#6b7280' }} />
+          <span className="text-xs font-medium flex-1 truncate" style={{ color: 'var(--color-text)' }}>
+            {d.display_name}
+          </span>
+          <span className="text-[10px] font-mono shrink-0" style={{ color: 'var(--color-text-faint)' }}>
+            {d.ip_address}
+          </span>
+        </label>
+      ))}
+    </div>
+  )
+}
+
+function ScheduleForm({ devices, allTags, initial, onSave, onCancel, saveLabel = 'Save schedule' }) {
+  const [targetMode, setTargetMode] = useState(
+    initial?.mac_addresses?.length ? 'devices'
+    : initial?.tags ? 'tags'
+    : 'whole'
+  )
+  const [selectedMacs, setSelectedMacs] = useState(initial?.mac_addresses || [])
+  const [tagInput,     setTagInput]     = useState(initial?.tags || '')
+  const [label,        setLabel]        = useState(initial?.label || '')
+  const [days,         setDays]         = useState(initial?.days_of_week || 'mon,tue,wed,thu,fri,sat,sun')
+  const [start,        setStart]        = useState(initial?.start_time || '22:00')
+  const [end,          setEnd]          = useState(initial?.end_time || '07:00')
+  const [saving,       setSaving]       = useState(false)
+  const [error,        setError]        = useState(null)
 
   async function handleSubmit(e) {
     e.preventDefault()
     if (!days) { setError('Select at least one day'); return }
+    if (targetMode === 'devices' && !selectedMacs.length) {
+      setError('Select at least one device'); return
+    }
     setSaving(true)
     setError(null)
     try {
-      const created = await api.createBlockSchedule({
-        mac_address:  mac || null,
-        label:        label || null,
-        days_of_week: days,
-        start_time:   start,
-        end_time:     end,
+      await onSave({
+        mac_addresses: targetMode === 'devices' ? selectedMacs : [],
+        tags:          targetMode === 'tags'    ? tagInput.trim() : '',
+        label:         label || null,
+        days_of_week:  days,
+        start_time:    start,
+        end_time:      end,
       })
-      onCreated(created)
     } catch (e) {
       setError(e.message)
-    } finally {
       setSaving(false)
     }
   }
@@ -86,19 +125,26 @@ function AddScheduleForm({ devices, onCreated, onCancel }) {
   return (
     <form onSubmit={handleSubmit} className="space-y-4 p-4 rounded-xl border"
       style={{ background: 'var(--color-surface-offset)', borderColor: 'var(--color-border)' }}>
-      <p className="text-xs font-semibold" style={{ color: 'var(--color-text)' }}>New Schedule</p>
 
       <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
         <div>
-          <label className="block text-xs mb-1" style={{ color: 'var(--color-text-muted)' }}>Device</label>
-          <select className="input w-full text-xs" value={mac} onChange={e => setMac(e.target.value)}>
-            <option value="">Whole network</option>
-            {devices.map(d => (
-              <option key={d.mac_address} value={d.mac_address}>
-                {d.display_name} ({d.ip_address})
-              </option>
+          <label className="block text-xs mb-1.5" style={{ color: 'var(--color-text-muted)' }}>Target</label>
+          <div className="flex rounded-lg overflow-hidden border text-xs" style={{ borderColor: 'var(--color-border)' }}>
+            {[
+              { key: 'whole',   label: 'Whole network' },
+              { key: 'devices', label: 'Devices' },
+              { key: 'tags',    label: 'By tags' },
+            ].map(opt => (
+              <button key={opt.key} type="button"
+                onClick={() => setTargetMode(opt.key)}
+                className="flex-1 py-1.5 font-medium transition-colors"
+                style={targetMode === opt.key
+                  ? { background: 'var(--color-brand)', color: 'white' }
+                  : { background: 'var(--color-surface)', color: 'var(--color-text-muted)' }}>
+                {opt.label}
+              </button>
             ))}
-          </select>
+          </div>
         </div>
         <div>
           <label className="block text-xs mb-1" style={{ color: 'var(--color-text-muted)' }}>Label (optional)</label>
@@ -106,6 +152,38 @@ function AddScheduleForm({ devices, onCreated, onCancel }) {
             value={label} onChange={e => setLabel(e.target.value)} />
         </div>
       </div>
+
+      {targetMode === 'devices' && (
+        <div>
+          <label className="block text-xs mb-1.5" style={{ color: 'var(--color-text-muted)' }}>
+            Select devices ({selectedMacs.length} selected)
+          </label>
+          <DeviceChecklist devices={devices} selected={selectedMacs} onChange={setSelectedMacs} />
+        </div>
+      )}
+
+      {targetMode === 'tags' && (
+        <div>
+          <label className="block text-xs mb-1" style={{ color: 'var(--color-text-muted)' }}>Tags (comma-separated)</label>
+          <input className="input w-full text-xs" placeholder="e.g. kids, iot, guest"
+            value={tagInput} onChange={e => setTagInput(e.target.value)} />
+          {allTags.length > 0 && (
+            <div className="flex flex-wrap gap-1 mt-1.5">
+              {allTags.map(t => (
+                <button key={t} type="button"
+                  onClick={() => {
+                    const current = tagInput.split(',').map(s => s.trim()).filter(Boolean)
+                    if (!current.includes(t)) setTagInput([...current, t].join(', '))
+                  }}
+                  className="px-1.5 py-0.5 rounded-full text-[10px] font-medium transition-opacity"
+                  style={{ background: 'var(--color-brand)', color: '#fff', opacity: 0.75 }}>
+                  {t}
+                </button>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
 
       <div>
         <label className="block text-xs mb-2" style={{ color: 'var(--color-text-muted)' }}>Days</label>
@@ -134,7 +212,7 @@ function AddScheduleForm({ devices, onCreated, onCancel }) {
           className="px-4 py-1.5 rounded-lg text-xs font-semibold text-white disabled:opacity-50 flex items-center gap-1.5"
           style={{ background: 'var(--color-brand)' }}>
           {saving && <Loader size={11} className="animate-spin" />}
-          Save schedule
+          {saveLabel}
         </button>
         <button type="button" onClick={onCancel}
           className="px-4 py-1.5 rounded-lg text-xs border"
@@ -146,11 +224,26 @@ function AddScheduleForm({ devices, onCreated, onCancel }) {
   )
 }
 
-function ScheduleRow({ schedule, devices, onToggle, onDelete }) {
+function ScheduleRow({ schedule, devices, allTags, onToggle, onDelete, onSave }) {
   const [deleting, setDeleting] = useState(false)
-  const deviceName = schedule.mac_address
-    ? devices.find(d => d.mac_address === schedule.mac_address)?.display_name || schedule.mac_address
-    : 'Whole network'
+  const [editing,  setEditing]  = useState(false)
+
+  const targetLabel = useMemo(() => {
+    if (schedule.mac_addresses?.length) {
+      const names = schedule.mac_addresses.map(mac => {
+        const d = devices.find(x => x.mac_address === mac)
+        return d ? d.display_name : mac
+      })
+      if (names.length === 1) return names[0]
+      if (names.length <= 3) return names.join(', ')
+      return `${names.slice(0, 2).join(', ')} +${names.length - 2} more`
+    }
+    if (schedule.tags) return null  // rendered as tag badges
+    if (schedule.mac_address) {
+      return devices.find(d => d.mac_address === schedule.mac_address)?.display_name || schedule.mac_address
+    }
+    return 'Whole network'
+  }, [schedule, devices])
 
   async function handleDelete() {
     if (!confirm('Delete this schedule?')) return
@@ -158,8 +251,28 @@ function ScheduleRow({ schedule, devices, onToggle, onDelete }) {
     try { await onDelete(schedule.id) } finally { setDeleting(false) }
   }
 
+  async function handleSave(data) {
+    await onSave(schedule.id, data)
+    setEditing(false)
+  }
+
   const days = schedule.days_of_week.split(',').map(d => d.trim())
   const allDays = days.length === 7
+
+  if (editing) {
+    return (
+      <div className="p-3 border-b last:border-0" style={{ borderColor: 'var(--color-border)' }}>
+        <ScheduleForm
+          devices={devices}
+          allTags={allTags}
+          initial={schedule}
+          onSave={handleSave}
+          onCancel={() => setEditing(false)}
+          saveLabel="Update schedule"
+        />
+      </div>
+    )
+  }
 
   return (
     <div className="flex items-center gap-3 px-4 py-3 border-b last:border-0"
@@ -174,11 +287,25 @@ function ScheduleRow({ schedule, devices, onToggle, onDelete }) {
 
       <div className="flex-1 min-w-0">
         <div className="flex items-center gap-2 flex-wrap">
-          <span className="text-sm font-medium" style={{ color: schedule.enabled ? 'var(--color-text)' : 'var(--color-text-faint)' }}>
-            {schedule.label || deviceName}
-          </span>
           {schedule.label && (
-            <span className="text-xs font-mono" style={{ color: 'var(--color-text-faint)' }}>{deviceName}</span>
+            <span className="text-sm font-medium" style={{ color: schedule.enabled ? 'var(--color-text)' : 'var(--color-text-faint)' }}>
+              {schedule.label}
+            </span>
+          )}
+          {schedule.tags ? (
+            <span className="flex items-center gap-1">
+              <Tag size={10} style={{ color: 'var(--color-brand)' }} />
+              {schedule.tags.split(',').map(t => t.trim()).filter(Boolean).map(t => (
+                <span key={t} className="text-[10px] px-1.5 py-0.5 rounded-full font-medium"
+                  style={{ background: 'color-mix(in srgb, var(--color-brand) 15%, transparent)', color: 'var(--color-brand)', border: '1px solid color-mix(in srgb, var(--color-brand) 30%, transparent)' }}>
+                  {t}
+                </span>
+              ))}
+            </span>
+          ) : (
+            <span className="text-xs font-mono" style={{ color: schedule.label ? 'var(--color-text-faint)' : (schedule.enabled ? 'var(--color-text)' : 'var(--color-text-faint)') }}>
+              {targetLabel}
+            </span>
           )}
         </div>
         <div className="flex items-center gap-3 mt-0.5 flex-wrap">
@@ -193,6 +320,13 @@ function ScheduleRow({ schedule, devices, onToggle, onDelete }) {
         </div>
       </div>
 
+      <button onClick={() => setEditing(true)}
+        className="p-1.5 rounded-lg transition-colors hover:opacity-80 shrink-0"
+        style={{ color: 'var(--color-text-faint)' }}
+        title="Edit schedule">
+        <Pencil size={13} />
+      </button>
+
       <button onClick={handleDelete} disabled={deleting}
         className="p-1.5 rounded-lg transition-colors hover:text-red-400 shrink-0"
         style={{ color: 'var(--color-text-faint)' }}
@@ -203,25 +337,40 @@ function ScheduleRow({ schedule, devices, onToggle, onDelete }) {
   )
 }
 
-export function DeviceBlocking({ devices }) {
+export function DeviceBlocking({ devices, onDeviceClick }) {
   const [networkStatus, setNetworkStatus] = useState(null)
   const [schedules,     setSchedules]     = useState([])
   const [loading,       setLoading]       = useState(true)
   const [pausing,       setPausing]       = useState(false)
   const [showAddForm,   setShowAddForm]   = useState(false)
   const [error,         setError]         = useState(null)
+  const [autoBlockNew,  setAutoBlockNew]  = useState(false)
+  const [autoBlockSev,  setAutoBlockSev]  = useState('none')
 
   const blockedDevices = devices.filter(d => d.is_blocked)
+
+  const allTags = useMemo(() => {
+    const tagSet = new Set()
+    for (const d of devices) {
+      if (d.tags_array) d.tags_array.forEach(t => tagSet.add(t))
+    }
+    return Array.from(tagSet).sort()
+  }, [devices])
 
   const load = useCallback(async () => {
     setLoading(true)
     try {
-      const [status, scheds] = await Promise.all([
+      const [status, scheds, settings] = await Promise.all([
         api.getNetworkStatus(),
         api.getBlockSchedules(),
+        api.getSettings(),
       ])
       setNetworkStatus(status)
       setSchedules(scheds)
+      const autoNew = settings.find(s => s.key === 'auto_block_new_devices')
+      const autoSev = settings.find(s => s.key === 'auto_block_vuln_severity')
+      if (autoNew) setAutoBlockNew(autoNew.value === 'true')
+      if (autoSev) setAutoBlockSev(autoSev.value || 'none')
     } catch (e) {
       setError(e.message)
     } finally {
@@ -264,6 +413,11 @@ export function DeviceBlocking({ devices }) {
     setSchedules(prev => prev.filter(s => s.id !== id))
   }
 
+  async function handleSaveSchedule(id, data) {
+    const updated = await api.updateBlockSchedule(id, data)
+    setSchedules(prev => prev.map(s => s.id === id ? updated : s))
+  }
+
   async function handleBlockDevice(mac) {
     try {
       await api.blockDevice(mac)
@@ -303,6 +457,52 @@ export function DeviceBlocking({ devices }) {
           <button onClick={() => setError(null)} className="ml-auto opacity-60 hover:opacity-100 text-xs">Dismiss</button>
         </div>
       )}
+
+      {/* Auto-block rules */}
+      <PageSection title="Automatic Blocking Rules">
+        <div className="space-y-4">
+          <div className="flex items-start gap-3">
+            <button onClick={async () => {
+              const next = !autoBlockNew
+              setAutoBlockNew(next)
+              await api.updateSetting('auto_block_new_devices', next ? 'true' : 'false').catch(() => {})
+            }}
+              className="shrink-0 mt-0.5 transition-colors"
+              title={autoBlockNew ? 'Disable auto-block for new devices' : 'Enable auto-block for new devices'}>
+              {autoBlockNew
+                ? <ToggleRight size={20} style={{ color: 'var(--color-brand)' }} />
+                : <ToggleLeft  size={20} style={{ color: 'var(--color-text-faint)' }} />}
+            </button>
+            <div>
+              <p className="text-sm font-medium" style={{ color: 'var(--color-text)' }}>Block new devices on discovery</p>
+              <p className="text-xs mt-0.5" style={{ color: 'var(--color-text-muted)' }}>
+                Automatically ARP-block any device the moment it is first discovered. Useful for a whitelist-style approach — manually unblock trusted devices.
+              </p>
+            </div>
+          </div>
+
+          <div className="flex items-start gap-3">
+            <div className="flex-1">
+              <p className="text-sm font-medium mb-1" style={{ color: 'var(--color-text)' }}>Auto-block on vulnerability severity</p>
+              <p className="text-xs mb-2" style={{ color: 'var(--color-text-muted)' }}>
+                Block a device automatically when a vuln scan finds issues at or above the selected severity.
+              </p>
+              <select className="input text-xs w-48"
+                value={autoBlockSev}
+                onChange={async e => {
+                  const v = e.target.value
+                  setAutoBlockSev(v)
+                  await api.updateSetting('auto_block_vuln_severity', v).catch(() => {})
+                }}>
+                <option value="none">Disabled</option>
+                <option value="medium">Medium and above</option>
+                <option value="high">High and above</option>
+                <option value="critical">Critical only</option>
+              </select>
+            </div>
+          </div>
+        </div>
+      </PageSection>
 
       {/* Network-wide pause */}
       <PageSection title="Network Internet Pause">
@@ -344,17 +544,23 @@ export function DeviceBlocking({ devices }) {
         ) : (
           <div className="rounded-lg border overflow-hidden mb-4" style={{ borderColor: 'var(--color-border)' }}>
             {schedules.map(s => (
-              <ScheduleRow key={s.id} schedule={s} devices={devices}
+              <ScheduleRow key={s.id} schedule={s} devices={devices} allTags={allTags}
                 onToggle={handleToggleSchedule}
-                onDelete={handleDeleteSchedule} />
+                onDelete={handleDeleteSchedule}
+                onSave={handleSaveSchedule} />
             ))}
           </div>
         )}
 
         {showAddForm ? (
-          <AddScheduleForm
+          <ScheduleForm
             devices={devices}
-            onCreated={s => { setSchedules(prev => [s, ...prev]); setShowAddForm(false) }}
+            allTags={allTags}
+            onSave={async data => {
+              const created = await api.createBlockSchedule(data)
+              setSchedules(prev => [created, ...prev])
+              setShowAddForm(false)
+            }}
             onCancel={() => setShowAddForm(false)}
           />
         ) : (
@@ -381,8 +587,11 @@ export function DeviceBlocking({ devices }) {
                   style={{ background: d.is_blocked ? 'rgba(239,68,68,0.06)' : 'var(--color-surface-offset)' }}>
                   <span className="w-2 h-2 rounded-full shrink-0"
                     style={{ background: d.is_online ? '#10b981' : '#ef4444' }} />
-                  <div className="flex-1 min-w-0">
-                    <p className="text-sm font-medium truncate" style={{ color: 'var(--color-text)' }}>
+                  <div className="flex-1 min-w-0"
+                    onClick={() => onDeviceClick && onDeviceClick(d)}
+                    style={{ cursor: onDeviceClick ? 'pointer' : 'default' }}>
+                    <p className="text-sm font-medium truncate hover:underline"
+                      style={{ color: onDeviceClick ? 'var(--color-brand)' : 'var(--color-text)' }}>
                       {d.display_name}
                     </p>
                     <p className="text-xs font-mono" style={{ color: 'var(--color-text-faint)' }}>

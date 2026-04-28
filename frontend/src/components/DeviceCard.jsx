@@ -78,6 +78,16 @@ function openPortCount(device) {
   return null
 }
 
+function baselineDrift(device) {
+  const baseline = device.baseline_ports
+  if (!baseline || !Array.isArray(baseline)) return null
+  const current = (device.scan_results?.open_ports || []).map(p => p.port)
+  const newPorts    = current.filter(p => !baseline.includes(p))
+  const closedPorts = baseline.filter(p => !current.includes(p))
+  if (!newPorts.length && !closedPorts.length) return null
+  return { newPorts, closedPorts }
+}
+
 export function DeviceCard({ device, onClick, onStarToggle, isVulnScanning }) {
   const name     = deviceDisplayName(device)
   const vendor   = cleanVendor(device.vendor_override || device.vendor)
@@ -85,6 +95,7 @@ export function DeviceCard({ device, onClick, onStarToggle, isVulnScanning }) {
   const category = getDeviceCategory(device)
   const ports    = openPortCount(device)
   const scanning = !device.deep_scanned
+  const drift    = baselineDrift(device)
 
 // Show vendor only when it adds info the title doesn't already give
   const showVendorSubtitle = vendor && vendor !== name && !device.ip_address?.startsWith(name)
@@ -175,9 +186,29 @@ export function DeviceCard({ device, onClick, onStarToggle, isVulnScanning }) {
         </div>
       )}
 
-      {/* Footer */}
-      <div className="flex items-center justify-end pt-1 border-t" style={{ borderColor: 'var(--color-border)' }}>
-        <span className="text-xs" style={{ color: 'var(--color-text-faint)' }}>{relativeTime(device.last_seen)}</span>
+      {/* Footer — always pinned to bottom */}
+      <div className="mt-auto flex items-center justify-between pt-1 border-t" style={{ borderColor: 'var(--color-border)' }}>
+        {drift ? (
+          <div className="flex items-center gap-1">
+            {drift.newPorts.length > 0 && (
+              <span className="text-[10px] font-semibold px-1.5 py-0.5 rounded-full"
+                style={{ background: 'rgba(239,68,68,0.15)', color: '#ef4444', border: '1px solid rgba(239,68,68,0.3)' }}
+                title={`New ports vs baseline: ${drift.newPorts.join(', ')}`}>
+                +{drift.newPorts.length}
+              </span>
+            )}
+            {drift.closedPorts.length > 0 && (
+              <span className="text-[10px] font-semibold px-1.5 py-0.5 rounded-full"
+                style={{ background: 'rgba(245,158,11,0.15)', color: '#f59e0b', border: '1px solid rgba(245,158,11,0.3)' }}
+                title={`Closed ports vs baseline: ${drift.closedPorts.join(', ')}`}>
+                -{drift.closedPorts.length}
+              </span>
+            )}
+          </div>
+        ) : <span />}
+        <span className="text-xs" style={{ color: device.is_online ? 'var(--color-text-faint)' : '#ef4444' }}>
+          {device.is_online ? `online · ${relativeTime(device.last_seen)}` : `offline · ${relativeTime(device.last_seen)}`}
+        </span>
       </div>
     </button>
   )

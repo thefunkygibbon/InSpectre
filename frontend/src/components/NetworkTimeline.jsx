@@ -80,7 +80,7 @@ function XAxisLabels({ windowStart, windowEnd, days }) {
   )
 }
 
-function DeviceRow({ device, windowStart, windowEnd, days }) {
+function DeviceRow({ device, windowStart, windowEnd, days, onDeviceClick }) {
   const onlinePct = useMemo(() => {
     const totalMs = new Date(windowEnd) - new Date(windowStart)
     if (totalMs <= 0) return 0
@@ -93,12 +93,20 @@ function DeviceRow({ device, windowStart, windowEnd, days }) {
   return (
     <div className="flex items-center gap-3 py-1.5">
       <div className="w-[160px] sm:w-[200px] flex items-center gap-2 shrink-0 min-w-0">
-        <span className="w-1.5 h-1.5 rounded-full shrink-0"
-          style={{ background: device.is_online ? '#10b981' : '#ef4444' }} />
-        <span className="text-xs truncate" style={{ color: 'var(--color-text)' }}
+        <button
+          onClick={() => onDeviceClick && onDeviceClick(device.mac)}
+          disabled={!onDeviceClick}
+          className="w-1.5 h-1.5 rounded-full shrink-0 transition-opacity hover:opacity-70 disabled:cursor-default"
+          style={{ background: device.is_online ? '#10b981' : '#ef4444' }}
+          title={device.is_online ? 'Online' : 'Offline'}
+        />
+        <button
+          onClick={() => onDeviceClick && onDeviceClick(device.mac)}
+          className="text-xs truncate text-left hover:underline"
+          style={{ color: onDeviceClick ? 'var(--color-brand)' : 'var(--color-text)' }}
           title={device.name}>
           {device.name}
-        </span>
+        </button>
       </div>
 
       <TimelineBar
@@ -118,7 +126,7 @@ function DeviceRow({ device, windowStart, windowEnd, days }) {
   )
 }
 
-export function NetworkTimeline() {
+export function NetworkTimeline({ onDeviceClick }) {
   const [days,    setDays]    = useState(7)
   const [data,    setData]    = useState(null)
   const [loading, setLoading] = useState(true)
@@ -254,6 +262,7 @@ export function NetworkTimeline() {
                 windowStart={data.window_start}
                 windowEnd={data.window_end}
                 days={days}
+                onDeviceClick={onDeviceClick}
               />
             ))}
           </div>

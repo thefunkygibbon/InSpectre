@@ -2,8 +2,169 @@ import { useState, useEffect } from 'react'
 import {
   ShieldAlert, ShieldCheck, RefreshCw, ScanLine,
   AlertTriangle, Info, Clock, ChevronDown, ChevronRight,
+  Settings2, Save, Loader, X,
 } from 'lucide-react'
 import { api } from '../api'
+
+// ---------------------------------------------------------------------------
+// Vuln scan settings panel
+// ---------------------------------------------------------------------------
+const VULN_SETTING_META = {
+  vuln_scan_schedule: {
+    label: 'Scheduled Scans', type: 'select',
+    options: [
+      { value: 'disabled', label: 'Disabled' },
+      { value: '6h',       label: 'Every 6 hours' },
+      { value: '12h',      label: 'Every 12 hours' },
+      { value: '24h',      label: 'Daily' },
+      { value: 'weekly',   label: 'Weekly' },
+    ],
+  },
+  vuln_scan_targets: {
+    label: 'Scan Targets', type: 'select',
+    options: [
+      { value: 'all',       label: 'All devices' },
+      { value: 'important', label: 'Watched devices only' },
+    ],
+  },
+  vuln_scan_on_new_device: {
+    label: 'Auto-scan New Devices', type: 'toggle',
+    description: 'Automatically run a scan when a new device is first discovered.',
+  },
+  vuln_scan_on_port_change: {
+    label: 'Scan on Port Change', type: 'toggle',
+    description: 'Automatically scan when a new open port is detected.',
+  },
+  nuclei_template_update_interval: {
+    label: 'Template Updates', type: 'select',
+    options: [
+      { value: 'disabled', label: 'Disabled' },
+      { value: '12h',      label: 'Every 12 hours' },
+      { value: '24h',      label: 'Daily' },
+      { value: '48h',      label: 'Every 48 hours' },
+      { value: 'weekly',   label: 'Weekly' },
+    ],
+  },
+  vuln_scan_templates: {
+    label: 'Template Tags', type: 'text',
+    description: 'Comma-separated tags (e.g. cve,exposure,misconfig,default-login,network).',
+  },
+}
+
+const VULN_KEYS = Object.keys(VULN_SETTING_META)
+
+function VulnSettingsPanel({ onClose }) {
+  const [vals,   setVals]   = useState({})
+  const [dirty,  setDirty]  = useState({})
+  const [saving, setSaving] = useState(false)
+  const [saved,  setSaved]  = useState(false)
+
+  useEffect(() => {
+    api.getSettings().then(all => {
+      const map = {}
+      for (const s of all) if (VULN_KEYS.includes(s.key)) map[s.key] = s.value
+      setVals(map)
+    }).catch(() => {})
+  }, [])
+
+  function handleChange(key, value) {
+    setDirty(d => ({ ...d, [key]: value }))
+  }
+
+  async function handleSave() {
+    setSaving(true)
+    await Promise.all(Object.entries(dirty).map(([k, v]) => api.updateSetting(k, v)))
+    setVals(v => ({ ...v, ...dirty }))
+    setDirty({})
+    setSaving(false)
+    setSaved(true)
+    setTimeout(() => setSaved(false), 2000)
+  }
+
+  const hasDirty = Object.keys(dirty).length > 0
+  const val = (key) => dirty[key] ?? vals[key] ?? ''
+
+  return (
+    <div className="card mb-6 overflow-hidden">
+      <div className="px-4 py-3 border-b flex items-center justify-between"
+        style={{ borderColor: 'var(--color-border)', background: 'var(--color-surface-offset)' }}>
+        <span className="flex items-center gap-2 text-xs font-semibold uppercase tracking-wider"
+          style={{ color: 'var(--color-text-muted)' }}>
+          <Settings2 size={13} /> Scan Settings
+        </span>
+        <button onClick={onClose} className="p-1 rounded hover:opacity-70 transition-opacity"
+          style={{ color: 'var(--color-text-faint)' }}>
+          <X size={14} />
+        </button>
+      </div>
+      <div className="px-4 py-4 grid grid-cols-1 sm:grid-cols-2 gap-4">
+        {VULN_KEYS.map(key => {
+          const meta = VULN_SETTING_META[key]
+          const v = val(key)
+          const isDirty = dirty[key] !== undefined
+          const dirtyStyle = isDirty ? { borderColor: 'color-mix(in srgb, var(--color-brand) 50%, transparent)' } : {}
+
+          if (meta.type === 'toggle') {
+            const isOn = v === 'true'
+            return (
+              <div key={key} className="space-y-1 sm:col-span-2">
+                <div className="flex items-center justify-between">
+                  <div>
+                    <span className="text-xs font-medium" style={{ color: 'var(--color-text)' }}>{meta.label}</span>
+                    {meta.description && (
+                      <p className="text-[10px] mt-0.5" style={{ color: 'var(--color-text-faint)' }}>{meta.description}</p>
+                    )}
+                  </div>
+                  <button type="button" role="switch" aria-checked={isOn}
+                    onClick={() => handleChange(key, isOn ? 'false' : 'true')}
+                    className="relative inline-flex h-5 w-9 items-center rounded-full transition-colors ml-4 shrink-0"
+                    style={{ background: isOn ? 'var(--color-brand)' : 'var(--color-border)' }}>
+                    <span className="inline-block h-3.5 w-3.5 rounded-full bg-white shadow transition-transform"
+                      style={{ transform: isOn ? 'translateX(19px)' : 'translateX(3px)' }} />
+                  </button>
+                </div>
+              </div>
+            )
+          }
+
+          if (meta.type === 'select') {
+            return (
+              <div key={key} className="space-y-1">
+                <label className="text-xs font-medium" style={{ color: 'var(--color-text)' }}>{meta.label}</label>
+                <select className="input text-xs w-full" style={dirtyStyle} value={v}
+                  onChange={e => handleChange(key, e.target.value)}>
+                  {meta.options?.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
+                </select>
+              </div>
+            )
+          }
+
+          return (
+            <div key={key} className="space-y-1 sm:col-span-2">
+              <label className="text-xs font-medium" style={{ color: 'var(--color-text)' }}>{meta.label}</label>
+              <input type="text" className="input text-xs font-mono w-full" style={dirtyStyle} value={v}
+                onChange={e => handleChange(key, e.target.value)} />
+              {meta.description && (
+                <p className="text-[10px]" style={{ color: 'var(--color-text-faint)' }}>{meta.description}</p>
+              )}
+            </div>
+          )
+        })}
+      </div>
+      {hasDirty && (
+        <div className="px-4 pb-4">
+          <button onClick={handleSave} disabled={saving}
+            className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold text-white disabled:opacity-50"
+            style={{ background: 'var(--color-brand)' }}>
+            {saving
+              ? <><Loader size={11} className="animate-spin" /> Saving…</>
+              : saved ? '✓ Saved' : <><Save size={11} /> Save settings</>}
+          </button>
+        </div>
+      )}
+    </div>
+  )
+}
 
 const SEV_CFG = {
   critical: { label: 'Critical', color: '#ef4444', bg: 'rgba(239,68,68,0.15)',  border: 'rgba(239,68,68,0.35)'  },
@@ -84,6 +245,7 @@ export function SecurityDashboard({ onDeviceClick }) {
   const [expandedVuln, setExpandedVuln] = useState({})
   const [scanning,     setScanning]     = useState(false)
   const [scanMsg,      setScanMsg]      = useState(null)
+  const [showSettings, setShowSettings] = useState(false)
 
   async function load() {
     setLoading(true)
@@ -164,6 +326,13 @@ export function SecurityDashboard({ onDeviceClick }) {
             <button onClick={load} disabled={loading} className="btn-ghost p-2" title="Refresh data">
               <RefreshCw size={15} className={loading ? 'animate-spin' : ''} />
             </button>
+            <button
+              onClick={() => setShowSettings(v => !v)}
+              className="btn-ghost p-2 transition-colors"
+              title="Scan settings"
+              style={showSettings ? { color: 'var(--color-brand)' } : {}}>
+              <Settings2 size={16} />
+            </button>
           </div>
         </div>
 
@@ -175,6 +344,8 @@ export function SecurityDashboard({ onDeviceClick }) {
             {scanMsg}
           </div>
         )}
+
+        {showSettings && <VulnSettingsPanel onClose={() => setShowSettings(false)} />}
 
         <div className="space-y-6">
 

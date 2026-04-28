@@ -1,7 +1,7 @@
 import { useState, useEffect, useRef } from 'react'
 import {
   Save, RotateCcw, Settings2, X, Download, Upload, FileText,
-  Database, Bell, ScanLine, Eye, EyeOff, Send, Globe, Zap,
+  Database, Bell, ScanLine, Eye, EyeOff, Send, Globe,
 } from 'lucide-react'
 import { api } from '../api'
 
@@ -33,6 +33,16 @@ const SETTING_META = {
   },
   vuln_scan_on_new_device: { label: 'Auto-scan New Devices', type: 'toggle', tab: 'scanner',
     description: 'Automatically run a vulnerability scan when a new device is first discovered.' },
+  vuln_scan_on_port_change: { label: 'Vuln-scan on Port Change', type: 'toggle', tab: 'scanner',
+    description: 'Automatically trigger a vulnerability scan when a new port is detected on a device.' },
+  nightly_scan_start:     { label: 'Nightly Scan Window Start', unit: 'hour (0–23)', type: 'number', min: 0, max: 23, tab: 'scanner',
+    description: 'Hour of day (24h) when the nightly deep-scan window begins.' },
+  nightly_scan_end:       { label: 'Nightly Scan Window End',   unit: 'hour (0–23)', type: 'number', min: 0, max: 23, tab: 'scanner',
+    description: 'Hour of day (24h) when the nightly deep-scan window closes.' },
+  offline_rescan_hours:   { label: 'Offline Return Rescan',  unit: 'hours offline', type: 'number', min: 1, max: 168, tab: 'scanner',
+    description: 'Re-run a deep scan when a device returns online after being offline for this many hours.' },
+  baseline_scan_count_threshold: { label: 'Baseline Confirmation Scans', unit: 'scans', type: 'number', min: 1, max: 10, tab: 'scanner',
+    description: 'Number of consecutive matching scans required before a port baseline is confirmed.' },
   nuclei_template_update_interval: { label: 'Vuln Template Updates', type: 'select', tab: 'scanner',
     options: [
       { value: 'disabled', label: 'Disabled' },
@@ -95,6 +105,9 @@ export function SettingsPanel({ onClose, onSettingChange }) {
   const [exportingDevs, setExportingDevs] = useState(false)
   const [exportingFp,   setExportingFp]   = useState(false)
   const [importStatus,  setImportStatus]  = useState(null)
+  const [backingUp,     setBackingUp]     = useState(false)
+  const [restoreStatus, setRestoreStatus] = useState(null)
+  const restoreInputRef = useRef(null)
   const [showPbKey,     setShowPbKey]     = useState(false)
   const [showGotifyToken, setShowGotifyToken] = useState(false)
   const [pbTestStatus,  setPbTestStatus]  = useState(null)
@@ -178,6 +191,24 @@ export function SettingsPanel({ onClose, onSettingChange }) {
     finally { setExportingFp(false) }
   }
 
+  async function handleBackup() {
+    setBackingUp(true)
+    try { await downloadResponse(await api.exportBackup(), 'inspectre-backup.json') }
+    catch (e) { alert('Backup failed: ' + e.message) }
+    finally { setBackingUp(false) }
+  }
+
+  async function handleRestoreBackup(e) {
+    const file = e.target.files?.[0]
+    if (!file) return
+    setRestoreStatus('loading')
+    try {
+      const result = await api.importRestore(file)
+      setRestoreStatus(result)
+    } catch { setRestoreStatus('error') }
+    finally { if (restoreInputRef.current) restoreInputRef.current.value = '' }
+  }
+
   async function handleImportFingerprints(e) {
     const file = e.target.files?.[0]
     if (!file) return
@@ -206,7 +237,6 @@ export function SettingsPanel({ onClose, onSettingChange }) {
 
   // ── Scanner tab grouping ────────────────────────────────────────────────────
   const networkScanKeys = ['scan_interval','offline_miss_threshold','os_confidence_threshold','sniffer_workers','ip_range','nmap_args']
-  const vulnScanKeys    = ['vuln_scan_templates','vuln_scan_schedule','vuln_scan_targets','vuln_scan_on_new_device','nuclei_template_update_interval']
 
   // ── Notifications tab grouping ──────────────────────────────────────────────
   const inAppKeys   = ['notifications_enabled','browser_notifications_enabled']
@@ -279,11 +309,6 @@ export function SettingsPanel({ onClose, onSettingChange }) {
                 <SettingRow key={s.key} s={s} dirty={dirty} onchange={handleChange} />
               ))}
 
-              {/* Vulnerability scanning */}
-              <SectionHeader label="Vulnerability Scanning" Icon={ScanLine} />
-              {settingsByKeys(vulnScanKeys).map(s => (
-                <SettingRow key={s.key} s={s} dirty={dirty} onchange={handleChange} />
-              ))}
             </>
           )}
 
@@ -438,6 +463,49 @@ export function SettingsPanel({ onClose, onSettingChange }) {
           {/* ── Data tab ────────────────────────────────────────────────────── */}
           {activeTab === 'data' && (
             <>
+              <SectionHeader label="Database Backup & Restore" Icon={Database} />
+              <div className="card p-4 space-y-3">
+                <p className="text-xs" style={{ color: 'var(--color-text-faint)' }}>
+                  Export a full backup of your settings and fingerprint data. Devices can be re-discovered
+                  automatically, but custom names, tags, and identity overrides are included.
+                </p>
+                <div className="flex gap-2 flex-wrap">
+                  <button onClick={handleBackup} disabled={backingUp}
+                    className="btn-secondary flex items-center gap-2 text-sm">
+                    <Download size={13} />
+                    {backingUp ? 'Exporting…' : 'Download backup.json'}
+                  </button>
+                  <button onClick={() => restoreInputRef.current?.click()}
+                    className="btn-secondary flex items-center gap-2 text-sm">
+                    <Upload size={13} /> Restore from backup
+                  </button>
+                  <input ref={restoreInputRef} type="file" accept=".json,application/json"
+                    className="sr-only" onChange={handleRestoreBackup} />
+                </div>
+                {restoreStatus === 'loading' && (
+                  <p className="text-xs" style={{ color: 'var(--color-text-muted)' }}>Restoring…</p>
+                )}
+                {restoreStatus === 'error' && (
+                  <p className="text-xs" style={{ color: '#ef4444' }}>
+                    Restore failed — check the file is a valid InSpectre backup.json.
+                  </p>
+                )}
+                {restoreStatus && restoreStatus !== 'loading' && restoreStatus !== 'error' && (
+                  <div className="rounded-lg p-3 text-xs space-y-1"
+                    style={{
+                      background: 'color-mix(in srgb, var(--color-success) 10%, var(--color-surface-offset))',
+                      color: 'var(--color-success)',
+                    }}>
+                    <p className="font-medium">Restore complete ✓</p>
+                    <p>
+                      {restoreStatus.settings_restored != null
+                        ? `${restoreStatus.settings_restored} settings · ${restoreStatus.fingerprints_restored} fingerprints restored`
+                        : JSON.stringify(restoreStatus)}
+                    </p>
+                  </div>
+                )}
+              </div>
+
               <SectionHeader label="Device List" Icon={FileText} />
               <div className="card p-4 space-y-2">
                 <p className="text-xs" style={{ color: 'var(--color-text-faint)' }}>

@@ -38,6 +38,12 @@ class Device(Base):
     zone                 = Column(String, nullable=True)
     is_ignored           = Column(Boolean, server_default='false', nullable=False)
 
+    # Phase 7: scan performance & port baseline
+    hostname_last_attempted = Column(DateTime(timezone=True), nullable=True)
+    deep_scan_last_run      = Column(DateTime(timezone=True), nullable=True)
+    baseline_ports          = Column(JSON, nullable=True)
+    baseline_scan_count     = Column(Integer, server_default='0', nullable=False)
+
     ip_history   = relationship("IPHistory",    back_populates="device",
                                 order_by="IPHistory.first_seen.desc()")
     events       = relationship("DeviceEvent",  back_populates="device",

@@ -24,7 +24,7 @@ import { NetworkTimeline }     from './components/NetworkTimeline'
 import { CategoryView }        from './components/CategoryView'
 import { SmartFilterBar }      from './components/SmartFilterBar'
 
-const APP_VERSION = '1.0.0'
+const APP_VERSION = '1.1.0'
 
 const SORT_OPTIONS = [
   { value: 'last_seen_desc', label: 'Last seen (newest)' },
@@ -415,7 +415,7 @@ export default function App() {
                   <>
                     <div className="fixed inset-0 z-30" onClick={() => setShowAlertDrop(false)} />
                     <div
-                      className="absolute right-0 top-full mt-2 w-80 rounded-xl shadow-xl z-40 p-4 space-y-3"
+                      className="fixed right-4 top-[4.5rem] w-80 max-w-[calc(100vw-2rem)] rounded-xl shadow-xl z-40 p-4 space-y-3"
                       style={{ background: 'var(--color-surface)', border: '1px solid var(--color-border)' }}
                     >
                       <div className="flex items-center justify-between">
@@ -524,11 +524,18 @@ export default function App() {
           )}
 
           {activePage === 'blocking' && (
-            <DeviceBlocking devices={devices} />
+            <DeviceBlocking devices={devices} onDeviceClick={dev => {
+              setActivePage(null)
+              openDevice(typeof dev === 'object' ? dev : devices.find(d => d.mac_address === dev))
+            }} />
           )}
 
           {activePage === 'timeline' && (
-            <NetworkTimeline />
+            <NetworkTimeline onDeviceClick={mac => {
+              setActivePage(null)
+              const dev = devices.find(d => d.mac_address === mac)
+              if (dev) openDevice(dev)
+            }} />
           )}
 
           {activePage === 'traffic' && (

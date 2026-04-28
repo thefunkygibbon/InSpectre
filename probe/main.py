@@ -9,7 +9,7 @@ import subprocess
 import sys
 import threading
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 import uvicorn
 from fastapi import FastAPI, HTTPException, Query
@@ -43,10 +43,18 @@ OFFLINE_MISS_THRESHOLD  = int(os.environ.get("OFFLINE_MISS_THRESHOLD",   3))
 SNIFFER_WORKERS         = int(os.environ.get("SNIFFER_WORKERS",          4))
 PROBE_API_PORT          = int(os.environ.get("PROBE_API_PORT",         8001))
 LAN_DNS_SERVER_ENV      = os.environ.get("LAN_DNS_SERVER", "").strip()
-MDNS_INTERVAL           = int(os.environ.get("MDNS_INTERVAL", 3600))  # default: 1 hour
+MDNS_INTERVAL_MINUTES   = int(os.environ.get("MDNS_INTERVAL_MINUTES", 120))  # default: 2 hours
 
-# mDNS rate-limiting — tracks last time a full browse was run
-_last_mdns_browse: float = 0.0
+# Scan scheduling globals (overridden by DB settings at each cycle)
+NIGHTLY_SCAN_START      = int(os.environ.get("NIGHTLY_SCAN_START", 2))
+NIGHTLY_SCAN_END        = int(os.environ.get("NIGHTLY_SCAN_END",   4))
+OFFLINE_RESCAN_HOURS    = int(os.environ.get("OFFLINE_RESCAN_HOURS", 4))
+BASELINE_SCAN_COUNT_THRESHOLD = 3   # loaded from settings each scan cycle
+HOSTNAME_COOLDOWN_HOURS = 24        # fixed per design
+
+# In-memory absent-port counters for baseline drift detection (resets on restart — acceptable)
+# { mac: { port: consecutive_absent_count } }
+_port_absent_counts: dict = {}
 PING_COUNT    = 40
 TRACE_MAX_HOP = 30
 
@@ -63,6 +71,7 @@ def _load_settings_from_db() -> None:
     """
     global SCAN_INTERVAL, IP_RANGE, NMAP_ARGS, OS_CONFIDENCE_THRESHOLD
     global OFFLINE_MISS_THRESHOLD, SNIFFER_WORKERS, NUCLEI_TEMPLATE_UPDATE_INTERVAL
+    global NIGHTLY_SCAN_START, NIGHTLY_SCAN_END, OFFLINE_RESCAN_HOURS, BASELINE_SCAN_COUNT_THRESHOLD
     try:
         session = Session()
         try:
@@ -78,6 +87,10 @@ def _load_settings_from_db() -> None:
         if "sniffer_workers"         in db: SNIFFER_WORKERS         = int(db["sniffer_workers"])
         if "nuclei_template_update_interval" in db:
             NUCLEI_TEMPLATE_UPDATE_INTERVAL = db["nuclei_template_update_interval"]
+        if "nightly_scan_start"            in db: NIGHTLY_SCAN_START            = int(db["nightly_scan_start"])
+        if "nightly_scan_end"              in db: NIGHTLY_SCAN_END              = int(db["nightly_scan_end"])
+        if "offline_rescan_hours"          in db: OFFLINE_RESCAN_HOURS          = int(db["offline_rescan_hours"])
+        if "baseline_scan_count_threshold" in db: BASELINE_SCAN_COUNT_THRESHOLD = int(db["baseline_scan_count_threshold"])
     except Exception as exc:
         print(f"[settings] DB load failed (using current values): {exc}", flush=True)
 
@@ -174,6 +187,12 @@ class Device(Base):
     deep_scanned = Column(Boolean, default=False)
     miss_count   = Column(Integer, default=0)
     is_important = Column(Boolean, default=False, nullable=False)
+    is_ignored   = Column(Boolean, default=False, nullable=False)
+    device_type_override    = Column(String,  nullable=True)
+    hostname_last_attempted = Column(DateTime(timezone=True), nullable=True)
+    deep_scan_last_run      = Column(DateTime(timezone=True), nullable=True)
+    baseline_ports          = Column(JSONB,   nullable=True)
+    baseline_scan_count     = Column(Integer, default=0, nullable=False)
 
 class IPHistory(Base):
     __tablename__ = "ip_history"
@@ -195,9 +214,6 @@ _upsert_locks_lock = threading.Lock()
 # window, so we don't falsely increment miss counts for devices the sniffer saw.
 _sniffer_seen_this_interval: set[str] = set()
 _sniffer_seen_lock = threading.Lock()
-
-# IPs where hostname resolution already failed — skip until device reconnects.
-_hostname_failed: set[str] = set()
 
 def _get_mac_lock(mac: str) -> threading.Lock:
     with _upsert_locks_lock:
@@ -238,6 +254,11 @@ def init_db() -> None:
             """))
             conn.execute(text("ALTER TABLE devices ADD COLUMN IF NOT EXISTS vuln_last_scanned TIMESTAMPTZ"))
             conn.execute(text("ALTER TABLE devices ADD COLUMN IF NOT EXISTS vuln_severity VARCHAR"))
+            conn.execute(text("ALTER TABLE devices ADD COLUMN IF NOT EXISTS device_type_override VARCHAR"))
+            conn.execute(text("ALTER TABLE devices ADD COLUMN IF NOT EXISTS hostname_last_attempted TIMESTAMPTZ"))
+            conn.execute(text("ALTER TABLE devices ADD COLUMN IF NOT EXISTS deep_scan_last_run TIMESTAMPTZ"))
+            conn.execute(text("ALTER TABLE devices ADD COLUMN IF NOT EXISTS baseline_ports JSONB"))
+            conn.execute(text("ALTER TABLE devices ADD COLUMN IF NOT EXISTS baseline_scan_count INTEGER NOT NULL DEFAULT 0"))
             conn.commit()
         except Exception as e:
             print(f"[DB] Column migration note: {e}", flush=True)
@@ -769,6 +790,25 @@ def _apply_mdns_enrichment(mdns_data: dict[str, dict]) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Standalone mDNS background loop (Change 3)
+# ---------------------------------------------------------------------------
+def _mdns_loop() -> None:
+    """Scheduled background thread: runs _mdns_browse every MDNS_INTERVAL_MINUTES minutes.
+    Independent of the main ARP sweep loop — never triggered per device join."""
+    interval_s = MDNS_INTERVAL_MINUTES * 60
+    print(f"[mdns] Scheduled loop started (interval={MDNS_INTERVAL_MINUTES}m)", flush=True)
+    while True:
+        time.sleep(interval_s)
+        try:
+            print(f"[mdns] Running scheduled browse (interval={MDNS_INTERVAL_MINUTES}m)", flush=True)
+            mdns_data = _mdns_browse()
+            if mdns_data:
+                _apply_mdns_enrichment(mdns_data)
+        except Exception as e:
+            print(f"[mdns] Loop error: {e}", flush=True)
+
+
+# ---------------------------------------------------------------------------
 # ARP sweep
 # ---------------------------------------------------------------------------
 def arp_scan(interface: str, ip_range: str) -> list[dict]:
@@ -784,6 +824,19 @@ def arp_scan(interface: str, ip_range: str) -> list[dict]:
 
 # Cap simultaneous deep scans so 21 newly-detected devices don't all scan at once
 _deep_scan_semaphore = threading.Semaphore(3)
+
+
+def _port_severity(device) -> str:
+    """Return severity for a port_opened event based on device type and importance."""
+    dtype = (getattr(device, 'device_type_override', None) or '').lower()
+    is_important = bool(getattr(device, 'is_important', False))
+    iot_types = {'iot', 'camera', 'smart_plug', 'smart_home', 'console'}
+    server_types = {'server', 'nas'}
+    if not dtype or dtype in iot_types:
+        return 'critical'
+    if is_important or dtype in server_types:
+        return 'warning'
+    return 'info'
 
 
 def _fast_port_sweep(ip: str) -> list[int]:
@@ -820,6 +873,77 @@ def _fast_port_sweep(ip: str) -> list[int]:
 
 
 # ---------------------------------------------------------------------------
+# Port baseline logic (Change 4)
+# ---------------------------------------------------------------------------
+def _update_port_baseline(mac: str, ip: str, current_ports: list[int]) -> None:
+    """Compare current port set against confirmed baseline; write port_opened/port_closed events."""
+    current_set = frozenset(current_ports)
+    session = Session()
+    try:
+        device = session.get(Device, mac)
+        if not device:
+            return
+
+        baseline    = device.baseline_ports       # list[int] or None
+        scan_count  = device.baseline_scan_count or 0
+        threshold   = BASELINE_SCAN_COUNT_THRESHOLD
+
+        if baseline is None:
+            # No baseline yet — seed it
+            device.baseline_ports      = sorted(current_set)
+            device.baseline_scan_count = 1
+            session.commit()
+            print(f"[baseline] {ip} ({mac}): baseline seeded with {len(current_set)} port(s)", flush=True)
+            return
+
+        baseline_set = frozenset(baseline)
+
+        if current_set == baseline_set:
+            # Consistent with baseline: increment confirmation count
+            device.baseline_scan_count = scan_count + 1
+            session.commit()
+            if scan_count + 1 == threshold:
+                print(f"[baseline] {ip} ({mac}): baseline confirmed after {threshold} matching scans", flush=True)
+            return
+
+        if scan_count < threshold:
+            # Baseline not yet confirmed and ports changed: reset tentative baseline
+            device.baseline_ports      = sorted(current_set)
+            device.baseline_scan_count = 1
+            session.commit()
+            print(f"[baseline] {ip} ({mac}): tentative baseline reset (not yet confirmed)", flush=True)
+            return
+
+        # --- Baseline is confirmed; check for drift ---
+        severity    = _port_severity(device)
+        new_ports   = current_set - baseline_set
+        gone_ports  = baseline_set - current_set
+
+        for port in sorted(new_ports):
+            _write_event(mac, "port_opened", {"port": port, "severity": severity})
+            print(f"[baseline] NEW port vs baseline on {ip}: port {port} severity={severity}", flush=True)
+
+        for port in sorted(gone_ports):
+            absent_map = _port_absent_counts.setdefault(mac, {})
+            absent_map[port] = absent_map.get(port, 0) + 1
+            if absent_map[port] >= 2:
+                _write_event(mac, "port_closed", {"port": port, "severity": "info"})
+                print(f"[baseline] CLOSED port vs baseline on {ip}: port {port}", flush=True)
+
+        # Reset absent counters for ports that re-appeared
+        if mac in _port_absent_counts:
+            for port in list(_port_absent_counts[mac].keys()):
+                if port in current_set:
+                    del _port_absent_counts[mac][port]
+
+    except Exception as e:
+        session.rollback()
+        print(f"[baseline] Error for {mac}: {e}", flush=True)
+    finally:
+        session.close()
+
+
+# ---------------------------------------------------------------------------
 # TCP port scan + scan result storage
 # ---------------------------------------------------------------------------
 def _run_deep_scan_thread(ip: str, mac: str) -> None:
@@ -851,8 +975,9 @@ def _run_deep_scan_thread(ip: str, mac: str) -> None:
                     new_ports = {(p.get("port"), p.get("proto")) for p in scan_results["open_ports"]}
                     is_rescan = bool(old_scan)
 
-                    device.scan_results = scan_results
-                    device.deep_scanned = True
+                    device.scan_results     = scan_results
+                    device.deep_scanned     = True
+                    device.deep_scan_last_run = datetime.now(timezone.utc)
                     session.commit()
 
                     _write_event(mac, "scan_complete", {"ports": len(fast_ports), "os": None})
@@ -875,6 +1000,10 @@ def _run_deep_scan_thread(ip: str, mac: str) -> None:
                 daemon=True,
                 name=f"nerva-{mac}",
             ).start()
+
+            # Stage 4: Port baseline & drift alerting (Change 4)
+            _update_port_baseline(mac, ip, fast_ports)
+
         finally:
             with _scan_lock:
                 _scanning.discard(mac)
@@ -882,6 +1011,17 @@ def _run_deep_scan_thread(ip: str, mac: str) -> None:
 def trigger_deep_scan(ip: str, mac: str) -> None:
     if not _is_valid_ip(ip):
         return
+    # Skip deep scan for ignored devices
+    try:
+        _s = Session()
+        try:
+            _dev = _s.get(Device, mac)
+            if _dev and getattr(_dev, 'is_ignored', False):
+                return
+        finally:
+            _s.close()
+    except Exception:
+        pass
     with _scan_lock:
         if mac in _scanning:
             return
@@ -919,21 +1059,33 @@ def upsert_seen_device(mac: str, ip: str, source: str) -> None:
             was_online = None if is_new else existing.is_online
             ip_changed = (not is_new) and (old_ip != ip)
 
+            # Track how long device was offline (used after commit to decide rescan)
+            offline_duration_s = 0.0
+            if not is_new and not was_online and existing.last_seen:
+                offline_duration_s = (now - existing.last_seen).total_seconds()
+
+            # --- DB-gated hostname resolution (Change 1) ---
+            hostname_resolution_attempted = False
             if is_new:
-                hostname = None if ip in _hostname_failed else resolve_hostname(ip)
-                if not hostname and ip not in _hostname_failed:
-                    _hostname_failed.add(ip)
+                hostname = resolve_hostname(ip)
+                hostname_resolution_attempted = True
                 vendor   = lookup_vendor(mac)
             else:
                 if existing.hostname:
+                    # Already resolved — never re-resolve automatically
                     hostname = existing.hostname
-                elif ip in _hostname_failed:
-                    hostname = None
                 else:
-                    hostname = resolve_hostname(ip)
-                    if not hostname:
-                        _hostname_failed.add(ip)
-                vendor   = existing.vendor
+                    last_att = existing.hostname_last_attempted
+                    cooldown_elapsed = (
+                        last_att is None or
+                        (now - last_att).total_seconds() >= HOSTNAME_COOLDOWN_HOURS * 3600
+                    )
+                    if cooldown_elapsed:
+                        hostname = resolve_hostname(ip)
+                        hostname_resolution_attempted = True
+                    else:
+                        hostname = None
+                vendor = existing.vendor
 
             safe_hostname = (hostname or '').replace("'", "''")
 
@@ -941,18 +1093,20 @@ def upsert_seen_device(mac: str, ip: str, source: str) -> None:
                 stmt = (
                     pg_insert(Device)
                     .values(
-                        mac_address  = mac,
-                        ip_address   = ip,
-                        primary_ip   = ip,
-                        hostname     = hostname,
-                        vendor       = vendor,
-                        custom_name  = None,
-                        is_online    = True,
-                        first_seen   = now,
-                        last_seen    = now,
-                        deep_scanned = False,
-                        miss_count   = 0,
-                        is_important = False,
+                        mac_address              = mac,
+                        ip_address               = ip,
+                        primary_ip               = ip,
+                        hostname                 = hostname,
+                        vendor                   = vendor,
+                        custom_name              = None,
+                        is_online                = True,
+                        first_seen               = now,
+                        last_seen                = now,
+                        deep_scanned             = False,
+                        miss_count               = 0,
+                        is_important             = False,
+                        hostname_last_attempted  = now,
+                        baseline_scan_count      = 0,
                     )
                     .on_conflict_do_update(
                         index_elements=["mac_address"],
@@ -1020,20 +1174,11 @@ def upsert_seen_device(mac: str, ip: str, source: str) -> None:
                 print(f"[+] New device via {source}: {ip} ({mac}) hostname={hostname} vendor={vendor}", flush=True)
                 _write_event(mac, "joined", {"ip": ip, "vendor": vendor or "Unknown"})
                 trigger_deep_scan(ip, mac)
-                # Trigger a one-shot mDNS browse shortly after a brand-new device joins
-                # so it gets hostname/services enriched quickly without waiting for the
-                # scheduled interval. Re-joins of known devices do NOT trigger this.
-                threading.Timer(
-                    5.0,
-                    lambda: _apply_mdns_enrichment(_mdns_browse()),
-                ).start()
             else:
                 if not was_online:
                     print(f"[~] Back online via {source}: {ip} ({mac})", flush=True)
                     _write_event(mac, "online", {"ip": ip})
-                    _hostname_failed.discard(ip)
                 if ip_changed:
-                    _hostname_failed.discard(ip)
                     primary = existing.primary_ip or old_ip
                     if ip == primary or not was_online:
                         # Device came back from offline at new IP → primary updated to new IP
@@ -1053,6 +1198,41 @@ def upsert_seen_device(mac: str, ip: str, source: str) -> None:
             return
         finally:
             session.close()
+
+    # Persist hostname_last_attempted if we attempted resolution this call
+    if hostname_resolution_attempted:
+        sess_hn = Session()
+        try:
+            sess_hn.execute(
+                text("UPDATE devices SET hostname_last_attempted = NOW() WHERE mac_address = :mac"),
+                {"mac": mac},
+            )
+            sess_hn.commit()
+        except Exception as e:
+            sess_hn.rollback()
+            print(f"[hostname] Failed to update hostname_last_attempted for {mac}: {e}", flush=True)
+        finally:
+            sess_hn.close()
+
+    # Offline-return rescan: if device was offline for > OFFLINE_RESCAN_HOURS, invalidate scan
+    if not is_new and not was_online and offline_duration_s >= OFFLINE_RESCAN_HOURS * 3600:
+        sess_or = Session()
+        try:
+            dev_or = sess_or.get(Device, mac)
+            if dev_or and dev_or.deep_scanned:
+                print(
+                    f"[scan] Device {ip} ({mac}) was offline {offline_duration_s/3600:.1f}h — "
+                    "invalidating deep scan for rescan",
+                    flush=True,
+                )
+                dev_or.deep_scanned = False
+                dev_or.scan_results = None
+                sess_or.commit()
+        except Exception as e:
+            sess_or.rollback()
+            print(f"[DB] Offline-return rescan error {mac}: {e}", flush=True)
+        finally:
+            sess_or.close()
 
     is_brand_new_ip = record_ip(mac, ip)
 
@@ -1105,6 +1285,8 @@ def refresh_missing_vendors() -> None:
         session.close()
 
 def refresh_missing_hostnames() -> None:
+    """Resolve hostnames for online devices that have none and whose cooldown has elapsed."""
+    now = datetime.now(timezone.utc)
     session = Session()
     try:
         unnamed = session.query(Device).filter(
@@ -1116,18 +1298,24 @@ def refresh_missing_hostnames() -> None:
             scan_ip = dev.primary_ip or dev.ip_address
             if not _is_valid_ip(scan_ip):
                 continue
-            if scan_ip in _hostname_failed:
+            last_att = dev.hostname_last_attempted
+            cooldown_elapsed = (
+                last_att is None or
+                (now - last_att).total_seconds() >= HOSTNAME_COOLDOWN_HOURS * 3600
+            )
+            if not cooldown_elapsed:
                 continue
             name = resolve_hostname(scan_ip)
+            # Always update hostname_last_attempted (prevents tight retry loops)
+            dev.hostname_last_attempted = now
             if name:
                 dev.hostname = name
                 updated += 1
                 print(f"[hostname] Resolved: {scan_ip} -> {name}", flush=True)
-            else:
-                _hostname_failed.add(scan_ip)
-        if updated:
+        if updated or True:  # commit timestamp updates even on miss
             session.commit()
-            print(f"[hostname] Resolved {updated} new hostnames this pass.", flush=True)
+            if updated:
+                print(f"[hostname] Resolved {updated} new hostnames this pass.", flush=True)
     except Exception as e:
         session.rollback()
         print(f"[hostname] Refresh error: {e}", flush=True)
@@ -1781,6 +1969,124 @@ def stream_tools_portscan(host: str = Query(...), ports: str = Query("1-1024")):
     )
 
 
+@probe_api.get("/stream/tools/speedtest")
+async def stream_speedtest(server_id: str = ""):
+    async def _gen():
+        cmd = ["speedtest-cli", "--no-pre-allocate"]
+        if server_id:
+            cmd += ["--server", server_id]
+        lines_seen: list[str] = []
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+            )
+            assert proc.stdout
+            async for raw in proc.stdout:
+                line = raw.decode(errors="replace").rstrip()
+                if line:
+                    lines_seen.append(line)
+                    yield f"data: {line}\n\n"
+            await proc.wait()
+            # Parse and emit structured result
+            result: dict = {}
+            for ln in lines_seen:
+                if ln.startswith("Download:"):
+                    try: result["download_mbps"] = float(ln.split()[1])
+                    except (IndexError, ValueError): pass
+                elif ln.startswith("Upload:"):
+                    try: result["upload_mbps"] = float(ln.split()[1])
+                    except (IndexError, ValueError): pass
+                elif "Hosted by" in ln:
+                    try:
+                        # "Hosted by Name (City) [Xkm]: Y ms"
+                        parts = ln.split(": ", 1)
+                        if len(parts) == 2:
+                            result["ping_ms"] = float(parts[1].split()[0])
+                        result["server"] = ln.replace("Hosted by ", "").split(" [")[0].strip()
+                    except (IndexError, ValueError): pass
+            yield f"data: RESULT:{json.dumps(result)}\n\n"
+        except FileNotFoundError:
+            yield "data: ERROR: speedtest-cli not found — rebuild probe container\n\n"
+        except Exception as exc:
+            yield f"data: ERROR: {exc}\n\n"
+    return StreamingResponse(
+        _gen(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+@probe_api.get("/tools/speedtest-servers")
+async def get_speedtest_servers():
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "speedtest-cli", "--list",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+        )
+        out, _ = await proc.communicate()
+        text = out.decode(errors="replace")
+        servers = []
+        for line in text.splitlines()[1:]:  # skip header
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                parts = line.split(")")
+                sid = parts[0].strip()
+                rest = parts[1].strip() if len(parts) > 1 else line
+                servers.append({"id": sid, "label": rest[:80]})
+            except Exception:
+                pass
+        return {"servers": servers[:50]}
+    except FileNotFoundError:
+        return {"servers": [], "error": "speedtest-cli not found"}
+    except Exception as exc:
+        return {"servers": [], "error": str(exc)}
+
+
+@probe_api.get("/tools/arp-table")
+def get_arp_table():
+    try:
+        import subprocess as sp
+        out = sp.run(["ip", "neigh", "show"], capture_output=True, text=True, timeout=5)
+        entries = []
+        for line in out.stdout.splitlines():
+            parts = line.split()
+            if len(parts) >= 5 and parts[1] == "dev":
+                ip  = parts[0]
+                mac = parts[4] if len(parts) > 4 else None
+                state = parts[-1] if len(parts) > 5 else "unknown"
+                if mac and mac != "FAILED" and ":" in mac:
+                    entries.append({"ip": ip, "mac": mac.upper(), "state": state})
+        return {"entries": entries}
+    except Exception as exc:
+        return {"entries": [], "error": str(exc)}
+
+
+@probe_api.post("/tools/wake-on-lan")
+async def wake_on_lan(body: dict):
+    mac = body.get("mac", "").strip()
+    broadcast = body.get("broadcast", "255.255.255.255")
+    if not mac:
+        raise HTTPException(400, "mac required")
+    # Normalise MAC and build magic packet
+    import re, socket
+    mac_clean = re.sub(r"[^0-9a-fA-F]", "", mac)
+    if len(mac_clean) != 12:
+        raise HTTPException(400, "Invalid MAC address")
+    magic = bytes.fromhex("FF" * 6 + mac_clean * 16)
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+            s.sendto(magic, (broadcast, 9))
+        return {"ok": True, "mac": mac}
+    except Exception as exc:
+        raise HTTPException(500, str(exc))
+
+
 @probe_api.get("/stream/vuln-scan/{ip}")
 async def stream_vuln_scan(ip: str, templates: str = "", mac: str = ""):
     import ipaddress
@@ -2153,11 +2459,8 @@ def main() -> None:
     threading.Thread(target=_nuclei_template_update_loop, daemon=True, name="nuclei-updater").start()
     time.sleep(2)
 
-    print("[*] Running startup hostname resolution pass...", flush=True)
-    threading.Thread(target=bulk_reresolve_all, daemon=True, name="startup-resolve").start()
-    threading.Thread(target=_startup_nerva_backfill, daemon=True, name="nerva-backfill").start()
-
     threading.Thread(target=start_arp_sniffer, daemon=True, name="arp-sniffer").start()
+    threading.Thread(target=_mdns_loop, daemon=True, name="mdns-loop").start()
 
     while True:
         _load_settings_from_db()
@@ -2189,18 +2492,25 @@ def main() -> None:
 
             threading.Thread(target=refresh_missing_hostnames, daemon=True).start()
 
-            # Rate-limited mDNS: only run a full browse if MDNS_INTERVAL seconds
-            # have elapsed since the last run. New device joins trigger their own
-            # one-shot browse via upsert_seen_device(), so this is just a
-            # periodic refresh to catch any devices that were missed or updated.
-            _now_ts = time.monotonic()
-            global _last_mdns_browse
-            if (_now_ts - _last_mdns_browse) >= MDNS_INTERVAL:
-                print(f"[mdns] Scheduled browse (interval={MDNS_INTERVAL}s)", flush=True)
-                mdns_data = _mdns_browse()
-                if mdns_data:
-                    _apply_mdns_enrichment(mdns_data)
-                _last_mdns_browse = _now_ts
+            # Nightly deep-scan window: rescan fully-scanned online devices once per day
+            now_hour = datetime.now().hour
+            if NIGHTLY_SCAN_START <= now_hour < NIGHTLY_SCAN_END:
+                nightly_threshold = datetime.now(timezone.utc) - timedelta(hours=23)
+                nightly_q = session.query(Device).filter(
+                    Device.is_online     == True,
+                    Device.deep_scanned  == True,
+                ).all()
+                nightly_count = 0
+                for dev in nightly_q:
+                    last_run = dev.deep_scan_last_run
+                    if last_run is None or last_run < nightly_threshold:
+                        scan_ip = dev.primary_ip or dev.ip_address
+                        if _is_valid_ip(scan_ip):
+                            print(f"[scan] Nightly rescan: {scan_ip} ({dev.mac_address})", flush=True)
+                            trigger_deep_scan(scan_ip, dev.mac_address)
+                            nightly_count += 1
+                if nightly_count:
+                    print(f"[scan] Nightly window queued {nightly_count} rescan(s)", flush=True)
         except Exception as e:
             session.rollback()
             print(f"[!] Sweep error: {e}", flush=True)

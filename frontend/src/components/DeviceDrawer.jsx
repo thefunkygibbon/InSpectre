@@ -6,6 +6,7 @@ import {
   ChevronDown, ChevronRight, Square, Tag, CheckCircle2,
   FileText, Star as StarIcon, ShieldAlert, EyeOff, Eye, Layers,
   AlertTriangle, Network, Loader2, GitMerge, Radio, BellOff, Plus, Trash2,
+  TrendingUp, TrendingDown,
 } from 'lucide-react'
 import { OnlineDot }      from './OnlineDot'
 import { StarButton }     from './StarButton'
@@ -61,11 +62,11 @@ function zoneStyle(zone) {
 }
 
 const TABS = [
-  { id: 'overview',  label: 'Overview'         },
-  { id: 'vulns',     label: 'Vulnerabilities'  },
-  { id: 'traffic',   label: 'Traffic'          },
-  { id: 'timeline',  label: 'Timeline'         },
-  { id: 'admin',     label: 'Admin'            },
+  { id: 'overview',  label: 'Overview'  },
+  { id: 'vulns',     label: 'Vulns'     },
+  { id: 'traffic',   label: 'Traffic'   },
+  { id: 'timeline',  label: 'Timeline'  },
+  { id: 'admin',     label: 'Admin'     },
 ]
 
 function Collapsible({ title, icon: Icon, defaultOpen = false, children }) {
@@ -307,6 +308,7 @@ export function DeviceDrawer({ device, onClose, onRename, onResolveName, onRefre
   const [activeTab,    setActiveTab]    = useState(initialTab || 'overview')
   const [blocking,     setBlocking]     = useState(false)
   const [ignoring,     setIgnoring]     = useState(false)
+  const [deleting,     setDeleting]     = useState(false)
 
   // Vuln scan state is owned by the parent (App.jsx) so it survives drawer close/reopen.
   // Proxy setters propagate functional updaters so rapid SSE lines don't get lost to stale closures.
@@ -444,7 +446,7 @@ export function DeviceDrawer({ device, onClose, onRename, onResolveName, onRefre
         </div>
 
         {/* Tab bar */}
-        <div className="flex border-b border-border px-6 gap-1" style={{ background: 'var(--color-surface)' }}>
+        <div className="flex border-b border-border px-4 gap-0 overflow-x-auto scrollbar-none" style={{ background: 'var(--color-surface)' }}>
           {TABS.map(tab => {
             const isVuln   = tab.id === 'vulns'
             const isActive = activeTab === tab.id
@@ -452,7 +454,7 @@ export function DeviceDrawer({ device, onClose, onRename, onResolveName, onRefre
               <button
                 key={tab.id}
                 onClick={() => setActiveTab(tab.id)}
-                className="px-3 py-3 text-xs font-medium border-b-2 transition-colors flex items-center gap-1.5"
+                className="px-3 py-3 text-xs font-medium border-b-2 transition-colors flex items-center gap-1.5 whitespace-nowrap shrink-0"
                 style={isActive
                   ? { borderColor: 'var(--color-brand)', color: 'var(--color-brand)' }
                   : { borderColor: 'transparent', color: 'var(--color-text-muted)' }}
@@ -620,8 +622,34 @@ export function DeviceDrawer({ device, onClose, onRename, onResolveName, onRefre
               </Collapsible>
 
               {/* Open Ports */}
-              {scan?.open_ports?.length > 0 && (
-                <Collapsible title={`Open Ports (${scan.open_ports.length})`} icon={Terminal} defaultOpen={true}>
+              {scan?.open_ports?.length > 0 && (() => {
+                // Summarise vuln severity counts from the latest report if available
+                const sevCounts = {}
+                const latestFindings = localDevice.latest_vuln_findings || []
+                for (const f of latestFindings) {
+                  if (['critical','high','medium'].includes(f.severity)) {
+                    sevCounts[f.severity] = (sevCounts[f.severity] || 0) + 1
+                  }
+                }
+                const sevBadges = Object.entries(sevCounts).map(([sev, n]) => {
+                  const colors = { critical: '#ef4444', high: '#f97316', medium: '#f59e0b' }
+                  return (
+                    <span key={sev} className="text-[9px] font-semibold px-1 rounded"
+                      style={{ background: `${colors[sev]}20`, color: colors[sev] }}>
+                      {n} {sev[0].toUpperCase()}
+                    </span>
+                  )
+                })
+                const portTitle = (
+                  <span className="flex items-center gap-1.5">
+                    Open Ports ({scan.open_ports.length})
+                    {sevBadges.length > 0 && (
+                      <span className="flex items-center gap-1 ml-1">{sevBadges}</span>
+                    )}
+                  </span>
+                )
+                return (
+                <Collapsible title={portTitle} icon={Terminal} defaultOpen={true}>
                   {scan.open_ports.map((p, i) => {
                     const web        = isWebPort(p.port)
                     const url        = web ? portUrl(localDevice.ip_address, p.port) : null
@@ -668,6 +696,18 @@ export function DeviceDrawer({ device, onClose, onRename, onResolveName, onRefre
                       </div>
                     )
                   })}
+                </Collapsible>
+                )
+              })()}
+
+              {/* Port Baseline */}
+              {localDevice.baseline_ports != null && (
+                <Collapsible title="Port Baseline" icon={GitBranch} defaultOpen={false}>
+                  <PortBaselineSection device={localDevice} onReset={() => {
+                    api.resetBaseline(mac).then(() => {
+                      setLocalDevice(prev => ({ ...prev, baseline_ports: null, baseline_scan_count: 0 }))
+                    }).catch(() => {})
+                  }} />
                 </Collapsible>
               )}
             </>
@@ -732,6 +772,41 @@ export function DeviceDrawer({ device, onClose, onRename, onResolveName, onRefre
               <Collapsible title="Alert Suppressions" icon={BellOff} defaultOpen={false}>
                 <SuppressionManager mac={mac} />
               </Collapsible>
+
+              {/* Danger zone */}
+              <div className="rounded-xl border border-red-500/30 overflow-hidden">
+                <div className="px-4 py-2.5 border-b border-red-500/20"
+                  style={{ background: 'rgba(239,68,68,0.06)' }}>
+                  <span className="text-xs font-semibold uppercase tracking-wider text-red-400">Danger Zone</span>
+                </div>
+                <div className="p-4 space-y-3">
+                  <p className="text-xs" style={{ color: 'var(--color-text-muted)' }}>
+                    Permanently delete this device and all associated data (events, scan reports,
+                    traffic stats, alerts). The device will be re-discovered automatically if it
+                    becomes active again on the network.
+                  </p>
+                  <button
+                    disabled={deleting}
+                    onClick={async () => {
+                      if (!window.confirm(`Delete ${localDevice.custom_name || localDevice.hostname || mac} and all its data? This cannot be undone.`)) return
+                      setDeleting(true)
+                      try {
+                        await api.deleteDevice(mac)
+                        onClose()
+                        if (onRefresh) onRefresh()
+                      } catch (e) {
+                        alert('Delete failed: ' + e.message)
+                        setDeleting(false)
+                      }
+                    }}
+                    className="flex items-center gap-2 px-3 py-2 rounded-lg border text-xs font-medium
+                               transition-colors duration-150 border-red-500/40 bg-red-500/10 text-red-400
+                               hover:bg-red-500/20 disabled:opacity-50 disabled:cursor-not-allowed">
+                    <Trash2 size={13} />
+                    {deleting ? 'Deleting…' : 'Delete Device'}
+                  </button>
+                </div>
+              </div>
             </div>
           )}
 
@@ -925,6 +1000,71 @@ function MdnsRow({ mac, scan, onRefreshed }) {
           {refreshing ? 'Scanning…' : 'Refresh mDNS'}
         </button>
       </div>
+    </div>
+  )
+}
+
+function PortBaselineSection({ device, onReset }) {
+  const baseline = device.baseline_ports || []
+  const current  = (device.scan_results?.open_ports || []).map(p => p.port)
+  const newPorts    = current.filter(p => !baseline.includes(p))
+  const closedPorts = baseline.filter(p => !current.includes(p))
+  const hasDrift    = newPorts.length > 0 || closedPorts.length > 0
+
+  return (
+    <div className="space-y-3">
+      <div className="flex items-center justify-between">
+        <span className="text-xs text-text-muted">
+          Confirmed baseline · {baseline.length} port{baseline.length !== 1 ? 's' : ''}
+        </span>
+        <button onClick={onReset}
+          className="flex items-center gap-1 text-[10px] opacity-60 hover:opacity-100 transition-opacity"
+          style={{ color: 'var(--color-text-muted)' }}>
+          <RotateCcw size={9} />
+          Reset
+        </button>
+      </div>
+      {baseline.length > 0 && (
+        <div className="flex flex-wrap gap-1">
+          {baseline.map(p => {
+            const isNew    = newPorts.includes(p)
+            const isClosed = closedPorts.includes(p)
+            return (
+              <span key={p} className="font-mono text-[10px] px-1.5 py-0.5 rounded"
+                style={isClosed
+                  ? { background: 'rgba(245,158,11,0.15)', color: '#f59e0b', border: '1px solid rgba(245,158,11,0.3)' }
+                  : { background: 'var(--color-surface-offset)', color: 'var(--color-text-muted)', border: '1px solid var(--color-border)' }}>
+                {p}
+              </span>
+            )
+          })}
+          {newPorts.map(p => (
+            <span key={`new-${p}`} className="font-mono text-[10px] px-1.5 py-0.5 rounded"
+              style={{ background: 'rgba(239,68,68,0.15)', color: '#ef4444', border: '1px solid rgba(239,68,68,0.3)' }}>
+              +{p}
+            </span>
+          ))}
+        </div>
+      )}
+      {hasDrift && (
+        <div className="flex flex-wrap gap-2 text-[11px]">
+          {newPorts.length > 0 && (
+            <span className="flex items-center gap-1" style={{ color: '#ef4444' }}>
+              <TrendingUp size={10} />
+              {newPorts.length} new port{newPorts.length !== 1 ? 's' : ''}: {newPorts.join(', ')}
+            </span>
+          )}
+          {closedPorts.length > 0 && (
+            <span className="flex items-center gap-1" style={{ color: '#f59e0b' }}>
+              <TrendingDown size={10} />
+              {closedPorts.length} closed: {closedPorts.join(', ')}
+            </span>
+          )}
+        </div>
+      )}
+      {!hasDrift && baseline.length > 0 && (
+        <p className="text-[11px]" style={{ color: 'var(--color-text-faint)' }}>No drift from baseline</p>
+      )}
     </div>
   )
 }

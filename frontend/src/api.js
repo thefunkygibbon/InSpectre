@@ -46,6 +46,7 @@ export const api = {
   updateMetadata:  (mac, body)  => request('PATCH', `/devices/${mac}/metadata`, body),
   resolveName:     (mac)        => request('POST',  `/devices/${mac}/resolve-name`),
   rescanDevice:    (mac)        => request('POST',  `/devices/${mac}/rescan`),
+  resetBaseline:   (mac)        => request('POST',  `/devices/${mac}/reset-baseline`),
   getScanResults:  (mac)        => request('GET',   `/devices/${mac}/scan`),
   getIpHistory:    (mac)        => request('GET',   `/devices/${mac}/ip-history`),
   getDeviceEvents: (mac, limit, type) => {
@@ -124,6 +125,35 @@ export const api = {
   toolsGeo:           (ip)          => request('GET', `/tools/geo?ip=${encodeURIComponent(ip)}`),
   toolsWhois:         (host)        => request('GET', `/tools/whois?host=${encodeURIComponent(host)}`),
   toolsEmail:         (domain)      => request('GET', `/tools/email?domain=${encodeURIComponent(domain)}`),
+  toolsArpLookup:     (query)       => request('GET', `/tools/arp-lookup?query=${encodeURIComponent(query)}`),
+  toolsWakeOnLan:     (mac, bcast)  => request('POST', '/tools/wake-on-lan', { mac, broadcast: bcast || '255.255.255.255' }),
+  toolsDoh:           (host, type)  => request('GET', `/tools/doh?host=${encodeURIComponent(host)}&type=${encodeURIComponent(type)}`),
+  toolsDnssec:        (host)        => request('GET', `/tools/dnssec?host=${encodeURIComponent(host)}`),
+  toolsRdnsBulk:      (cidr)        => request('GET', `/tools/rdns-bulk?cidr=${encodeURIComponent(cidr)}`),
+  toolsRedirectChain: (url)         => request('GET', `/tools/redirect-chain?url=${encodeURIComponent(url)}`),
+  toolsHttpTiming:    (url)         => request('GET', `/tools/http-timing?url=${encodeURIComponent(url)}`),
+  toolsTlsVersions:   (host, port)  => request('GET', `/tools/tls-versions?host=${encodeURIComponent(host)}&port=${port || 443}`),
+  toolsBgp:           (query)       => request('GET', `/tools/bgp?query=${encodeURIComponent(query)}`),
+  toolsSmtpBanner:    (host, port)  => request('GET', `/tools/smtp-banner?host=${encodeURIComponent(host)}&port=${port || 25}`),
+  toolsBimi:          (domain)      => request('GET', `/tools/bimi?domain=${encodeURIComponent(domain)}`),
+  toolsDnsbl:         (ip)          => request('GET', `/tools/dnsbl?ip=${encodeURIComponent(ip)}`),
+
+  // Speed test
+  speedtestResults:   ()                => request('GET',    '/speedtest/results'),
+  deleteSpeedtest:    (id)              => request('DELETE', `/speedtest/results/${id}`),
+  speedtestServers:   ()                => request('GET',    '/tools/speedtest-servers'),
+
+  // Delete device
+  deleteDevice:       (mac)             => request('DELETE', `/devices/${mac}`),
+
+  // Backup / restore
+  exportBackup:       ()                => fetch(`${BASE}/export/backup`),
+  importRestore:      (file)            => {
+    const form = new FormData()
+    form.append('file', file)
+    return fetch(`${BASE}/import/restore`, { method: 'POST', body: form })
+      .then(r => { if (!r.ok) throw new Error(`Restore failed: ${r.status}`); return r.json() })
+  },
 
   // Block schedules
   getBlockSchedules:    ()          => request('GET',    '/block-schedules'),
@@ -137,7 +167,8 @@ export const api = {
   networkResume:    ()  => request('POST', '/network/resume'),
 
   // Timeline
-  getTimeline: (days) => request('GET', `/timeline${days ? `?days=${days}` : ''}`),
+  getTimeline:       (days)      => request('GET', `/timeline${days ? `?days=${days}` : ''}`),
+  getDeviceTimeline: (mac, days) => request('GET', `/devices/${mac}/timeline${days ? `?days=${days}` : ''}`),
 
   // Zones
   getZones:     ()     => request('GET',  '/zones'),

@@ -120,6 +120,8 @@ def _migrate(db: Session):
         """,
         "CREATE INDEX IF NOT EXISTS ix_block_schedules_mac ON block_schedules(mac_address)",
         "ALTER TABLE devices ADD COLUMN IF NOT EXISTS is_schedule_blocked BOOLEAN NOT NULL DEFAULT FALSE",
+        "ALTER TABLE block_schedules ADD COLUMN IF NOT EXISTS mac_addresses TEXT[] DEFAULT '{}'",
+        "ALTER TABLE block_schedules ADD COLUMN IF NOT EXISTS tags TEXT DEFAULT ''",
         # Phase 6 — traffic monitoring stat buckets
         """
         CREATE TABLE IF NOT EXISTS traffic_stats (
@@ -146,6 +148,24 @@ def _migrate(db: Session):
         """,
         "CREATE INDEX IF NOT EXISTS ix_traffic_stats_mac    ON traffic_stats(mac_address)",
         "CREATE INDEX IF NOT EXISTS ix_traffic_stats_bucket ON traffic_stats(bucket_ts)",
+        # Phase 7 — scan performance & port baseline
+        "ALTER TABLE devices ADD COLUMN IF NOT EXISTS hostname_last_attempted TIMESTAMPTZ",
+        "ALTER TABLE devices ADD COLUMN IF NOT EXISTS deep_scan_last_run TIMESTAMPTZ",
+        "ALTER TABLE devices ADD COLUMN IF NOT EXISTS baseline_ports JSONB",
+        "ALTER TABLE devices ADD COLUMN IF NOT EXISTS baseline_scan_count INTEGER NOT NULL DEFAULT 0",
+        # Phase 8 — speed test history + auto-block settings
+        """
+        CREATE TABLE IF NOT EXISTS speedtest_results (
+            id            SERIAL PRIMARY KEY,
+            tested_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            server        VARCHAR,
+            ping_ms       REAL,
+            download_mbps REAL,
+            upload_mbps   REAL,
+            raw_output    TEXT
+        )
+        """,
+        "CREATE INDEX IF NOT EXISTS ix_speedtest_results_tested ON speedtest_results(tested_at)",
     ]
     for sql in migrations:
         try:
@@ -187,11 +207,22 @@ DEFAULT_SETTINGS = {
     "gotify_url":              ("",       "Gotify server URL (leave blank to disable)."),
     "gotify_token":            ("",       "Gotify application token."),
     "network_paused":          ("false",  "Whether internet access is paused for the whole network via ARP blocking."),
+    # Phase 7 — scan performance & port baseline
+    "nightly_scan_start":            ("2",     "Hour (0-23) when the nightly deep-scan window opens."),
+    "nightly_scan_end":              ("4",     "Hour (0-23) when the nightly deep-scan window closes."),
+    "offline_rescan_hours":          ("4",     "Hours a device must be offline before triggering a rescan on return."),
+    "baseline_scan_count_threshold": ("3",     "Consecutive matching scans required to confirm a port baseline."),
+    "vuln_scan_on_port_change":      ("false", "Auto-trigger a vulnerability scan when a new port is detected above baseline."),
     # Phase 6 — traffic monitoring
     "traffic_enabled":         ("true",   "Enable per-device traffic monitoring feature."),
     "traffic_retention_days":  ("30",     "Number of days to retain traffic_stats rows before deletion."),
     "traffic_max_sessions":    ("10",     "Maximum number of concurrent traffic monitor sessions."),
     "traffic_geoip_path":      ("/opt/geoip/GeoLite2-Country.mmdb", "Path to MaxMind GeoLite2-Country mmdb file on the probe."),
+    # Phase 8 — speed test
+    "speedtest_schedule":      ("disabled", "Scheduled speed test interval. Options: disabled, 30m, 1h, 6h, 24h."),
+    # Phase 8 — auto-block
+    "auto_block_new_devices":    ("false", "Automatically ARP-block newly discovered devices until manually approved."),
+    "auto_block_vuln_severity":  ("none",  "Minimum vuln severity to trigger auto-block. Options: none, medium, high, critical."),
 }
 
 
@@ -276,7 +307,7 @@ async def _run_scheduled_vuln_scans():
         scripts    = (settings_s.value or "").strip() if settings_s else ""
         targets_s  = db.get(Setting, "vuln_scan_targets")
         targets    = targets_s.value if targets_s else "important"
-        q = db.query(Device).filter(Device.is_online == True, Device.ip_address != None)
+        q = db.query(Device).filter(Device.is_online == True, Device.ip_address != None, Device.is_ignored == False)
         if targets == "important":
             q = q.filter(Device.is_important == True)
         devices = [(d.mac_address, d.ip_address) for d in q.all()]
@@ -421,13 +452,17 @@ async def _alert_dispatch_loop():
             db = SessionLocal()
             try:
                 settings = {s.key: s.value for s in db.query(Setting).all()}
-                alert_new          = settings.get("alert_on_new_device",    "false") == "true"
-                alert_offline      = settings.get("alert_on_offline",       "false") == "true"
-                alert_vuln         = settings.get("alert_on_vuln",          "false") == "true"
-                alert_port_change  = settings.get("alert_on_port_change",   "true")  == "true"
-                vuln_on_new_device = settings.get("vuln_scan_on_new_device","false") == "true"
+                alert_new              = settings.get("alert_on_new_device",      "false") == "true"
+                alert_offline          = settings.get("alert_on_offline",         "false") == "true"
+                alert_vuln             = settings.get("alert_on_vuln",            "false") == "true"
+                alert_port_change      = settings.get("alert_on_port_change",     "true")  == "true"
+                vuln_on_new_device     = settings.get("vuln_scan_on_new_device",  "false") == "true"
+                vuln_on_port_change    = settings.get("vuln_scan_on_port_change", "false") == "true"
+                auto_block_new         = settings.get("auto_block_new_devices",   "false") == "true"
+                auto_block_sev         = settings.get("auto_block_vuln_severity", "none")
+                SEV_ORDER = ["none", "info", "clean", "low", "medium", "high", "critical"]
 
-                if alert_new or alert_offline or alert_vuln or alert_port_change or vuln_on_new_device:
+                if alert_new or alert_offline or alert_vuln or alert_port_change or vuln_on_new_device or vuln_on_port_change or auto_block_new or auto_block_sev != "none":
                     rows = db.execute(text("""
                         SELECT de.id, de.mac_address, de.type, de.detail, de.created_at,
                                COALESCE(d.custom_name, d.hostname, d.ip_address, de.mac_address) AS name,
@@ -441,13 +476,14 @@ async def _alert_dispatch_loop():
                         LIMIT 50
                     """), {
                         "last_id": _last_alert_event_id,
-                        "types":   ["joined", "offline", "vuln_scan_complete", "port_change"],
+                        "types":   ["joined", "offline", "vuln_scan_complete", "port_change", "port_opened", "port_closed"],
                     }).fetchall()
                 else:
                     rows = []
 
                 pending_alerts = []
                 vuln_scans_to_run = []
+                devices_to_block: list[str] = []
                 suppression_cache: dict = {}
                 for row in rows:
                     eid, mac, etype, detail, created_at, name, ip, is_important, is_ignored = row
@@ -460,20 +496,24 @@ async def _alert_dispatch_loop():
                     if etype == "joined":
                         if alert_new:
                             pending_alerts.append((f"New device detected: {name} ({ip})", "new_device"))
+                        if auto_block_new:
+                            devices_to_block.append(mac)
                         if vuln_on_new_device and ip:
                             scripts_s = db.get(Setting, "vuln_scan_templates")
                             scripts   = (scripts_s.value or "").strip() if scripts_s else ""
                             vuln_scans_to_run.append((mac, ip, scripts))
                     elif etype == "offline" and alert_offline and is_important:
                         pending_alerts.append((f"Watched device offline: {name} ({ip})", "device_offline"))
-                    elif etype == "vuln_scan_complete" and alert_vuln:
+                    elif etype == "vuln_scan_complete":
                         severity = (detail or {}).get("severity", "unknown")
-                        if severity not in ("clean", "info"):
+                        if alert_vuln and severity not in ("clean", "info"):
                             count = (detail or {}).get("vuln_count", 0)
                             pending_alerts.append((
                                 f"Vulnerabilities found on {name} ({ip}): {severity} severity, {count} finding(s)",
                                 "vuln_found",
                             ))
+                        if auto_block_sev != "none" and SEV_ORDER.index(severity) >= SEV_ORDER.index(auto_block_sev):
+                            devices_to_block.append(mac)
                     elif etype == "port_change" and alert_port_change:
                         d = detail or {}
                         added   = d.get("added", [])
@@ -488,6 +528,26 @@ async def _alert_dispatch_loop():
                                 f"Port change on {name} — " + "; ".join(parts),
                                 "port_change",
                             ))
+                    elif etype == "port_opened":
+                        d = detail or {}
+                        port     = d.get("port", "?")
+                        severity = d.get("severity", "info")
+                        if alert_port_change:
+                            pending_alerts.append((
+                                f"New port detected on {name} ({ip}) — port {port} [{severity}]",
+                                "port_change",
+                            ))
+                        if vuln_on_port_change and ip:
+                            scripts_s = db.get(Setting, "vuln_scan_templates")
+                            scripts   = (scripts_s.value or "").strip() if scripts_s else ""
+                            vuln_scans_to_run.append((mac, ip, scripts))
+                    elif etype == "port_closed" and alert_port_change:
+                        d    = detail or {}
+                        port = d.get("port", "?")
+                        pending_alerts.append((
+                            f"Port closed on {name} ({ip}) — port {port} [baseline drift]",
+                            "port_change",
+                        ))
 
             finally:
                 db.close()
@@ -497,6 +557,19 @@ async def _alert_dispatch_loop():
             for mac, ip, scripts in vuln_scans_to_run:
                 print(f"[alerts] Auto vuln scan triggered for new device {ip} ({mac})", flush=True)
                 asyncio.ensure_future(_run_single_vuln_scan(mac, ip, scripts))
+            for mac in devices_to_block:
+                try:
+                    async with httpx.AsyncClient(timeout=10) as c:
+                        await c.post(f"{PROBE_URL}/block/{mac}")
+                    db2 = SessionLocal()
+                    try:
+                        db2.execute(text("UPDATE devices SET is_blocked=true WHERE mac_address=:mac"), {"mac": mac})
+                        db2.commit()
+                    finally:
+                        db2.close()
+                    print(f"[alerts] Auto-blocked {mac}", flush=True)
+                except Exception as exc:
+                    print(f"[alerts] Auto-block failed for {mac}: {exc}", flush=True)
 
         except Exception as exc:
             print(f"[alerts] Dispatch loop error: {exc}", flush=True)
@@ -551,6 +624,63 @@ async def _traffic_flush_loop():
             print(f"[traffic_flush] retention cleanup error: {exc}", flush=True)
 
         await asyncio.sleep(300)  # 5-minute poll
+
+
+_last_speedtest_run: datetime | None = None
+
+async def _speedtest_schedule_loop():
+    global _last_speedtest_run
+    await asyncio.sleep(120)
+    INTERVALS = {"30m": 1800, "1h": 3600, "6h": 21600, "24h": 86400}
+    while True:
+        try:
+            db = SessionLocal()
+            try:
+                sched_s = db.get(Setting, "speedtest_schedule")
+                sched   = sched_s.value if sched_s else "disabled"
+            finally:
+                db.close()
+            interval = INTERVALS.get(sched)
+            if interval:
+                now = datetime.now(timezone.utc)
+                if _last_speedtest_run is None or (now - _last_speedtest_run).total_seconds() >= interval:
+                    await _run_speedtest_and_save()
+                    _last_speedtest_run = now
+        except Exception as exc:
+            print(f"[speedtest] schedule loop error: {exc}", flush=True)
+        await asyncio.sleep(300)
+
+
+async def _run_speedtest_and_save():
+    try:
+        result: dict = {}
+        raw_lines: list[str] = []
+        async with httpx.AsyncClient(timeout=180) as client:
+            async with client.stream("GET", f"{PROBE_URL}/stream/tools/speedtest") as resp:
+                async for line in resp.aiter_lines():
+                    if line.startswith("data: RESULT:"):
+                        result = json.loads(line[len("data: RESULT:"):])
+                    elif line.startswith("data: "):
+                        raw_lines.append(line[6:])
+        if result:
+            db = SessionLocal()
+            try:
+                db.execute(text(
+                    "INSERT INTO speedtest_results (server, ping_ms, download_mbps, upload_mbps, raw_output) "
+                    "VALUES (:server, :ping, :dl, :ul, :raw)"
+                ), {
+                    "server": result.get("server"),
+                    "ping":   result.get("ping_ms"),
+                    "dl":     result.get("download_mbps"),
+                    "ul":     result.get("upload_mbps"),
+                    "raw":    "\n".join(raw_lines),
+                })
+                db.commit()
+            finally:
+                db.close()
+            print(f"[speedtest] completed — DL: {result.get('download_mbps')} Mbps, UL: {result.get('upload_mbps')} Mbps", flush=True)
+    except Exception as exc:
+        print(f"[speedtest] scheduled run error: {exc}", flush=True)
 
 
 def _flush_traffic_sessions(db, sessions: list) -> None:
@@ -609,6 +739,7 @@ async def on_startup():
     asyncio.ensure_future(_alert_dispatch_loop())
     asyncio.ensure_future(_block_schedule_loop())
     asyncio.ensure_future(_traffic_flush_loop())
+    asyncio.ensure_future(_speedtest_schedule_loop())
 
 
 def get_db():
@@ -654,19 +785,23 @@ class TestNotifyPayload(BaseModel):
     api_key: Optional[str] = None
 
 class BlockScheduleCreate(BaseModel):
-    mac_address:  Optional[str] = None
-    label:        Optional[str] = None
-    days_of_week: str  = "mon,tue,wed,thu,fri,sat,sun"
-    start_time:   str
-    end_time:     str
-    enabled:      bool = True
+    mac_address:   Optional[str]      = None
+    mac_addresses: List[str]          = []
+    tags:          str                = ""
+    label:         Optional[str]      = None
+    days_of_week:  str                = "mon,tue,wed,thu,fri,sat,sun"
+    start_time:    str
+    end_time:      str
+    enabled:       bool               = True
 
 class BlockScheduleUpdate(BaseModel):
-    label:        Optional[str]  = None
-    days_of_week: Optional[str]  = None
-    start_time:   Optional[str]  = None
-    end_time:     Optional[str]  = None
-    enabled:      Optional[bool] = None
+    label:         Optional[str]       = None
+    days_of_week:  Optional[str]       = None
+    start_time:    Optional[str]       = None
+    end_time:      Optional[str]       = None
+    enabled:       Optional[bool]      = None
+    mac_addresses: Optional[List[str]] = None
+    tags:          Optional[str]       = None
 
 
 # ---------------------------------------------------------------------------
@@ -812,6 +947,9 @@ def _to_dict(d: Device) -> dict:
         "device_type_inferred": inferred,
         "vuln_last_scanned": d.vuln_last_scanned.isoformat() if d.vuln_last_scanned else None,
         "vuln_severity":     d.vuln_severity,
+        "deep_scan_last_run":    d.deep_scan_last_run.isoformat() if getattr(d, 'deep_scan_last_run', None) else None,
+        "baseline_ports":        getattr(d, 'baseline_ports', None),
+        "baseline_scan_count":   getattr(d, 'baseline_scan_count', 0) or 0,
         "is_blocked":            bool(getattr(d, 'is_blocked', False)),
         "zone":                  getattr(d, 'zone', None),
         "is_ignored":            bool(getattr(d, 'is_ignored', False)),
@@ -1023,7 +1161,15 @@ def get_device(mac: str, db: Session = Depends(get_db)):
     d = db.get(Device, mac.lower())
     if not d:
         raise HTTPException(404, "Device not found")
-    return _to_dict(d)
+    result = _to_dict(d)
+    latest = (
+        db.query(VulnReport)
+        .filter(VulnReport.mac_address == mac.lower())
+        .order_by(VulnReport.scanned_at.desc())
+        .first()
+    )
+    result["latest_vuln_findings"] = latest.findings if latest else []
+    return result
 
 
 @app.patch("/devices/{mac}")
@@ -1098,6 +1244,32 @@ def rescan_device(mac: str, db: Session = Depends(get_db)):
     d.deep_scanned = False
     db.commit()
     return {"mac": mac, "queued": True}
+
+
+@app.post("/devices/{mac}/reset-baseline")
+def reset_baseline(mac: str, db: Session = Depends(get_db)):
+    d = db.get(Device, mac.lower())
+    if not d:
+        raise HTTPException(404, "Device not found")
+    d.baseline_ports      = None
+    d.baseline_scan_count = 0
+    db.commit(); db.refresh(d)
+    return _to_dict(d)
+
+
+@app.delete("/devices/{mac}")
+def delete_device(mac: str, db: Session = Depends(get_db)):
+    d = db.get(Device, mac.lower())
+    if not d:
+        raise HTTPException(404, "Device not found")
+    db.execute(text("DELETE FROM device_events WHERE mac_address = :mac"), {"mac": mac.lower()})
+    db.execute(text("DELETE FROM ip_history WHERE mac_address = :mac"), {"mac": mac.lower()})
+    db.execute(text("DELETE FROM vuln_reports WHERE mac_address = :mac"), {"mac": mac.lower()})
+    db.execute(text("DELETE FROM traffic_stats WHERE mac_address = :mac"), {"mac": mac.lower()})
+    db.execute(text("DELETE FROM alert_suppressions WHERE mac_address = :mac"), {"mac": mac.lower()})
+    db.delete(d)
+    db.commit()
+    return {"ok": True, "mac": mac.lower()}
 
 
 @app.get("/devices/{mac}/scan")
@@ -2177,6 +2349,89 @@ async def import_fingerprints_json(file: UploadFile = File(...), db: Session = D
 
 
 # ---------------------------------------------------------------------------
+# Database backup / restore
+# ---------------------------------------------------------------------------
+@app.get("/export/backup")
+def export_backup(db: Session = Depends(get_db)):
+    """Export all user data as a portable JSON backup."""
+    devices = [_to_dict(d) for d in db.query(Device).all()]
+    settings = [{"key": s.key, "value": s.value} for s in db.query(Setting).all()]
+    fps = [{"oui_prefix": f.oui_prefix, "device_type": f.device_type, "vendor_name": f.vendor_name,
+            "open_ports": f.open_ports, "hostname_pattern": f.hostname_pattern,
+            "confidence_score": f.confidence_score, "source": f.source}
+           for f in db.query(FingerprintEntry).all()]
+    payload = {
+        "version": 1,
+        "exported_at": datetime.now(timezone.utc).isoformat(),
+        "devices": devices,
+        "settings": settings,
+        "fingerprints": fps,
+    }
+    content = json.dumps(payload, indent=2, default=str)
+    return Response(
+        content=content.encode(),
+        media_type="application/json",
+        headers={"Content-Disposition": "attachment; filename=inspectre_backup.json"},
+    )
+
+
+@app.post("/import/restore")
+async def import_restore(file: UploadFile = File(...), db: Session = Depends(get_db)):
+    """Restore settings and fingerprints from a backup JSON (devices are merged, not overwritten)."""
+    content = await file.read()
+    try:
+        payload = json.loads(content)
+    except Exception as exc:
+        raise HTTPException(400, f"Invalid JSON: {exc}")
+    if not isinstance(payload, dict) or payload.get("version") != 1:
+        raise HTTPException(400, "Unrecognised backup format")
+
+    stats = {"settings": 0, "fingerprints_merged": 0, "devices_skipped": 0}
+
+    # Restore settings (skip sensitive delivery keys)
+    SKIP_KEYS = {"pushbullet_api_key", "gotify_token", "alert_webhook_url", "ntfy_topic"}
+    for s in payload.get("settings", []):
+        key, value = s.get("key"), s.get("value")
+        if not key or key in SKIP_KEYS:
+            continue
+        existing = db.get(Setting, key)
+        if existing:
+            existing.value = value
+        else:
+            db.add(Setting(key=key, value=value, description="Restored from backup"))
+        stats["settings"] += 1
+
+    # Restore fingerprints (merge)
+    for fp in payload.get("fingerprints", []):
+        device_type = fp.get("device_type", "").strip()
+        if not device_type:
+            continue
+        oui = (fp.get("oui_prefix") or "").strip().lower() or None
+        existing = None
+        if oui:
+            existing = db.query(FingerprintEntry).filter(
+                FingerprintEntry.oui_prefix == oui,
+                FingerprintEntry.device_type == device_type
+            ).first()
+        if not existing:
+            db.add(FingerprintEntry(
+                oui_prefix=oui,
+                device_type=device_type,
+                vendor_name=fp.get("vendor_name"),
+                open_ports=fp.get("open_ports"),
+                hostname_pattern=fp.get("hostname_pattern"),
+                confidence_score=float(fp.get("confidence_score", 1.0)),
+                source=fp.get("source", "backup"),
+                hit_count=1,
+            ))
+            stats["fingerprints_merged"] += 1
+
+    db.commit()
+    stats["devices_skipped"] = len(payload.get("devices", []))
+    return stats
+
+
+# ---------------------------------------------------------------------------
 # SSE streaming (ping / traceroute) — proxied through probe
 # ---------------------------------------------------------------------------
 @app.get("/devices/{mac}/ping")
@@ -2348,10 +2603,23 @@ async def tools_portscan(host: str = Query(...), ports: str = Query("1-1024")):
 async def tools_dns(host: str = Query(...), type: str = Query("A")):
     import dns.resolver
     _validate_tool_host(host)
-    valid_types = {"A", "AAAA", "MX", "CNAME", "TXT", "NS", "SOA", "PTR"}
+    ALL_TYPES = ["A", "AAAA", "MX", "CNAME", "TXT", "NS", "SOA", "PTR", "SRV", "CAA", "DNSKEY", "DS", "NAPTR"]
+    valid_types = set(ALL_TYPES)
     qtype = type.upper()
+
+    if qtype == "ALL":
+        results = []
+        for t in ALL_TYPES:
+            try:
+                answers = dns.resolver.resolve(host, t, lifetime=5)
+                for r in answers:
+                    results.append({"type": t, "value": str(r), "ttl": answers.rrset.ttl})
+            except Exception:
+                pass
+        return {"host": host, "type": "ALL", "all_records": results, "error": None}
+
     if qtype not in valid_types:
-        raise HTTPException(400, f"Type must be one of: {', '.join(sorted(valid_types))}")
+        raise HTTPException(400, f"Type must be one of: {', '.join(sorted(valid_types))} or ALL")
     try:
         answers = dns.resolver.resolve(host, qtype, lifetime=10)
         return {"host": host, "type": qtype,
@@ -2554,25 +2822,487 @@ async def tools_email(domain: str = Query(...)):
 
 
 # ---------------------------------------------------------------------------
+# ARP lookup + Wake-on-LAN (proxied to probe)
+# ---------------------------------------------------------------------------
+@app.get("/tools/arp-lookup")
+async def tools_arp_lookup(query: str = Query(...)):
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.get(f"{PROBE_URL}/tools/arp-table")
+            data = resp.json()
+        entries = data.get("entries", [])
+        q = query.strip().lower()
+        matches = [e for e in entries if q in e.get("ip", "").lower() or q in e.get("mac", "").lower()]
+        return {"query": query, "matches": matches, "total": len(entries)}
+    except Exception as exc:
+        return {"query": query, "matches": [], "error": str(exc)}
+
+
+class WolPayload(BaseModel):
+    mac: str
+    broadcast: Optional[str] = "255.255.255.255"
+
+@app.post("/tools/wake-on-lan")
+async def tools_wake_on_lan(payload: WolPayload):
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.post(f"{PROBE_URL}/tools/wake-on-lan",
+                                     json={"mac": payload.mac, "broadcast": payload.broadcast})
+            return resp.json()
+    except Exception as exc:
+        raise HTTPException(500, str(exc))
+
+
+# ---------------------------------------------------------------------------
+# DNS over HTTPS tester
+# ---------------------------------------------------------------------------
+@app.get("/tools/doh")
+async def tools_doh(host: str = Query(...), type: str = Query("A")):
+    _validate_tool_host(host)
+    qtype = type.upper()
+    resolvers = {
+        "Cloudflare (1.1.1.1)": "https://cloudflare-dns.com/dns-query",
+        "Google (8.8.8.8)":     "https://dns.google/resolve",
+        # Use IP directly for Quad9 to avoid DNS resolution issues in containers
+        "Quad9 (9.9.9.9)":      "https://9.9.9.9/dns-query",
+    }
+    results = []
+    async with httpx.AsyncClient(timeout=10, verify=False) as client:
+        for name, url in resolvers.items():
+            try:
+                resp = await client.get(url, params={"name": host, "type": qtype},
+                                        headers={"accept": "application/dns-json"})
+                if not resp.content:
+                    results.append({"name": name, "records": [], "error": "Empty response"})
+                    continue
+                data = resp.json()
+                answers = [a.get("data", "") for a in data.get("Answer", []) if a.get("type")]
+                results.append({"name": name, "records": answers, "status": data.get("Status", -1), "error": None})
+            except Exception as e:
+                results.append({"name": name, "records": [], "error": str(e)})
+    return {"host": host, "type": qtype, "results": results}
+
+
+# ---------------------------------------------------------------------------
+# DNSSEC validator
+# ---------------------------------------------------------------------------
+@app.get("/tools/dnssec")
+async def tools_dnssec(host: str = Query(...)):
+    import dns.resolver, dns.dnssec, dns.rdatatype, dns.name
+    _validate_tool_host(host)
+    chain = []
+    try:
+        # Check DS record at parent
+        try:
+            ds_ans = dns.resolver.resolve(host, "DS", lifetime=8)
+            chain.append({"record": "DS", "present": True,
+                          "values": [str(r) for r in ds_ans][:3]})
+        except Exception:
+            chain.append({"record": "DS", "present": False, "values": []})
+
+        # Check DNSKEY
+        try:
+            dk_ans = dns.resolver.resolve(host, "DNSKEY", lifetime=8)
+            chain.append({"record": "DNSKEY", "present": True,
+                          "values": [f"flags={r.flags} protocol={r.protocol} algorithm={r.algorithm}" for r in dk_ans][:3]})
+        except Exception:
+            chain.append({"record": "DNSKEY", "present": False, "values": []})
+
+        # Check RRSIG on A record
+        try:
+            rrsig_ans = dns.resolver.resolve(host, "RRSIG", lifetime=8)
+            chain.append({"record": "RRSIG", "present": True,
+                          "values": [str(r)[:80] for r in rrsig_ans][:2]})
+        except Exception:
+            chain.append({"record": "RRSIG", "present": False, "values": []})
+
+        signed = all(r["present"] for r in chain)
+        return {"host": host, "signed": signed, "chain": chain, "error": None}
+    except Exception as exc:
+        return {"host": host, "signed": False, "chain": chain, "error": str(exc)}
+
+
+# ---------------------------------------------------------------------------
+# Reverse DNS bulk lookup (CIDR)
+# ---------------------------------------------------------------------------
+@app.get("/tools/rdns-bulk")
+async def tools_rdns_bulk(cidr: str = Query(...)):
+    import ipaddress as _ipa
+    try:
+        net = _ipa.ip_network(cidr, strict=False)
+    except ValueError:
+        raise HTTPException(400, "Invalid CIDR")
+    if net.num_addresses > 256:
+        raise HTTPException(400, "Maximum /24 subnet (256 hosts)")
+    results = []
+    for ip in net.hosts():
+        ip_str = str(ip)
+        try:
+            hostname = socket.gethostbyaddr(ip_str)[0]
+            results.append({"ip": ip_str, "hostname": hostname})
+        except Exception:
+            results.append({"ip": ip_str, "hostname": None})
+    return {"cidr": cidr, "results": results}
+
+
+# ---------------------------------------------------------------------------
+# Redirect chain follower
+# ---------------------------------------------------------------------------
+@app.get("/tools/redirect-chain")
+async def tools_redirect_chain(url: str = Query(...)):
+    chain = []
+    current = url
+    try:
+        async with httpx.AsyncClient(follow_redirects=False, timeout=10,
+                                     headers={"User-Agent": "InSpectre/1.0"}) as client:
+            for _ in range(15):
+                t0 = asyncio.get_event_loop().time()
+                resp = await client.get(current)
+                ms   = round((asyncio.get_event_loop().time() - t0) * 1000)
+                chain.append({"url": current, "status": resp.status_code, "ms": ms,
+                               "location": resp.headers.get("location")})
+                if resp.status_code not in (301, 302, 303, 307, 308):
+                    break
+                next_url = resp.headers.get("location", "")
+                if not next_url:
+                    break
+                if next_url.startswith("/"):
+                    from urllib.parse import urlparse
+                    p = urlparse(current)
+                    next_url = f"{p.scheme}://{p.netloc}{next_url}"
+                current = next_url
+        return {"chain": chain, "hops": len(chain), "final": current}
+    except Exception as exc:
+        return {"chain": chain, "hops": len(chain), "final": current, "error": str(exc)}
+
+
+# ---------------------------------------------------------------------------
+# HTTP response timing
+# ---------------------------------------------------------------------------
+@app.get("/tools/http-timing")
+async def tools_http_timing(url: str = Query(...)):
+    import time
+    steps: list[dict] = []
+    try:
+        t_start = time.perf_counter()
+        async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
+            resp = await client.get(url, headers={"User-Agent": "InSpectre/1.0"})
+            t_end = time.perf_counter()
+        total_ms = round((t_end - t_start) * 1000)
+        return {
+            "url": url,
+            "status": resp.status_code,
+            "total_ms": total_ms,
+            "content_length": int(resp.headers.get("content-length", 0) or 0),
+            "server": resp.headers.get("server"),
+            "error": None,
+        }
+    except Exception as exc:
+        return {"url": url, "total_ms": None, "error": str(exc)}
+
+
+# ---------------------------------------------------------------------------
+# TLS version & cipher suite tester (via nmap ssl-enum-ciphers)
+# ---------------------------------------------------------------------------
+@app.get("/tools/tls-versions")
+async def tools_tls_versions(host: str = Query(...), port: int = Query(443)):
+    _validate_tool_host(host)
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "nmap", "--script", "ssl-enum-ciphers", "-p", str(port), host,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+        )
+        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=60)
+        output = stdout.decode(errors="replace")
+        # Parse TLS versions and ciphers from nmap pipe-prefixed output
+        # Lines look like: "|   TLSv1.2:", "|       TLS_ECDHE_RSA... - A", "|   least strength: A"
+        versions: dict[str, dict] = {}
+        cur_ver   = None
+        in_ciphers = False
+        for raw_line in output.splitlines():
+            # Strip leading whitespace and pipe characters (nmap output prefix)
+            line = raw_line.strip().lstrip("|").strip()
+            if not line:
+                continue
+            ver_line = line.rstrip(":")
+            if ver_line.startswith("TLSv") or ver_line.startswith("SSLv"):
+                cur_ver    = ver_line
+                in_ciphers = False
+                versions[cur_ver] = {"ciphers": [], "grade": None}
+            elif cur_ver and line.lower().startswith("ciphers"):
+                in_ciphers = True
+            elif cur_ver and line.lower().startswith("compressors"):
+                in_ciphers = False
+            elif cur_ver and line.lower().startswith("cipher preference"):
+                in_ciphers = False
+            elif cur_ver and in_ciphers and line.startswith("TLS_"):
+                # Line format: "TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384 (ecdh_x25519) - A"
+                versions[cur_ver]["ciphers"].append(line)
+            elif cur_ver and "least strength" in line.lower():
+                grade = line.split(":")[-1].strip()
+                versions[cur_ver]["grade"] = grade
+        return {"host": host, "port": port, "versions": versions, "raw": output[:3000]}
+    except asyncio.TimeoutError:
+        return {"host": host, "port": port, "versions": {}, "error": "Scan timed out"}
+    except FileNotFoundError:
+        return {"host": host, "port": port, "versions": {}, "error": "nmap not available on backend"}
+    except Exception as exc:
+        return {"host": host, "port": port, "versions": {}, "error": str(exc)}
+
+
+# ---------------------------------------------------------------------------
+# BGP / ASN lookup via RIPE Stat (stat.ripe.net) — no auth, highly reliable
+# ---------------------------------------------------------------------------
+@app.get("/tools/bgp")
+async def tools_bgp(query: str = Query(...)):
+    try:
+        async with httpx.AsyncClient(timeout=15, headers={"User-Agent": "InSpectre/1.0"}) as client:
+            q = query.strip()
+            if q.upper().startswith("AS"):
+                asn_num = q[2:] if q[2:].isdigit() else q[2:]
+                resp    = await client.get(
+                    f"https://stat.ripe.net/data/as-overview/data.json?resource=AS{asn_num}&sourceapp=InSpectre"
+                )
+                raw = resp.json()
+                asn_data = raw.get("data", {})
+                holder  = asn_data.get("holder", "")
+                block   = asn_data.get("block", {})
+                return {"data": {
+                    "asn":         int(asn_num) if asn_num.isdigit() else None,
+                    "name":        holder,
+                    "country_code": block.get("country", ""),
+                    "description_short": asn_data.get("description", holder),
+                    "resource":    f"AS{asn_num}",
+                    "prefixes":    [],
+                }}
+            else:
+                # IP lookup — use RIPE prefix-overview + routing-status
+                resp = await client.get(
+                    f"https://stat.ripe.net/data/prefix-overview/data.json?resource={q}&sourceapp=InSpectre"
+                )
+                raw  = resp.json()
+                data = raw.get("data", {})
+                asns = data.get("asns", [])
+                asn_info = asns[0] if asns else {}
+                return {"data": {
+                    "ip":          q,
+                    "asn":         asn_info.get("asn"),
+                    "name":        asn_info.get("holder", ""),
+                    "description_short": asn_info.get("holder", ""),
+                    "country_code": "",
+                    "rir_allocation": {"prefix": data.get("resource", "")},
+                    "prefixes":    [{"prefix": data.get("resource", "")}] if data.get("resource") else [],
+                }}
+    except Exception as exc:
+        return {"error": str(exc)}
+
+
+# ---------------------------------------------------------------------------
+# SMTP banner grab
+# ---------------------------------------------------------------------------
+@app.get("/tools/smtp-banner")
+async def tools_smtp_banner(host: str = Query(...), port: int = Query(25)):
+    _validate_tool_host(host)
+    lines: list[str] = []
+    try:
+        reader, writer = await asyncio.wait_for(
+            asyncio.open_connection(host, port), timeout=10
+        )
+        try:
+            # Read banner
+            banner = (await asyncio.wait_for(reader.readline(), timeout=5)).decode(errors="replace").strip()
+            lines.append(banner)
+            # Send EHLO
+            writer.write(b"EHLO inspectre.local\r\n")
+            await writer.drain()
+            while True:
+                line = await asyncio.wait_for(reader.readline(), timeout=5)
+                decoded = line.decode(errors="replace").strip()
+                if not decoded:
+                    break
+                lines.append(decoded)
+                if decoded[:3].isdigit() and decoded[3] != "-":
+                    break
+        finally:
+            writer.close()
+        return {"host": host, "port": port, "banner": banner, "ehlo": lines[1:], "error": None}
+    except asyncio.TimeoutError:
+        return {"host": host, "port": port, "banner": None, "ehlo": lines, "error": "Connection timed out"}
+    except Exception as exc:
+        return {"host": host, "port": port, "banner": None, "ehlo": lines, "error": str(exc)}
+
+
+# ---------------------------------------------------------------------------
+# BIMI checker
+# ---------------------------------------------------------------------------
+@app.get("/tools/bimi")
+async def tools_bimi(domain: str = Query(...)):
+    import dns.resolver
+    _validate_tool_host(domain)
+    result: dict = {"domain": domain}
+    try:
+        recs = dns.resolver.resolve(f"default._bimi.{domain}", "TXT", lifetime=8)
+        txt  = " ".join(str(r).strip('"') for r in recs)
+        result["present"] = True
+        result["record"]  = txt
+        # Extract l= (logo URL) and a= (VMC URL)
+        for part in txt.split(";"):
+            part = part.strip()
+            if part.startswith("l="):
+                result["logo_url"] = part[2:].strip()
+            elif part.startswith("a="):
+                result["vmc_url"] = part[2:].strip()
+    except dns.resolver.NXDOMAIN:
+        result["present"] = False
+        result["record"]  = None
+    except dns.resolver.NoAnswer:
+        result["present"] = False
+        result["record"]  = None
+    except Exception as exc:
+        result["present"] = False
+        result["error"] = str(exc)
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Email blacklist (DNSBL) checker
+# ---------------------------------------------------------------------------
+DNSBL_LISTS = [
+    ("Spamhaus ZEN",     "zen.spamhaus.org"),
+    ("Spamhaus SBL",     "sbl.spamhaus.org"),
+    ("Barracuda",        "b.barracudacentral.org"),
+    ("SORBS SPAM",       "spam.sorbs.net"),
+    ("UCEProtect L1",    "dnsbl-1.uceprotect.net"),
+    ("SpamCop",          "bl.spamcop.net"),
+    ("NordSpam",         "combined.njabl.org"),
+]
+
+@app.get("/tools/dnsbl")
+async def tools_dnsbl(ip: str = Query(...)):
+    try:
+        _ipaddress.ip_address(ip)
+    except ValueError:
+        raise HTTPException(400, "Invalid IP address")
+    reversed_ip = ".".join(reversed(ip.split(".")))
+    results = []
+    for name, bl in DNSBL_LISTS:
+        query = f"{reversed_ip}.{bl}"
+        try:
+            socket.gethostbyname(query)
+            results.append({"list": name, "listed": True, "query": query})
+        except socket.gaierror:
+            results.append({"list": name, "listed": False, "query": query})
+        except Exception as exc:
+            results.append({"list": name, "listed": None, "query": query, "error": str(exc)})
+    listed = sum(1 for r in results if r.get("listed"))
+    return {"ip": ip, "listed_count": listed, "total": len(results), "results": results}
+
+
+# ---------------------------------------------------------------------------
+# Speedtest — stream proxy, server list, results, and delete
+# ---------------------------------------------------------------------------
+@app.get("/tools/speedtest")
+async def stream_speedtest_proxy(server_id: str = ""):
+    probe_url = f"{PROBE_URL}/stream/tools/speedtest"
+    params    = {}
+    if server_id:
+        params["server_id"] = server_id
+    raw_lines: list[str] = []
+
+    async def _gen():
+        try:
+            async with httpx.AsyncClient(timeout=None) as client:
+                async with client.stream("GET", probe_url, params=params) as resp:
+                    if resp.status_code != 200:
+                        yield f"data: ERROR Probe returned {resp.status_code}\n\n"
+                        return
+                    async for line in resp.aiter_lines():
+                        if line:
+                            raw_lines.append(line)
+                            yield f"{line}\n"
+                            if line.startswith("data: RESULT:"):
+                                payload_str = line[len("data: RESULT:"):]
+                                try:
+                                    data = json.loads(payload_str)
+                                    db2 = SessionLocal()
+                                    try:
+                                        db2.execute(text(
+                                            "INSERT INTO speedtest_results (server, ping_ms, download_mbps, upload_mbps, raw_output) "
+                                            "VALUES (:server, :ping, :dl, :ul, :raw)"
+                                        ), {
+                                            "server": data.get("server"),
+                                            "ping":   data.get("ping_ms"),
+                                            "dl":     data.get("download_mbps"),
+                                            "ul":     data.get("upload_mbps"),
+                                            "raw":    "\n".join(l[6:] for l in raw_lines if l.startswith("data: ")),
+                                        })
+                                        db2.commit()
+                                    finally:
+                                        db2.close()
+                                except Exception:
+                                    pass
+        except httpx.ConnectError:
+            yield f"data: ERROR Cannot reach probe at {PROBE_URL}\n\n"
+        except Exception as exc:
+            yield f"data: ERROR {exc}\n\n"
+
+    return StreamingResponse(
+        _gen(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+@app.get("/tools/speedtest-servers")
+async def get_speedtest_servers():
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            resp = await client.get(f"{PROBE_URL}/tools/speedtest-servers")
+            return resp.json()
+    except Exception as exc:
+        return {"servers": [], "error": str(exc)}
+
+
+@app.get("/speedtest/results")
+def get_speedtest_results(db: Session = Depends(get_db)):
+    rows = db.execute(text(
+        "SELECT id, tested_at, server, ping_ms, download_mbps, upload_mbps "
+        "FROM speedtest_results ORDER BY tested_at DESC LIMIT 20"
+    )).fetchall()
+    return [{"id": r[0], "tested_at": r[1].isoformat() if r[1] else None,
+             "server": r[2], "ping_ms": r[3], "download_mbps": r[4], "upload_mbps": r[5]}
+            for r in rows]
+
+
+@app.delete("/speedtest/results/{result_id}")
+def delete_speedtest_result(result_id: int, db: Session = Depends(get_db)):
+    db.execute(text("DELETE FROM speedtest_results WHERE id = :id"), {"id": result_id})
+    db.commit()
+    return {"ok": True}
+
+
+# ---------------------------------------------------------------------------
 # Block schedules — CRUD
 # ---------------------------------------------------------------------------
 def _schedule_row_to_dict(row) -> dict:
     return {
-        "id":           row[0],
-        "mac_address":  row[1],
-        "label":        row[2],
-        "days_of_week": row[3],
-        "start_time":   row[4],
-        "end_time":     row[5],
-        "enabled":      row[6],
-        "created_at":   row[7].isoformat() if row[7] else None,
+        "id":            row[0],
+        "mac_address":   row[1],
+        "label":         row[2],
+        "days_of_week":  row[3],
+        "start_time":    row[4],
+        "end_time":      row[5],
+        "enabled":       row[6],
+        "created_at":    row[7].isoformat() if row[7] else None,
+        "mac_addresses": list(row[8]) if row[8] else [],
+        "tags":          row[9] or "",
     }
 
 
 @app.get("/block-schedules")
 def list_block_schedules(db: Session = Depends(get_db)):
     rows = db.execute(text(
-        "SELECT id, mac_address, label, days_of_week, start_time, end_time, enabled, created_at "
+        "SELECT id, mac_address, label, days_of_week, start_time, end_time, enabled, created_at, mac_addresses, tags "
         "FROM block_schedules ORDER BY created_at DESC"
     )).fetchall()
     return [_schedule_row_to_dict(r) for r in rows]
@@ -2583,15 +3313,18 @@ def create_block_schedule(payload: BlockScheduleCreate, db: Session = Depends(ge
     if not payload.start_time or not payload.end_time:
         raise HTTPException(400, "start_time and end_time are required")
     row = db.execute(text(
-        "INSERT INTO block_schedules (mac_address, label, days_of_week, start_time, end_time, enabled) "
-        "VALUES (:mac, :label, :days, :start, :end, :enabled) RETURNING id, mac_address, label, days_of_week, start_time, end_time, enabled, created_at"
+        "INSERT INTO block_schedules (mac_address, label, days_of_week, start_time, end_time, enabled, mac_addresses, tags) "
+        "VALUES (:mac, :label, :days, :start, :end, :enabled, :mac_addresses, :tags) "
+        "RETURNING id, mac_address, label, days_of_week, start_time, end_time, enabled, created_at, mac_addresses, tags"
     ), {
-        "mac":     payload.mac_address,
-        "label":   payload.label or "",
-        "days":    payload.days_of_week,
-        "start":   payload.start_time,
-        "end":     payload.end_time,
-        "enabled": payload.enabled,
+        "mac":          payload.mac_address,
+        "label":        payload.label or "",
+        "days":         payload.days_of_week,
+        "start":        payload.start_time,
+        "end":          payload.end_time,
+        "enabled":      payload.enabled,
+        "mac_addresses": payload.mac_addresses or [],
+        "tags":         payload.tags or "",
     }).fetchone()
     db.commit()
     return _schedule_row_to_dict(row)
@@ -2610,13 +3343,15 @@ def update_block_schedule(schedule_id: int, payload: BlockScheduleUpdate, db: Se
     if payload.start_time   is not None: updates["start_time"]   = payload.start_time
     if payload.end_time     is not None: updates["end_time"]     = payload.end_time
     if payload.enabled      is not None: updates["enabled"]      = payload.enabled
+    if payload.mac_addresses is not None: updates["mac_addresses"] = payload.mac_addresses
+    if payload.tags          is not None: updates["tags"]          = payload.tags
     if updates:
         set_clause = ", ".join(f"{k} = :{k}" for k in updates)
         updates["id"] = schedule_id
         db.execute(text(f"UPDATE block_schedules SET {set_clause} WHERE id = :id"), updates)
         db.commit()
     row = db.execute(text(
-        "SELECT id, mac_address, label, days_of_week, start_time, end_time, enabled, created_at "
+        "SELECT id, mac_address, label, days_of_week, start_time, end_time, enabled, created_at, mac_addresses, tags "
         "FROM block_schedules WHERE id = :id"
     ), {"id": schedule_id}).fetchone()
     return _schedule_row_to_dict(row)
@@ -2795,6 +3530,51 @@ def get_timeline(days: int = Query(7, ge=1, le=365), db: Session = Depends(get_d
     }
 
 
+@app.get("/devices/{mac}/timeline")
+def get_device_timeline(mac: str, days: int = Query(7, ge=1, le=365), db: Session = Depends(get_db)):
+    now          = datetime.now(timezone.utc)
+    window_start = now - timedelta(days=days)
+
+    rows = db.execute(text("""
+        SELECT type, created_at FROM device_events
+        WHERE mac_address = :mac
+          AND type IN ('online', 'offline', 'joined')
+          AND created_at >= :window_start
+        ORDER BY created_at ASC
+    """), {"mac": mac, "window_start": window_start}).fetchall()
+
+    prior = db.execute(text("""
+        SELECT type FROM device_events
+        WHERE mac_address = :mac
+          AND type IN ('online', 'offline', 'joined')
+          AND created_at < :window_start
+        ORDER BY created_at DESC LIMIT 1
+    """), {"mac": mac, "window_start": window_start}).fetchone()
+
+    initial = "online" if (prior and prior[0] in ("online", "joined")) else "unknown" if not prior else "offline"
+    segments = []
+    seg_start  = window_start
+    seg_status = initial
+
+    for r in rows:
+        etype, ts = r[0], r[1]
+        new_status = "online" if etype in ("online", "joined") else "offline"
+        if new_status != seg_status:
+            segments.append({"from": seg_start.isoformat(), "to": ts.isoformat(), "status": seg_status})
+            seg_start  = ts
+            seg_status = new_status
+
+    segments.append({"from": seg_start.isoformat(), "to": now.isoformat(), "status": seg_status})
+
+    return {
+        "mac":          mac,
+        "window_start": window_start.isoformat(),
+        "window_end":   now.isoformat(),
+        "days":         days,
+        "segments":     segments,
+    }
+
+
 # ---------------------------------------------------------------------------
 # Block schedule enforcement background loop
 # ---------------------------------------------------------------------------
@@ -2830,7 +3610,8 @@ async def _block_schedule_loop():
             db = SessionLocal()
             try:
                 schedules = db.execute(text(
-                    "SELECT id, mac_address, days_of_week, start_time, end_time FROM block_schedules WHERE enabled = TRUE"
+                    "SELECT id, mac_address, days_of_week, start_time, end_time, mac_addresses, tags "
+                    "FROM block_schedules WHERE enabled = TRUE"
                 )).fetchall()
 
                 # Build set of (mac_or_None, should_be_blocked) from all schedules
@@ -2838,14 +3619,33 @@ async def _block_schedule_loop():
                 device_should_block: dict = {}  # mac -> bool (True = schedule says block)
 
                 for sched in schedules:
-                    _, mac, days, start, end = sched
+                    _, mac, days, start, end, mac_addresses, sched_tags = sched
                     active = _schedule_active_now(days, start, end)
-                    if mac:
-                        # Per-device schedule
-                        if mac not in device_should_block:
-                            device_should_block[mac] = False
-                        if active:
-                            device_should_block[mac] = True
+
+                    # Determine target MACs
+                    target_macs = None  # None = network-wide
+                    if mac_addresses:
+                        target_macs = list(mac_addresses)
+                    elif sched_tags:
+                        tag_list = [t.strip().lower() for t in sched_tags.split(',') if t.strip()]
+                        all_devices = db.execute(text(
+                            "SELECT mac_address, tags FROM devices WHERE is_ignored = FALSE AND tags IS NOT NULL"
+                        )).fetchall()
+                        target_macs = []
+                        for dev_mac, dev_tags in all_devices:
+                            if dev_tags:
+                                dev_tag_list = [t.strip().lower() for t in dev_tags.split(',') if t.strip()]
+                                if any(t in dev_tag_list for t in tag_list):
+                                    target_macs.append(dev_mac)
+                    elif mac:
+                        target_macs = [mac]
+
+                    if target_macs is not None:
+                        for m in target_macs:
+                            if m not in device_should_block:
+                                device_should_block[m] = False
+                            if active:
+                                device_should_block[m] = True
                     else:
                         # Network-wide: apply to all non-ignored devices
                         all_macs = db.execute(text(
