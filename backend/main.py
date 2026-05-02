@@ -1,6 +1,7 @@
-from fastapi import FastAPI, HTTPException, Depends, UploadFile, File, Query
+from fastapi import FastAPI, HTTPException, Depends, UploadFile, File, Query, Security, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse, Response
+from fastapi.responses import StreamingResponse, Response, JSONResponse
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker, Session
 from pydantic import BaseModel
@@ -15,6 +16,8 @@ import subprocess
 from datetime import datetime, timezone, timedelta
 
 import httpx
+import bcrypt as _bcrypt
+from jose import JWTError, jwt
 
 from models import Base, Device, DeviceEvent, FingerprintEntry, Setting, TrafficStat, VulnReport
 
@@ -26,9 +29,24 @@ PROBE_URL    = (
     or "http://host.docker.internal:8666"
 )
 
+# ---------------------------------------------------------------------------
+# Auth configuration
+# ---------------------------------------------------------------------------
+SECRET_KEY   = os.environ.get("SECRET_KEY", "CHANGE_ME_IN_PRODUCTION_use_a_long_random_string")
+ALGORITHM    = "HS256"
+TOKEN_EXPIRE = 60 * 24  # minutes — 24 hours
+bearer_scheme = HTTPBearer(auto_error=False)
+
 engine       = create_engine(DATABASE_URL, pool_pre_ping=True)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base.metadata.create_all(bind=engine)
+
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
 
 # ---------------------------------------------------------------------------
 # DB migration
@@ -166,6 +184,19 @@ def _migrate(db: Session):
         )
         """,
         "CREATE INDEX IF NOT EXISTS ix_speedtest_results_tested ON speedtest_results(tested_at)",
+        # Users table for authentication
+        """
+        CREATE TABLE IF NOT EXISTS users (
+            id           SERIAL PRIMARY KEY,
+            username     VARCHAR(64) NOT NULL UNIQUE,
+            password_hash VARCHAR(256) NOT NULL,
+            is_admin     BOOLEAN NOT NULL DEFAULT TRUE,
+            created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            last_login   TIMESTAMPTZ
+        )
+        """,
+        "CREATE INDEX IF NOT EXISTS ix_users_username ON users(username)",
+        "ALTER TABLE users ADD COLUMN IF NOT EXISTS must_change_password BOOLEAN NOT NULL DEFAULT FALSE",
     ]
     for sql in migrations:
         try:
@@ -184,7 +215,7 @@ DEFAULT_SETTINGS = {
     "os_confidence_threshold": ("85",    "Minimum nmap OS-match confidence (%) to record."),
     "sniffer_workers":         ("4",     "Number of parallel scanner threads."),
     "ip_range":                ("192.168.0.0/24", "CIDR range to scan."),
-    "nmap_args":               ("-O --osscan-limit -sV --version-intensity 5 -T4 -p-", "Extra arguments passed to nmap."),
+    "nmap_args":               ("-sT -O --osscan-limit -T4", "nmap flags for port discovery. Service version detection (-sV) runs automatically on found ports as a separate pass."),
     "notifications_enabled":              ("true",  "Show popup toasts when new devices appear or go offline."),
     "browser_notifications_enabled":      ("false", "Show OS-level browser notifications for device events."),
     "pushbullet_api_key":                 ("",      "Pushbullet API access token for push notifications."),
@@ -223,6 +254,11 @@ DEFAULT_SETTINGS = {
     # Phase 8 — auto-block
     "auto_block_new_devices":    ("false", "Automatically ARP-block newly discovered devices until manually approved."),
     "auto_block_vuln_severity":  ("none",  "Minimum vuln severity to trigger auto-block. Options: none, medium, high, critical."),
+    # Network / probe identity
+    "dns_server":                ("",      "LAN DNS server IP (auto-detected if blank). Set this to your router's IP for best hostname resolution."),
+    "probe_interface":           ("",      "Network interface the probe uses for scanning (e.g. eth0, eno1). Requires probe restart to change."),
+    # Setup wizard
+    "setup_complete":            ("false", "Whether the initial setup wizard has been completed."),
 }
 
 
@@ -578,12 +614,52 @@ async def _alert_dispatch_loop():
 
 
 app = FastAPI(title="InSpectre API", version="1.0.0")
+
+_CORS_ORIGINS = [o.strip() for o in os.environ.get(
+    "CORS_ORIGINS",
+    "http://localhost:3000,http://localhost:5173,http://127.0.0.1:3000"
+).split(",") if o.strip()]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=_CORS_ORIGINS,
+    allow_credentials=True,
+    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type", "X-Requested-With"],
 )
+
+# Paths that do NOT require a valid JWT (auth + setup wizard + FastAPI docs)
+_PUBLIC_PATHS = frozenset([
+    "/",
+    "/health",
+    "/auth/login",
+    "/setup/status",
+    "/setup/create-user",
+    "/setup/network-info",
+    "/setup/apply-network",
+    "/setup/complete",
+    "/docs",
+    "/redoc",
+    "/openapi.json",
+])
+
+@app.middleware("http")
+async def _auth_middleware(request: Request, call_next):
+    """Reject unauthenticated requests to all non-public paths."""
+    # Always pass CORS preflight and public endpoints through
+    if request.method == "OPTIONS" or request.url.path in _PUBLIC_PATHS:
+        return await call_next(request)
+
+    auth_header = request.headers.get("Authorization", "")
+    if not auth_header.startswith("Bearer "):
+        return JSONResponse({"detail": "Not authenticated"}, status_code=401)
+
+    # _decode_token is defined later in this file — valid at call time
+    username = _decode_token(auth_header[7:])
+    if not username:
+        return JSONResponse({"detail": "Invalid or expired token"}, status_code=401)
+
+    return await call_next(request)
 
 
 # ---------------------------------------------------------------------------
@@ -689,8 +765,32 @@ def _flush_traffic_sessions(db, sessions: list) -> None:
         ip  = s.get("target_ip")
         if not mac:
             continue
-        # Flush completed historical buckets
-        for bucket in s.get("history", []):
+        # Batch-query existing timestamps to avoid N+1 queries
+        history = s.get("history", [])
+        if not history:
+            continue
+        ts_candidates = []
+        for bucket in history:
+            ts_str = bucket.get("ts")
+            if not ts_str:
+                continue
+            try:
+                ts_candidates.append((datetime.fromisoformat(ts_str), bucket))
+            except Exception:
+                continue
+        if not ts_candidates:
+            continue
+        existing_ts = set()
+        try:
+            rows = db.execute(
+                text("SELECT bucket_ts FROM traffic_stats WHERE mac_address=:mac AND bucket_ts = ANY(:ts)"),
+                {"mac": mac, "ts": [t for t, _ in ts_candidates]},
+            ).fetchall()
+            existing_ts = {r[0] for r in rows}
+        except Exception:
+            pass
+        # Flush completed historical buckets (use pre-fetched existing_ts to skip N+1 queries)
+        for bucket in history:
             ts_str = bucket.get("ts")
             if not ts_str:
                 continue
@@ -698,11 +798,12 @@ def _flush_traffic_sessions(db, sessions: list) -> None:
                 ts = datetime.fromisoformat(ts_str)
             except Exception:
                 continue
-            existing = db.execute(
-                text("SELECT id FROM traffic_stats WHERE mac_address=:mac AND bucket_ts=:ts LIMIT 1"),
-                {"mac": mac, "ts": ts},
-            ).fetchone()
-            if existing:
+            # Use timezone-aware comparison; strip tz if existing_ts has naive datetimes
+            ts_key = ts.replace(tzinfo=None) if ts.tzinfo else ts
+            if any(
+                (e.replace(tzinfo=None) if hasattr(e, 'replace') else e) == ts_key
+                for e in existing_ts
+            ):
                 continue
             row = TrafficStat(
                 mac_address   = mac,
@@ -727,12 +828,97 @@ def _flush_traffic_sessions(db, sessions: list) -> None:
     db.commit()
 
 
+# ---------------------------------------------------------------------------
+# Auth helpers
+# ---------------------------------------------------------------------------
+def _hash_password(password: str) -> str:
+    return _bcrypt.hashpw(password.encode(), _bcrypt.gensalt()).decode()
+
+def _verify_password(plain: str, hashed: str) -> bool:
+    return _bcrypt.checkpw(plain.encode(), hashed.encode())
+
+def _create_token(username: str) -> str:
+    expire = datetime.now(timezone.utc) + timedelta(minutes=TOKEN_EXPIRE)
+    return jwt.encode({"sub": username, "exp": expire}, SECRET_KEY, algorithm=ALGORITHM)
+
+def _decode_token(token: str) -> str | None:
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        return payload.get("sub")
+    except JWTError:
+        return None
+
+def _has_any_user(db: Session) -> bool:
+    try:
+        row = db.execute(text("SELECT id FROM users LIMIT 1")).fetchone()
+        return row is not None
+    except Exception:
+        return False
+
+def get_current_user(
+    credentials: HTTPAuthorizationCredentials | None = Security(bearer_scheme),
+    db: Session = Depends(get_db),
+) -> str:
+    """Dependency that returns the username of the authenticated user or raises 401."""
+    token = credentials.credentials if credentials else None
+    if not token:
+        raise HTTPException(401, "Not authenticated")
+    username = _decode_token(token)
+    if not username:
+        raise HTTPException(401, "Invalid or expired token")
+    row = db.execute(text("SELECT username FROM users WHERE username = :u"), {"u": username}).fetchone()
+    if not row:
+        raise HTTPException(401, "User not found")
+    return username
+
+def get_current_user_optional(
+    credentials: HTTPAuthorizationCredentials | None = Security(bearer_scheme),
+    db: Session = Depends(get_db),
+) -> str | None:
+    """Like get_current_user but returns None instead of raising (used for setup check)."""
+    if not _has_any_user(db):
+        return "__setup__"  # sentinel: setup not done, allow access
+    token = credentials.credentials if credentials else None
+    if not token:
+        return None
+    return _decode_token(token)
+
+
+def _seed_default_user(db: Session) -> None:
+    """
+    Fallback only: if setup is marked complete but no users exist (e.g. users table
+    was wiped, or the wizard was skipped on an older deployment), create admin/admin
+    so the instance isn't permanently locked out.
+
+    Does NOT run when setup_complete = false — in that case the wizard handles
+    user creation and this would conflict with it.
+    """
+    try:
+        if _has_any_user(db):
+            return
+        s = db.get(Setting, "setup_complete")
+        if not s or s.value != "true":
+            return  # Wizard hasn't run yet — let it create the first user
+        db.execute(
+            text("""INSERT INTO users (username, password_hash, is_admin, must_change_password)
+                    VALUES (:u, :h, TRUE, TRUE)
+                    ON CONFLICT (username) DO NOTHING"""),
+            {"u": "admin", "h": _hash_password("admin")},
+        )
+        db.commit()
+        print("[startup] No users found — created default admin/admin. Please change the password.", flush=True)
+    except Exception as e:
+        db.rollback()
+        print(f"[startup] Could not seed default user: {e}", flush=True)
+
+
 @app.on_event("startup")
 async def on_startup():
     db = SessionLocal()
     try:
         _migrate(db)
         _seed_settings(db)
+        _seed_default_user(db)
     finally:
         db.close()
     asyncio.ensure_future(_scheduled_vuln_scan_loop())
@@ -740,14 +926,6 @@ async def on_startup():
     asyncio.ensure_future(_block_schedule_loop())
     asyncio.ensure_future(_traffic_flush_loop())
     asyncio.ensure_future(_speedtest_schedule_loop())
-
-
-def get_db():
-    db = SessionLocal()
-    try:
-        yield db
-    finally:
-        db.close()
 
 
 # ---------------------------------------------------------------------------
@@ -802,6 +980,31 @@ class BlockScheduleUpdate(BaseModel):
     enabled:       Optional[bool]      = None
     mac_addresses: Optional[List[str]] = None
     tags:          Optional[str]       = None
+
+class LoginRequest(BaseModel):
+    username: str
+    password: str
+
+class ChangePasswordRequest(BaseModel):
+    current_password: str
+    new_password: str
+
+class SetupUserRequest(BaseModel):
+    username: str
+    password: str
+
+class SetupNetworkRequest(BaseModel):
+    ip_range:    Optional[str] = None
+    dns_server:  Optional[str] = None
+    gateway:     Optional[str] = None
+
+class SetupCompleteRequest(BaseModel):
+    vuln_scan_enabled:    bool   = False
+    vuln_scan_schedule:   str    = "disabled"
+    vuln_scan_on_new:     bool   = False
+    notifications_enabled: bool  = True
+    ntfy_topic:           str    = ""
+    ntfy_url:             str    = "https://ntfy.sh"
 
 
 # ---------------------------------------------------------------------------
@@ -1039,6 +1242,196 @@ def root():
 
 
 # ---------------------------------------------------------------------------
+# Health check — no auth required
+# ---------------------------------------------------------------------------
+@app.get("/health")
+async def health_check(db: Session = Depends(get_db)):
+    """Return connectivity status of all platform components."""
+    result = {
+        "backend": {"ok": True, "message": "Running"},
+        "database": {"ok": False, "message": ""},
+        "probe":    {"ok": False, "message": ""},
+        "setup_complete": False,
+    }
+
+    # Check database
+    try:
+        row = db.execute(text("SELECT COUNT(*) FROM devices")).scalar()
+        result["database"] = {"ok": True, "message": f"{row} devices in DB"}
+    except Exception as e:
+        result["database"] = {"ok": False, "message": str(e)[:120]}
+
+    # Check probe
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            resp = await client.get(f"{PROBE_URL}/health")
+            if resp.status_code == 200:
+                probe_data = resp.json()
+                result["probe"] = {"ok": True, "message": probe_data.get("message", "Running")}
+            else:
+                result["probe"] = {"ok": False, "message": f"HTTP {resp.status_code}"}
+    except httpx.ConnectError:
+        result["probe"] = {"ok": False, "message": f"Cannot reach probe at {PROBE_URL}"}
+    except Exception as e:
+        result["probe"] = {"ok": False, "message": str(e)[:120]}
+
+    # Check setup complete
+    try:
+        s = db.get(Setting, "setup_complete")
+        result["setup_complete"] = (s.value if s else "false") == "true"
+    except Exception:
+        pass
+
+    result["all_ok"] = all(v["ok"] for v in [result["backend"], result["database"], result["probe"]])
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Auth routes
+# ---------------------------------------------------------------------------
+@app.post("/auth/login")
+def login(payload: LoginRequest, db: Session = Depends(get_db)):
+    row = db.execute(
+        text("SELECT username, password_hash, must_change_password FROM users WHERE username = :u"),
+        {"u": payload.username}
+    ).fetchone()
+    if not row or not _verify_password(payload.password, row[1]):
+        raise HTTPException(401, "Invalid username or password")
+    db.execute(
+        text("UPDATE users SET last_login = NOW() WHERE username = :u"),
+        {"u": payload.username}
+    )
+    db.commit()
+    token = _create_token(payload.username)
+    return {"token": token, "username": payload.username, "must_change_password": bool(row[2])}
+
+
+@app.get("/auth/me")
+def auth_me(username: str = Depends(get_current_user), db: Session = Depends(get_db)):
+    row = db.execute(
+        text("SELECT must_change_password FROM users WHERE username = :u"), {"u": username}
+    ).fetchone()
+    must_change = bool(row[0]) if row else False
+    return {"username": username, "authenticated": True, "must_change_password": must_change}
+
+
+@app.post("/auth/change-password")
+def change_password(
+    payload: ChangePasswordRequest,
+    username: str = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    row = db.execute(
+        text("SELECT password_hash FROM users WHERE username = :u"), {"u": username}
+    ).fetchone()
+    if not row or not _verify_password(payload.current_password, row[0]):
+        raise HTTPException(401, "Current password is incorrect")
+    if len(payload.new_password) < 8:
+        raise HTTPException(400, "New password must be at least 8 characters")
+    new_hash = _hash_password(payload.new_password)
+    db.execute(
+        text("UPDATE users SET password_hash = :h, must_change_password = FALSE WHERE username = :u"),
+        {"h": new_hash, "u": username}
+    )
+    db.commit()
+    return {"ok": True}
+
+
+# ---------------------------------------------------------------------------
+# Setup wizard routes (no auth required — only usable before setup is done)
+# ---------------------------------------------------------------------------
+@app.get("/setup/status")
+def setup_status(db: Session = Depends(get_db)):
+    """Returns whether setup is complete and whether any users exist."""
+    has_user = _has_any_user(db)
+    s = db.get(Setting, "setup_complete")
+    setup_done = (s.value if s else "false") == "true"
+    return {"setup_complete": setup_done, "has_user": has_user}
+
+
+@app.post("/setup/create-user")
+def setup_create_user(payload: SetupUserRequest, db: Session = Depends(get_db)):
+    """Create the first admin user. Only works if no users exist yet."""
+    if _has_any_user(db):
+        raise HTTPException(403, "Setup already completed — users exist")
+    if len(payload.username.strip()) < 3:
+        raise HTTPException(400, "Username must be at least 3 characters")
+    if len(payload.password) < 8:
+        raise HTTPException(400, "Password must be at least 8 characters")
+    pw_hash = _hash_password(payload.password)
+    try:
+        db.execute(
+            text("INSERT INTO users (username, password_hash, is_admin) VALUES (:u, :h, TRUE)"),
+            {"u": payload.username.strip().lower(), "h": pw_hash}
+        )
+        db.commit()
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(500, f"Could not create user: {e}")
+    token = _create_token(payload.username.strip().lower())
+    return {"ok": True, "token": token, "username": payload.username.strip().lower()}
+
+
+@app.get("/setup/network-info")
+async def setup_network_info():
+    """Proxy network detection to the probe — it runs on the host network so its
+    interface/route/IP info reflects the real LAN, not the Docker bridge."""
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            r = await client.get(f"{PROBE_URL}/network/info")
+            r.raise_for_status()
+            return r.json()
+    except Exception:
+        # Probe unreachable — return empty values; user can fill in manually
+        return {"ip_range": None, "gateway": None, "dns_server": None, "interface": None}
+
+
+@app.post("/setup/apply-network")
+def setup_apply_network(payload: SetupNetworkRequest, db: Session = Depends(get_db)):
+    """Save network settings confirmed in the wizard."""
+    updates: dict[str, str] = {}
+    if payload.ip_range:
+        updates["ip_range"] = payload.ip_range
+    if payload.dns_server:
+        updates["dns_server"] = payload.dns_server  # stored for reference
+    for key, value in updates.items():
+        s = db.get(Setting, key)
+        if s:
+            s.value = value
+        else:
+            db.add(Setting(key=key, value=value))
+    db.commit()
+    return {"ok": True, "applied": updates}
+
+
+@app.post("/setup/complete")
+def setup_complete(
+    payload: SetupCompleteRequest,
+    username: str = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Finalise setup: apply notification/vuln settings and mark setup complete."""
+    to_save = {
+        "setup_complete":            "true",
+        "notifications_enabled":     "true" if payload.notifications_enabled else "false",
+        "vuln_scan_on_new_device":   "true" if payload.vuln_scan_on_new else "false",
+        "vuln_scan_schedule":        payload.vuln_scan_schedule if payload.vuln_scan_enabled else "disabled",
+    }
+    if payload.ntfy_topic:
+        to_save["ntfy_topic"] = payload.ntfy_topic
+    if payload.ntfy_url:
+        to_save["ntfy_url"] = payload.ntfy_url
+    for key, value in to_save.items():
+        s = db.get(Setting, key)
+        if s:
+            s.value = value
+        else:
+            db.add(Setting(key=key, value=value))
+    db.commit()
+    return {"ok": True, "setup_complete": True}
+
+
+# ---------------------------------------------------------------------------
 # Devices
 # ---------------------------------------------------------------------------
 def _is_locally_admin_mac(mac: str) -> bool:
@@ -1237,12 +1630,18 @@ def resolve_name(mac: str, db: Session = Depends(get_db)):
 
 
 @app.post("/devices/{mac}/rescan")
-def rescan_device(mac: str, db: Session = Depends(get_db)):
+async def rescan_device(mac: str, db: Session = Depends(get_db)):
     d = db.get(Device, mac.lower())
     if not d:
         raise HTTPException(404, "Device not found")
     d.deep_scanned = False
     db.commit()
+    # Ask the probe to start scanning immediately rather than waiting for the next sweep
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            await client.post(f"{PROBE_URL}/rescan/{mac.lower()}")
+    except Exception:
+        pass  # probe will pick it up on next sweep if unreachable
     return {"mac": mac, "queued": True}
 
 
@@ -2440,10 +2839,12 @@ async def stream_ping(mac: str, db: Session = Depends(get_db)):
     if not d:
         raise HTTPException(404, "Device not found")
 
+    target_ip = getattr(d, 'primary_ip', None) or d.ip_address
+
     async def _gen():
         try:
             async with httpx.AsyncClient(timeout=None) as client:
-                async with client.stream("GET", f"{PROBE_URL}/stream/ping/{d.ip_address}") as resp:
+                async with client.stream("GET", f"{PROBE_URL}/stream/ping/{target_ip}") as resp:
                     async for line in resp.aiter_lines():
                         yield f"{line}\n"
         except httpx.ConnectError:
@@ -2499,10 +2900,12 @@ async def stream_traceroute(mac: str, db: Session = Depends(get_db)):
     if not d:
         raise HTTPException(404, "Device not found")
 
+    trace_ip = getattr(d, 'primary_ip', None) or d.ip_address
+
     async def _gen():
         try:
             async with httpx.AsyncClient(timeout=None) as client:
-                async with client.stream("GET", f"{PROBE_URL}/stream/traceroute/{d.ip_address}") as resp:
+                async with client.stream("GET", f"{PROBE_URL}/stream/traceroute/{trace_ip}") as resp:
                     async for line in resp.aiter_lines():
                         yield f"{line}\n"
         except httpx.ConnectError:
@@ -3843,11 +4246,6 @@ async def traffic_summary(db: Session = Depends(get_db)):
         """),
         {"cutoff": cutoff},
     ).fetchone()
-    try:
-        active_resp = await (httpx.AsyncClient(timeout=5.0).__aenter__())
-    except Exception:
-        active_resp = None
-
     active_count = 0
     try:
         async with httpx.AsyncClient(timeout=5.0) as client:

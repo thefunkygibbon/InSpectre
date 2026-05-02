@@ -1,5 +1,5 @@
 import { useState, useRef, useCallback, useEffect } from 'react'
-import { streamSSE } from '../api'
+import { streamSSE, getToken } from '../api'
 
 /**
  * useStreamAction
@@ -44,7 +44,11 @@ export function useStreamAction() {
     const BASE = import.meta.env.VITE_API_URL || '/api'
 
     // Use fetch directly for maximum control over the SSE stream
-    fetch(`${BASE}${path}`, { signal: controller.signal })
+    const token = getToken()
+    fetch(`${BASE}${path}`, {
+      signal: controller.signal,
+      headers: token ? { 'Authorization': `Bearer ${token}` } : {},
+    })
       .then(async (res) => {
         if (!res.ok) {
           setLines([`ERROR: server returned ${res.status}`])

@@ -1,7 +1,7 @@
 import { useState, useEffect, useRef } from 'react'
 import {
   Save, RotateCcw, Settings2, X, Download, Upload, FileText,
-  Database, Bell, ScanLine, Eye, EyeOff, Send, Globe,
+  Database, Bell, ScanLine, Eye, EyeOff, Send, Globe, User, Key,
 } from 'lucide-react'
 import { api } from '../api'
 
@@ -14,6 +14,10 @@ const SETTING_META = {
   sniffer_workers:         { label: 'Sniffer Workers',     unit: 'threads',       type: 'number', min: 1,  max: 16,   tab: 'scanner' },
   ip_range:                { label: 'IP Range',            unit: '',              type: 'text',              tab: 'scanner' },
   nmap_args:               { label: 'Nmap Arguments',      unit: '',              type: 'text',              tab: 'scanner' },
+  dns_server:              { label: 'LAN DNS Server',      unit: 'IP',            type: 'text',              tab: 'scanner',
+    description: 'DNS server used for hostname resolution. Leave blank to auto-detect from host.' },
+  probe_interface:         { label: 'Probe Interface',     unit: '',              type: 'text',              tab: 'scanner',
+    description: 'Network interface the probe uses for scanning (e.g. eth0, eno1). Leave blank to auto-detect.' },
   vuln_scan_templates:     { label: 'Vuln Scan Templates', unit: '',              type: 'text',              tab: 'scanner',
     description: 'Comma-separated template tags for vulnerability scanning (e.g. cve,exposure,misconfig,default-login,network).' },
   vuln_scan_schedule:      { label: 'Scheduled Vuln Scans', unit: '',             type: 'select', tab: 'scanner',
@@ -83,6 +87,7 @@ const TABS = [
   { id: 'scanner',       label: 'Scanner',       Icon: ScanLine },
   { id: 'notifications', label: 'Notifications', Icon: Bell     },
   { id: 'data',          label: 'Data',          Icon: Database },
+  { id: 'account',       label: 'Account',       Icon: User     },
 ]
 
 async function downloadResponse(res, filename) {
@@ -220,8 +225,37 @@ export function SettingsPanel({ onClose, onSettingChange }) {
     finally { if (fileInputRef.current) fileInputRef.current.value = '' }
   }
 
+  const [cpCurrent,    setCpCurrent]    = useState('')
+  const [cpNew,        setCpNew]        = useState('')
+  const [cpConfirm,    setCpConfirm]    = useState('')
+  const [cpError,      setCpError]      = useState('')
+  const [cpSuccess,    setCpSuccess]    = useState(false)
+  const [cpLoading,    setCpLoading]    = useState(false)
+  const [showCpCurr,   setShowCpCurr]   = useState(false)
+  const [showCpNew,    setShowCpNew]    = useState(false)
+
+  async function handleChangePassword(e) {
+    e.preventDefault()
+    if (!cpCurrent || !cpNew || !cpConfirm) return
+    if (cpNew !== cpConfirm) { setCpError('New passwords do not match'); return }
+    if (cpNew.length < 8)   { setCpError('Password must be at least 8 characters'); return }
+    setCpError('')
+    setCpLoading(true)
+    try {
+      await api.changePassword(cpCurrent, cpNew)
+      setCpSuccess(true)
+      setCpCurrent('')
+      setCpNew('')
+      setCpConfirm('')
+    } catch {
+      setCpError('Current password is incorrect')
+    } finally {
+      setCpLoading(false)
+    }
+  }
+
   const hasDirty   = Object.keys(dirty).length > 0
-  const showFooter = activeTab !== 'data'
+  const showFooter = activeTab !== 'data' && activeTab !== 'account'
 
   // Returns current value for a key (dirty-aware)
   function val(key) {
@@ -236,7 +270,8 @@ export function SettingsPanel({ onClose, onSettingChange }) {
   const bnEnabled = val('browser_notifications_enabled') === 'true'
 
   // ── Scanner tab grouping ────────────────────────────────────────────────────
-  const networkScanKeys = ['scan_interval','offline_miss_threshold','os_confidence_threshold','sniffer_workers','ip_range','nmap_args']
+  const networkScanKeys   = ['scan_interval','offline_miss_threshold','os_confidence_threshold','sniffer_workers']
+  const networkConfigKeys = ['ip_range','nmap_args','dns_server','probe_interface']
 
   // ── Notifications tab grouping ──────────────────────────────────────────────
   const inAppKeys   = ['notifications_enabled','browser_notifications_enabled']
@@ -306,6 +341,12 @@ export function SettingsPanel({ onClose, onSettingChange }) {
               {/* Network scanning */}
               <SectionHeader label="Network Scanning" Icon={ScanLine} />
               {settingsByKeys(networkScanKeys).map(s => (
+                <SettingRow key={s.key} s={s} dirty={dirty} onchange={handleChange} />
+              ))}
+
+              {/* Network configuration */}
+              <SectionHeader label="Network Configuration" Icon={ScanLine} />
+              {settingsByKeys(networkConfigKeys).map(s => (
                 <SettingRow key={s.key} s={s} dirty={dirty} onchange={handleChange} />
               ))}
 
@@ -565,6 +606,86 @@ export function SettingsPanel({ onClose, onSettingChange }) {
                     <p>{importStatus.inserted} new · {importStatus.merged} merged · {importStatus.corrected} devices auto-corrected</p>
                   </div>
                 )}
+              </div>
+            </>
+          )}
+
+          {/* ── Account tab ─────────────────────────────────────────────────── */}
+          {activeTab === 'account' && (
+            <>
+              <p className="text-xs" style={{ color: 'var(--color-text-faint)' }}>
+                Manage your account credentials.
+              </p>
+
+              <SectionHeader label="Change Password" Icon={Key} />
+              <div className="card p-4">
+                <form onSubmit={handleChangePassword} className="space-y-3">
+                  <div className="space-y-1">
+                    <label className="text-xs font-medium" style={{ color: 'var(--color-text-muted)' }}>Current password</label>
+                    <div className="relative">
+                      <input
+                        type={showCpCurr ? 'text' : 'password'}
+                        className="input pr-10 w-full"
+                        value={cpCurrent}
+                        onChange={e => { setCpCurrent(e.target.value); setCpSuccess(false) }}
+                        disabled={cpLoading}
+                        autoComplete="current-password"
+                      />
+                      <button type="button" onClick={() => setShowCpCurr(v => !v)}
+                        className="absolute right-3 top-1/2 -translate-y-1/2 opacity-50 hover:opacity-100 transition-opacity"
+                        tabIndex={-1}>
+                        {showCpCurr ? <EyeOff size={14} /> : <Eye size={14} />}
+                      </button>
+                    </div>
+                  </div>
+
+                  <div className="space-y-1">
+                    <label className="text-xs font-medium" style={{ color: 'var(--color-text-muted)' }}>New password</label>
+                    <div className="relative">
+                      <input
+                        type={showCpNew ? 'text' : 'password'}
+                        className="input pr-10 w-full"
+                        value={cpNew}
+                        onChange={e => { setCpNew(e.target.value); setCpSuccess(false); setCpError('') }}
+                        disabled={cpLoading}
+                        autoComplete="new-password"
+                      />
+                      <button type="button" onClick={() => setShowCpNew(v => !v)}
+                        className="absolute right-3 top-1/2 -translate-y-1/2 opacity-50 hover:opacity-100 transition-opacity"
+                        tabIndex={-1}>
+                        {showCpNew ? <EyeOff size={14} /> : <Eye size={14} />}
+                      </button>
+                    </div>
+                  </div>
+
+                  <div className="space-y-1">
+                    <label className="text-xs font-medium" style={{ color: 'var(--color-text-muted)' }}>Confirm new password</label>
+                    <input
+                      type="password"
+                      className="input w-full"
+                      value={cpConfirm}
+                      onChange={e => { setCpConfirm(e.target.value); setCpSuccess(false); setCpError('') }}
+                      disabled={cpLoading}
+                      autoComplete="new-password"
+                    />
+                  </div>
+
+                  {cpError && (
+                    <p className="text-xs" style={{ color: '#ef4444' }}>{cpError}</p>
+                  )}
+                  {cpSuccess && (
+                    <p className="text-xs" style={{ color: '#10b981' }}>Password changed successfully.</p>
+                  )}
+
+                  <button
+                    type="submit"
+                    disabled={cpLoading || !cpCurrent || !cpNew || !cpConfirm}
+                    className="btn-primary w-full flex items-center justify-center gap-2"
+                    style={{ opacity: cpLoading || !cpCurrent || !cpNew || !cpConfirm ? 0.5 : 1 }}
+                  >
+                    {cpLoading ? 'Changing…' : 'Change Password'}
+                  </button>
+                </form>
               </div>
             </>
           )}

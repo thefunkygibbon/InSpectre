@@ -5,7 +5,7 @@ services:
     restart: always
     environment:
       POSTGRES_USER: admin
-      POSTGRES_PASSWORD: password123 # Change this!
+      POSTGRES_PASSWORD: 2bffaeae7a209b178854078631c5b136 
       POSTGRES_DB: inspectre
     ports:
       - "5432:5432"
@@ -25,8 +25,11 @@ services:
     ports:
       - "8000:8000"
     environment:
-      DATABASE_URL: postgresql://admin:password123@db:5432/inspectre
+      DATABASE_URL: postgresql://admin:2bffaeae7a209b178854078631c5b136@db:5432/inspectre
       PROBE_API_URL: http://host.docker.internal:8666
+      SECRET_KEY: d3689ad87d9ee61a507399d6224c5c1039d7eaddedc1eea2d80b92e68130b4c6
+      # Comma-separated list of allowed frontend origins
+      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:3000,http://localhost:5173}
     extra_hosts:
       - "host.docker.internal:host-gateway"
     depends_on:
@@ -40,13 +43,15 @@ services:
     privileged: true
     restart: always
     environment:
-      DATABASE_URL: postgresql://admin:password123@localhost:5432/inspectre
+      DATABASE_URL: postgresql://admin:2bffaeae7a209b178854078631c5b136@localhost:5432/inspectre
       IP_RANGE: "192.168.0.0/24"
       INTERFACE: "eno1"
       SCAN_INTERVAL: "60"
-      NMAP_ARGS: "-O --osscan-guess -sV --version-intensity 5 -T4 -p-"
+      NMAP_ARGS: "-sT -O --osscan-limit -T4"
       PROBE_API_PORT: "8666"
       PYTHONUNBUFFERED: "1"
+      # Prevent any host NMAP_OPTS from leaking in and creating a duplicate -p flag
+      NMAP_OPTS: ""
       # ── DNS / Hostname resolution ──────────────────────────────────────────
       LAN_DNS_SERVER: "192.168.0.1"
     cap_add:

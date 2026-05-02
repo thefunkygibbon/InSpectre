@@ -1,17 +1,35 @@
 const BASE = import.meta.env.VITE_API_URL || '/api'
 
+// ---------------------------------------------------------------------------
+// Token storage
+// ---------------------------------------------------------------------------
+export function getToken() { return localStorage.getItem('inspectre_token') }
+export function setToken(t) { if (t) localStorage.setItem('inspectre_token', t); else localStorage.removeItem('inspectre_token') }
+export function clearToken() { localStorage.removeItem('inspectre_token') }
+
 async function request(method, path, body) {
+  const token = getToken()
+  const headers = {}
+  if (body) headers['Content-Type'] = 'application/json'
+  if (token) headers['Authorization'] = `Bearer ${token}`
   const res = await fetch(`${BASE}${path}`, {
     method,
-    headers: body ? { 'Content-Type': 'application/json' } : {},
+    headers,
     body: body ? JSON.stringify(body) : undefined,
   })
+  if (res.status === 401) {
+    clearToken()
+    window.location.reload()
+    throw new Error('Session expired')
+  }
   if (!res.ok) throw new Error(`${method} ${path} \u2192 ${res.status}`)
   return res.json()
 }
 
 async function streamSSE(path, onLine, signal) {
-  const res = await fetch(`${BASE}${path}`, { signal })
+  const token   = getToken()
+  const headers = token ? { Authorization: `Bearer ${token}` } : {}
+  const res = await fetch(`${BASE}${path}`, { signal, headers })
   if (!res.ok) throw new Error(`GET ${path} \u2192 ${res.status}`)
   const reader  = res.body.getReader()
   const decoder = new TextDecoder()
@@ -33,6 +51,31 @@ async function streamSSE(path, onLine, signal) {
 }
 
 export const api = {
+  // Health / status
+  getHealth: () => {
+    const token = getToken()
+    return fetch(`${BASE}/health`, {
+      headers: token ? { Authorization: `Bearer ${token}` } : {},
+    }).then(r => r.json()).catch(() => ({
+      backend: { ok: false, message: 'Unreachable' },
+      database: { ok: false, message: 'Unknown' },
+      probe:    { ok: false, message: 'Unknown' },
+      all_ok: false,
+    }))
+  },
+
+  // Auth
+  login:          (username, password) => request('POST', '/auth/login', { username, password }),
+  authMe:         ()                   => request('GET',  '/auth/me'),
+  changePassword: (current, next)      => request('POST', '/auth/change-password', { current_password: current, new_password: next }),
+
+  // Setup wizard
+  setupStatus:      ()       => request('GET',  '/setup/status'),
+  setupCreateUser:  (u, p)   => request('POST', '/setup/create-user', { username: u, password: p }),
+  setupNetworkInfo: ()       => request('GET',  '/setup/network-info'),
+  setupApplyNetwork:(body)   => request('POST', '/setup/apply-network', body),
+  setupComplete:    (body)   => request('POST', '/setup/complete', body),
+
   // Devices
   getDevices:      (params = {}) => {
     const p = new URLSearchParams()
@@ -82,15 +125,23 @@ export const api = {
   resetSettings:   ()           => request('POST', '/settings/reset'),
   applySettings:   ()           => request('POST', '/settings/apply'),
 
-  // Export
-  exportDevicesCsv:       ()     => fetch(`${BASE}/export/devices`),
-  exportFingerprintsJson: ()     => fetch(`${BASE}/export/fingerprints`),
+  // Export (include auth header so the global middleware allows through)
+  exportDevicesCsv: () => {
+    const token = getToken()
+    return fetch(`${BASE}/export/devices`, { headers: token ? { Authorization: `Bearer ${token}` } : {} })
+  },
+  exportFingerprintsJson: () => {
+    const token = getToken()
+    return fetch(`${BASE}/export/fingerprints`, { headers: token ? { Authorization: `Bearer ${token}` } : {} })
+  },
 
   // Import
   importFingerprintsJson: (file) => {
     const form = new FormData()
     form.append('file', file)
-    return fetch(`${BASE}/import/fingerprints`, { method: 'POST', body: form })
+    const token = getToken()
+    const headers = token ? { Authorization: `Bearer ${token}` } : {}
+    return fetch(`${BASE}/import/fingerprints`, { method: 'POST', body: form, headers })
       .then(r => { if (!r.ok) throw new Error(`Import failed: ${r.status}`); return r.json() })
   },
 
@@ -147,11 +198,16 @@ export const api = {
   deleteDevice:       (mac)             => request('DELETE', `/devices/${mac}`),
 
   // Backup / restore
-  exportBackup:       ()                => fetch(`${BASE}/export/backup`),
-  importRestore:      (file)            => {
+  exportBackup: () => {
+    const token = getToken()
+    return fetch(`${BASE}/export/backup`, { headers: token ? { Authorization: `Bearer ${token}` } : {} })
+  },
+  importRestore: (file) => {
     const form = new FormData()
     form.append('file', file)
-    return fetch(`${BASE}/import/restore`, { method: 'POST', body: form })
+    const token = getToken()
+    const headers = token ? { Authorization: `Bearer ${token}` } : {}
+    return fetch(`${BASE}/import/restore`, { method: 'POST', body: form, headers })
       .then(r => { if (!r.ok) throw new Error(`Restore failed: ${r.status}`); return r.json() })
   },
 
