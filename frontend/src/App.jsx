@@ -41,7 +41,7 @@ const SORT_OPTIONS = [
   { value: 'important',      label: 'Watched first' },
 ]
 
-const TOAST_DURATION = 7000
+const TOAST_DURATION = 2500
 
 // Page definitions for the nav
 const PAGES = [
@@ -84,12 +84,14 @@ function useClock() {
 
 // ── Toast ─────────────────────────────────────────────────────────────────────────────
 function Toast({ alert, kind, onDismiss, onDeviceClick }) {
-  const timerRef = useRef(null)
+  const timerRef    = useRef(null)
+  const dismissRef  = useRef(onDismiss)
+  useEffect(() => { dismissRef.current = onDismiss }, [onDismiss])
 
   useEffect(() => {
-    timerRef.current = setTimeout(() => onDismiss(alert.id), TOAST_DURATION)
+    timerRef.current = setTimeout(() => dismissRef.current(alert.id), TOAST_DURATION)
     return () => clearTimeout(timerRef.current)
-  }, [alert.id, onDismiss])
+  }, [alert.id])
 
   function handleClick(e) {
     if (e.target.closest('[data-dismiss]')) return
@@ -160,7 +162,7 @@ function NotificationToasts({ newAlerts, offlineAlerts, onDismissNew, onDismissO
   const all = [
     ...newAlerts.map(a     => ({ ...a, kind: 'new'     })),
     ...offlineAlerts.map(a => ({ ...a, kind: 'offline' })),
-  ]
+  ].filter(a => a.toastable !== false)
   if (!all.length) return null
   return (
     <div

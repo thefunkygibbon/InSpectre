@@ -31,25 +31,23 @@ export function useDevices(intervalMs = 10000, { onAlert } = {}) {
       const devList = rawList.map(enrich)
 
       // New device detection
+      const pageVisible = typeof document !== 'undefined' ? !document.hidden : true
       if (knownMacsRef.current === null) {
         knownMacsRef.current = new Set(devList.map(d => d.mac_address))
       } else {
         const newOnes = devList.filter(d => !knownMacsRef.current.has(d.mac_address))
         if (newOnes.length) {
           const alerts = newOnes.map(d => ({
-            id:       d.mac_address,
-            mac:      d.mac_address,
-            ip:       d.ip_address,
-            vendor:   d.vendor || 'Unknown vendor',
-            hostname: d.hostname || null,
+            id:        d.mac_address,
+            mac:       d.mac_address,
+            ip:        d.ip_address,
+            vendor:    d.vendor || 'Unknown vendor',
+            hostname:  d.hostname || null,
+            toastable: pageVisible,
           }))
           setNewDeviceAlerts(prev => [...prev, ...alerts])
           newOnes.forEach(d => knownMacsRef.current.add(d.mac_address))
           alerts.forEach(a => onAlertRef.current?.({ kind: 'new_device', ...a }))
-          setTimeout(() => {
-            const ids = new Set(alerts.map(a => a.id))
-            setNewDeviceAlerts(prev => prev.filter(a => !ids.has(a.id)))
-          }, 8000)
         }
       }
 
@@ -66,6 +64,7 @@ export function useDevices(intervalMs = 10000, { onAlert } = {}) {
           ip:           d.ip_address,
           name:         d.display_name || d.ip_address,
           is_important: d.is_important,
+          toastable:    pageVisible,
         }))
         setOfflineAlerts(prev => [...prev, ...offAlerts])
         offAlerts.forEach(a => onAlertRef.current?.({ kind: 'offline', ...a }))

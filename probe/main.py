@@ -192,6 +192,7 @@ class Device(Base):
     miss_count   = Column(Integer, default=0)
     is_important = Column(Boolean, default=False, nullable=False)
     is_ignored   = Column(Boolean, default=False, nullable=False)
+    status_changed_at       = Column(DateTime(timezone=True), nullable=True)
     device_type_override    = Column(String,  nullable=True)
     hostname_last_attempted = Column(DateTime(timezone=True), nullable=True)
     deep_scan_last_run      = Column(DateTime(timezone=True), nullable=True)
@@ -263,6 +264,7 @@ def init_db() -> None:
             conn.execute(text("ALTER TABLE devices ADD COLUMN IF NOT EXISTS deep_scan_last_run TIMESTAMPTZ"))
             conn.execute(text("ALTER TABLE devices ADD COLUMN IF NOT EXISTS baseline_ports JSONB"))
             conn.execute(text("ALTER TABLE devices ADD COLUMN IF NOT EXISTS baseline_scan_count INTEGER NOT NULL DEFAULT 0"))
+            conn.execute(text("ALTER TABLE devices ADD COLUMN IF NOT EXISTS status_changed_at TIMESTAMPTZ"))
             conn.commit()
         except Exception as e:
             print(f"[DB] Column migration note: {e}", flush=True)
@@ -1260,6 +1262,7 @@ def upsert_seen_device(mac: str, ip: str, source: str) -> None:
                         is_online                = True,
                         first_seen               = now,
                         last_seen                = now,
+                        status_changed_at        = now,
                         deep_scanned             = False,
                         miss_count               = 0,
                         is_important             = False,
@@ -1274,8 +1277,9 @@ def upsert_seen_device(mac: str, ip: str, source: str) -> None:
                                 "CASE WHEN devices.primary_ip IS NOT NULL "
                                 "THEN devices.primary_ip ELSE EXCLUDED.primary_ip END"
                             ),
-                            is_online  = True,
-                            last_seen  = text("CASE WHEN devices.is_online = false THEN NOW() ELSE devices.last_seen END"),
+                            is_online         = True,
+                            last_seen         = text("CASE WHEN devices.is_online = false THEN NOW() ELSE devices.last_seen END"),
+                            status_changed_at = text("CASE WHEN devices.is_online = false THEN NOW() ELSE devices.status_changed_at END"),
                             miss_count = 0,
                             # Use EXCLUDED.hostname (the value we inserted) which is already parameterized
                             hostname   = text(
@@ -1289,18 +1293,19 @@ def upsert_seen_device(mac: str, ip: str, source: str) -> None:
                 stmt = (
                     pg_insert(Device)
                     .values(
-                        mac_address  = mac,
-                        ip_address   = ip,
-                        primary_ip   = existing.primary_ip or ip,
-                        hostname     = hostname_val or None,
-                        vendor       = vendor,
-                        custom_name  = existing.custom_name,
-                        is_online    = True,
-                        first_seen   = existing.first_seen or now,
-                        last_seen    = now,
-                        deep_scanned = existing.deep_scanned,
-                        miss_count   = 0,
-                        is_important = existing.is_important,
+                        mac_address       = mac,
+                        ip_address        = ip,
+                        primary_ip        = existing.primary_ip or ip,
+                        hostname          = hostname_val or None,
+                        vendor            = vendor,
+                        custom_name       = existing.custom_name,
+                        is_online         = True,
+                        first_seen        = existing.first_seen or now,
+                        last_seen         = now,
+                        status_changed_at = now,
+                        deep_scanned      = existing.deep_scanned,
+                        miss_count        = 0,
+                        is_important      = existing.is_important,
                     )
                     .on_conflict_do_update(
                         index_elements=["mac_address"],
@@ -1315,8 +1320,9 @@ def upsert_seen_device(mac: str, ip: str, source: str) -> None:
                                 "WHEN devices.primary_ip IS NOT NULL THEN devices.primary_ip "
                                 "ELSE EXCLUDED.primary_ip END"
                             ),
-                            is_online  = True,
-                            last_seen  = text("CASE WHEN devices.is_online = false THEN NOW() ELSE devices.last_seen END"),
+                            is_online         = True,
+                            last_seen         = text("CASE WHEN devices.is_online = false THEN NOW() ELSE devices.last_seen END"),
+                            status_changed_at = text("CASE WHEN devices.is_online = false THEN NOW() ELSE devices.status_changed_at END"),
                             miss_count = 0,
                             hostname   = text(
                                 "CASE WHEN devices.hostname IS NOT NULL AND devices.hostname != '' "
@@ -1536,6 +1542,8 @@ def update_presence_from_sweep(session, active_macs: set) -> None:
 
     for dev in session.query(Device).all():
         if dev.mac_address in seen_this_cycle:
+            if not dev.is_online:
+                dev.status_changed_at = now
             dev.is_online = True
             dev.miss_count = 0
             continue
@@ -1556,6 +1564,7 @@ def update_presence_from_sweep(session, active_macs: set) -> None:
             continue
 
         dev.is_online = False
+        dev.status_changed_at = now
         print(
             f"[-] Offline: {confirm_ip or dev.ip_address} ({dev.mac_address}) "
             f"after {dev.miss_count} missed sweeps + ping confirm",

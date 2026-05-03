@@ -197,6 +197,7 @@ def _migrate(db: Session):
         """,
         "CREATE INDEX IF NOT EXISTS ix_users_username ON users(username)",
         "ALTER TABLE users ADD COLUMN IF NOT EXISTS must_change_password BOOLEAN NOT NULL DEFAULT FALSE",
+        "ALTER TABLE devices ADD COLUMN IF NOT EXISTS status_changed_at TIMESTAMPTZ",
     ]
     for sql in migrations:
         try:
@@ -1140,6 +1141,7 @@ def _to_dict(d: Device) -> dict:
         "location":             getattr(d, 'location', None),
         "first_seen":           d.first_seen.isoformat()  if d.first_seen  else None,
         "last_seen":            d.last_seen.isoformat()   if d.last_seen   else None,
+        "status_changed_at":    d.status_changed_at.isoformat() if getattr(d, 'status_changed_at', None) else None,
         "scan_results":         d.scan_results,
         "services":             (d.scan_results or {}).get("services"),
         "pipeline_stage":       (d.scan_results or {}).get("pipeline_stage"),

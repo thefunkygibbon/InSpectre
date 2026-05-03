@@ -38,6 +38,9 @@ class Device(Base):
     zone                 = Column(String, nullable=True)
     is_ignored           = Column(Boolean, server_default='false', nullable=False)
 
+    # Tracks when is_online last changed (online↔offline transitions)
+    status_changed_at        = Column(DateTime(timezone=True), nullable=True)
+
     # Phase 7: scan performance & port baseline
     hostname_last_attempted = Column(DateTime(timezone=True), nullable=True)
     deep_scan_last_run      = Column(DateTime(timezone=True), nullable=True)
