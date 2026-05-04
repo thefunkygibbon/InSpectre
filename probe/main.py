@@ -31,12 +31,51 @@ import traffic_monitor as _tm
 VERSION = "1.0.0"
 
 # ---------------------------------------------------------------------------
+# Startup network auto-detection
+# Runs once at import time so INTERFACE and IP_RANGE can be set without ENVs.
+# ENV vars are accepted as explicit overrides but are never the primary source.
+# ---------------------------------------------------------------------------
+def _startup_detect_interface() -> str | None:
+    """Return the interface that carries the default route, or None."""
+    try:
+        out = subprocess.run(["ip", "route", "show", "default"],
+                             capture_output=True, text=True, timeout=3)
+        for line in out.stdout.splitlines():
+            parts = line.split()
+            if parts and parts[0] == "default" and "dev" in parts:
+                iface = parts[parts.index("dev") + 1]
+                if iface and not iface.startswith("lo"):
+                    return iface
+    except Exception:
+        pass
+    return None
+
+def _startup_detect_ip_range(iface: str) -> str | None:
+    """Derive the network CIDR from the named interface, or None."""
+    import ipaddress as _ipa
+    try:
+        out = subprocess.run(["ip", "addr", "show", iface],
+                             capture_output=True, text=True, timeout=3)
+        for line in out.stdout.splitlines():
+            line = line.strip()
+            if line.startswith("inet ") and "/" in line:
+                return str(_ipa.ip_interface(line.split()[1]).network)
+    except Exception:
+        pass
+    return None
+
+_autodetected_interface = _startup_detect_interface()
+_autodetected_ip_range  = _startup_detect_ip_range(_autodetected_interface) if _autodetected_interface else None
+
+# ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
 DATABASE_URL            = os.environ.get("DATABASE_URL",            "postgresql://admin:password123@localhost:5432/inspectre")
 SCAN_INTERVAL           = int(os.environ.get("SCAN_INTERVAL",           60))
-IP_RANGE                = os.environ.get("IP_RANGE",                "192.168.0.0/24")
-INTERFACE               = os.environ.get("INTERFACE",               "eth0")
+# Auto-detected at startup; ENV is an explicit override (e.g. for multi-NIC hosts)
+INTERFACE               = os.environ.get("INTERFACE", "").strip() or _autodetected_interface or "eth0"
+# Auto-detected from interface CIDR; DB overrides this each scan cycle anyway
+IP_RANGE                = os.environ.get("IP_RANGE",  "").strip() or _autodetected_ip_range  or "192.168.0.0/24"
 NMAP_ARGS               = os.environ.get("NMAP_ARGS",               "-O --osscan-limit -sV --version-intensity 5 -T4 -p-")
 OS_CONFIDENCE_THRESHOLD = int(os.environ.get("OS_CONFIDENCE_THRESHOLD", 85))
 OFFLINE_MISS_THRESHOLD  = int(os.environ.get("OFFLINE_MISS_THRESHOLD",   3))
@@ -412,10 +451,7 @@ def _get_default_gateway() -> str | None:
     return None
 
 def _detect_dns_server() -> str | None:
-    if LAN_DNS_SERVER_ENV:
-        print(f"[hostname] DNS server from env (LAN_DNS_SERVER): {LAN_DNS_SERVER_ENV}", flush=True)
-        return LAN_DNS_SERVER_ENV
-
+    # 1. Real detection: non-loopback nameserver from /etc/resolv.conf
     try:
         with open("/etc/resolv.conf") as f:
             for line in f:
@@ -430,13 +466,19 @@ def _detect_dns_server() -> str | None:
     except Exception:
         pass
 
+    # 2. Default gateway (router is almost always a working DNS forwarder)
     gw = _get_default_gateway()
     if gw:
         print(f"[hostname] Using default gateway as DNS server: {gw}", flush=True)
         return gw
 
-    print("[hostname] WARNING: no usable DNS server found. "
-          "Set LAN_DNS_SERVER=<router_ip> in docker-compose.yml.", flush=True)
+    # 3. Last resort: LAN_DNS_SERVER env var
+    if LAN_DNS_SERVER_ENV:
+        print(f"[hostname] DNS server from LAN_DNS_SERVER env: {LAN_DNS_SERVER_ENV}", flush=True)
+        return LAN_DNS_SERVER_ENV
+
+    print("[hostname] WARNING: no DNS server found automatically. "
+          "Set LAN_DNS_SERVER=<router_ip> in docker-compose.yml if resolution fails.", flush=True)
     return None
 
 def resolve_hostname(ip: str) -> str | None:
@@ -2501,41 +2543,59 @@ def probe_traffic_stream(mac: str):
 
 @probe_api.get("/network/info")
 def probe_network_info():
-    """Detect network configuration from the host (probe runs on host network)."""
+    """Detect network configuration from the host. ENV vars used as last-resort only."""
     import ipaddress as _ipaddress
-    info = {
-        "interface":  INTERFACE,
-        "ip_range":   None,
-        "gateway":    None,
-        "dns_server": _DNS_SERVER,
-    }
-    # Detect gateway and interface from the host routing table
+    info = {"interface": None, "ip_range": None, "gateway": None, "dns_server": None}
+
+    # 1. Gateway + interface from the host routing table
     try:
-        out = subprocess.run(["ip", "route", "show", "default"], capture_output=True, text=True, timeout=3)
+        out = subprocess.run(["ip", "route", "show", "default"],
+                             capture_output=True, text=True, timeout=3)
         for line in out.stdout.splitlines():
             parts = line.split()
-            if len(parts) >= 3 and parts[0] == "default" and parts[1] == "via":
-                info["gateway"] = parts[2]
+            if parts and parts[0] == "default" and "via" in parts:
+                info["gateway"] = parts[parts.index("via") + 1]
                 if "dev" in parts:
                     info["interface"] = parts[parts.index("dev") + 1]
                 break
     except Exception:
         pass
-    # Derive the network CIDR from the detected interface
+
+    # 2. Network CIDR from the detected interface
     try:
-        if info["interface"]:
-            out = subprocess.run(["ip", "addr", "show", info["interface"]], capture_output=True, text=True, timeout=3)
+        iface = info["interface"] or INTERFACE
+        if iface:
+            out = subprocess.run(["ip", "addr", "show", iface],
+                                 capture_output=True, text=True, timeout=3)
             for line in out.stdout.splitlines():
                 line = line.strip()
                 if line.startswith("inet ") and "/" in line:
-                    cidr = line.split()[1]
-                    info["ip_range"] = str(_ipaddress.ip_interface(cidr).network)
+                    info["ip_range"] = str(_ipaddress.ip_interface(line.split()[1]).network)
                     break
     except Exception:
         pass
-    # Fall back: if DNS not yet detected, use gateway
-    if not info["dns_server"] and info["gateway"]:
-        info["dns_server"] = info["gateway"]
+
+    # 3. DNS: real detection — resolv.conf, then gateway
+    try:
+        with open("/etc/resolv.conf") as f:
+            for line in f:
+                parts = line.strip().split()
+                if parts and parts[0] == "nameserver" and len(parts) >= 2:
+                    ip = parts[1]
+                    if not ip.startswith("127.") and not ip.startswith("169.254."):
+                        info["dns_server"] = ip
+                        break
+    except Exception:
+        pass
+    if not info["dns_server"]:
+        info["dns_server"] = info["gateway"]  # router is almost always a DNS forwarder
+
+    # ENV fallbacks — only applied when auto-detection produced nothing
+    if not info["interface"] and os.environ.get("INTERFACE", "").strip():
+        info["interface"] = os.environ.get("INTERFACE").strip()
+    if not info["dns_server"] and LAN_DNS_SERVER_ENV:
+        info["dns_server"] = LAN_DNS_SERVER_ENV
+
     return info
 
 

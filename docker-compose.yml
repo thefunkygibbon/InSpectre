@@ -44,8 +44,8 @@ services:
     restart: always
     environment:
       DATABASE_URL: postgresql://admin:2bffaeae7a209b178854078631c5b136@localhost:5432/inspectre
-      IP_RANGE: "192.168.0.0/24"
-      INTERFACE: "eno1"
+      #IP_RANGE: "192.168.0.0/24"
+      #INTERFACE: "eno1"
       SCAN_INTERVAL: "60"
       NMAP_ARGS: "-sT -O --osscan-limit -T4"
       PROBE_API_PORT: "8666"
@@ -53,7 +53,7 @@ services:
       # Prevent any host NMAP_OPTS from leaking in and creating a duplicate -p flag
       NMAP_OPTS: ""
       # ── DNS / Hostname resolution ──────────────────────────────────────────
-      LAN_DNS_SERVER: "192.168.0.1"
+      #LAN_DNS_SERVER: "192.168.0.1"
     cap_add:
       - NET_ADMIN
       - NET_RAW

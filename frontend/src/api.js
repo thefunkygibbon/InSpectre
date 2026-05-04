@@ -210,6 +210,12 @@ export const api = {
     return fetch(`${BASE}/import/restore`, { method: 'POST', body: form, headers })
       .then(r => { if (!r.ok) throw new Error(`Restore failed: ${r.status}`); return r.json() })
   },
+  setupRestoreFromBackup: (file) => {
+    const form = new FormData()
+    form.append('file', file)
+    return fetch(`${BASE}/setup/restore-from-backup`, { method: 'POST', body: form })
+      .then(r => { if (!r.ok) throw new Error(`Restore failed: ${r.status}`); return r.json() })
+  },
 
   // Block schedules
   getBlockSchedules:    ()          => request('GET',    '/block-schedules'),

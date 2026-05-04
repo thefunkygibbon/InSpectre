@@ -1,40 +1,164 @@
 import { useState, useEffect } from 'react'
 import {
   User, Lock, Network, Shield, Bell, ArrowRight,
-  CheckCircle, Eye, EyeOff, Upload, RotateCcw,
+  CheckCircle, Eye, EyeOff, Upload, RotateCcw, Database,
 } from 'lucide-react'
 import { Logo } from './Logo'
 import { api, setToken } from '../api'
 
-const STEPS = [
-  { id: 'user',    label: 'Create Account',      Icon: User    },
-  { id: 'restore', label: 'Restore Backup',       Icon: Upload  },
-  { id: 'network', label: 'Network Settings',     Icon: Network },
-  { id: 'vuln',    label: 'Vulnerability Scans',  Icon: Shield  },
-  { id: 'notify',  label: 'Notifications',        Icon: Bell    },
-  { id: 'done',    label: 'All Set!',             Icon: CheckCircle },
+// Steps for the "fresh setup" path only (restore path bypasses all of these)
+const FRESH_STEPS = [
+  { id: 'user',    label: 'Create Account',     Icon: User        },
+  { id: 'network', label: 'Network Settings',   Icon: Network     },
+  { id: 'vuln',    label: 'Vuln Scans',         Icon: Shield      },
+  { id: 'notify',  label: 'Notifications',      Icon: Bell        },
+  { id: 'done',    label: 'All Set!',           Icon: CheckCircle },
 ]
 
 function StepDot({ step, current, completed }) {
   const isDone = completed > step
   const isCur  = current === step
   return (
-    <div className="flex flex-col items-center gap-1">
-      <div
-        className="w-8 h-8 rounded-full flex items-center justify-center text-xs font-bold transition-all"
-        style={{
-          background: isDone ? '#10b981' : isCur ? 'var(--color-brand)' : 'var(--color-surface-offset)',
-          color: isDone || isCur ? 'white' : 'var(--color-text-muted)',
-          border: isCur ? '2px solid var(--color-brand)' : 'none',
-        }}
+    <div
+      className="w-8 h-8 rounded-full flex items-center justify-center text-xs font-bold transition-all"
+      style={{
+        background: isDone ? '#10b981' : isCur ? 'var(--color-brand)' : 'var(--color-surface-offset)',
+        color: isDone || isCur ? 'white' : 'var(--color-text-muted)',
+        border: isCur ? '2px solid var(--color-brand)' : 'none',
+      }}
+    >
+      {isDone ? <CheckCircle size={14} /> : step + 1}
+    </div>
+  )
+}
+
+// ── Choice screen ──────────────────────────────────────────────────────────
+function ChoiceScreen({ onFresh, onRestore }) {
+  return (
+    <div className="space-y-4">
+      <p className="text-sm" style={{ color: 'var(--color-text-muted)' }}>
+        Is this a new installation or are you migrating from an existing one?
+      </p>
+
+      <button
+        onClick={onFresh}
+        className="w-full p-4 rounded-xl border-2 text-left flex items-start gap-4 transition-colors hover:border-[var(--color-brand)]"
+        style={{ borderColor: 'var(--color-border)', background: 'var(--color-surface-offset)' }}
       >
-        {isDone ? <CheckCircle size={14} /> : step + 1}
+        <User size={22} className="mt-0.5 shrink-0" style={{ color: 'var(--color-brand)' }} />
+        <div>
+          <p className="font-semibold text-sm" style={{ color: 'var(--color-text)' }}>Start fresh</p>
+          <p className="text-xs mt-0.5" style={{ color: 'var(--color-text-muted)' }}>
+            New installation — create a new admin account and configure settings.
+          </p>
+        </div>
+      </button>
+
+      <button
+        onClick={onRestore}
+        className="w-full p-4 rounded-xl border-2 text-left flex items-start gap-4 transition-colors hover:border-[var(--color-brand)]"
+        style={{ borderColor: 'var(--color-border)', background: 'var(--color-surface-offset)' }}
+      >
+        <Database size={22} className="mt-0.5 shrink-0" style={{ color: 'var(--color-brand)' }} />
+        <div>
+          <p className="font-semibold text-sm" style={{ color: 'var(--color-text)' }}>Restore from backup</p>
+          <p className="text-xs mt-0.5" style={{ color: 'var(--color-text-muted)' }}>
+            Import a backup file — restores all devices, settings, history, and credentials.
+          </p>
+        </div>
+      </button>
+    </div>
+  )
+}
+
+// ── Restore path ───────────────────────────────────────────────────────────
+function RestorePath({ onComplete, onBack }) {
+  const [status,  setStatus]  = useState(null)   // null | {ok, msg, stats}
+  const [loading, setLoading] = useState(false)
+
+  async function handleFile(e) {
+    const file = e.target.files?.[0]
+    if (!file) return
+    setLoading(true)
+    setStatus(null)
+    try {
+      const result = await api.setupRestoreFromBackup(file)
+      const r = result.restored ?? {}
+      setStatus({
+        ok: true,
+        msg: `Restored successfully — ${r.devices ?? 0} devices, ${r.settings ?? 0} settings, `
+           + `${r.device_events ?? 0} events, ${r.vuln_reports ?? 0} vuln reports.`,
+      })
+    } catch (err) {
+      setStatus({ ok: false, msg: 'Restore failed — invalid or incompatible backup file.' })
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  return (
+    <div className="space-y-4">
+      <p className="text-sm" style={{ color: 'var(--color-text-muted)' }}>
+        Select your <code className="text-xs px-1 py-0.5 rounded" style={{ background: 'var(--color-surface-offset)' }}>inspectre_backup.json</code> file.
+        All devices, settings, timelines, vuln history, and your login credentials will be restored.
+      </p>
+
+      {!status?.ok && (
+        <label
+          className={`flex flex-col items-center justify-center gap-3 border-2 border-dashed rounded-xl p-8 cursor-pointer transition-colors ${loading ? 'opacity-50 pointer-events-none' : ''}`}
+          style={{ borderColor: 'var(--color-border)', background: 'var(--color-surface-offset)' }}
+        >
+          <Upload size={24} style={{ color: 'var(--color-text-muted)' }} />
+          <span className="text-sm font-medium text-center" style={{ color: 'var(--color-text-muted)' }}>
+            {loading ? 'Restoring…' : 'Click to select backup file'}
+          </span>
+          <input type="file" accept=".json" className="hidden" onChange={handleFile} disabled={loading} />
+        </label>
+      )}
+
+      {status && (
+        <div className="px-4 py-3 rounded-xl space-y-1"
+          style={{ background: status.ok ? 'rgba(16,185,129,0.1)' : 'rgba(239,68,68,0.1)',
+                   border: `1px solid ${status.ok ? 'rgba(16,185,129,0.3)' : 'rgba(239,68,68,0.3)'}` }}>
+          <p className="text-sm font-semibold" style={{ color: status.ok ? '#10b981' : '#ef4444' }}>
+            {status.ok ? 'Restore complete' : 'Restore failed'}
+          </p>
+          <p className="text-xs" style={{ color: 'var(--color-text-muted)' }}>{status.msg}</p>
+          {status.ok && (
+            <p className="text-xs mt-1" style={{ color: 'var(--color-text-faint)' }}>
+              Please log in using your previous credentials.
+            </p>
+          )}
+        </div>
+      )}
+
+      <div className="flex gap-3">
+        {!status?.ok && (
+          <button
+            onClick={onBack}
+            className="py-2.5 px-4 rounded-xl text-sm font-medium border transition-colors"
+            style={{ borderColor: 'var(--color-border)', color: 'var(--color-text-muted)', background: 'transparent' }}
+            disabled={loading}
+          >
+            Back
+          </button>
+        )}
+        {status?.ok && (
+          <button
+            onClick={onComplete}
+            className="w-full py-2.5 rounded-xl font-semibold text-sm flex items-center justify-center gap-2"
+            style={{ background: 'var(--color-brand)', color: 'white' }}
+          >
+            Go to Login <ArrowRight size={14} />
+          </button>
+        )}
       </div>
     </div>
   )
 }
 
-// ── Step 1: Create user ────────────────────────────────────────────────────
+// ── Fresh path steps ───────────────────────────────────────────────────────
+
 function StepUser({ onNext }) {
   const [username, setUsername] = useState('')
   const [password, setPassword] = useState('')
@@ -102,65 +226,6 @@ function StepUser({ onNext }) {
   )
 }
 
-// ── Step 2: Restore backup ─────────────────────────────────────────────────
-function StepRestore({ onNext, onSkip }) {
-  const [status, setStatus] = useState(null)
-  const [loading, setLoading] = useState(false)
-
-  async function handleFile(e) {
-    const file = e.target.files?.[0]
-    if (!file) return
-    setLoading(true)
-    setStatus(null)
-    try {
-      const result = await api.importRestore(file)
-      setStatus({ ok: true, msg: `Restored: ${result.settings} settings, ${result.fingerprints_merged} fingerprints` })
-    } catch (err) {
-      setStatus({ ok: false, msg: 'Restore failed — invalid backup file.' })
-    } finally {
-      setLoading(false)
-    }
-  }
-
-  return (
-    <div className="space-y-4">
-      <p className="text-sm" style={{ color: 'var(--color-text-muted)' }}>
-        If you have a backup from a previous InSpectre installation, you can restore it now.
-        Device data and fingerprints will be merged; settings will be restored.
-      </p>
-
-      <label className={`flex flex-col items-center justify-center gap-3 border-2 border-dashed rounded-xl p-8 cursor-pointer transition-colors ${loading ? 'opacity-50 pointer-events-none' : ''}`}
-        style={{ borderColor: 'var(--color-border)', background: 'var(--color-surface-offset)' }}>
-        <Upload size={24} style={{ color: 'var(--color-text-muted)' }} />
-        <span className="text-sm font-medium" style={{ color: 'var(--color-text-muted)' }}>
-          {loading ? 'Restoring…' : 'Click to select backup file (inspectre_backup.json)'}
-        </span>
-        <input type="file" accept=".json" className="hidden" onChange={handleFile} />
-      </label>
-
-      {status && (
-        <div className="text-xs px-3 py-2 rounded-lg"
-          style={{ background: status.ok ? 'rgba(16,185,129,0.1)' : 'rgba(239,68,68,0.1)',
-                   color: status.ok ? '#10b981' : '#ef4444' }}>
-          {status.msg}
-        </div>
-      )}
-
-      <div className="flex gap-3">
-        <button onClick={onSkip} className="flex-1 py-2.5 rounded-xl text-sm font-medium border transition-colors"
-          style={{ borderColor: 'var(--color-border)', color: 'var(--color-text-muted)', background: 'transparent' }}>
-          Skip
-        </button>
-        <button onClick={onNext} className="flex-1 py-2.5 rounded-xl text-sm font-semibold flex items-center justify-center gap-2"
-          style={{ background: 'var(--color-brand)', color: 'white' }}>
-          Continue <ArrowRight size={14} />
-        </button>
-      </div>
-    </div>
-  )
-}
-
-// ── Step 3: Network settings ───────────────────────────────────────────────
 function StepNetwork({ onNext }) {
   const [ipRange,   setIpRange]   = useState('')
   const [dns,       setDns]       = useState('')
@@ -242,7 +307,6 @@ function StepNetwork({ onNext }) {
   )
 }
 
-// ── Step 4: Vulnerability scans ────────────────────────────────────────────
 function StepVuln({ onNext }) {
   const [enabled,  setEnabled]  = useState(false)
   const [schedule, setSchedule] = useState('24h')
@@ -310,7 +374,6 @@ function StepVuln({ onNext }) {
   )
 }
 
-// ── Step 5: Notifications ──────────────────────────────────────────────────
 function StepNotify({ onNext }) {
   const [toasts,    setToasts]    = useState(true)
   const [ntfyTopic, setNtfyTopic] = useState('')
@@ -366,16 +429,7 @@ function StepNotify({ onNext }) {
   )
 }
 
-// ── Step 6: Done ───────────────────────────────────────────────────────────
 function StepDone({ onFinish }) {
-  const [loading, setLoading] = useState(false)
-
-  async function handleFinish() {
-    setLoading(true)
-    // Complete is called by the wizard coordinator — just fire onFinish
-    onFinish()
-  }
-
   return (
     <div className="space-y-6 text-center">
       <div className="flex justify-center">
@@ -388,10 +442,10 @@ function StepDone({ onFinish }) {
           You can adjust any of these settings later from the Settings panel.
         </p>
       </div>
-      <button onClick={handleFinish} disabled={loading}
+      <button onClick={onFinish}
         className="w-full py-2.5 rounded-xl font-semibold text-sm"
-        style={{ background: 'var(--color-brand)', color: 'white', opacity: loading ? 0.7 : 1 }}>
-        {loading ? 'Finishing…' : 'Go to Dashboard'}
+        style={{ background: 'var(--color-brand)', color: 'white' }}>
+        Go to Dashboard
       </button>
     </div>
   )
@@ -399,6 +453,8 @@ function StepDone({ onFinish }) {
 
 // ── Main wizard ────────────────────────────────────────────────────────────
 export function SetupWizard({ onComplete }) {
+  // mode: null = choice screen, 'restore' = restore path, 'fresh' = fresh setup path
+  const [mode,      setMode]      = useState(null)
   const [step,      setStep]      = useState(0)
   const [collected, setCollected] = useState({})
 
@@ -421,7 +477,11 @@ export function SetupWizard({ onComplete }) {
     onComplete()
   }
 
-  const currentStep = STEPS[step]
+  // Determine header content
+  const isChoice = mode === null
+  const isRestore = mode === 'restore'
+  const isFresh = mode === 'fresh'
+  const currentStep = isFresh ? FRESH_STEPS[step] : null
 
   return (
     <div className="min-h-screen flex flex-col items-center justify-center px-4"
@@ -433,30 +493,61 @@ export function SetupWizard({ onComplete }) {
         <div className="flex flex-col items-center gap-2 mb-6">
           <Logo size={36} />
           <h1 className="text-xl font-bold" style={{ color: 'var(--color-text)' }}>Welcome to InSpectre</h1>
-          <p className="text-xs" style={{ color: 'var(--color-text-faint)' }}>Initial setup — step {step + 1} of {STEPS.length}</p>
+          {isChoice && (
+            <p className="text-xs" style={{ color: 'var(--color-text-faint)' }}>How would you like to get started?</p>
+          )}
+          {isRestore && (
+            <p className="text-xs" style={{ color: 'var(--color-text-faint)' }}>Restoring from backup</p>
+          )}
+          {isFresh && (
+            <p className="text-xs" style={{ color: 'var(--color-text-faint)' }}>Initial setup — step {step + 1} of {FRESH_STEPS.length}</p>
+          )}
         </div>
 
-        {/* Progress dots */}
-        <div className="flex items-center justify-center gap-2 mb-6">
-          {STEPS.map((s, i) => (
-            <StepDot key={s.id} step={i} current={step} completed={step} />
-          ))}
-        </div>
+        {/* Progress dots — only for fresh path */}
+        {isFresh && (
+          <div className="flex items-center justify-center gap-2 mb-6">
+            {FRESH_STEPS.map((s, i) => (
+              <StepDot key={s.id} step={i} current={step} completed={step} />
+            ))}
+          </div>
+        )}
 
         <div className="card p-6">
+          {/* Card header */}
           <div className="flex items-center gap-2 mb-5">
-            <currentStep.Icon size={18} style={{ color: 'var(--color-brand)' }} />
+            {isChoice  && <Database  size={18} style={{ color: 'var(--color-brand)' }} />}
+            {isRestore && <Upload    size={18} style={{ color: 'var(--color-brand)' }} />}
+            {isFresh   && currentStep && <currentStep.Icon size={18} style={{ color: 'var(--color-brand)' }} />}
             <h2 className="text-base font-semibold" style={{ color: 'var(--color-text)' }}>
-              {currentStep.label}
+              {isChoice  ? 'Get started'           : ''}
+              {isRestore ? 'Restore from backup'   : ''}
+              {isFresh   ? currentStep?.label      : ''}
             </h2>
           </div>
 
-          {step === 0 && <StepUser      onNext={handleNext} />}
-          {step === 1 && <StepRestore   onNext={handleNext} onSkip={() => handleNext()} />}
-          {step === 2 && <StepNetwork   onNext={handleNext} />}
-          {step === 3 && <StepVuln      onNext={handleNext} />}
-          {step === 4 && <StepNotify    onNext={handleNext} />}
-          {step === 5 && <StepDone      onFinish={handleFinish} />}
+          {/* Choice screen */}
+          {isChoice && (
+            <ChoiceScreen
+              onFresh={() => setMode('fresh')}
+              onRestore={() => setMode('restore')}
+            />
+          )}
+
+          {/* Restore path */}
+          {isRestore && (
+            <RestorePath
+              onComplete={onComplete}
+              onBack={() => setMode(null)}
+            />
+          )}
+
+          {/* Fresh setup steps */}
+          {isFresh && step === 0 && <StepUser    onNext={handleNext} />}
+          {isFresh && step === 1 && <StepNetwork onNext={handleNext} />}
+          {isFresh && step === 2 && <StepVuln    onNext={handleNext} />}
+          {isFresh && step === 3 && <StepNotify  onNext={handleNext} />}
+          {isFresh && step === 4 && <StepDone    onFinish={handleFinish} />}
         </div>
       </div>
     </div>
