@@ -47,7 +47,6 @@ services:
       #IP_RANGE: "192.168.0.0/24"
       #INTERFACE: "eno1"
       SCAN_INTERVAL: "60"
-      NMAP_ARGS: "-sT -O --osscan-limit -T4"
       PROBE_API_PORT: "8666"
       PYTHONUNBUFFERED: "1"
       # Prevent any host NMAP_OPTS from leaking in and creating a duplicate -p flag

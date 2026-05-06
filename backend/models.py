@@ -47,6 +47,9 @@ class Device(Base):
     baseline_ports          = Column(JSON, nullable=True)
     baseline_scan_count     = Column(Integer, server_default='0', nullable=False)
 
+    # Scan type determined at discovery time: 'syn' (default) or 'tcp_connect' (probe host)
+    scan_type               = Column(String, nullable=False, server_default='syn')
+
     ip_history   = relationship("IPHistory",    back_populates="device",
                                 order_by="IPHistory.first_seen.desc()")
     events       = relationship("DeviceEvent",  back_populates="device",

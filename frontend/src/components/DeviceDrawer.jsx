@@ -616,8 +616,8 @@ export function DeviceDrawer({ device, onClose, onRename, onResolveName, onRefre
 
               {/* Timeline summary */}
               <Collapsible title="Timeline" icon={Clock} defaultOpen={true}>
-                <Row label="First seen" value={fmt(localDevice.first_seen)} />
-                <Row label="Last seen"  value={fmt(localDevice.last_seen)} />
+                <Row label="First seen"    value={fmt(localDevice.first_seen)} />
+                <Row label="Last changed" value={fmt(localDevice.last_seen)} />
                 {scan?.scanned_at && <Row label="Scanned at" value={fmt(scan.scanned_at)} />}
               </Collapsible>
 

@@ -8,12 +8,15 @@ import { api } from '../api'
 // ── Setting definitions ────────────────────────────────────────────────────────
 const SETTING_META = {
   // Scanner tab
-  scan_interval:           { label: 'Scan Interval',       unit: 'seconds',       type: 'number', min: 5,  max: 3600, tab: 'scanner' },
-  offline_miss_threshold:  { label: 'Offline Threshold',   unit: 'missed sweeps', type: 'number', min: 1,  max: 20,   tab: 'scanner' },
-  os_confidence_threshold: { label: 'OS Confidence Min',   unit: '%',             type: 'number', min: 50, max: 100,  tab: 'scanner' },
-  sniffer_workers:         { label: 'Sniffer Workers',     unit: 'threads',       type: 'number', min: 1,  max: 16,   tab: 'scanner' },
+  scan_interval:           { label: 'Scan Interval',       unit: 'seconds',       type: 'number', min: 5,  max: 3600, tab: 'scanner',
+    description: 'How often the probe sweeps the network looking for devices.' },
+  offline_miss_threshold:  { label: 'Offline Threshold',   unit: 'missed sweeps', type: 'number', min: 1,  max: 20,   tab: 'scanner',
+    description: 'How many consecutive missed ARP sweeps before a device is marked offline.' },
+  sniffer_workers:         { label: 'Sniffer Workers',     unit: 'threads',       type: 'number', min: 1,  max: 16,   tab: 'scanner',
+    description: 'Number of parallel packet capture threads. Requires probe restart to take effect.' },
+  arp_scan_retry:          { label: 'ARP Sweep Retries',   unit: 'extra rounds',  type: 'number', min: 0,  max: 3,    tab: 'scanner',
+    description: 'Extra ARP broadcast rounds per sweep (0 = single pass, 1 = two rounds). Each retry wakes sleeping mobile devices and adds broadcast traffic. The passive sniffer catches most devices that miss sweeps.' },
   ip_range:                { label: 'IP Range',            unit: '',              type: 'text',              tab: 'scanner' },
-  nmap_args:               { label: 'Nmap Arguments',      unit: '',              type: 'text',              tab: 'scanner' },
   dns_server:              { label: 'LAN DNS Server',      unit: 'IP',            type: 'text',              tab: 'scanner',
     description: 'DNS server used for hostname resolution. Leave blank to auto-detect from host.' },
   probe_interface:         { label: 'Probe Interface',     unit: '',              type: 'text',              tab: 'scanner',
@@ -270,8 +273,8 @@ export function SettingsPanel({ onClose, onSettingChange }) {
   const bnEnabled = val('browser_notifications_enabled') === 'true'
 
   // ── Scanner tab grouping ────────────────────────────────────────────────────
-  const networkScanKeys   = ['scan_interval','offline_miss_threshold','os_confidence_threshold','sniffer_workers']
-  const networkConfigKeys = ['ip_range','nmap_args','dns_server','probe_interface']
+  const networkScanKeys   = ['scan_interval','offline_miss_threshold','sniffer_workers','arp_scan_retry']
+  const networkConfigKeys = ['ip_range','dns_server','probe_interface']
 
   // ── Notifications tab grouping ──────────────────────────────────────────────
   const inAppKeys   = ['notifications_enabled','browser_notifications_enabled']
@@ -711,6 +714,7 @@ export function SettingsPanel({ onClose, onSettingChange }) {
 
 // ── Sub-components ─────────────────────────────────────────────────────────────
 
+// ---------------------------------------------------------------------------
 function SectionHeader({ label, Icon }) {
   return (
     <div className="flex items-center gap-2 pt-1">

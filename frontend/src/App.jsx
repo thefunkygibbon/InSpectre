@@ -30,8 +30,8 @@ import { StatusButton }        from './components/StatusButton'
 const APP_VERSION = '1.1.0'
 
 const SORT_OPTIONS = [
-  { value: 'last_seen_desc', label: 'Last seen (newest)' },
-  { value: 'last_seen_asc',  label: 'Last seen (oldest)' },
+  { value: 'last_seen_desc', label: 'Last changed (newest)' },
+  { value: 'last_seen_asc',  label: 'Last changed (oldest)' },
   { value: 'ip_asc',         label: 'IP address (asc)'   },
   { value: 'ip_desc',        label: 'IP address (desc)'  },
   { value: 'name_asc',       label: 'Name (A–Z)'    },
@@ -693,7 +693,7 @@ function MainApp({ onLogout }) {
                           <span>Name / IP</span>
                           <span className="hidden sm:block">MAC</span>
                           <span className="hidden sm:block">Vendor</span>
-                          <span className="hidden sm:block">Last Seen</span>
+                          <span className="hidden sm:block">Last Changed</span>
                           <span>Status</span>
                           <span />
                         </div>

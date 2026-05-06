@@ -198,6 +198,12 @@ def _migrate(db: Session):
         "CREATE INDEX IF NOT EXISTS ix_users_username ON users(username)",
         "ALTER TABLE users ADD COLUMN IF NOT EXISTS must_change_password BOOLEAN NOT NULL DEFAULT FALSE",
         "ALTER TABLE devices ADD COLUMN IF NOT EXISTS status_changed_at TIMESTAMPTZ",
+        # Migrate old aggressive nmap defaults to safer values (including the interim --max-rate 300 default)
+        "UPDATE settings SET value = '-sS -T3 --max-rate 100' WHERE key = 'nmap_args' AND value IN ('-sT -O --osscan-limit -T4', '-sT -O --osscan-limit -T4 -p-', '-O --osscan-limit -sV --version-intensity 5 -T4 -p-', '-sS -T3 --max-rate 300')",
+        # Fix: --max-rate 100 with 65535 ports takes ~655s, exceeding the 900s subprocess timeout — raise to 200 (328s)
+        "UPDATE settings SET value = '-sS -T4' WHERE key = 'nmap_args' AND value IN ('-sS -T3 --max-rate 100', '-sS -T4 --max-rate 200', '-sS -T4 --max-rate 200 --host-timeout 360s')",
+        # scan_type: which nmap mode to use for this device (auto-detected at discovery)
+        "ALTER TABLE devices ADD COLUMN IF NOT EXISTS scan_type VARCHAR NOT NULL DEFAULT 'syn'",
     ]
     for sql in migrations:
         try:
@@ -213,10 +219,9 @@ def _migrate(db: Session):
 DEFAULT_SETTINGS = {
     "scan_interval":           ("60",    "How often to sweep the network, in seconds."),
     "offline_miss_threshold":  ("3",     "Number of missed sweeps before a device is marked offline."),
-    "os_confidence_threshold": ("85",    "Minimum nmap OS-match confidence (%) to record."),
     "sniffer_workers":         ("4",     "Number of parallel scanner threads."),
     "ip_range":                ("192.168.0.0/24", "CIDR range to scan."),
-    "nmap_args":               ("-sT -O --osscan-limit -T4", "nmap flags for port discovery. Service version detection (-sV) runs automatically on found ports as a separate pass."),
+    "arp_scan_retry":          ("1", "ARP sweep retry rounds (0 = single pass, 1 = two rounds). Higher values increase broadcast traffic but may catch more sleeping devices. The passive sniffer catches most devices that miss sweeps."),
     "notifications_enabled":              ("true",  "Show popup toasts when new devices appear or go offline."),
     "browser_notifications_enabled":      ("false", "Show OS-level browser notifications for device events."),
     "pushbullet_api_key":                 ("",      "Pushbullet API access token for push notifications."),
@@ -2500,14 +2505,10 @@ async def apply_settings(db: Session = Depends(get_db)):
         payload["scan_interval"] = int(settings["scan_interval"])
     if "offline_miss_threshold" in settings:
         payload["offline_miss_threshold"] = int(settings["offline_miss_threshold"])
-    if "os_confidence_threshold" in settings:
-        payload["os_confidence_threshold"] = int(settings["os_confidence_threshold"])
     if "sniffer_workers" in settings:
         payload["sniffer_workers"] = int(settings["sniffer_workers"])
     if "ip_range" in settings:
         payload["ip_range"] = settings["ip_range"]
-    if "nmap_args" in settings:
-        payload["nmap_args"] = settings["nmap_args"]
     if "nuclei_template_update_interval" in settings:
         payload["nuclei_template_update_interval"] = settings["nuclei_template_update_interval"]
 

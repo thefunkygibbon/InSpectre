@@ -2,7 +2,7 @@ import { useState, useEffect, useCallback, useRef } from 'react'
 import {
   Activity, Play, Square, RefreshCw, AlertTriangle,
   Globe, Wifi, ChevronDown, ChevronUp,
-  Gauge, Trash2, Clock, Download, Upload, Zap,
+  Gauge, Trash2, Clock, Download, Upload, Zap, Settings2,
 } from 'lucide-react'
 import { api, streamSSE } from '../api'
 
@@ -261,22 +261,38 @@ function SpeedTestPanel() {
             style={{ borderColor: 'var(--color-border)', color: 'var(--color-text-muted)' }}>
             {showServers ? 'Hide server picker' : 'Choose server'}
           </button>
-          {/* Schedule picker */}
-          <div className="ml-auto flex items-center gap-2">
-            <label className="text-[10px]" style={{ color: 'var(--color-text-faint)' }}>Auto-run:</label>
-            <select className="input text-xs py-1"
-              value={schedule}
-              onChange={async e => {
-                const v = e.target.value
-                setSchedule(v)
-                await api.updateSetting('speedtest_schedule', v).catch(() => {})
-              }}>
-              <option value="disabled">Off</option>
-              <option value="30m">Every 30m</option>
-              <option value="1h">Every hour</option>
-              <option value="6h">Every 6h</option>
-              <option value="24h">Daily</option>
-            </select>
+          {/* Schedule settings gear */}
+          <div className="ml-auto relative">
+            <details className="group">
+              <summary
+                className="list-none flex items-center justify-center w-8 h-8 rounded-lg border cursor-pointer transition-colors hover:border-[var(--color-brand)] hover:text-[var(--color-brand)]"
+                style={{ borderColor: 'var(--color-border)', color: 'var(--color-text-muted)' }}
+                title="Speed test schedule"
+              >
+                <Settings2 size={14} />
+              </summary>
+              <div
+                className="absolute right-0 top-10 z-20 min-w-[180px] rounded-xl p-3 space-y-2 shadow-xl"
+                style={{ background: 'var(--color-surface)', border: '1px solid var(--color-border)' }}
+              >
+                <p className="text-[10px] font-semibold uppercase tracking-wider" style={{ color: 'var(--color-text-faint)' }}>
+                  Auto-run schedule
+                </p>
+                <select className="input text-xs py-1 w-full"
+                  value={schedule}
+                  onChange={async e => {
+                    const v = e.target.value
+                    setSchedule(v)
+                    await api.updateSetting('speedtest_schedule', v).catch(() => {})
+                  }}>
+                  <option value="disabled">Off</option>
+                  <option value="30m">Every 30m</option>
+                  <option value="1h">Every hour</option>
+                  <option value="6h">Every 6h</option>
+                  <option value="24h">Daily</option>
+                </select>
+              </div>
+            </details>
           </div>
         </div>
 

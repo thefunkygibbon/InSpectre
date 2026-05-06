@@ -375,12 +375,29 @@ function StepVuln({ onNext }) {
 }
 
 function StepNotify({ onNext }) {
-  const [toasts,    setToasts]    = useState(true)
-  const [ntfyTopic, setNtfyTopic] = useState('')
-  const [ntfyUrl,   setNtfyUrl]   = useState('https://ntfy.sh')
+  const [toasts,      setToasts]      = useState(true)
+  const [provider,    setProvider]    = useState('None')
+  const [ntfyTopic,   setNtfyTopic]   = useState('')
+  const [ntfyUrl,     setNtfyUrl]     = useState('https://ntfy.sh')
+  const [gotifyUrl,   setGotifyUrl]   = useState('')
+  const [gotifyToken, setGotifyToken] = useState('')
+  const [pbKey,       setPbKey]       = useState('')
+  const [webhookUrl,  setWebhookUrl]  = useState('')
 
   function handleNext() {
-    onNext({ notifications_enabled: toasts, ntfy_topic: ntfyTopic.trim(), ntfy_url: ntfyUrl.trim() })
+    const data = { notifications_enabled: toasts }
+    if (provider === 'ntfy') {
+      data.ntfy_topic = ntfyTopic.trim()
+      data.ntfy_url   = ntfyUrl.trim()
+    } else if (provider === 'Gotify') {
+      data.gotify_url   = gotifyUrl.trim()
+      data.gotify_token = gotifyToken.trim()
+    } else if (provider === 'Pushbullet') {
+      data.pushbullet_api_key = pbKey.trim()
+    } else if (provider === 'Webhook') {
+      data.alert_webhook_url = webhookUrl.trim()
+    }
+    onNext(data)
   }
 
   return (
@@ -400,22 +417,73 @@ function StepNotify({ onNext }) {
       </label>
 
       <div className="space-y-3">
-        <p className="text-xs font-semibold uppercase tracking-wider" style={{ color: 'var(--color-text-muted)' }}>
-          ntfy push notifications (optional)
-        </p>
         <div>
-          <label className="block text-xs font-medium mb-1" style={{ color: 'var(--color-text-muted)' }}>
-            ntfy topic (leave blank to skip)
+          <label className="block text-xs font-semibold uppercase tracking-wider mb-1.5" style={{ color: 'var(--color-text-muted)' }}>
+            Push notification provider
           </label>
-          <input className="input w-full" placeholder="e.g. inspectre-alerts"
-            value={ntfyTopic} onChange={e => setNtfyTopic(e.target.value)} />
+          <select className="input w-full" value={provider} onChange={e => setProvider(e.target.value)}>
+            <option value="None">None</option>
+            <option value="ntfy">ntfy</option>
+            <option value="Gotify">Gotify</option>
+            <option value="Pushbullet">Pushbullet</option>
+            <option value="Webhook">Webhook</option>
+          </select>
         </div>
-        {ntfyTopic && (
+
+        {provider === 'ntfy' && (
+          <>
+            <div>
+              <label className="block text-xs font-medium mb-1" style={{ color: 'var(--color-text-muted)' }}>
+                ntfy topic
+              </label>
+              <input className="input w-full" placeholder="e.g. inspectre-alerts"
+                value={ntfyTopic} onChange={e => setNtfyTopic(e.target.value)} />
+            </div>
+            <div>
+              <label className="block text-xs font-medium mb-1" style={{ color: 'var(--color-text-muted)' }}>
+                ntfy server URL
+              </label>
+              <input className="input w-full" value={ntfyUrl} onChange={e => setNtfyUrl(e.target.value)} />
+            </div>
+          </>
+        )}
+
+        {provider === 'Gotify' && (
+          <>
+            <div>
+              <label className="block text-xs font-medium mb-1" style={{ color: 'var(--color-text-muted)' }}>
+                Gotify server URL
+              </label>
+              <input className="input w-full" placeholder="https://gotify.example.com"
+                value={gotifyUrl} onChange={e => setGotifyUrl(e.target.value)} />
+            </div>
+            <div>
+              <label className="block text-xs font-medium mb-1" style={{ color: 'var(--color-text-muted)' }}>
+                App token
+              </label>
+              <input className="input w-full font-mono" placeholder="A1b2C3d4…"
+                value={gotifyToken} onChange={e => setGotifyToken(e.target.value)} />
+            </div>
+          </>
+        )}
+
+        {provider === 'Pushbullet' && (
           <div>
             <label className="block text-xs font-medium mb-1" style={{ color: 'var(--color-text-muted)' }}>
-              ntfy server URL
+              Pushbullet API key
             </label>
-            <input className="input w-full" value={ntfyUrl} onChange={e => setNtfyUrl(e.target.value)} />
+            <input className="input w-full font-mono" placeholder="o.XXXXXXXXXXXXXXXXXXXXXXXX"
+              value={pbKey} onChange={e => setPbKey(e.target.value)} />
+          </div>
+        )}
+
+        {provider === 'Webhook' && (
+          <div>
+            <label className="block text-xs font-medium mb-1" style={{ color: 'var(--color-text-muted)' }}>
+              Webhook URL
+            </label>
+            <input type="url" className="input w-full" placeholder="https://example.com/webhook"
+              value={webhookUrl} onChange={e => setWebhookUrl(e.target.value)} />
           </div>
         )}
       </div>
@@ -472,6 +540,10 @@ export function SetupWizard({ onComplete }) {
         notifications_enabled: collected.notifications_enabled ?? true,
         ntfy_topic:            collected.ntfy_topic            ?? '',
         ntfy_url:              collected.ntfy_url              ?? 'https://ntfy.sh',
+        gotify_url:            collected.gotify_url            ?? '',
+        gotify_token:          collected.gotify_token          ?? '',
+        pushbullet_api_key:    collected.pushbullet_api_key    ?? '',
+        alert_webhook_url:     collected.alert_webhook_url     ?? '',
       })
     } catch (_) { /* ignore — dashboard still loads */ }
     onComplete()

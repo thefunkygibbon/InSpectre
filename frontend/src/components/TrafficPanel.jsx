@@ -205,9 +205,24 @@ export function TrafficPanel({ device }) {
       )}
 
       {!monitoring && !loading && (
-        <p className="text-xs text-center py-6" style={{ color: 'var(--color-text-faint)' }}>
-          Start monitoring to capture live traffic for this device.
-        </p>
+        <div className="space-y-4">
+          <div className="rounded-lg p-3 text-xs space-y-1.5"
+            style={{ background: 'rgba(234,179,8,0.08)', border: '1px solid rgba(234,179,8,0.25)', color: 'rgba(234,179,8,0.9)' }}>
+            <div className="flex items-center gap-1.5 font-semibold">
+              <AlertTriangle size={12} />
+              Uses ARP redirection (MiTM)
+            </div>
+            <p style={{ color: 'var(--color-text-muted)' }}>
+              Traffic monitoring works by redirecting packets through this host. Routers with
+              Dynamic ARP Inspection (Ubiquiti, MikroTik, managed switches) may block or flag
+              this as an attack. If the probe container stops unexpectedly, the target device
+              may lose internet access for up to 2 minutes until its ARP cache expires.
+            </p>
+          </div>
+          <p className="text-xs text-center py-2" style={{ color: 'var(--color-text-faint)' }}>
+            Start monitoring to capture live traffic for this device.
+          </p>
+        </div>
       )}
 
       {loading && (

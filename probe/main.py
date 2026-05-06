@@ -76,10 +76,9 @@ SCAN_INTERVAL           = int(os.environ.get("SCAN_INTERVAL",           60))
 INTERFACE               = os.environ.get("INTERFACE", "").strip() or _autodetected_interface or "eth0"
 # Auto-detected from interface CIDR; DB overrides this each scan cycle anyway
 IP_RANGE                = os.environ.get("IP_RANGE",  "").strip() or _autodetected_ip_range  or "192.168.0.0/24"
-NMAP_ARGS               = os.environ.get("NMAP_ARGS",               "-O --osscan-limit -sV --version-intensity 5 -T4 -p-")
-OS_CONFIDENCE_THRESHOLD = int(os.environ.get("OS_CONFIDENCE_THRESHOLD", 85))
 OFFLINE_MISS_THRESHOLD  = int(os.environ.get("OFFLINE_MISS_THRESHOLD",   3))
 SNIFFER_WORKERS         = int(os.environ.get("SNIFFER_WORKERS",          4))
+ARP_SCAN_RETRY          = int(os.environ.get("ARP_SCAN_RETRY",           1))
 PROBE_API_PORT          = int(os.environ.get("PROBE_API_PORT",         8001))
 LAN_DNS_SERVER_ENV      = os.environ.get("LAN_DNS_SERVER", "").strip()
 MDNS_INTERVAL_MINUTES   = int(os.environ.get("MDNS_INTERVAL_MINUTES", 120))  # default: 2 hours
@@ -108,9 +107,10 @@ def _load_settings_from_db() -> None:
     so that UI changes take effect without a container restart.
     Silently skips any key that is missing from the DB.
     """
-    global SCAN_INTERVAL, IP_RANGE, NMAP_ARGS, OS_CONFIDENCE_THRESHOLD
+    global SCAN_INTERVAL, IP_RANGE
     global OFFLINE_MISS_THRESHOLD, SNIFFER_WORKERS, NUCLEI_TEMPLATE_UPDATE_INTERVAL
     global NIGHTLY_SCAN_START, NIGHTLY_SCAN_END, OFFLINE_RESCAN_HOURS, BASELINE_SCAN_COUNT_THRESHOLD
+    global ARP_SCAN_RETRY
     try:
         session = Session()
         try:
@@ -120,8 +120,6 @@ def _load_settings_from_db() -> None:
         db = {r[0]: r[1] for r in rows}
         if "scan_interval"           in db: SCAN_INTERVAL           = int(db["scan_interval"])
         if "ip_range"                in db: IP_RANGE                = db["ip_range"].strip()
-        if "nmap_args"               in db: NMAP_ARGS               = db["nmap_args"].strip()
-        if "os_confidence_threshold" in db: OS_CONFIDENCE_THRESHOLD = int(db["os_confidence_threshold"])
         if "offline_miss_threshold"  in db: OFFLINE_MISS_THRESHOLD  = int(db["offline_miss_threshold"])
         if "sniffer_workers"         in db: SNIFFER_WORKERS         = int(db["sniffer_workers"])
         if "nuclei_template_update_interval" in db:
@@ -130,6 +128,24 @@ def _load_settings_from_db() -> None:
         if "nightly_scan_end"              in db: NIGHTLY_SCAN_END              = int(db["nightly_scan_end"])
         if "offline_rescan_hours"          in db: OFFLINE_RESCAN_HOURS          = int(db["offline_rescan_hours"])
         if "baseline_scan_count_threshold" in db: BASELINE_SCAN_COUNT_THRESHOLD = int(db["baseline_scan_count_threshold"])
+        if "arp_scan_retry"                in db: ARP_SCAN_RETRY                = int(db["arp_scan_retry"])
+
+        # Write the auto-detected interface back so the UI can display it.
+        # Only writes when the DB value is empty (user hasn't set an override).
+        if db.get("probe_interface", "").strip() == "" and INTERFACE:
+            try:
+                wb = Session()
+                try:
+                    wb.execute(
+                        text("UPDATE settings SET value = :v WHERE key = 'probe_interface'"),
+                        {"v": INTERFACE},
+                    )
+                    wb.commit()
+                    print(f"[settings] Wrote detected interface '{INTERFACE}' to probe_interface setting", flush=True)
+                finally:
+                    wb.close()
+            except Exception as wb_exc:
+                print(f"[settings] Could not write probe_interface: {wb_exc}", flush=True)
     except Exception as exc:
         print(f"[settings] DB load failed (using current values): {exc}", flush=True)
 
@@ -150,7 +166,8 @@ def ping_once(ip: str, timeout_s: int = 2) -> bool:
 
 
 def apply_runtime_config(payload: dict) -> dict:
-    global SCAN_INTERVAL, IP_RANGE, NMAP_ARGS, OS_CONFIDENCE_THRESHOLD, OFFLINE_MISS_THRESHOLD, SNIFFER_WORKERS, NUCLEI_TEMPLATE_UPDATE_INTERVAL
+    global SCAN_INTERVAL, IP_RANGE, OFFLINE_MISS_THRESHOLD, SNIFFER_WORKERS, NUCLEI_TEMPLATE_UPDATE_INTERVAL
+    global ARP_SCAN_RETRY
 
     changes = {}
 
@@ -160,12 +177,6 @@ def apply_runtime_config(payload: dict) -> dict:
     if "ip_range" in payload:
         IP_RANGE = str(payload["ip_range"]).strip()
         changes["ip_range"] = IP_RANGE
-    if "nmap_args" in payload:
-        NMAP_ARGS = str(payload["nmap_args"]).strip()
-        changes["nmap_args"] = NMAP_ARGS
-    if "os_confidence_threshold" in payload:
-        OS_CONFIDENCE_THRESHOLD = int(payload["os_confidence_threshold"])
-        changes["os_confidence_threshold"] = OS_CONFIDENCE_THRESHOLD
     if "offline_miss_threshold" in payload:
         OFFLINE_MISS_THRESHOLD = int(payload["offline_miss_threshold"])
         changes["offline_miss_threshold"] = OFFLINE_MISS_THRESHOLD
@@ -178,6 +189,9 @@ def apply_runtime_config(payload: dict) -> dict:
     if "nuclei_template_update_interval" in payload:
         NUCLEI_TEMPLATE_UPDATE_INTERVAL = str(payload["nuclei_template_update_interval"]).strip()
         changes["nuclei_template_update_interval"] = NUCLEI_TEMPLATE_UPDATE_INTERVAL
+    if "arp_scan_retry" in payload:
+        ARP_SCAN_RETRY = int(payload["arp_scan_retry"])
+        changes["arp_scan_retry"] = ARP_SCAN_RETRY
 
     return {
         "applied": True,
@@ -185,8 +199,6 @@ def apply_runtime_config(payload: dict) -> dict:
         "effective": {
             "scan_interval": SCAN_INTERVAL,
             "ip_range": IP_RANGE,
-            "nmap_args": NMAP_ARGS,
-            "os_confidence_threshold": OS_CONFIDENCE_THRESHOLD,
             "offline_miss_threshold": OFFLINE_MISS_THRESHOLD,
             "sniffer_workers": SNIFFER_WORKERS,
             "nuclei_template_update_interval": NUCLEI_TEMPLATE_UPDATE_INTERVAL,
@@ -237,6 +249,7 @@ class Device(Base):
     deep_scan_last_run      = Column(DateTime(timezone=True), nullable=True)
     baseline_ports          = Column(JSONB,   nullable=True)
     baseline_scan_count     = Column(Integer, default=0, nullable=False)
+    scan_type               = Column(String,  nullable=False, server_default='syn')
 
 class IPHistory(Base):
     __tablename__ = "ip_history"
@@ -304,6 +317,7 @@ def init_db() -> None:
             conn.execute(text("ALTER TABLE devices ADD COLUMN IF NOT EXISTS baseline_ports JSONB"))
             conn.execute(text("ALTER TABLE devices ADD COLUMN IF NOT EXISTS baseline_scan_count INTEGER NOT NULL DEFAULT 0"))
             conn.execute(text("ALTER TABLE devices ADD COLUMN IF NOT EXISTS status_changed_at TIMESTAMPTZ"))
+            conn.execute(text("ALTER TABLE devices ADD COLUMN IF NOT EXISTS scan_type VARCHAR NOT NULL DEFAULT 'syn'"))
             conn.commit()
         except Exception as e:
             print(f"[DB] Column migration note: {e}", flush=True)
@@ -863,9 +877,7 @@ def _mdns_loop() -> None:
 # ---------------------------------------------------------------------------
 def arp_scan(interface: str, ip_range: str) -> list[dict]:
     pkt    = Ether(dst="ff:ff:ff:ff:ff:ff") / ARP(pdst=ip_range)
-    # Increased timeout from 3s → 5s and added retry=2 so slow/sleeping
-    # devices (IoT, phones, printers) have more time to respond.
-    result = srp(pkt, iface=interface, timeout=5, retry=2, verbose=0)[0]
+    result = srp(pkt, iface=interface, timeout=5, retry=ARP_SCAN_RETRY, verbose=0)[0]
     return [{"ip": rcv.psrc, "mac": rcv.hwsrc.lower()} for _, rcv in result]
 
 # ---------------------------------------------------------------------------
@@ -891,14 +903,16 @@ def _port_severity(device) -> str:
 
 def _tcp_connect_sweep(ip: str) -> list[int]:
     """
-    Fallback TCP connect sweep used when nmap is unavailable or broken.
-    Conservative: 50 workers × 1.0 s timeout to avoid flooding the target.
+    Primary port discovery: pure-Python TCP connect sweep of all 65535 ports.
+    300 workers × 0.5 s timeout ≈ 60-120 s per host on a typical LAN.
+    Works correctly for all hosts including the local Docker host (no raw-socket
+    quirks), so no special scan_type distinction is needed.
     """
     import concurrent.futures
     import socket as _socket
 
-    WORKERS = 50
-    TIMEOUT = 1.0
+    WORKERS = 300
+    TIMEOUT = 0.5
 
     def _check(port: int) -> int | None:
         try:
@@ -922,144 +936,6 @@ def _tcp_connect_sweep(ip: str) -> list[int]:
     except Exception as exc:
         print(f"[scan] TCP fallback error for {ip}: {exc}", flush=True)
     return sorted(open_ports)
-
-
-def _nmap_scan(ip: str) -> tuple[list[int], dict[int, dict], list[dict], str | None]:
-    """
-    Primary port discovery using nmap with the NMAP_ARGS setting.
-
-    Key fix: we clear NMAP_OPTS in the subprocess environment.  nmap reads
-    NMAP_OPTS before command-line args (documented behaviour), so if the host
-    or container has NMAP_OPTS=-p<something> set, our own -p flag becomes a
-    duplicate and nmap aborts with "Only 1 -p option allowed".
-
-    We also use the explicit "-p" "1-65535" form (two argv tokens) rather than
-    the combined "-p-" shorthand, which can be mis-parsed by some nmap builds.
-
-    Falls back to a conservative TCP connect sweep if nmap is unavailable or
-    keeps failing.
-    """
-    import shlex
-    import xml.etree.ElementTree as ET
-
-    if nmap_opts := os.environ.get("NMAP_OPTS", ""):
-        print(f"[scan] WARNING: NMAP_OPTS='{nmap_opts}' detected — clearing it "
-              f"to prevent duplicate -p flag for {ip}", flush=True)
-
-    # Subprocess env with NMAP_OPTS cleared so nmap won't prepend extra flags
-    nmap_env = {k: v for k, v in os.environ.items() if k != "NMAP_OPTS"}
-
-    try:
-        raw_extra = shlex.split(NMAP_ARGS)
-    except ValueError:
-        raw_extra = []
-
-    # Strip any -p / -p- / -p<range> args from NMAP_ARGS — we always supply
-    # our own explicit "-p" "1-65535" so there is exactly one port spec.
-    extra: list[str] = []
-    skip_next = False
-    for arg in raw_extra:
-        if skip_next:
-            skip_next = False
-            continue
-        if arg == "-p":
-            skip_next = True
-            continue
-        if arg.startswith("-p") and len(arg) > 2:
-            continue
-        extra.append(arg)
-
-    # Use "-p" "1-65535" (two argv tokens) rather than the combined "-p-"
-    # shorthand; both are documented equivalents but the explicit form is
-    # unambiguous for nmap's argument parser.
-    cmd = ["nmap", "-Pn"] + extra + ["-p", "1-65535", "--open", "-oX", "-", ip]
-    print(f"[scan] cmd: {' '.join(cmd)}", flush=True)
-
-    try:
-        result = subprocess.run(
-            cmd, capture_output=True, text=True, timeout=600, env=nmap_env,
-        )
-    except FileNotFoundError:
-        print(f"[scan] nmap not found — using TCP connect fallback for {ip}", flush=True)
-        return _tcp_connect_sweep(ip), {}, [], None
-    except subprocess.TimeoutExpired:
-        print(f"[scan] nmap timed out for {ip} (>600 s)", flush=True)
-        return [], {}, [], None
-    except Exception as exc:
-        print(f"[scan] nmap error for {ip}: {exc}", flush=True)
-        return [], {}, [], None
-
-    if not result.stdout.strip():
-        err_lines = [l for l in result.stderr.strip().splitlines() if l.strip()]
-        print(f"[scan] nmap returned no output for {ip} (rc={result.returncode}): "
-              f"{' | '.join(err_lines[-3:]) or '(no stderr)'}", flush=True)
-
-        # Retry without OS detection flags (requires raw sockets / root)
-        os_flags = {"-O", "--osscan-guess", "--osscan-limit"}
-        stripped = [a for a in extra if a not in os_flags]
-        if stripped != extra:
-            print(f"[scan] Retrying {ip} without OS detection flags", flush=True)
-            cmd2 = ["nmap", "-Pn"] + stripped + ["-p", "1-65535", "--open", "-oX", "-", ip]
-            print(f"[scan] cmd2: {' '.join(cmd2)}", flush=True)
-            try:
-                result = subprocess.run(
-                    cmd2, capture_output=True, text=True, timeout=600, env=nmap_env,
-                )
-            except Exception:
-                pass
-            if not result.stdout.strip():
-                err2 = [l for l in result.stderr.strip().splitlines() if l.strip()]
-                if err2:
-                    print(f"[scan] retry nmap error for {ip} (rc={result.returncode}): "
-                          f"{' | '.join(err2[-3:])}", flush=True)
-                print(f"[scan] nmap failed — falling back to TCP sweep for {ip}", flush=True)
-                return _tcp_connect_sweep(ip), {}, [], None
-        else:
-            print(f"[scan] nmap failed — falling back to TCP sweep for {ip}", flush=True)
-            return _tcp_connect_sweep(ip), {}, [], None
-
-    try:
-        root = ET.fromstring(result.stdout)
-    except ET.ParseError as exc:
-        print(f"[scan] nmap XML parse error for {ip}: {exc}", flush=True)
-        return [], {}, [], None
-
-    open_ports: list[int] = []
-    service_map: dict[int, dict] = {}
-    os_matches: list[dict] = []
-    nmap_hostname: str | None = None
-
-    for host in root.findall("host"):
-        if nmap_hostname is None:
-            for hn in host.findall("hostnames/hostname"):
-                name = hn.get("name", "").strip()
-                if name and hn.get("type") in ("PTR", "user"):
-                    nmap_hostname = _strip_fqdn(name)
-                    break
-
-        for port_el in host.findall("ports/port"):
-            state = port_el.find("state")
-            if state is None or state.get("state") != "open":
-                continue
-            portid = int(port_el.get("portid", 0))
-            open_ports.append(portid)
-            svc = port_el.find("service")
-            if svc is not None:
-                service_map[portid] = {
-                    "service":   svc.get("name", ""),
-                    "product":   svc.get("product", ""),
-                    "version":   svc.get("version", ""),
-                    "extrainfo": svc.get("extrainfo", ""),
-                    "cpe":       svc.get("cpe", ""),
-                }
-
-        for osmatch in host.findall("os/osmatch"):
-            os_matches.append({
-                "name":     osmatch.get("name", ""),
-                "accuracy": int(osmatch.get("accuracy", 0)),
-            })
-
-    return sorted(open_ports), service_map, os_matches, nmap_hostname
 
 
 # ---------------------------------------------------------------------------
@@ -1140,8 +1016,11 @@ def _run_deep_scan_thread(ip: str, mac: str) -> None:
     with _deep_scan_semaphore:
         try:
             t0 = time.monotonic()
-            print(f"[scan] nmap scan starting: {ip} ({mac})", flush=True)
-            fast_ports, service_map, os_matches, nmap_hostname = _nmap_scan(ip)
+            print(f"[scan] TCP sweep starting: {ip} ({mac})", flush=True)
+            fast_ports = _tcp_connect_sweep(ip)
+            service_map: dict[int, dict] = {}
+            os_matches: list[dict] = []
+            nmap_hostname: str | None = None
             elapsed = round(time.monotonic() - t0, 1)
             print(f"[scan] {len(fast_ports)} open TCP port(s) on {ip} in {elapsed}s", flush=True)
 
@@ -1856,88 +1735,6 @@ def _run_nerva_fingerprint(ip: str, mac: str, open_ports: list[int]) -> None:
     finally:
         session.close()
 
-    # Stage 3b: optional nmap -sV version enrichment
-    if open_ports:
-        threading.Thread(
-            target=_run_nmap_version_scan,
-            args=(ip, mac, open_ports),
-            daemon=True,
-            name=f"nmap-ver-{mac}",
-        ).start()
-
-
-# ---------------------------------------------------------------------------
-# nmap version scan (Stage 3b — runs after Nerva)
-# ---------------------------------------------------------------------------
-def _run_nmap_version_scan(ip: str, mac: str, open_ports: list[int]) -> None:
-    """
-    Run nmap -sV on confirmed-open ports to enrich service banners.
-    Runs as a separate pass after port discovery so it never interferes
-    with the accuracy of the full-range port scan.
-    """
-    if not open_ports:
-        return
-    nmap_env = {k: v for k, v in os.environ.items() if k != "NMAP_OPTS"}
-    port_str = ",".join(str(p) for p in open_ports[:200])
-    try:
-        result = subprocess.run(
-            ["nmap", "-Pn", "-sV", "--version-intensity", "5", "-T4",
-             "-p", port_str, "--open", "-oX", "-", ip],
-            capture_output=True, text=True, timeout=300, env=nmap_env,
-        )
-        if result.returncode != 0 or not result.stdout.strip():
-            return
-        import xml.etree.ElementTree as ET
-        root = ET.fromstring(result.stdout)
-        version_map: dict[int, dict] = {}
-        for host in root.findall("host"):
-            for port_el in host.findall("ports/port"):
-                portid = int(port_el.get("portid", 0))
-                svc = port_el.find("service")
-                if svc is not None:
-                    version_map[portid] = {
-                        "service":   svc.get("name", ""),
-                        "product":   svc.get("product", ""),
-                        "version":   svc.get("version", ""),
-                        "extrainfo": svc.get("extrainfo", ""),
-                        "cpe":       svc.get("cpe", ""),
-                    }
-        if not version_map:
-            return
-
-        session = Session()
-        try:
-            device = session.get(Device, mac)
-            if device and device.scan_results:
-                scan = dict(device.scan_results)
-                updated_ports = []
-                for p in (scan.get("open_ports") or []):
-                    port_num = p.get("port")
-                    if port_num in version_map:
-                        p = dict(p)
-                        p.update(version_map[port_num])
-                    updated_ports.append(p)
-                scan["open_ports"] = updated_ports
-                scan["pipeline_stage"] = "versions_done"
-                device.scan_results = scan
-                session.commit()
-                _write_event(mac, "version_scan_complete", {
-                    "versioned_ports": len(version_map)
-                })
-                print(f"[nmap-version] {ip} ({mac}): {len(version_map)} port(s) versioned", flush=True)
-        except Exception as e:
-            session.rollback()
-            print(f"[nmap-version] DB save error {mac}: {e}", flush=True)
-        finally:
-            session.close()
-
-    except FileNotFoundError:
-        print(f"[nmap-version] nmap not found — skipping version scan for {ip}", flush=True)
-    except subprocess.TimeoutExpired:
-        print(f"[nmap-version] Timeout for {ip}", flush=True)
-    except Exception as e:
-        print(f"[nmap-version] Error for {ip}: {e}", flush=True)
-
 
 # ---------------------------------------------------------------------------
 # Nuclei template updater
@@ -2039,8 +1836,6 @@ def probe_health():
         "config": {
             "scan_interval": SCAN_INTERVAL,
             "ip_range": IP_RANGE,
-            "nmap_args": NMAP_ARGS,
-            "os_confidence_threshold": OS_CONFIDENCE_THRESHOLD,
             "offline_miss_threshold": OFFLINE_MISS_THRESHOLD,
             "sniffer_workers": SNIFFER_WORKERS,
         },
@@ -2050,8 +1845,6 @@ def probe_health():
 class ConfigReloadRequest(BaseModel):
     scan_interval: int | None = None
     ip_range: str | None = None
-    nmap_args: str | None = None
-    os_confidence_threshold: int | None = None
     offline_miss_threshold: int | None = None
     sniffer_workers: int | None = None
     nuclei_template_update_interval: str | None = None
@@ -2706,7 +2499,7 @@ def main() -> None:
     threading.Thread(target=_startup_nerva_backfill, daemon=True, name="nerva-backfill").start()
     print(
         f"[*] Scanning {IP_RANGE} on {INTERFACE} every {SCAN_INTERVAL}s\n"
-        f"[*] Offline threshold: {OFFLINE_MISS_THRESHOLD} missed sweeps | OS confidence: {OS_CONFIDENCE_THRESHOLD}%",
+        f"[*] Offline threshold: {OFFLINE_MISS_THRESHOLD} missed sweeps",
         flush=True,
     )
 
