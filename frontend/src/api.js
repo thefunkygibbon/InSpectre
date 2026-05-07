@@ -248,6 +248,27 @@ export const api = {
   createSuppression:  (body) => request('POST',   '/suppressions', body),
   deleteSuppression:  (id)   => request('DELETE', `/suppressions/${id}`),
 
+  // Docker container monitoring
+  dockerStats:            ()              => request('GET',  '/docker/stats'),
+  dockerContainers:       ()              => request('GET',  '/docker/containers'),
+  dockerContainer:        (id)            => request('GET',  `/docker/containers/${id}`),
+  dockerStart:            (id)            => request('POST', `/docker/containers/${id}/start`),
+  dockerStop:             (id)            => request('POST', `/docker/containers/${id}/stop`),
+  dockerRestart:          (id)            => request('POST', `/docker/containers/${id}/restart`),
+  dockerLogs:             (id, tail, onLine, signal) => streamSSE(`/docker/containers/${id}/logs${tail ? `?tail=${tail}` : ''}`, onLine, signal),
+  dockerTrivyScan:        (id, onLine, signal)       => streamSSE(`/docker/containers/${id}/trivy-scan`, onLine, signal),
+  dockerAutoScanResult:   (name)      => request('GET',  `/docker/auto-scan/${encodeURIComponent(name)}`),
+  dockerVulnSummary:      ()          => request('GET',  '/docker/vuln-summary'),
+  dockerScanAll:          ()          => request('POST', '/docker/scan-all'),
+  getContainerTimeline:   (days)      => request('GET',  `/docker/timeline?days=${days}`),
+
+  // Container host management (multi-host: Docker + Proxmox)
+  listContainerHosts:     ()          => request('GET',    '/container-hosts'),
+  createContainerHost:    (body)      => request('POST',   '/container-hosts', body),
+  updateContainerHost:    (id, body)  => request('PUT',    `/container-hosts/${id}`, body),
+  deleteContainerHost:    (id)        => request('DELETE', `/container-hosts/${id}`),
+  testContainerHost:      (id)        => request('POST',   `/container-hosts/${id}/test`),
+
   // Traffic monitoring
   trafficStart:       (mac)        => request('POST',   `/traffic/start/${mac}`),
   trafficStop:        (mac)        => request('DELETE', `/traffic/stop/${mac}`),

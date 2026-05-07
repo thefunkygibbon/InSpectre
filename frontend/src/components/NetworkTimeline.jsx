@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback, useMemo } from 'react'
-import { Loader, Wifi, WifiOff, Clock, Search } from 'lucide-react'
+import { Loader, Wifi, WifiOff, Clock, Search, Box } from 'lucide-react'
 import { api } from '../api'
 
 const PERIODS = [
@@ -126,12 +126,156 @@ function DeviceRow({ device, windowStart, windowEnd, days, onDeviceClick }) {
   )
 }
 
+function ContainerTimelineRow({ container, windowStart, windowEnd }) {
+  const STATUS_COLORS = { running: '#22c55e', stopped: '#6b7280', unknown: '#374151', paused: '#f59e0b' }
+
+  const uptimePct = useMemo(() => {
+    const totalMs = new Date(windowEnd) - new Date(windowStart)
+    if (totalMs <= 0) return 0
+    const runMs = container.segments
+      .filter(s => s.status === 'running')
+      .reduce((sum, s) => sum + (new Date(s.to) - new Date(s.from)), 0)
+    return Math.round((runMs / totalMs) * 100)
+  }, [container.segments, windowStart, windowEnd])
+
+  return (
+    <div className="flex items-center gap-3 py-1.5">
+      <div className="w-[160px] sm:w-[200px] flex items-center gap-2 shrink-0 min-w-0">
+        <span className="w-1.5 h-1.5 rounded-full shrink-0"
+          style={{ background: container.is_running ? '#22c55e' : '#6b7280' }} />
+        <span className="text-xs truncate" style={{ color: 'var(--color-text)' }} title={container.name}>
+          {container.name}
+        </span>
+      </div>
+
+      <div className="flex-1 h-6 rounded overflow-hidden flex" style={{ background: 'var(--color-surface-offset)' }}>
+        {container.segments.map((seg, i) => {
+          const totalMs = new Date(windowEnd) - new Date(windowStart)
+          const pct = Math.max(0.1, ((new Date(seg.to) - new Date(seg.from)) / totalMs) * 100)
+          const color = STATUS_COLORS[seg.status] || STATUS_COLORS.unknown
+          return (
+            <div key={i}
+              title={`${container.name}: ${seg.status} from ${new Date(seg.from).toLocaleString()} to ${new Date(seg.to).toLocaleString()}`}
+              className="h-full transition-opacity hover:opacity-80 cursor-default"
+              style={{ width: `${pct}%`, background: color, opacity: seg.status === 'unknown' ? 0.3 : 0.85 }}
+            />
+          )
+        })}
+      </div>
+
+      <div className="w-[70px] sm:w-[80px] text-right shrink-0">
+        <span className="text-[10px] font-mono tabular-nums"
+          style={{ color: uptimePct >= 90 ? '#22c55e' : uptimePct >= 50 ? '#f59e0b' : '#6b7280' }}>
+          {uptimePct}% up
+        </span>
+      </div>
+    </div>
+  )
+}
+
+function ContainerTimeline({ days }) {
+  const [data,    setData]    = useState(null)
+  const [loading, setLoading] = useState(true)
+  const [error,   setError]   = useState(null)
+  const [search,  setSearch]  = useState('')
+
+  const load = useCallback(async (d) => {
+    setLoading(true)
+    setError(null)
+    try {
+      const result = await api.getContainerTimeline(d)
+      setData(result)
+    } catch (e) {
+      if (e.message?.includes('503') || e.message?.toLowerCase().includes('disabled')) {
+        setError('Docker monitoring is disabled. Enable it in Settings → Docker.')
+      } else {
+        setError(e.message)
+      }
+    } finally {
+      setLoading(false)
+    }
+  }, [])
+
+  useEffect(() => { load(days) }, [days, load])
+
+  const filtered = useMemo(() => {
+    if (!data?.containers) return []
+    const q = search.toLowerCase()
+    if (!q) return data.containers
+    return data.containers.filter(c => c.name.toLowerCase().includes(q))
+  }, [data, search])
+
+  return (
+    <div>
+      <div className="relative mb-4 max-w-xs">
+        <Search size={13} className="absolute left-3 top-1/2 -translate-y-1/2 pointer-events-none"
+          style={{ color: 'var(--color-text-muted)' }} />
+        <input className="input pl-8 text-xs w-full" placeholder="Filter containers…"
+          value={search} onChange={e => setSearch(e.target.value)} />
+      </div>
+
+      {/* Legend */}
+      <div className="flex items-center gap-4 mb-4 text-xs" style={{ color: 'var(--color-text-muted)' }}>
+        <span className="flex items-center gap-1.5">
+          <span className="w-3 h-3 rounded-sm inline-block" style={{ background: '#22c55e', opacity: 0.85 }} />
+          Running
+        </span>
+        <span className="flex items-center gap-1.5">
+          <span className="w-3 h-3 rounded-sm inline-block" style={{ background: '#6b7280', opacity: 0.85 }} />
+          Stopped
+        </span>
+        <span className="flex items-center gap-1.5">
+          <span className="w-3 h-3 rounded-sm inline-block" style={{ background: '#374151', opacity: 0.3 }} />
+          Unknown
+        </span>
+      </div>
+
+      {loading ? (
+        <div className="flex items-center justify-center py-20">
+          <Loader size={24} className="animate-spin" style={{ color: 'var(--color-text-faint)' }} />
+        </div>
+      ) : error ? (
+        <div className="card p-6 text-center">
+          <p className="text-sm" style={{ color: '#ef4444' }}>{error}</p>
+        </div>
+      ) : !filtered.length ? (
+        <div className="card p-10 flex flex-col items-center gap-3 text-center">
+          <Box size={28} style={{ color: 'var(--color-text-faint)' }} />
+          <p className="text-sm" style={{ color: 'var(--color-text-muted)' }}>
+            {search ? 'No containers match your search' : 'No container timeline data yet'}
+          </p>
+          <p className="text-xs" style={{ color: 'var(--color-text-faint)' }}>
+            Container start/stop events will be recorded here once the Docker event watcher is active.
+          </p>
+        </div>
+      ) : (
+        <div className="card overflow-hidden">
+          <div className="px-4 pt-3 pb-1">
+            <XAxisLabels windowStart={data.window_start} windowEnd={data.window_end} days={days} />
+          </div>
+          <div className="px-4 pb-4 divide-y" style={{ divideColor: 'var(--color-border)' }}>
+            {filtered.map(c => (
+              <ContainerTimelineRow
+                key={c.name}
+                container={c}
+                windowStart={data.window_start}
+                windowEnd={data.window_end}
+              />
+            ))}
+          </div>
+        </div>
+      )}
+    </div>
+  )
+}
+
 export function NetworkTimeline({ onDeviceClick }) {
   const [days,    setDays]    = useState(7)
   const [data,    setData]    = useState(null)
   const [loading, setLoading] = useState(true)
   const [error,   setError]   = useState(null)
   const [search,  setSearch]  = useState('')
+  const [view,    setView]    = useState('devices')
 
   const load = useCallback(async (d) => {
     setLoading(true)
@@ -184,33 +328,60 @@ export function NetworkTimeline({ onDeviceClick }) {
 
       {/* Controls row */}
       <div className="flex flex-col sm:flex-row gap-3 mb-6 items-start sm:items-center">
+        {/* View toggle: Devices / Containers */}
+        <div className="flex items-center gap-1 glass rounded-xl p-1">
+          <button onClick={() => setView('devices')}
+            className="px-3 py-1.5 rounded-lg text-xs font-medium transition-all flex items-center gap-1.5"
+            style={view === 'devices'
+              ? { background: 'var(--color-brand)', color: 'white' }
+              : { color: 'var(--color-text-muted)' }}>
+            <Wifi size={11} /> Devices
+          </button>
+          <button onClick={() => setView('containers')}
+            className="px-3 py-1.5 rounded-lg text-xs font-medium transition-all flex items-center gap-1.5"
+            style={view === 'containers'
+              ? { background: 'var(--color-brand)', color: 'white' }
+              : { color: 'var(--color-text-muted)' }}>
+            <Box size={11} /> Containers
+          </button>
+        </div>
+
+        {/* Period picker */}
         <div className="flex items-center gap-1 glass rounded-xl p-1">
           {PERIODS.map(p => (
             <button key={p.days}
               onClick={() => handlePeriodChange(p.days)}
               className="px-3 py-1.5 rounded-lg text-xs font-medium transition-all"
               style={days === p.days
-                ? { background: 'var(--color-brand)', color: 'white' }
+                ? { background: 'var(--color-surface-offset)', color: 'var(--color-text)' }
                 : { color: 'var(--color-text-muted)' }}>
               {p.label}
             </button>
           ))}
         </div>
 
-        <div className="relative flex-1 max-w-xs">
-          <Search size={13} className="absolute left-3 top-1/2 -translate-y-1/2 pointer-events-none"
-            style={{ color: 'var(--color-text-muted)' }} />
-          <input className="input pl-8 text-xs w-full" placeholder="Filter devices…"
-            value={search} onChange={e => setSearch(e.target.value)} />
-        </div>
+        {view === 'devices' && (
+          <div className="relative flex-1 max-w-xs">
+            <Search size={13} className="absolute left-3 top-1/2 -translate-y-1/2 pointer-events-none"
+              style={{ color: 'var(--color-text-muted)' }} />
+            <input className="input pl-8 text-xs w-full" placeholder="Filter devices…"
+              value={search} onChange={e => setSearch(e.target.value)} />
+          </div>
+        )}
 
-        {stats && (
+        {view === 'devices' && stats && (
           <div className="flex items-center gap-4 text-xs" style={{ color: 'var(--color-text-muted)' }}>
             <span>{stats.total} device{stats.total !== 1 ? 's' : ''}</span>
             <span>Avg uptime: <span className="font-semibold" style={{ color: 'var(--color-text)' }}>{stats.avgUptime}%</span></span>
           </div>
         )}
       </div>
+
+      {/* Container timeline view */}
+      {view === 'containers' && <ContainerTimeline days={days} />}
+
+      {/* Devices view below */}
+      {view === 'devices' && <>
 
       {/* Legend */}
       <div className="flex items-center gap-4 mb-4 text-xs" style={{ color: 'var(--color-text-muted)' }}>
@@ -268,6 +439,8 @@ export function NetworkTimeline({ onDeviceClick }) {
           </div>
         </div>
       )}
+
+      </>}
     </div>
   )
 }

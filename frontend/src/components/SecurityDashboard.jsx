@@ -2,7 +2,7 @@ import { useState, useEffect } from 'react'
 import {
   ShieldAlert, ShieldCheck, RefreshCw, ScanLine,
   AlertTriangle, Info, Clock, ChevronDown, ChevronRight,
-  Settings2, Save, Loader, X,
+  Settings2, Save, Loader, X, Box,
 } from 'lucide-react'
 import { api } from '../api'
 
@@ -237,15 +237,161 @@ function fmtRelative(iso) {
   return `${Math.floor(h / 24)}d ago`
 }
 
-export function SecurityDashboard({ onDeviceClick }) {
-  const [data,         setData]         = useState(null)
-  const [trend,        setTrend]        = useState(null)
-  const [loading,      setLoading]      = useState(true)
-  const [error,        setError]        = useState(null)
-  const [expandedVuln, setExpandedVuln] = useState({})
-  const [scanning,     setScanning]     = useState(false)
-  const [scanMsg,      setScanMsg]      = useState(null)
-  const [showSettings, setShowSettings] = useState(false)
+const SEV_ORDER_DASH = ['critical', 'high', 'medium', 'low']
+
+function ContainerVulnList({ rows, onContainerClick }) {
+  const [expanded, setExpanded] = useState({})
+  const [sevFilter, setSevFilter] = useState({})  // per-container severity filter
+
+  function toggleExpand(name) {
+    setExpanded(prev => ({ ...prev, [name]: !prev[name] }))
+  }
+
+  return (
+    <div className="card divide-y" style={{ '--tw-divide-opacity': 1 }}>
+      {rows.map((c, i) => {
+        const cfg    = SEV_CFG[c.severity] || SEV_CFG.info
+        const counts = c.counts || {}
+        const vulns  = c.vulns  || []
+        const isOpen = !!expanded[c.name]
+        const activeSev = sevFilter[c.name]
+        const visVulns = activeSev ? vulns.filter(v => v.severity === activeSev) : vulns
+
+        return (
+          <div key={i}>
+            {/* Row header */}
+            <div className="px-3 py-2.5 flex items-center gap-2">
+              {/* Expand toggle (only if has vulns) */}
+              {vulns.length > 0 ? (
+                <button onClick={() => toggleExpand(c.name)} className="p-0.5 hover:opacity-70 transition-opacity">
+                  {isOpen
+                    ? <ChevronDown  size={12} style={{ color: 'var(--color-text-faint)' }} />
+                    : <ChevronRight size={12} style={{ color: 'var(--color-text-faint)' }} />}
+                </button>
+              ) : (
+                <span className="w-5" />
+              )}
+
+              <Box size={13} style={{ color: 'var(--color-text-faint)', flexShrink: 0 }} />
+
+              <div className="flex-1 min-w-0">
+                <button
+                  onClick={() => onContainerClick && onContainerClick(c.name)}
+                  className="text-xs font-medium hover:underline truncate block text-left"
+                  style={{ color: 'var(--color-brand)' }}
+                  title="Open container vuln tab">
+                  {c.name}
+                </button>
+                <p className="text-[10px] font-mono truncate" style={{ color: 'var(--color-text-faint)' }}>
+                  {c.image}
+                </p>
+              </div>
+
+              {c.scanning ? (
+                <span className="text-[10px] flex items-center gap-1 shrink-0" style={{ color: 'var(--color-text-faint)' }}>
+                  <span className="inline-block w-1.5 h-1.5 rounded-full bg-green-500 animate-pulse" />
+                  Scanning…
+                </span>
+              ) : c.severity ? (
+                <div className="flex items-center gap-1 flex-wrap justify-end shrink-0">
+                  {SEV_ORDER_DASH.filter(s => counts[s] > 0).map(s => {
+                    const sc = SEV_CFG[s]
+                    const active = activeSev === s
+                    return (
+                      <button key={s}
+                        onClick={() => {
+                          setSevFilter(prev => ({ ...prev, [c.name]: active ? null : s }))
+                          if (!isOpen) toggleExpand(c.name)
+                        }}
+                        className="text-[9px] px-1.5 py-0.5 rounded-full font-bold transition-opacity hover:opacity-80"
+                        style={{
+                          background: sc.bg, color: sc.color,
+                          border: `1px solid ${active ? sc.color : sc.border}`,
+                          outline: active ? `2px solid ${sc.color}40` : 'none',
+                        }}>
+                        {counts[s]} {s.slice(0,4).toUpperCase()}
+                      </button>
+                    )
+                  })}
+                  {c.severity === 'clean' && (
+                    <span className="text-[10px] font-medium" style={{ color: '#22c55e' }}>Clean</span>
+                  )}
+                  {!c.scanned_at && (
+                    <span className="text-[10px] italic" style={{ color: 'var(--color-text-faint)' }}>not scanned</span>
+                  )}
+                </div>
+              ) : (
+                <span className="text-[10px] italic shrink-0" style={{ color: 'var(--color-text-faint)' }}>not scanned</span>
+              )}
+            </div>
+
+            {/* Expanded CVE list */}
+            {isOpen && vulns.length > 0 && (
+              <div className="px-3 pb-3 pt-1 border-t" style={{ borderColor: 'var(--color-border)', background: 'rgba(0,0,0,0.15)' }}>
+                {activeSev && (
+                  <button onClick={() => setSevFilter(prev => ({ ...prev, [c.name]: null }))}
+                    className="text-[10px] mb-2 flex items-center gap-1 hover:opacity-70 transition-opacity"
+                    style={{ color: 'var(--color-brand)' }}>
+                    <X size={10} /> Clear filter — showing {SEV_CFG[activeSev]?.label} only
+                  </button>
+                )}
+                <div className="space-y-1 max-h-64 overflow-y-auto pr-1">
+                  {visVulns.map((v, vi) => {
+                    const sc = SEV_CFG[v.severity] || SEV_CFG.info
+                    return (
+                      <div key={vi} className="flex items-start gap-2 py-1 border-b last:border-0"
+                        style={{ borderColor: 'var(--color-border)' }}>
+                        <span className="text-[9px] px-1.5 py-0.5 rounded font-bold shrink-0 mt-0.5"
+                          style={{ background: sc.bg, color: sc.color, border: `1px solid ${sc.border}` }}>
+                          {(v.severity || 'unk').slice(0,4).toUpperCase()}
+                        </span>
+                        <div className="min-w-0 flex-1">
+                          <p className="text-[11px] font-mono font-medium" style={{ color: 'var(--color-text)' }}>
+                            {v.id}
+                            {v.cvss != null && (
+                              <span className="ml-2 font-sans font-normal text-[10px]" style={{ color: sc.color }}>
+                                CVSS {v.cvss.toFixed(1)}
+                              </span>
+                            )}
+                          </p>
+                          <p className="text-[10px] truncate" style={{ color: 'var(--color-text-faint)' }}>
+                            {v.pkg} {v.installed && `@ ${v.installed}`}{v.fixed && ` → ${v.fixed}`}
+                          </p>
+                          {v.title && (
+                            <p className="text-[10px] leading-snug mt-0.5" style={{ color: 'var(--color-text-muted)' }}>
+                              {v.title}
+                            </p>
+                          )}
+                        </div>
+                      </div>
+                    )
+                  })}
+                </div>
+                <p className="text-[10px] mt-2" style={{ color: 'var(--color-text-faint)' }}>
+                  {visVulns.length} of {vulns.length} vulnerabilities
+                  {c.scanned_at && ` · scanned ${fmtRelative(c.scanned_at)}`}
+                </p>
+              </div>
+            )}
+          </div>
+        )
+      })}
+    </div>
+  )
+}
+
+export function SecurityDashboard({ onDeviceClick, onContainerClick }) {
+  const [data,            setData]            = useState(null)
+  const [trend,           setTrend]           = useState(null)
+  const [loading,         setLoading]         = useState(true)
+  const [error,           setError]           = useState(null)
+  const [expandedVuln,    setExpandedVuln]    = useState({})
+  const [scanning,        setScanning]        = useState(false)
+  const [scanMsg,         setScanMsg]         = useState(null)
+  const [showSettings,    setShowSettings]    = useState(false)
+  const [dockerEnabled,   setDockerEnabled]   = useState(false)
+  const [containerVulns,  setContainerVulns]  = useState([])
+  const [scanningContainers, setScanningContainers] = useState(false)
 
   async function load() {
     setLoading(true)
@@ -262,6 +408,14 @@ export function SecurityDashboard({ onDeviceClick }) {
     } finally {
       setLoading(false)
     }
+    // Load docker container vuln data if available
+    api.dockerVulnSummary().then(rows => {
+      setDockerEnabled(true)
+      setContainerVulns(rows)
+    }).catch(() => {
+      setDockerEnabled(false)
+      setContainerVulns([])
+    })
   }
 
   useEffect(() => { load() }, [])
@@ -276,6 +430,23 @@ export function SecurityDashboard({ onDeviceClick }) {
       setScanMsg(`Error: ${e.message}`)
     } finally {
       setScanning(false)
+    }
+  }
+
+  async function handleScanAllContainers() {
+    setScanningContainers(true)
+    setScanMsg(null)
+    try {
+      const res = await api.dockerScanAll()
+      setScanMsg(`Container scan started on ${res.started} container${res.started !== 1 ? 's' : ''}.`)
+    } catch (e) {
+      setScanMsg(`Error: ${e.message}`)
+    } finally {
+      setScanningContainers(false)
+      // Reload container vuln data after a short delay
+      setTimeout(() => {
+        api.dockerVulnSummary().then(rows => setContainerVulns(rows)).catch(() => {})
+      }, 3000)
     }
   }
 
@@ -315,7 +486,16 @@ export function SecurityDashboard({ onDeviceClick }) {
             </span>
             <h2 className="font-semibold" style={{ color: 'var(--color-text)' }}>Security Overview</h2>
           </div>
-          <div className="flex items-center gap-2">
+          <div className="flex items-center gap-2 flex-wrap">
+            {dockerEnabled && (
+              <button onClick={handleScanAllContainers} disabled={scanningContainers || loading}
+                className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold text-white disabled:opacity-50 transition-opacity"
+                style={{ background: '#6366f1' }}
+                title="Run Trivy vulnerability scan on all running Docker containers">
+                <Box size={13} className={scanningContainers ? 'animate-pulse' : ''} />
+                {scanningContainers ? 'Starting…' : 'Scan all containers'}
+              </button>
+            )}
             <button onClick={handleScanAll} disabled={scanning || loading}
               className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold text-white disabled:opacity-50 transition-opacity"
               style={{ background: 'var(--color-brand)' }}
@@ -530,7 +710,58 @@ export function SecurityDashboard({ onDeviceClick }) {
                 </div>
               )}
 
-              {topVuln.length === 0 && recentScan.length === 0 && (
+              {/* Docker container vuln section */}
+              {dockerEnabled && containerVulns.length > 0 && (
+                <div>
+                  <p className="text-xs font-semibold uppercase tracking-wider mb-3"
+                    style={{ color: 'var(--color-text-muted)' }}>Docker Container Scans</p>
+
+                  {/* Container vuln stats */}
+                  {(() => {
+                    const scanned = containerVulns.filter(c => c.scanned_at && !c.scanning)
+                    const totals = { critical: 0, high: 0, medium: 0, low: 0 }
+                    for (const c of scanned)
+                      for (const [k, v] of Object.entries(c.counts || {}))
+                        if (k in totals) totals[k] += v
+                    const totalVulns = Object.values(totals).reduce((a, b) => a + b, 0)
+                    const cleanCount = scanned.filter(c => c.severity === 'clean').length
+                    return (
+                      <div className="grid grid-cols-3 gap-2 mb-3">
+                        <div className="card p-3">
+                          <p className="text-[11px]" style={{ color: 'var(--color-text-faint)' }}>Scanned</p>
+                          <p className="text-xl font-bold mt-0.5" style={{ color: 'var(--color-text)' }}>
+                            {scanned.length}/{containerVulns.length}
+                          </p>
+                          <p className="text-[10px] mt-0.5" style={{ color: 'var(--color-text-faint)' }}>containers</p>
+                        </div>
+                        <div className="card p-3">
+                          <p className="text-[11px]" style={{ color: 'var(--color-text-faint)' }}>Total CVEs</p>
+                          <p className="text-xl font-bold mt-0.5" style={{ color: totalVulns > 0 ? '#ef4444' : '#22c55e' }}>
+                            {totalVulns}
+                          </p>
+                          <p className="text-[10px] mt-0.5" style={{ color: 'var(--color-text-faint)' }}>
+                            {totals.critical > 0 && <span className="text-red-400">{totals.critical} crit </span>}
+                            {totals.high > 0 && <span className="text-orange-400">{totals.high} high</span>}
+                            {totalVulns === 0 && 'none found'}
+                          </p>
+                        </div>
+                        <div className="card p-3">
+                          <p className="text-[11px]" style={{ color: 'var(--color-text-faint)' }}>Clean</p>
+                          <p className="text-xl font-bold mt-0.5" style={{ color: '#22c55e' }}>{cleanCount}</p>
+                          <p className="text-[10px] mt-0.5" style={{ color: 'var(--color-text-faint)' }}>no findings</p>
+                        </div>
+                      </div>
+                    )
+                  })()}
+
+                  <ContainerVulnList
+                    rows={containerVulns}
+                    onContainerClick={onContainerClick}
+                  />
+                </div>
+              )}
+
+              {topVuln.length === 0 && recentScan.length === 0 && (!dockerEnabled || containerVulns.length === 0) && (
                 <div className="card p-8 flex flex-col items-center gap-3 text-center">
                   <ShieldCheck size={32} style={{ color: '#22c55e' }} />
                   <p className="text-sm font-medium" style={{ color: 'var(--color-text)' }}>

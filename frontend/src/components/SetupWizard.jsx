@@ -1,7 +1,7 @@
 import { useState, useEffect } from 'react'
 import {
   User, Lock, Network, Shield, Bell, ArrowRight,
-  CheckCircle, Eye, EyeOff, Upload, RotateCcw, Database,
+  CheckCircle, Eye, EyeOff, Upload, RotateCcw, Database, Box,
 } from 'lucide-react'
 import { Logo } from './Logo'
 import { api, setToken } from '../api'
@@ -12,6 +12,7 @@ const FRESH_STEPS = [
   { id: 'network', label: 'Network Settings',   Icon: Network     },
   { id: 'vuln',    label: 'Vuln Scans',         Icon: Shield      },
   { id: 'notify',  label: 'Notifications',      Icon: Bell        },
+  { id: 'docker',  label: 'Docker Monitoring',  Icon: Box         },
   { id: 'done',    label: 'All Set!',           Icon: CheckCircle },
 ]
 
@@ -497,6 +498,184 @@ function StepNotify({ onNext }) {
   )
 }
 
+const HOST_TYPES = [
+  {
+    value: 'docker_local',
+    label: 'Local Docker',
+    desc:  'Connect via Unix socket (default for same-host Docker).',
+    defaultUrl: 'unix:///var/run/docker.sock',
+  },
+  {
+    value: 'docker_remote',
+    label: 'Remote Docker',
+    desc:  'Connect to a Docker daemon on another machine over TCP.',
+    defaultUrl: 'tcp://192.168.1.x:2375',
+  },
+  {
+    value: 'proxmox',
+    label: 'Proxmox VE',
+    desc:  'Connect to a Proxmox VE node to monitor LXC containers.',
+    defaultUrl: 'https://192.168.1.x:8006',
+  },
+]
+
+function StepDocker({ onNext }) {
+  const [enabled,    setEnabled]    = useState(false)
+  const [hostType,   setHostType]   = useState('docker_local')
+  const [name,       setName]       = useState('Local Docker')
+  const [url,        setUrl]        = useState('unix:///var/run/docker.sock')
+  const [authUser,   setAuthUser]   = useState('')
+  const [authToken,  setAuthToken]  = useState('')
+  const [tlsVerify,  setTlsVerify]  = useState(false)
+  const [node,       setNode]       = useState('pve')
+
+  function selectType(t) {
+    setHostType(t)
+    const def = HOST_TYPES.find(h => h.value === t)
+    setUrl(def?.defaultUrl || '')
+    setName(def?.label || t)
+  }
+
+  function handleNext() {
+    if (!enabled) { onNext({ containerHost: null }); return }
+    onNext({
+      containerHost: {
+        name: name.trim() || hostType,
+        type: hostType,
+        url: url.trim() || null,
+        auth_user: authUser.trim() || null,
+        auth_token: authToken || null,
+        tls_verify: tlsVerify,
+        node: node.trim() || 'pve',
+        enabled: true,
+      },
+    })
+  }
+
+  const isProxmox = hostType === 'proxmox'
+  const isRemote  = hostType === 'docker_remote' || isProxmox
+
+  return (
+    <div className="space-y-5">
+      <p className="text-sm" style={{ color: 'var(--color-text-muted)' }}>
+        InSpectre can monitor Docker and Proxmox containers — view running containers,
+        stream logs, and scan images for vulnerabilities. You can add more hosts later
+        in Settings → Docker.
+      </p>
+
+      <label className="flex items-start gap-3 cursor-pointer p-3 rounded-xl border transition-colors"
+        style={{
+          borderColor: enabled ? 'var(--color-brand)' : 'var(--color-border)',
+          background: enabled ? 'rgba(99,102,241,0.06)' : 'transparent',
+        }}>
+        <input type="checkbox" className="mt-0.5" checked={enabled}
+          onChange={e => setEnabled(e.target.checked)} />
+        <div>
+          <p className="text-sm font-medium" style={{ color: 'var(--color-text)' }}>Enable container monitoring</p>
+          <p className="text-xs mt-0.5" style={{ color: 'var(--color-text-muted)' }}>
+            Adds a Containers page to view, manage, and scan containers.
+          </p>
+        </div>
+      </label>
+
+      {enabled && (
+        <div className="space-y-4">
+          {/* Host type selector */}
+          <div className="space-y-2">
+            <label className="block text-xs font-semibold uppercase tracking-wider" style={{ color: 'var(--color-text-muted)' }}>
+              Host Type
+            </label>
+            <div className="grid grid-cols-1 gap-2">
+              {HOST_TYPES.map(t => (
+                <button key={t.value} type="button" onClick={() => selectType(t.value)}
+                  className="text-left p-3 rounded-xl border transition-colors"
+                  style={{
+                    borderColor: hostType === t.value ? 'var(--color-brand)' : 'var(--color-border)',
+                    background: hostType === t.value ? 'rgba(99,102,241,0.08)' : 'var(--color-surface-offset)',
+                  }}>
+                  <p className="text-sm font-medium" style={{ color: 'var(--color-text)' }}>{t.label}</p>
+                  <p className="text-xs mt-0.5" style={{ color: 'var(--color-text-muted)' }}>{t.desc}</p>
+                </button>
+              ))}
+            </div>
+          </div>
+
+          {/* Display name */}
+          <div className="space-y-1">
+            <label className="block text-xs font-medium" style={{ color: 'var(--color-text-muted)' }}>Display Name</label>
+            <input className="input w-full" placeholder="e.g. Home Server"
+              value={name} onChange={e => setName(e.target.value)} />
+          </div>
+
+          {/* URL */}
+          <div className="space-y-1">
+            <label className="block text-xs font-medium" style={{ color: 'var(--color-text-muted)' }}>
+              {isProxmox ? 'Proxmox URL' : hostType === 'docker_remote' ? 'Docker TCP URL' : 'Socket Path'}
+            </label>
+            <input className="input w-full font-mono text-sm"
+              value={url} onChange={e => setUrl(e.target.value)}
+              placeholder={HOST_TYPES.find(t => t.value === hostType)?.defaultUrl} />
+          </div>
+
+          {/* Proxmox credentials */}
+          {isProxmox && (
+            <>
+              <div className="space-y-1">
+                <label className="block text-xs font-medium" style={{ color: 'var(--color-text-muted)' }}>
+                  API User <span className="font-mono">(e.g. root@pam)</span>
+                </label>
+                <input className="input w-full font-mono text-sm" placeholder="root@pam"
+                  value={authUser} onChange={e => setAuthUser(e.target.value)} />
+              </div>
+              <div className="space-y-1">
+                <label className="block text-xs font-medium" style={{ color: 'var(--color-text-muted)' }}>
+                  API Token <span className="font-mono">(TOKENID=SECRET)</span>
+                </label>
+                <input type="password" className="input w-full font-mono text-sm"
+                  placeholder="mytoken=xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+                  value={authToken} onChange={e => setAuthToken(e.target.value)} />
+                <p className="text-[11px]" style={{ color: 'var(--color-text-faint)' }}>
+                  Create via Datacenter → API Tokens in the Proxmox UI.
+                </p>
+              </div>
+              <div className="space-y-1">
+                <label className="block text-xs font-medium" style={{ color: 'var(--color-text-muted)' }}>Default Node</label>
+                <input className="input w-full font-mono text-sm" placeholder="pve"
+                  value={node} onChange={e => setNode(e.target.value)} />
+              </div>
+            </>
+          )}
+
+          {/* TLS verify */}
+          {isRemote && (
+            <div className="flex items-center justify-between">
+              <div>
+                <p className="text-sm font-medium" style={{ color: 'var(--color-text)' }}>Verify TLS</p>
+                <p className="text-[11px]" style={{ color: 'var(--color-text-faint)' }}>
+                  Disable for self-signed certs on trusted LANs.
+                </p>
+              </div>
+              <button type="button" role="switch" aria-checked={tlsVerify}
+                onClick={() => setTlsVerify(v => !v)}
+                className="relative inline-flex h-5 w-9 items-center rounded-full transition-colors shrink-0"
+                style={{ background: tlsVerify ? 'var(--color-brand)' : 'var(--color-border)' }}>
+                <span className="inline-block h-3.5 w-3.5 rounded-full bg-white shadow transition-transform"
+                  style={{ transform: tlsVerify ? 'translateX(19px)' : 'translateX(3px)' }} />
+              </button>
+            </div>
+          )}
+        </div>
+      )}
+
+      <button onClick={handleNext}
+        className="w-full py-2.5 rounded-xl font-semibold text-sm flex items-center justify-center gap-2"
+        style={{ background: 'var(--color-brand)', color: 'white' }}>
+        {enabled ? 'Save & Continue' : 'Skip'} <ArrowRight size={14} />
+      </button>
+    </div>
+  )
+}
+
 function StepDone({ onFinish }) {
   return (
     <div className="space-y-6 text-center">
@@ -544,8 +723,13 @@ export function SetupWizard({ onComplete }) {
         gotify_token:          collected.gotify_token          ?? '',
         pushbullet_api_key:    collected.pushbullet_api_key    ?? '',
         alert_webhook_url:     collected.alert_webhook_url     ?? '',
+        docker_enabled:        collected.containerHost != null,
+        docker_host:           collected.containerHost?.url    ?? 'unix:///var/run/docker.sock',
       })
     } catch (_) { /* ignore — dashboard still loads */ }
+    if (collected.containerHost) {
+      await api.createContainerHost(collected.containerHost).catch(() => {})
+    }
     onComplete()
   }
 
@@ -619,7 +803,8 @@ export function SetupWizard({ onComplete }) {
           {isFresh && step === 1 && <StepNetwork onNext={handleNext} />}
           {isFresh && step === 2 && <StepVuln    onNext={handleNext} />}
           {isFresh && step === 3 && <StepNotify  onNext={handleNext} />}
-          {isFresh && step === 4 && <StepDone    onFinish={handleFinish} />}
+          {isFresh && step === 4 && <StepDocker  onNext={handleNext} />}
+          {isFresh && step === 5 && <StepDone    onFinish={handleFinish} />}
         </div>
       </div>
     </div>

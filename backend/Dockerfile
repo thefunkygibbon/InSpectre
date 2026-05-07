@@ -1,6 +1,6 @@
-FROM python:3.11-slim
+FROM python:3.12-slim
 
-# Install ping, traceroute, iputils, and nmap (required for vuln scanning)
+# Install system tools + Trivy (optional: for container image vuln scanning)
 RUN apt-get update && apt-get install -y --no-install-recommends \
         iputils-ping \
         traceroute \
@@ -8,7 +8,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         nmap \
         whois \
         dnsutils \
-    && rm -rf /var/lib/apt/lists/*
+        curl \
+        ca-certificates \
+    && TRIVY_VERSION=$(curl -s https://api.github.com/repos/aquasecurity/trivy/releases/latest \
+        | grep '"tag_name"' | sed 's/.*"v\([^"]*\)".*/\1/' || echo "0.62.0") \
+    && curl -sfL "https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz" \
+        | tar -xz -C /usr/local/bin trivy 2>/dev/null || true \
+    && rm -rf /var/lib/apt/lists/* \
+    && trivy image --download-db-only --no-progress --scanners vuln 2>/dev/null || true
 
 WORKDIR /app
 COPY requirements.txt .
