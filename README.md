@@ -93,11 +93,6 @@ Check the [Wiki](https://github.com/thefunkygibbon/InSpectre/wiki) for full admi
 git clone https://github.com/thefunkygibbon/InSpectre.git
 cd InSpectre
 
-# Edit docker-compose.yml and set:
-#   IP_RANGE       e.g. 192.168.1.0/24
-#   INTERFACE      e.g. eth0
-#   LAN_DNS_SERVER e.g. 192.168.1.1
-
 ./inspectre.sh up
 ```
 
