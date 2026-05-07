@@ -10,6 +10,7 @@ import { api } from '../api'
 // Vuln scan settings panel
 // ---------------------------------------------------------------------------
 const VULN_SETTING_META = {
+  // ── Network device scanning (Nuclei) ──────────────────────────────────────
   vuln_scan_schedule: {
     label: 'Scheduled Scans', type: 'select',
     options: [
@@ -49,8 +50,23 @@ const VULN_SETTING_META = {
     label: 'Template Tags', type: 'text',
     description: 'Comma-separated tags (e.g. cve,exposure,misconfig,default-login,network).',
   },
+  // ── Container image scanning (Trivy) ──────────────────────────────────────
+  trivy_db_update_hours: {
+    label: 'Trivy DB Update Interval', type: 'number', min: 0, unit: 'hours',
+    description: 'How often to refresh the Trivy CVE database. Set to 0 to disable.',
+  },
+  docker_scan_on_new: {
+    label: 'Scan New Containers', type: 'toggle',
+    description: 'Run a Trivy scan automatically when a new container is created.',
+  },
+  docker_scan_on_update: {
+    label: 'Scan on Image Update', type: 'toggle',
+    description: 'Run a Trivy scan when a container restarts with a new image.',
+  },
 }
 
+const NETWORK_VULN_KEYS    = ['vuln_scan_schedule','vuln_scan_targets','vuln_scan_on_new_device','vuln_scan_on_port_change','nuclei_template_update_interval','vuln_scan_templates']
+const CONTAINER_VULN_KEYS  = ['trivy_db_update_hours','docker_scan_on_new','docker_scan_on_update']
 const VULN_KEYS = Object.keys(VULN_SETTING_META)
 
 function VulnSettingsPanel({ onClose }) {
@@ -98,15 +114,16 @@ function VulnSettingsPanel({ onClose }) {
         </button>
       </div>
       <div className="px-4 py-4 grid grid-cols-1 sm:grid-cols-2 gap-4">
-        {VULN_KEYS.map(key => {
+        {VULN_KEYS.flatMap(key => {
           const meta = VULN_SETTING_META[key]
           const v = val(key)
           const isDirty = dirty[key] !== undefined
           const dirtyStyle = isDirty ? { borderColor: 'color-mix(in srgb, var(--color-brand) 50%, transparent)' } : {}
 
+          let element
           if (meta.type === 'toggle') {
             const isOn = v === 'true'
-            return (
+            element = (
               <div key={key} className="space-y-1 sm:col-span-2">
                 <div className="flex items-center justify-between">
                   <div>
@@ -125,10 +142,8 @@ function VulnSettingsPanel({ onClose }) {
                 </div>
               </div>
             )
-          }
-
-          if (meta.type === 'select') {
-            return (
+          } else if (meta.type === 'select') {
+            element = (
               <div key={key} className="space-y-1">
                 <label className="text-xs font-medium" style={{ color: 'var(--color-text)' }}>{meta.label}</label>
                 <select className="input text-xs w-full" style={dirtyStyle} value={v}
@@ -137,18 +152,49 @@ function VulnSettingsPanel({ onClose }) {
                 </select>
               </div>
             )
+          } else if (meta.type === 'number') {
+            element = (
+              <div key={key} className="space-y-1">
+                <label className="text-xs font-medium" style={{ color: 'var(--color-text)' }}>{meta.label}</label>
+                <div className="flex items-center gap-2">
+                  <input type="number" min={meta.min} className="input text-xs w-24" style={dirtyStyle} value={v}
+                    onChange={e => handleChange(key, e.target.value)} />
+                  {meta.unit && (
+                    <span className="text-xs" style={{ color: 'var(--color-text-faint)' }}>{meta.unit}</span>
+                  )}
+                </div>
+                {meta.description && (
+                  <p className="text-[10px]" style={{ color: 'var(--color-text-faint)' }}>{meta.description}</p>
+                )}
+              </div>
+            )
+          } else {
+            element = (
+              <div key={key} className="space-y-1 sm:col-span-2">
+                <label className="text-xs font-medium" style={{ color: 'var(--color-text)' }}>{meta.label}</label>
+                <input type="text" className="input text-xs font-mono w-full" style={dirtyStyle} value={v}
+                  onChange={e => handleChange(key, e.target.value)} />
+                {meta.description && (
+                  <p className="text-[10px]" style={{ color: 'var(--color-text-faint)' }}>{meta.description}</p>
+                )}
+              </div>
+            )
           }
 
-          return (
-            <div key={key} className="space-y-1 sm:col-span-2">
-              <label className="text-xs font-medium" style={{ color: 'var(--color-text)' }}>{meta.label}</label>
-              <input type="text" className="input text-xs font-mono w-full" style={dirtyStyle} value={v}
-                onChange={e => handleChange(key, e.target.value)} />
-              {meta.description && (
-                <p className="text-[10px]" style={{ color: 'var(--color-text-faint)' }}>{meta.description}</p>
-              )}
-            </div>
-          )
+          if (key === CONTAINER_VULN_KEYS[0]) {
+            return [
+              <div key="container-divider" className="sm:col-span-2 pt-2 border-t flex items-center gap-2"
+                style={{ borderColor: 'var(--color-border)' }}>
+                <Box size={11} style={{ color: 'var(--color-text-faint)' }} />
+                <span className="text-[10px] font-semibold uppercase tracking-wider"
+                  style={{ color: 'var(--color-text-faint)' }}>
+                  Container Image Scanning (Trivy)
+                </span>
+              </div>,
+              element,
+            ]
+          }
+          return [element]
         })}
       </div>
       {hasDirty && (

@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback, useMemo } from 'react'
-import { Box, RefreshCw, Search, AlertCircle, Play, Square, Loader2, LayoutGrid, List } from 'lucide-react'
+import { Box, RefreshCw, Search, AlertCircle, Play, Square, Loader2, LayoutGrid, List, ArrowUpDown } from 'lucide-react'
 import { api } from '../api'
 import { ContainerCard } from './ContainerCard'
 import { ContainerDrawer } from './ContainerDrawer'
@@ -14,6 +14,15 @@ const STATUS_FILTERS = [
   { value: 'paused',     label: 'Paused' },
   { value: 'restarting', label: 'Restarting' },
 ]
+
+const SORT_OPTIONS = [
+  { value: 'name-asc',  label: 'Name (A → Z)' },
+  { value: 'name-desc', label: 'Name (Z → A)' },
+  { value: 'status',    label: 'Status' },
+  { value: 'host',      label: 'Host' },
+]
+
+const STATUS_SORT_ORDER = ['running', 'restarting', 'paused', 'created', 'exited', 'dead']
 
 const STATUS_COLOR = {
   running:    '#22c55e',
@@ -148,6 +157,7 @@ export function ContainersPage({ openContainer }) {
   const [search,      setSearch]      = useState('')
   const [filter,      setFilter]      = useState('all')
   const [hostFilter,  setHostFilter]  = useState('all')
+  const [sort,        setSort]        = useState('name-asc')
   const [layout,      setLayout]      = useState('grid')
   const [refreshing,  setRefreshing]  = useState(false)
 
@@ -228,6 +238,22 @@ export function ContainersPage({ openContainer }) {
           || (c.networks || []).some(n => n.toLowerCase().includes(q))
     }
     return true
+  })
+
+  const sorted = [...filtered].sort((a, b) => {
+    switch (sort) {
+      case 'name-desc': return b.name.localeCompare(a.name)
+      case 'status': {
+        const ai = STATUS_SORT_ORDER.indexOf(a.status)
+        const bi = STATUS_SORT_ORDER.indexOf(b.status)
+        if (ai !== bi) return (ai === -1 ? 99 : ai) - (bi === -1 ? 99 : bi)
+        return a.name.localeCompare(b.name)
+      }
+      case 'host':
+        return (a.host_name || '').localeCompare(b.host_name || '') || a.name.localeCompare(b.name)
+      default:
+        return a.name.localeCompare(b.name)
+    }
   })
 
   return (
@@ -311,6 +337,13 @@ export function ContainersPage({ openContainer }) {
           )}
 
           <div className="ml-auto flex items-center gap-1">
+            {/* Sort */}
+            <div className="flex items-center gap-1 mr-1">
+              <ArrowUpDown size={13} style={{ color: 'var(--color-text-faint)' }} />
+              <select className="input text-xs py-1" value={sort} onChange={e => setSort(e.target.value)}>
+                {SORT_OPTIONS.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
+              </select>
+            </div>
             {/* Layout toggle */}
             <button onClick={() => setLayout('grid')} className="btn-ghost p-2"
               title="Grid view" aria-label="Grid view"
@@ -335,12 +368,12 @@ export function ContainersPage({ openContainer }) {
         <SkeletonCards />
       ) : disabled ? (
         <DisabledState />
-      ) : filtered.length === 0 ? (
+      ) : sorted.length === 0 ? (
         <EmptyState search={search} filter={filter} />
       ) : (
         <section>
           <p className="text-xs mb-4" style={{ color: 'var(--color-text-faint)' }}>
-            Showing {filtered.length} of {containers.length} container{containers.length !== 1 ? 's' : ''}
+            Showing {sorted.length} of {containers.length} container{containers.length !== 1 ? 's' : ''}
             {filter !== 'all' && (
               <span className="ml-2 px-2 py-0.5 rounded-full text-[10px] font-semibold uppercase"
                 style={{ background: 'var(--color-brand)', color: 'white' }}>{filter}</span>
@@ -349,7 +382,7 @@ export function ContainersPage({ openContainer }) {
 
           {layout === 'grid' ? (
             <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-4">
-              {filtered.map(c => (
+              {sorted.map(c => (
                 <ContainerCard key={c.id} container={c} onClick={() => setSelected(c)} />
               ))}
             </div>
@@ -367,7 +400,7 @@ export function ContainersPage({ openContainer }) {
                 <span className="w-28 hidden xl:block">Host</span>
                 <span className="w-24 text-right hidden sm:block">Uptime</span>
               </div>
-              {filtered.map(c => (
+              {sorted.map(c => (
                 <ContainerRow key={c.id} container={c} onClick={() => setSelected(c)} />
               ))}
             </div>

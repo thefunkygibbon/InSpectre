@@ -111,6 +111,7 @@ def _load_settings_from_db() -> None:
     global OFFLINE_MISS_THRESHOLD, SNIFFER_WORKERS, NUCLEI_TEMPLATE_UPDATE_INTERVAL
     global NIGHTLY_SCAN_START, NIGHTLY_SCAN_END, OFFLINE_RESCAN_HOURS, BASELINE_SCAN_COUNT_THRESHOLD
     global ARP_SCAN_RETRY
+    global _DNS_SERVER, _DNS_DETECTED
     try:
         session = Session()
         try:
@@ -129,6 +130,13 @@ def _load_settings_from_db() -> None:
         if "offline_rescan_hours"          in db: OFFLINE_RESCAN_HOURS          = int(db["offline_rescan_hours"])
         if "baseline_scan_count_threshold" in db: BASELINE_SCAN_COUNT_THRESHOLD = int(db["baseline_scan_count_threshold"])
         if "arp_scan_retry"                in db: ARP_SCAN_RETRY                = int(db["arp_scan_retry"])
+        # DNS server: DB value (set by wizard) takes priority over auto-detection.
+        if db.get("dns_server", "").strip():
+            new_dns = db["dns_server"].strip()
+            if new_dns != _DNS_SERVER:
+                print(f"[settings] DNS server from DB: {new_dns}", flush=True)
+            _DNS_SERVER   = new_dns
+            _DNS_DETECTED = True
 
         # Write the auto-detected interface back so the UI can display it.
         # Only writes when the DB value is empty (user hasn't set an override).
@@ -2487,6 +2495,8 @@ def _graceful_shutdown(signum, frame) -> None:
 
 
 def main() -> None:
+    global _DNS_SERVER, _DNS_DETECTED
+
     signal.signal(signal.SIGTERM, _graceful_shutdown)
     signal.signal(signal.SIGINT,  _graceful_shutdown)
 
@@ -2503,17 +2513,17 @@ def main() -> None:
         flush=True,
     )
 
-    global _DNS_SERVER, _DNS_DETECTED
-    _DNS_SERVER   = _detect_dns_server()
-    _DNS_DETECTED = True
-    print(f"[*] DNS server: {_DNS_SERVER or 'NOT DETECTED — set LAN_DNS_SERVER in docker-compose!'}", flush=True)
+    # DNS: use DB value if wizard already ran, otherwise auto-detect as fallback.
+    if not _DNS_DETECTED:
+        _DNS_SERVER   = _detect_dns_server()
+        _DNS_DETECTED = True
+    print(f"[*] DNS server: {_DNS_SERVER or 'not detected yet — will use DB value after wizard'}", flush=True)
 
     threading.Thread(target=start_probe_api, daemon=True, name="probe-api").start()
     threading.Thread(target=_nuclei_template_update_loop, daemon=True, name="nuclei-updater").start()
     time.sleep(2)
 
-    threading.Thread(target=start_arp_sniffer, daemon=True, name="arp-sniffer").start()
-    threading.Thread(target=_mdns_loop, daemon=True, name="mdns-loop").start()
+    _sniffer_started = False
 
     while True:
         _load_settings_from_db()
@@ -2533,6 +2543,14 @@ def main() -> None:
             print("[*] Waiting for setup wizard to complete before scanning…", flush=True)
             time.sleep(10)
             continue
+
+        # Start passive sniffer and mDNS loop only once, after wizard is done.
+        # This ensures they use the correct interface and don't record devices
+        # before the user has configured the network settings.
+        if not _sniffer_started:
+            threading.Thread(target=start_arp_sniffer, daemon=True, name="arp-sniffer").start()
+            threading.Thread(target=_mdns_loop, daemon=True, name="mdns-loop").start()
+            _sniffer_started = True
 
         with _sniffer_seen_lock:
             _sniffer_seen_this_interval.clear()

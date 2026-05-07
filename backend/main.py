@@ -4896,7 +4896,7 @@ def _proxmox_request(host, method: str, path: str, **kwargs):
         raise ValueError("Proxmox URL not configured.")
     headers = {}
     if user and token:
-        headers["Authorization"] = f"PVEAPIToken={user}!{token}"
+        headers["Authorization"] = f"PVEAPIToken={user}={token}"
     with httpx.Client(verify=verify, timeout=15) as client:
         resp = client.request(method, f"{base}{path}", headers=headers, **kwargs)
         resp.raise_for_status()
@@ -4983,6 +4983,7 @@ def _fetch_containers_for_host(host: dict) -> list:
         result = []
         for c in client.containers.list(all=True):
             d = _fmt_container(c)
+            d["id"]        = f"dk-{host['id']}-{c.id}"  # host-scoped ID for routing
             d["host_id"]   = host["id"]
             d["host_name"] = host["name"]
             d["host_type"] = htype
@@ -5131,6 +5132,33 @@ def _parse_proxmox_id(container_id: str):
         return None
 
 
+def _parse_docker_id(container_id: str):
+    """Parse 'dk-{host_id}-{docker_id}' → (host_id, docker_id) or None."""
+    if not container_id.startswith("dk-"):
+        return None
+    parts = container_id.split("-", 2)
+    if len(parts) != 3:
+        return None
+    try:
+        return int(parts[1]), parts[2]
+    except ValueError:
+        return None
+
+
+def _resolve_docker_host(container_id: str, db: Session) -> tuple:
+    """Return (host_url, docker_container_id) for a Docker container_id.
+    dk- prefix routes to the specific host; falls back to first enabled host."""
+    dk = _parse_docker_id(container_id)
+    if dk:
+        host_id, docker_id = dk
+        host = _get_host_row(db, host_id)
+        return host["url"] or "unix:///var/run/docker.sock", docker_id
+    docker_hosts = [h for h in _get_enabled_hosts(db) if h["type"] != "proxmox"]
+    if not docker_hosts:
+        raise HTTPException(503, "No Docker hosts configured.")
+    return docker_hosts[0]["url"] or "unix:///var/run/docker.sock", container_id
+
+
 def _get_host_row(db: Session, host_id: int) -> dict:
     row = db.execute(text("SELECT * FROM container_hosts WHERE id = :id"), {"id": host_id}).fetchone()
     if not row:
@@ -5164,18 +5192,14 @@ async def get_docker_container(container_id: str, db: Session = Depends(get_db))
         except Exception as e:
             raise HTTPException(503, str(e))
 
-    hosts = _get_enabled_hosts(db)
-    docker_hosts = [h for h in hosts if h["type"] != "proxmox"]
-    if not docker_hosts:
-        raise HTTPException(503, "No Docker hosts configured.")
-    host_url = docker_hosts[0]["url"] or "unix:///var/run/docker.sock"
+    host_url, docker_id = _resolve_docker_host(container_id, db)
 
     def _do():
         client = _make_docker_client(host_url)
         try:
-            c = client.containers.get(container_id)
+            c = client.containers.get(docker_id)
             d = _fmt_container(c)
-            d["host_id"] = docker_hosts[0]["id"]; d["host_name"] = docker_hosts[0]["name"]
+            d["id"] = container_id  # preserve prefixed ID
             return d
         finally:
             client.close()
@@ -5200,18 +5224,14 @@ async def docker_start(container_id: str, db: Session = Depends(get_db)):
         except Exception as e:
             raise HTTPException(400, str(e))
 
-    hosts = _get_enabled_hosts(db)
-    docker_hosts = [h for h in hosts if h["type"] != "proxmox"]
-    if not docker_hosts:
-        raise HTTPException(503, "No Docker hosts.")
-    host_url = docker_hosts[0]["url"] or "unix:///var/run/docker.sock"
+    host_url, docker_id = _resolve_docker_host(container_id, db)
 
     def _do():
         client = _make_docker_client(host_url)
         try:
-            c = client.containers.get(container_id)
+            c = client.containers.get(docker_id)
             c.start(); c.reload()
-            return _fmt_container(c)
+            d = _fmt_container(c); d["id"] = container_id; return d
         finally:
             client.close()
 
@@ -5234,18 +5254,14 @@ async def docker_stop(container_id: str, db: Session = Depends(get_db)):
         except Exception as e:
             raise HTTPException(400, str(e))
 
-    hosts = _get_enabled_hosts(db)
-    docker_hosts = [h for h in hosts if h["type"] != "proxmox"]
-    if not docker_hosts:
-        raise HTTPException(503, "No Docker hosts.")
-    host_url = docker_hosts[0]["url"] or "unix:///var/run/docker.sock"
+    host_url, docker_id = _resolve_docker_host(container_id, db)
 
     def _do():
         client = _make_docker_client(host_url)
         try:
-            c = client.containers.get(container_id)
+            c = client.containers.get(docker_id)
             c.stop(timeout=10); c.reload()
-            return _fmt_container(c)
+            d = _fmt_container(c); d["id"] = container_id; return d
         finally:
             client.close()
 
@@ -5268,18 +5284,14 @@ async def docker_restart(container_id: str, db: Session = Depends(get_db)):
         except Exception as e:
             raise HTTPException(400, str(e))
 
-    hosts = _get_enabled_hosts(db)
-    docker_hosts = [h for h in hosts if h["type"] != "proxmox"]
-    if not docker_hosts:
-        raise HTTPException(503, "No Docker hosts.")
-    host_url = docker_hosts[0]["url"] or "unix:///var/run/docker.sock"
+    host_url, docker_id = _resolve_docker_host(container_id, db)
 
     def _do():
         client = _make_docker_client(host_url)
         try:
-            c = client.containers.get(container_id)
+            c = client.containers.get(docker_id)
             c.restart(timeout=10); c.reload()
-            return _fmt_container(c)
+            d = _fmt_container(c); d["id"] = container_id; return d
         finally:
             client.close()
 
@@ -5298,16 +5310,15 @@ async def stream_docker_logs(container_id: str, tail: int = 100, db: Session = D
         raise HTTPException(400, "Log streaming is not yet available for Proxmox containers.")
     if not _docker_enabled(db):
         raise HTTPException(503, "No container hosts configured.")
-    docker_hosts = [h for h in _get_enabled_hosts(db) if h["type"] != "proxmox"]
-    host = docker_hosts[0]["url"] if docker_hosts else _get_docker_host(db)
+    host_url, docker_id = _resolve_docker_host(container_id, db)
 
     line_queue: asyncio.Queue = asyncio.Queue()
     loop = asyncio.get_event_loop()
 
     def _stream():
         try:
-            client = _make_docker_client(host)
-            c = client.containers.get(container_id)
+            client = _make_docker_client(host_url)
+            c = client.containers.get(docker_id)
             for raw in c.logs(stream=True, follow=True, tail=tail, timestamps=True):
                 line = raw.decode("utf-8", errors="replace").rstrip("\n")
                 loop.call_soon_threadsafe(line_queue.put_nowait, line)
@@ -5364,15 +5375,12 @@ async def stream_docker_trivy_scan(container_id: str, db: Session = Depends(get_
         raise HTTPException(400, "Trivy image scanning is not available for Proxmox containers.")
     if not _docker_enabled(db):
         raise HTTPException(503, "No container hosts configured.")
-    # Resolve the Docker host for this container
-    hosts = _get_enabled_hosts(db)
-    docker_hosts = [h for h in hosts if h["type"] != "proxmox"]
-    host = docker_hosts[0]["url"] if docker_hosts else _get_docker_host(db)
+    host_url, docker_id = _resolve_docker_host(container_id, db)
 
     def _get_container_info():
-        client = _make_docker_client(host)
+        client = _make_docker_client(host_url)
         try:
-            c = client.containers.get(container_id)
+            c = client.containers.get(docker_id)
             image = (c.attrs.get("Config") or {}).get("Image", "")
             name  = c.name.lstrip("/")
             return image, name

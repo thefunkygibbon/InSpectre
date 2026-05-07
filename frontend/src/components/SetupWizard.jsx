@@ -622,21 +622,21 @@ function StepDocker({ onNext }) {
             <>
               <div className="space-y-1">
                 <label className="block text-xs font-medium" style={{ color: 'var(--color-text-muted)' }}>
-                  API User <span className="font-mono">(e.g. root@pam)</span>
+                  Token ID <span className="font-mono">(user@realm!tokenname)</span>
                 </label>
-                <input className="input w-full font-mono text-sm" placeholder="root@pam"
+                <input className="input w-full font-mono text-sm" placeholder="root@pam!mytoken"
                   value={authUser} onChange={e => setAuthUser(e.target.value)} />
+                <p className="text-[11px]" style={{ color: 'var(--color-text-faint)' }}>
+                  The Token ID shown in Datacenter → API Tokens in the Proxmox UI.
+                </p>
               </div>
               <div className="space-y-1">
                 <label className="block text-xs font-medium" style={{ color: 'var(--color-text-muted)' }}>
-                  API Token <span className="font-mono">(TOKENID=SECRET)</span>
+                  Token Secret <span className="font-mono">(UUID)</span>
                 </label>
                 <input type="password" className="input w-full font-mono text-sm"
-                  placeholder="mytoken=xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+                  placeholder="xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
                   value={authToken} onChange={e => setAuthToken(e.target.value)} />
-                <p className="text-[11px]" style={{ color: 'var(--color-text-faint)' }}>
-                  Create via Datacenter → API Tokens in the Proxmox UI.
-                </p>
               </div>
               <div className="space-y-1">
                 <label className="block text-xs font-medium" style={{ color: 'var(--color-text-muted)' }}>Default Node</label>
