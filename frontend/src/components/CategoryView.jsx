@@ -95,16 +95,17 @@ function CategoryGroup({ label, devices, layout, onDeviceClick, defaultOpen }) {
         ) : (
           <div className="card overflow-hidden ml-2">
             <div
-              className="grid grid-cols-[1.5rem_2fr_1fr_1fr_1fr_6rem] gap-4 px-4 py-2.5 border-b
+              className="grid grid-cols-[1.5rem_1fr_5rem_1.5rem] sm:grid-cols-[1.5rem_2fr_1fr_1fr_1fr_6rem_1.5rem] gap-3 sm:gap-4 px-4 py-2.5 border-b
                          text-xs font-semibold uppercase tracking-wider"
               style={{ borderColor: 'var(--color-border)', color: 'var(--color-text-muted)' }}
             >
               <span />
               <span>Name / IP</span>
-              <span>MAC</span>
-              <span>Vendor</span>
-              <span>Last Seen</span>
+              <span className="hidden sm:block">MAC</span>
+              <span className="hidden sm:block">Vendor</span>
+              <span className="hidden sm:block">Last Changed</span>
               <span>Status</span>
+              <span />
             </div>
             {devices.map((d, i) => (
               <DeviceRow

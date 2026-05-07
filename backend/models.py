@@ -38,11 +38,17 @@ class Device(Base):
     zone                 = Column(String, nullable=True)
     is_ignored           = Column(Boolean, server_default='false', nullable=False)
 
+    # Tracks when is_online last changed (online↔offline transitions)
+    status_changed_at        = Column(DateTime(timezone=True), nullable=True)
+
     # Phase 7: scan performance & port baseline
     hostname_last_attempted = Column(DateTime(timezone=True), nullable=True)
     deep_scan_last_run      = Column(DateTime(timezone=True), nullable=True)
     baseline_ports          = Column(JSON, nullable=True)
     baseline_scan_count     = Column(Integer, server_default='0', nullable=False)
+
+    # Scan type determined at discovery time: 'syn' (default) or 'tcp_connect' (probe host)
+    scan_type               = Column(String, nullable=False, server_default='syn')
 
     ip_history   = relationship("IPHistory",    back_populates="device",
                                 order_by="IPHistory.first_seen.desc()")

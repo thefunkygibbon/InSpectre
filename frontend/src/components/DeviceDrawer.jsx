@@ -242,7 +242,7 @@ function ScanPipeline({ device, vulnScanning }) {
       return is_online ? 'running' : 'pending'
     }
     if (key === 'services') {
-      if (pipeline_stage === 'services_done') return 'done'
+      if (pipeline_stage === 'services_done' || pipeline_stage === 'versions_done') return 'done'
       if (deep_scanned) return 'running'
       return 'pending'
     }
@@ -616,8 +616,8 @@ export function DeviceDrawer({ device, onClose, onRename, onResolveName, onRefre
 
               {/* Timeline summary */}
               <Collapsible title="Timeline" icon={Clock} defaultOpen={true}>
-                <Row label="First seen" value={fmt(localDevice.first_seen)} />
-                <Row label="Last seen"  value={fmt(localDevice.last_seen)} />
+                <Row label="First seen"    value={fmt(localDevice.first_seen)} />
+                <Row label="Last changed" value={fmt(localDevice.last_seen)} />
                 {scan?.scanned_at && <Row label="Scanned at" value={fmt(scan.scanned_at)} />}
               </Collapsible>
 
@@ -713,7 +713,7 @@ export function DeviceDrawer({ device, onClose, onRename, onResolveName, onRefre
             </>
           )}
 
-          {activeTab === 'vulns' && (
+          <div style={{ display: activeTab === 'vulns' ? 'block' : 'none' }}>
             <VulnPanel
               device={localDevice}
               lines={vulnLines}
@@ -727,7 +727,7 @@ export function DeviceDrawer({ device, onClose, onRename, onResolveName, onRefre
                 }).catch(() => {})
               }}
             />
-          )}
+          </div>
 
           {activeTab === 'traffic' && (
             <TrafficPanel device={localDevice} />

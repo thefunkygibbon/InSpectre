@@ -1,19 +1,27 @@
 import { useState, useEffect, useRef } from 'react'
 import {
   Save, RotateCcw, Settings2, X, Download, Upload, FileText,
-  Database, Bell, ScanLine, Eye, EyeOff, Send, Globe,
+  Database, Bell, ScanLine, Eye, EyeOff, Send, Globe, User, Key, Box,
 } from 'lucide-react'
 import { api } from '../api'
+import { HostsManager } from './HostsManager'
 
 // ── Setting definitions ────────────────────────────────────────────────────────
 const SETTING_META = {
   // Scanner tab
-  scan_interval:           { label: 'Scan Interval',       unit: 'seconds',       type: 'number', min: 5,  max: 3600, tab: 'scanner' },
-  offline_miss_threshold:  { label: 'Offline Threshold',   unit: 'missed sweeps', type: 'number', min: 1,  max: 20,   tab: 'scanner' },
-  os_confidence_threshold: { label: 'OS Confidence Min',   unit: '%',             type: 'number', min: 50, max: 100,  tab: 'scanner' },
-  sniffer_workers:         { label: 'Sniffer Workers',     unit: 'threads',       type: 'number', min: 1,  max: 16,   tab: 'scanner' },
+  scan_interval:           { label: 'Scan Interval',       unit: 'seconds',       type: 'number', min: 5,  max: 3600, tab: 'scanner',
+    description: 'How often the probe sweeps the network looking for devices.' },
+  offline_miss_threshold:  { label: 'Offline Threshold',   unit: 'missed sweeps', type: 'number', min: 1,  max: 20,   tab: 'scanner',
+    description: 'How many consecutive missed ARP sweeps before a device is marked offline.' },
+  sniffer_workers:         { label: 'Sniffer Workers',     unit: 'threads',       type: 'number', min: 1,  max: 16,   tab: 'scanner',
+    description: 'Number of parallel packet capture threads. Requires probe restart to take effect.' },
+  arp_scan_retry:          { label: 'ARP Sweep Retries',   unit: 'extra rounds',  type: 'number', min: 0,  max: 3,    tab: 'scanner',
+    description: 'Extra ARP broadcast rounds per sweep (0 = single pass, 1 = two rounds). Each retry wakes sleeping mobile devices and adds broadcast traffic. The passive sniffer catches most devices that miss sweeps.' },
   ip_range:                { label: 'IP Range',            unit: '',              type: 'text',              tab: 'scanner' },
-  nmap_args:               { label: 'Nmap Arguments',      unit: '',              type: 'text',              tab: 'scanner' },
+  dns_server:              { label: 'LAN DNS Server',      unit: 'IP',            type: 'text',              tab: 'scanner',
+    description: 'DNS server used for hostname resolution. Leave blank to auto-detect from host.' },
+  probe_interface:         { label: 'Probe Interface',     unit: '',              type: 'text',              tab: 'scanner',
+    description: 'Network interface the probe uses for scanning (e.g. eth0, eno1). Leave blank to auto-detect.' },
   vuln_scan_templates:     { label: 'Vuln Scan Templates', unit: '',              type: 'text',              tab: 'scanner',
     description: 'Comma-separated template tags for vulnerability scanning (e.g. cve,exposure,misconfig,default-login,network).' },
   vuln_scan_schedule:      { label: 'Scheduled Vuln Scans', unit: '',             type: 'select', tab: 'scanner',
@@ -74,15 +82,28 @@ const SETTING_META = {
   gotify_url:        { tab: 'notifications' },
   gotify_token:      { tab: 'notifications' },
   pushbullet_api_key:{ tab: 'notifications' },
+
+  // Docker monitoring — handled as custom cards, referenced here for tab routing
+  docker_enabled:        { tab: 'docker' },
+  docker_host:           { tab: 'docker' },
+  docker_tls_verify:     { tab: 'docker' },
+  trivy_db_update_hours: { tab: 'docker' },
+  docker_scan_on_new:    { tab: 'docker' },
+  docker_scan_on_update: { tab: 'docker' },
 }
 
 // Keys rendered as custom delivery-channel cards, not through SettingRow
 const DELIVERY_KEYS = new Set(['alert_webhook_url','ntfy_url','ntfy_topic','gotify_url','gotify_token','pushbullet_api_key'])
 
+// Docker keys handled as custom cards
+const DOCKER_KEYS = new Set(['docker_enabled','docker_host','docker_tls_verify','trivy_db_update_hours','docker_scan_on_new','docker_scan_on_update'])
+
 const TABS = [
   { id: 'scanner',       label: 'Scanner',       Icon: ScanLine },
   { id: 'notifications', label: 'Notifications', Icon: Bell     },
+  { id: 'docker',        label: 'Docker',        Icon: Box      },
   { id: 'data',          label: 'Data',          Icon: Database },
+  { id: 'account',       label: 'Account',       Icon: User     },
 ]
 
 async function downloadResponse(res, filename) {
@@ -220,8 +241,37 @@ export function SettingsPanel({ onClose, onSettingChange }) {
     finally { if (fileInputRef.current) fileInputRef.current.value = '' }
   }
 
+  const [cpCurrent,    setCpCurrent]    = useState('')
+  const [cpNew,        setCpNew]        = useState('')
+  const [cpConfirm,    setCpConfirm]    = useState('')
+  const [cpError,      setCpError]      = useState('')
+  const [cpSuccess,    setCpSuccess]    = useState(false)
+  const [cpLoading,    setCpLoading]    = useState(false)
+  const [showCpCurr,   setShowCpCurr]   = useState(false)
+  const [showCpNew,    setShowCpNew]    = useState(false)
+
+  async function handleChangePassword(e) {
+    e.preventDefault()
+    if (!cpCurrent || !cpNew || !cpConfirm) return
+    if (cpNew !== cpConfirm) { setCpError('New passwords do not match'); return }
+    if (cpNew.length < 8)   { setCpError('Password must be at least 8 characters'); return }
+    setCpError('')
+    setCpLoading(true)
+    try {
+      await api.changePassword(cpCurrent, cpNew)
+      setCpSuccess(true)
+      setCpCurrent('')
+      setCpNew('')
+      setCpConfirm('')
+    } catch {
+      setCpError('Current password is incorrect')
+    } finally {
+      setCpLoading(false)
+    }
+  }
+
   const hasDirty   = Object.keys(dirty).length > 0
-  const showFooter = activeTab !== 'data'
+  const showFooter = activeTab !== 'data' && activeTab !== 'account' && activeTab !== 'docker'
 
   // Returns current value for a key (dirty-aware)
   function val(key) {
@@ -236,7 +286,8 @@ export function SettingsPanel({ onClose, onSettingChange }) {
   const bnEnabled = val('browser_notifications_enabled') === 'true'
 
   // ── Scanner tab grouping ────────────────────────────────────────────────────
-  const networkScanKeys = ['scan_interval','offline_miss_threshold','os_confidence_threshold','sniffer_workers','ip_range','nmap_args']
+  const networkScanKeys   = ['scan_interval','offline_miss_threshold','sniffer_workers','arp_scan_retry']
+  const networkConfigKeys = ['ip_range','dns_server','probe_interface']
 
   // ── Notifications tab grouping ──────────────────────────────────────────────
   const inAppKeys   = ['notifications_enabled','browser_notifications_enabled']
@@ -306,6 +357,12 @@ export function SettingsPanel({ onClose, onSettingChange }) {
               {/* Network scanning */}
               <SectionHeader label="Network Scanning" Icon={ScanLine} />
               {settingsByKeys(networkScanKeys).map(s => (
+                <SettingRow key={s.key} s={s} dirty={dirty} onchange={handleChange} />
+              ))}
+
+              {/* Network configuration */}
+              <SectionHeader label="Network Configuration" Icon={ScanLine} />
+              {settingsByKeys(networkConfigKeys).map(s => (
                 <SettingRow key={s.key} s={s} dirty={dirty} onchange={handleChange} />
               ))}
 
@@ -460,6 +517,89 @@ export function SettingsPanel({ onClose, onSettingChange }) {
             </>
           )}
 
+          {/* ── Docker tab ──────────────────────────────────────────────────── */}
+          {activeTab === 'docker' && (
+            <>
+              <p className="text-xs" style={{ color: 'var(--color-text-faint)' }}>
+                Connect to Docker hosts and Proxmox VE servers to monitor and manage containers.
+                Enable individual hosts with their toggle — at least one must be active for the Containers page to work.
+              </p>
+
+              <SectionHeader label="Container Hosts" Icon={Box} />
+              <HostsManager />
+
+              <SectionHeader label="Image Vulnerability Scanning (Trivy)" Icon={Box} />
+              <div className="card p-4 space-y-4">
+                <p className="text-xs" style={{ color: 'var(--color-text-faint)' }}>
+                  Trivy scans container images for known CVEs. The vulnerability database is pre-downloaded
+                  during the backend build and refreshed automatically at the interval below. Rebuild with{' '}
+                  <code className="font-mono text-[10px] px-1 py-0.5 rounded"
+                    style={{ background: 'var(--color-surface-offset)' }}>./inspectre.sh rebuild keep-data</code> to update Trivy itself.
+                </p>
+
+                {/* DB update interval */}
+                <div className="space-y-1.5">
+                  <label className="text-xs font-medium" style={{ color: 'var(--color-text-muted)' }}>
+                    Vulnerability DB update interval (hours)
+                  </label>
+                  <input
+                    type="number" min="0" className="input text-sm w-28"
+                    value={val('trivy_db_update_hours')}
+                    onChange={e => handleChange('trivy_db_update_hours', e.target.value)}
+                    style={dirty['trivy_db_update_hours'] !== undefined ? { borderColor: 'color-mix(in srgb, var(--color-brand) 50%, transparent)' } : {}}
+                  />
+                  <p className="text-xs" style={{ color: 'var(--color-text-faint)' }}>
+                    How often the backend refreshes the Trivy CVE database. Set to 0 to disable automatic updates.
+                  </p>
+                </div>
+
+                {/* Auto-scan on new container */}
+                {(() => {
+                  const isOn = val('docker_scan_on_new') === 'true'
+                  return (
+                    <div className="flex items-center justify-between">
+                      <div>
+                        <p className="text-sm font-medium" style={{ color: 'var(--color-text)' }}>Scan on new container</p>
+                        <p className="text-xs mt-0.5" style={{ color: 'var(--color-text-faint)' }}>
+                          Automatically run a Trivy scan when a new container is created.
+                        </p>
+                      </div>
+                      <button type="button" role="switch" aria-checked={isOn}
+                        onClick={() => handleChange('docker_scan_on_new', isOn ? 'false' : 'true')}
+                        className="relative inline-flex h-6 w-11 items-center rounded-full transition-colors duration-200 focus:outline-none shrink-0"
+                        style={{ background: isOn ? 'var(--color-brand)' : 'var(--color-border)' }}>
+                        <span className="inline-block h-4 w-4 rounded-full bg-white shadow transition-transform duration-200"
+                          style={{ transform: isOn ? 'translateX(22px)' : 'translateX(4px)' }} />
+                      </button>
+                    </div>
+                  )
+                })()}
+
+                {/* Auto-scan on container update */}
+                {(() => {
+                  const isOn = val('docker_scan_on_update') === 'true'
+                  return (
+                    <div className="flex items-center justify-between">
+                      <div>
+                        <p className="text-sm font-medium" style={{ color: 'var(--color-text)' }}>Scan on image update</p>
+                        <p className="text-xs mt-0.5" style={{ color: 'var(--color-text-faint)' }}>
+                          Automatically scan when a container restarts with a different image (updated version).
+                        </p>
+                      </div>
+                      <button type="button" role="switch" aria-checked={isOn}
+                        onClick={() => handleChange('docker_scan_on_update', isOn ? 'false' : 'true')}
+                        className="relative inline-flex h-6 w-11 items-center rounded-full transition-colors duration-200 focus:outline-none shrink-0"
+                        style={{ background: isOn ? 'var(--color-brand)' : 'var(--color-border)' }}>
+                        <span className="inline-block h-4 w-4 rounded-full bg-white shadow transition-transform duration-200"
+                          style={{ transform: isOn ? 'translateX(22px)' : 'translateX(4px)' }} />
+                      </button>
+                    </div>
+                  )
+                })()}
+              </div>
+            </>
+          )}
+
           {/* ── Data tab ────────────────────────────────────────────────────── */}
           {activeTab === 'data' && (
             <>
@@ -568,6 +708,86 @@ export function SettingsPanel({ onClose, onSettingChange }) {
               </div>
             </>
           )}
+
+          {/* ── Account tab ─────────────────────────────────────────────────── */}
+          {activeTab === 'account' && (
+            <>
+              <p className="text-xs" style={{ color: 'var(--color-text-faint)' }}>
+                Manage your account credentials.
+              </p>
+
+              <SectionHeader label="Change Password" Icon={Key} />
+              <div className="card p-4">
+                <form onSubmit={handleChangePassword} className="space-y-3">
+                  <div className="space-y-1">
+                    <label className="text-xs font-medium" style={{ color: 'var(--color-text-muted)' }}>Current password</label>
+                    <div className="relative">
+                      <input
+                        type={showCpCurr ? 'text' : 'password'}
+                        className="input pr-10 w-full"
+                        value={cpCurrent}
+                        onChange={e => { setCpCurrent(e.target.value); setCpSuccess(false) }}
+                        disabled={cpLoading}
+                        autoComplete="current-password"
+                      />
+                      <button type="button" onClick={() => setShowCpCurr(v => !v)}
+                        className="absolute right-3 top-1/2 -translate-y-1/2 opacity-50 hover:opacity-100 transition-opacity"
+                        tabIndex={-1}>
+                        {showCpCurr ? <EyeOff size={14} /> : <Eye size={14} />}
+                      </button>
+                    </div>
+                  </div>
+
+                  <div className="space-y-1">
+                    <label className="text-xs font-medium" style={{ color: 'var(--color-text-muted)' }}>New password</label>
+                    <div className="relative">
+                      <input
+                        type={showCpNew ? 'text' : 'password'}
+                        className="input pr-10 w-full"
+                        value={cpNew}
+                        onChange={e => { setCpNew(e.target.value); setCpSuccess(false); setCpError('') }}
+                        disabled={cpLoading}
+                        autoComplete="new-password"
+                      />
+                      <button type="button" onClick={() => setShowCpNew(v => !v)}
+                        className="absolute right-3 top-1/2 -translate-y-1/2 opacity-50 hover:opacity-100 transition-opacity"
+                        tabIndex={-1}>
+                        {showCpNew ? <EyeOff size={14} /> : <Eye size={14} />}
+                      </button>
+                    </div>
+                  </div>
+
+                  <div className="space-y-1">
+                    <label className="text-xs font-medium" style={{ color: 'var(--color-text-muted)' }}>Confirm new password</label>
+                    <input
+                      type="password"
+                      className="input w-full"
+                      value={cpConfirm}
+                      onChange={e => { setCpConfirm(e.target.value); setCpSuccess(false); setCpError('') }}
+                      disabled={cpLoading}
+                      autoComplete="new-password"
+                    />
+                  </div>
+
+                  {cpError && (
+                    <p className="text-xs" style={{ color: '#ef4444' }}>{cpError}</p>
+                  )}
+                  {cpSuccess && (
+                    <p className="text-xs" style={{ color: '#10b981' }}>Password changed successfully.</p>
+                  )}
+
+                  <button
+                    type="submit"
+                    disabled={cpLoading || !cpCurrent || !cpNew || !cpConfirm}
+                    className="btn-primary w-full flex items-center justify-center gap-2"
+                    style={{ opacity: cpLoading || !cpCurrent || !cpNew || !cpConfirm ? 0.5 : 1 }}
+                  >
+                    {cpLoading ? 'Changing…' : 'Change Password'}
+                  </button>
+                </form>
+              </div>
+            </>
+          )}
         </div>
 
         {/* Footer */}
@@ -590,6 +810,7 @@ export function SettingsPanel({ onClose, onSettingChange }) {
 
 // ── Sub-components ─────────────────────────────────────────────────────────────
 
+// ---------------------------------------------------------------------------
 function SectionHeader({ label, Icon }) {
   return (
     <div className="flex items-center gap-2 pt-1">

@@ -391,6 +391,105 @@ function GenericView({ lines, running }) {
 }
 
 // ---------------------------------------------------------------------------
+// Trivy output — colorizes CVE severity columns
+// ---------------------------------------------------------------------------
+function trivyLineStyle(l) {
+  if (/\bCRITICAL\b/.test(l)) return { color: '#f87171' }
+  if (/\bHIGH\b/.test(l))     return { color: '#fb923c' }
+  if (/\bMEDIUM\b/.test(l))   return { color: '#fbbf24' }
+  if (/\bLOW\b/.test(l))      return { color: '#60a5fa' }
+  if (/\b(WARN|WARNING)\b/i.test(l) || l.startsWith('[WARN]')) return { color: '#fbbf24' }
+  if (l.startsWith('[ERROR]')) return { color: '#f87171' }
+  if (/^(INFO|FATAL)\b/.test(l) || l.startsWith('[INFO]')) return { color: '#8b949e' }
+  if (/^Total:/.test(l))       return { color: '#c9d1d9', fontWeight: 'bold' }
+  return { color: '#8b949e' }
+}
+
+function parseTrivyCounts(lines) {
+  // Count severity occurrences from Trivy tabular output
+  const counts = { CRITICAL: 0, HIGH: 0, MEDIUM: 0, LOW: 0 }
+  // Prefer the "Total:" summary line if present: "Total: 5 (UNKNOWN: 0, LOW: 2, MEDIUM: 1, HIGH: 1, CRITICAL: 1)"
+  const totalLine = lines.find(l => /^Total:\s+\d+/.test(l))
+  if (totalLine) {
+    for (const sev of ['CRITICAL', 'HIGH', 'MEDIUM', 'LOW']) {
+      const m = totalLine.match(new RegExp(`${sev}:\\s*(\\d+)`))
+      if (m) counts[sev] = parseInt(m[1])
+    }
+  } else {
+    // Fallback: count rows containing a severity keyword
+    for (const l of lines) {
+      for (const sev of ['CRITICAL', 'HIGH', 'MEDIUM', 'LOW']) {
+        if (new RegExp(`\\b${sev}\\b`).test(l)) { counts[sev]++; break }
+      }
+    }
+  }
+  return counts
+}
+
+function TrivyView({ lines, running }) {
+  const SEV_COLOR = { CRITICAL: '#f87171', HIGH: '#fb923c', MEDIUM: '#fbbf24', LOW: '#60a5fa' }
+
+  const done      = lines.includes('TRIVY_DONE')
+  const visLines  = lines.filter(l => l !== 'TRIVY_DONE')
+  const counts    = parseTrivyCounts(visLines)
+  const hasCounts = Object.values(counts).some(n => n > 0)
+
+  return (
+    <div className="space-y-2">
+      {/* Completion banner */}
+      {done && !running && (
+        hasCounts ? (
+          <div className="flex flex-wrap items-center gap-1.5 px-3 py-2 rounded-lg"
+            style={{ background: 'rgba(239,68,68,0.08)', border: '1px solid rgba(239,68,68,0.25)' }}>
+            <span className="text-[10px] font-semibold uppercase tracking-wider mr-1" style={{ color: '#f87171' }}>
+              Scan complete —
+            </span>
+            {Object.entries(counts).filter(([, n]) => n > 0).map(([sev, n]) => (
+              <span key={sev}
+                className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-bold"
+                style={{ background: SEV_COLOR[sev] + '22', color: SEV_COLOR[sev], border: `1px solid ${SEV_COLOR[sev]}55` }}>
+                {n} {sev}
+              </span>
+            ))}
+          </div>
+        ) : (
+          <div className="flex items-center gap-2 px-3 py-2 rounded-lg"
+            style={{ background: 'rgba(34,197,94,0.08)', border: '1px solid rgba(34,197,94,0.25)' }}>
+            <span className="text-[11px] font-semibold" style={{ color: '#22c55e' }}>
+              ✓ Scan complete — no vulnerabilities found
+            </span>
+          </div>
+        )
+      )}
+
+      {/* Live severity summary while scanning */}
+      {running && hasCounts && (
+        <div className="flex flex-wrap gap-1.5 pb-1">
+          {Object.entries(counts).filter(([, n]) => n > 0).map(([sev, n]) => (
+            <span key={sev}
+              className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-bold"
+              style={{ background: SEV_COLOR[sev] + '22', color: SEV_COLOR[sev], border: `1px solid ${SEV_COLOR[sev]}55` }}>
+              {n} {sev}
+            </span>
+          ))}
+        </div>
+      )}
+
+      {/* Raw lines with colour coding */}
+      <div className="space-y-0.5">
+        {visLines.filter(l => l.trim()).map((l, i) => (
+          <div key={i} className="font-mono leading-relaxed break-words whitespace-pre"
+            style={{ fontSize: '10px', ...trivyLineStyle(l) }}>
+            {l}
+          </div>
+        ))}
+        {running && <span className="inline-block animate-pulse text-green-400" style={{ fontSize: 10 }}>▌</span>}
+      </div>
+    </div>
+  )
+}
+
+// ---------------------------------------------------------------------------
 // Public export
 // ---------------------------------------------------------------------------
 export function StreamOutput({ lines = [], running = false, onStop, mode = 'generic' }) {
@@ -398,15 +497,18 @@ export function StreamOutput({ lines = [], running = false, onStop, mode = 'gene
 
   const inner = (() => {
     switch (mode) {
-      case 'ping':       return <PingView       lines={lines} running={running} />
-      case 'traceroute': return <TracerouteView lines={lines} running={running} />
+      case 'ping':       return <PingView         lines={lines} running={running} />
+      case 'traceroute': return <TracerouteView   lines={lines} running={running} />
       case 'vuln':       return <VulnProgressView lines={lines} running={running} />
-      default:           return <GenericView    lines={lines} running={running} />
+      case 'trivy':      return <TrivyView        lines={lines} running={running} />
+      default:           return <GenericView      lines={lines} running={running} />
     }
   })()
 
+  const rawLines = mode === 'trivy' ? lines.filter(l => l !== 'TRIVY_DONE') : lines
+
   return (
-    <TermChrome onStop={onStop} running={running} rawLines={lines}
+    <TermChrome onStop={onStop} running={running} rawLines={rawLines}
       defaultOpen={mode === 'generic'}>
       {inner}
     </TermChrome>

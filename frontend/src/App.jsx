@@ -4,13 +4,14 @@ import {
   Search, AlertCircle, Activity,
   LayoutGrid, List, Sun, Moon, ChevronDown,
   Bell, X, Layers, Star, ShieldAlert, Wrench, Ban, BarChart2,
-  ArrowLeft, SlidersHorizontal,
+  ArrowLeft, SlidersHorizontal, LogOut, Eye, EyeOff, Box,
 } from 'lucide-react'
 import { TrafficPage } from './components/TrafficPage'
+import { ContainersPage } from './components/ContainersPage'
 import { useDevices }          from './hooks/useDevices'
 import { useTheme }            from './hooks/useTheme'
 import { useSmartFilters }     from './hooks/useSmartFilters'
-import { api }                 from './api'
+import { api, getToken, clearToken } from './api'
 import { Logo }                from './components/Logo'
 import { StatCard }            from './components/StatCard'
 import { DeviceCard }          from './components/DeviceCard'
@@ -23,12 +24,15 @@ import { DeviceBlocking }      from './components/DeviceBlocking'
 import { NetworkTimeline }     from './components/NetworkTimeline'
 import { CategoryView }        from './components/CategoryView'
 import { SmartFilterBar }      from './components/SmartFilterBar'
+import { LoginPage }           from './components/LoginPage'
+import { SetupWizard }         from './components/SetupWizard'
+import { StatusButton }        from './components/StatusButton'
 
 const APP_VERSION = '1.1.0'
 
 const SORT_OPTIONS = [
-  { value: 'last_seen_desc', label: 'Last seen (newest)' },
-  { value: 'last_seen_asc',  label: 'Last seen (oldest)' },
+  { value: 'last_seen_desc', label: 'Last changed (newest)' },
+  { value: 'last_seen_asc',  label: 'Last changed (oldest)' },
   { value: 'ip_asc',         label: 'IP address (asc)'   },
   { value: 'ip_desc',        label: 'IP address (desc)'  },
   { value: 'name_asc',       label: 'Name (A–Z)'    },
@@ -38,15 +42,16 @@ const SORT_OPTIONS = [
   { value: 'important',      label: 'Watched first' },
 ]
 
-const TOAST_DURATION = 7000
+const TOAST_DURATION = 2500
 
 // Page definitions for the nav
 const PAGES = [
-  { id: 'tools',    label: 'Network Tools',       Icon: Wrench,     title: 'Network Tools' },
-  { id: 'security', label: 'Vulnerability Report', Icon: ShieldAlert, title: 'Vulnerability Report' },
-  { id: 'blocking', label: 'Device Blocking',      Icon: Ban,        title: 'Device Blocking' },
-  { id: 'timeline', label: 'Device Timeline',      Icon: BarChart2,  title: 'Device Timeline' },
-  { id: 'traffic',  label: 'Traffic Monitor',      Icon: Activity,   title: 'Traffic Monitor' },
+  { id: 'tools',      label: 'Network Tools',       Icon: Wrench,     title: 'Network Tools' },
+  { id: 'security',   label: 'Vulnerability Report', Icon: ShieldAlert, title: 'Vulnerability Report' },
+  { id: 'blocking',   label: 'Device Blocking',      Icon: Ban,        title: 'Device Blocking' },
+  { id: 'timeline',   label: 'Device Timeline',      Icon: BarChart2,  title: 'Device Timeline' },
+  { id: 'traffic',    label: 'Traffic Monitor',      Icon: Activity,   title: 'Traffic Monitor' },
+  { id: 'containers', label: 'Docker Containers',    Icon: Box,        title: 'Docker Containers' },
 ]
 
 function ipToNum(ip) {
@@ -81,12 +86,14 @@ function useClock() {
 
 // ── Toast ─────────────────────────────────────────────────────────────────────────────
 function Toast({ alert, kind, onDismiss, onDeviceClick }) {
-  const timerRef = useRef(null)
+  const timerRef    = useRef(null)
+  const dismissRef  = useRef(onDismiss)
+  useEffect(() => { dismissRef.current = onDismiss }, [onDismiss])
 
   useEffect(() => {
-    timerRef.current = setTimeout(() => onDismiss(alert.id), TOAST_DURATION)
+    timerRef.current = setTimeout(() => dismissRef.current(alert.id), TOAST_DURATION)
     return () => clearTimeout(timerRef.current)
-  }, [alert.id, onDismiss])
+  }, [alert.id])
 
   function handleClick(e) {
     if (e.target.closest('[data-dismiss]')) return
@@ -157,7 +164,7 @@ function NotificationToasts({ newAlerts, offlineAlerts, onDismissNew, onDismissO
   const all = [
     ...newAlerts.map(a     => ({ ...a, kind: 'new'     })),
     ...offlineAlerts.map(a => ({ ...a, kind: 'offline' })),
-  ]
+  ].filter(a => a.toastable !== false)
   if (!all.length) return null
   return (
     <div
@@ -177,8 +184,50 @@ function NotificationToasts({ newAlerts, offlineAlerts, onDismissNew, onDismissO
   )
 }
 
+// ── Mobile nav dropdown ──────────────────────────────────────────────────────────────────
+function MobileNavMenu({ pages, onSelect }) {
+  const [open, setOpen] = useState(false)
+  const ref = useRef(null)
+
+  useEffect(() => {
+    if (!open) return
+    function handler(e) {
+      if (ref.current && !ref.current.contains(e.target)) setOpen(false)
+    }
+    document.addEventListener('mousedown', handler)
+    return () => document.removeEventListener('mousedown', handler)
+  }, [open])
+
+  return (
+    <div ref={ref} className="relative">
+      <button
+        onClick={() => setOpen(o => !o)}
+        className="btn-ghost p-2 flex items-center gap-1"
+        aria-label="Pages menu"
+        title="Pages">
+        <LayoutGrid size={16} />
+        <ChevronDown size={12} style={{ opacity: 0.6 }} />
+      </button>
+      {open && (
+        <div className="absolute left-0 top-full mt-1 z-50 rounded-xl shadow-xl py-1 min-w-[180px]"
+          style={{ background: 'var(--color-surface)', border: '1px solid var(--color-border)' }}>
+          {pages.map(p => (
+            <button key={p.id}
+              onClick={() => { onSelect(p.id); setOpen(false) }}
+              className="w-full flex items-center gap-3 px-4 py-2.5 text-sm text-left transition-colors hover:opacity-80"
+              style={{ color: 'var(--color-text)' }}>
+              <p.Icon size={15} style={{ color: 'var(--color-brand)', flexShrink: 0 }} />
+              {p.label}
+            </button>
+          ))}
+        </div>
+      )}
+    </div>
+  )
+}
+
 // ── Main App ────────────────────────────────────────────────────────────────────────────
-export default function App() {
+function MainApp({ onLogout }) {
   const [notificationsEnabled,  setNotificationsEnabled]  = useState(true)
   const [browserNotifsEnabled,  setBrowserNotifsEnabled]  = useState(false)
   const [pushbulletConfigured,  setPushbulletConfigured]  = useState(false)
@@ -232,6 +281,11 @@ export default function App() {
   const [activePage,       setActivePage]       = useState(null) // null | 'tools' | 'security' | 'blocking' | 'timeline'
   const [showAlertDrop,    setShowAlertDrop]    = useState(false)
   const [showFilters,      setShowFilters]      = useState(false)
+  const [containerToOpen,  setContainerToOpen]  = useState(null)
+
+  useEffect(() => {
+    if (activePage !== 'containers') setContainerToOpen(null)
+  }, [activePage])
 
   useEffect(() => {
     api.getSettings().then(s => {
@@ -358,19 +412,26 @@ export default function App() {
               )}
             </div>
 
-            {/* Page nav icons — left of clock */}
+            {/* Page nav — icon row on md+, dropdown on small screens */}
             {!activePage && (
-              <div className="flex items-center gap-0.5 ml-2">
-                {PAGES.map(p => (
-                  <button key={p.id}
-                    onClick={() => setActivePage(p.id)}
-                    className="btn-ghost p-2 relative"
-                    aria-label={p.label}
-                    title={p.label}>
-                    <p.Icon size={16} />
-                  </button>
-                ))}
-              </div>
+              <>
+                {/* Desktop: icon row */}
+                <div className="hidden md:flex items-center gap-0.5 ml-2">
+                  {PAGES.map(p => (
+                    <button key={p.id}
+                      onClick={() => setActivePage(p.id)}
+                      className="btn-ghost p-2 relative shrink-0"
+                      aria-label={p.label}
+                      title={p.label}>
+                      <p.Icon size={16} />
+                    </button>
+                  ))}
+                </div>
+                {/* Mobile: dropdown */}
+                <div className="md:hidden ml-2 relative">
+                  <MobileNavMenu pages={PAGES} onSelect={setActivePage} />
+                </div>
+              </>
             )}
 
             {/* Page title when on a page */}
@@ -493,6 +554,10 @@ export default function App() {
                 aria-label="Settings" title="Settings">
                 <Settings size={16} />
               </button>
+              <button onClick={onLogout} className="btn-ghost p-2"
+                aria-label="Sign out" title="Sign out">
+                <LogOut size={16} />
+              </button>
             </div>
           </div>
         </header>
@@ -520,6 +585,10 @@ export default function App() {
                 const dev = devices.find(d => d.mac_address === mac)
                 if (dev) openDevice(dev, tab || 'overview')
               }}
+              onContainerClick={name => {
+                setContainerToOpen(name)
+                setActivePage('containers')
+              }}
             />
           )}
 
@@ -540,6 +609,10 @@ export default function App() {
 
           {activePage === 'traffic' && (
             <TrafficPage />
+          )}
+
+          {activePage === 'containers' && (
+            <ContainersPage openContainer={containerToOpen} />
           )}
 
           {/* ── Main dashboard ── */}
@@ -684,7 +757,7 @@ export default function App() {
                           <span>Name / IP</span>
                           <span className="hidden sm:block">MAC</span>
                           <span className="hidden sm:block">Vendor</span>
-                          <span className="hidden sm:block">Last Seen</span>
+                          <span className="hidden sm:block">Last Changed</span>
                           <span>Status</span>
                           <span />
                         </div>
@@ -714,10 +787,7 @@ export default function App() {
                   className="hover:underline">thefunkygibbon</a>
               </span>
             </div>
-            <div className="flex items-center gap-1.5 text-xs" style={{ color: '#10b981' }}>
-              <Activity size={12} />
-              <span>API connected</span>
-            </div>
+            <StatusButton />
           </div>
         </footer>
       </div>
@@ -821,4 +891,144 @@ function EmptyState({ search, filter, hasSmartFilters, onClearSmartFilters }) {
       </div>
     </div>
   )
+}
+
+// ── Auth loading screen ──────────────────────────────────────────────────────
+function AppLoadingScreen() {
+  return (
+    <div className="min-h-screen flex flex-col items-center justify-center"
+      style={{ background: 'var(--color-bg)' }}>
+      <div className="noise-overlay" />
+      <div className="relative z-10 flex flex-col items-center gap-4">
+        <Logo size={48} />
+        <p className="text-sm animate-pulse" style={{ color: 'var(--color-text-muted)' }}>Loading…</p>
+      </div>
+    </div>
+  )
+}
+
+// ── Root App — handles auth routing ─────────────────────────────────────────
+// authState: 'loading' | 'setup' | 'login' | 'app'
+// ── Forced password change (shown when must_change_password = true) ──────────
+function ForcePasswordChange({ onDone }) {
+  const [current,  setCurrent]  = useState('')
+  const [next,     setNext]     = useState('')
+  const [confirm,  setConfirm]  = useState('')
+  const [showPw,   setShowPw]   = useState(false)
+  const [error,    setError]    = useState('')
+  const [loading,  setLoading]  = useState(false)
+
+  async function handleSubmit(e) {
+    e.preventDefault()
+    if (next !== confirm) { setError('Passwords do not match'); return }
+    if (next.length < 8)  { setError('Password must be at least 8 characters'); return }
+    setError('')
+    setLoading(true)
+    try {
+      await api.changePassword(current, next)
+      onDone()
+    } catch {
+      setError('Current password is incorrect')
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  return (
+    <div className="min-h-screen flex flex-col items-center justify-center px-4"
+      style={{ background: 'var(--color-bg)' }}>
+      <div className="noise-overlay" />
+      <div className="relative z-10 w-full max-w-sm space-y-6">
+        <div className="flex flex-col items-center gap-3">
+          <Logo size={48} />
+          <div className="text-center">
+            <h1 className="text-2xl font-bold" style={{ color: 'var(--color-text)' }}>Change Password</h1>
+            <p className="text-sm mt-1" style={{ color: 'var(--color-text-muted)' }}>
+              You must set a new password before continuing.
+            </p>
+          </div>
+        </div>
+        <div className="card p-6 space-y-3">
+          <div className="text-xs px-3 py-2 rounded-lg" style={{ background: 'rgba(239,168,68,0.1)', color: '#f59e0b', border: '1px solid rgba(239,168,68,0.3)' }}>
+            Default credentials were detected. Please choose a secure password.
+          </div>
+          <form onSubmit={handleSubmit} className="space-y-3">
+            <input className="input w-full" type="password" placeholder="Current password (admin)"
+              value={current} onChange={e => setCurrent(e.target.value)} disabled={loading} autoComplete="current-password" />
+            <div className="relative">
+              <input className="input w-full pr-10" type={showPw ? 'text' : 'password'}
+                placeholder="New password" value={next}
+                onChange={e => { setNext(e.target.value); setError('') }} disabled={loading} autoComplete="new-password" />
+              <button type="button" onClick={() => setShowPw(v => !v)} tabIndex={-1}
+                className="absolute right-3 top-1/2 -translate-y-1/2 opacity-50 hover:opacity-100 transition-opacity">
+                {showPw ? <EyeOff size={14} /> : <Eye size={14} />}
+              </button>
+            </div>
+            <input className="input w-full" type="password" placeholder="Confirm new password"
+              value={confirm} onChange={e => { setConfirm(e.target.value); setError('') }} disabled={loading} autoComplete="new-password" />
+            {error && <p className="text-xs px-1" style={{ color: '#ef4444' }}>{error}</p>}
+            <button type="submit" disabled={loading || !current || !next || !confirm}
+              className="w-full py-2.5 rounded-xl font-semibold text-sm transition-all"
+              style={{ background: 'var(--color-brand)', color: 'white',
+                       opacity: loading || !current || !next || !confirm ? 0.6 : 1 }}>
+              {loading ? 'Saving…' : 'Set Password'}
+            </button>
+          </form>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+// ── Root App — handles auth routing ─────────────────────────────────────────
+// authState: 'loading' | 'setup' | 'login' | 'change_password' | 'app'
+export default function App() {
+  const [authState, setAuthState] = useState('loading')
+
+  useEffect(() => {
+    async function boot() {
+      // First check if setup has been completed (public endpoint)
+      try {
+        const status = await api.setupStatus()
+        if (!status.setup_complete) {
+          setAuthState('setup')
+          return
+        }
+      } catch {
+        // Server unreachable or old version without setup endpoint — fall through to auth
+      }
+
+      // Check for a stored token
+      const token = getToken()
+      if (!token) {
+        setAuthState('login')
+        return
+      }
+
+      // Validate the token and check if password change is required
+      try {
+        const me = await api.authMe()
+        setAuthState(me.must_change_password ? 'change_password' : 'app')
+      } catch {
+        clearToken()
+        setAuthState('login')
+      }
+    }
+    boot()
+  }, [])
+
+  function handleLogin(mustChange) {
+    setAuthState(mustChange ? 'change_password' : 'app')
+  }
+
+  function handleLogout() {
+    clearToken()
+    setAuthState('login')
+  }
+
+  if (authState === 'loading')         return <AppLoadingScreen />
+  if (authState === 'setup')           return <SetupWizard onComplete={() => setAuthState('login')} />
+  if (authState === 'login')           return <LoginPage onLogin={handleLogin} />
+  if (authState === 'change_password') return <ForcePasswordChange onDone={() => setAuthState('app')} />
+  return <MainApp onLogout={handleLogout} />
 }

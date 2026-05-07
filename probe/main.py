@@ -31,16 +31,54 @@ import traffic_monitor as _tm
 VERSION = "1.0.0"
 
 # ---------------------------------------------------------------------------
+# Startup network auto-detection
+# Runs once at import time so INTERFACE and IP_RANGE can be set without ENVs.
+# ENV vars are accepted as explicit overrides but are never the primary source.
+# ---------------------------------------------------------------------------
+def _startup_detect_interface() -> str | None:
+    """Return the interface that carries the default route, or None."""
+    try:
+        out = subprocess.run(["ip", "route", "show", "default"],
+                             capture_output=True, text=True, timeout=3)
+        for line in out.stdout.splitlines():
+            parts = line.split()
+            if parts and parts[0] == "default" and "dev" in parts:
+                iface = parts[parts.index("dev") + 1]
+                if iface and not iface.startswith("lo"):
+                    return iface
+    except Exception:
+        pass
+    return None
+
+def _startup_detect_ip_range(iface: str) -> str | None:
+    """Derive the network CIDR from the named interface, or None."""
+    import ipaddress as _ipa
+    try:
+        out = subprocess.run(["ip", "addr", "show", iface],
+                             capture_output=True, text=True, timeout=3)
+        for line in out.stdout.splitlines():
+            line = line.strip()
+            if line.startswith("inet ") and "/" in line:
+                return str(_ipa.ip_interface(line.split()[1]).network)
+    except Exception:
+        pass
+    return None
+
+_autodetected_interface = _startup_detect_interface()
+_autodetected_ip_range  = _startup_detect_ip_range(_autodetected_interface) if _autodetected_interface else None
+
+# ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
 DATABASE_URL            = os.environ.get("DATABASE_URL",            "postgresql://admin:password123@localhost:5432/inspectre")
 SCAN_INTERVAL           = int(os.environ.get("SCAN_INTERVAL",           60))
-IP_RANGE                = os.environ.get("IP_RANGE",                "192.168.0.0/24")
-INTERFACE               = os.environ.get("INTERFACE",               "eth0")
-NMAP_ARGS               = os.environ.get("NMAP_ARGS",               "-O --osscan-limit -sV --version-intensity 5 -T4 -p-")
-OS_CONFIDENCE_THRESHOLD = int(os.environ.get("OS_CONFIDENCE_THRESHOLD", 85))
+# Auto-detected at startup; ENV is an explicit override (e.g. for multi-NIC hosts)
+INTERFACE               = os.environ.get("INTERFACE", "").strip() or _autodetected_interface or "eth0"
+# Auto-detected from interface CIDR; DB overrides this each scan cycle anyway
+IP_RANGE                = os.environ.get("IP_RANGE",  "").strip() or _autodetected_ip_range  or "192.168.0.0/24"
 OFFLINE_MISS_THRESHOLD  = int(os.environ.get("OFFLINE_MISS_THRESHOLD",   3))
 SNIFFER_WORKERS         = int(os.environ.get("SNIFFER_WORKERS",          4))
+ARP_SCAN_RETRY          = int(os.environ.get("ARP_SCAN_RETRY",           1))
 PROBE_API_PORT          = int(os.environ.get("PROBE_API_PORT",         8001))
 LAN_DNS_SERVER_ENV      = os.environ.get("LAN_DNS_SERVER", "").strip()
 MDNS_INTERVAL_MINUTES   = int(os.environ.get("MDNS_INTERVAL_MINUTES", 120))  # default: 2 hours
@@ -69,9 +107,10 @@ def _load_settings_from_db() -> None:
     so that UI changes take effect without a container restart.
     Silently skips any key that is missing from the DB.
     """
-    global SCAN_INTERVAL, IP_RANGE, NMAP_ARGS, OS_CONFIDENCE_THRESHOLD
+    global SCAN_INTERVAL, IP_RANGE
     global OFFLINE_MISS_THRESHOLD, SNIFFER_WORKERS, NUCLEI_TEMPLATE_UPDATE_INTERVAL
     global NIGHTLY_SCAN_START, NIGHTLY_SCAN_END, OFFLINE_RESCAN_HOURS, BASELINE_SCAN_COUNT_THRESHOLD
+    global ARP_SCAN_RETRY
     try:
         session = Session()
         try:
@@ -81,8 +120,6 @@ def _load_settings_from_db() -> None:
         db = {r[0]: r[1] for r in rows}
         if "scan_interval"           in db: SCAN_INTERVAL           = int(db["scan_interval"])
         if "ip_range"                in db: IP_RANGE                = db["ip_range"].strip()
-        if "nmap_args"               in db: NMAP_ARGS               = db["nmap_args"].strip()
-        if "os_confidence_threshold" in db: OS_CONFIDENCE_THRESHOLD = int(db["os_confidence_threshold"])
         if "offline_miss_threshold"  in db: OFFLINE_MISS_THRESHOLD  = int(db["offline_miss_threshold"])
         if "sniffer_workers"         in db: SNIFFER_WORKERS         = int(db["sniffer_workers"])
         if "nuclei_template_update_interval" in db:
@@ -91,6 +128,24 @@ def _load_settings_from_db() -> None:
         if "nightly_scan_end"              in db: NIGHTLY_SCAN_END              = int(db["nightly_scan_end"])
         if "offline_rescan_hours"          in db: OFFLINE_RESCAN_HOURS          = int(db["offline_rescan_hours"])
         if "baseline_scan_count_threshold" in db: BASELINE_SCAN_COUNT_THRESHOLD = int(db["baseline_scan_count_threshold"])
+        if "arp_scan_retry"                in db: ARP_SCAN_RETRY                = int(db["arp_scan_retry"])
+
+        # Write the auto-detected interface back so the UI can display it.
+        # Only writes when the DB value is empty (user hasn't set an override).
+        if db.get("probe_interface", "").strip() == "" and INTERFACE:
+            try:
+                wb = Session()
+                try:
+                    wb.execute(
+                        text("UPDATE settings SET value = :v WHERE key = 'probe_interface'"),
+                        {"v": INTERFACE},
+                    )
+                    wb.commit()
+                    print(f"[settings] Wrote detected interface '{INTERFACE}' to probe_interface setting", flush=True)
+                finally:
+                    wb.close()
+            except Exception as wb_exc:
+                print(f"[settings] Could not write probe_interface: {wb_exc}", flush=True)
     except Exception as exc:
         print(f"[settings] DB load failed (using current values): {exc}", flush=True)
 
@@ -111,7 +166,8 @@ def ping_once(ip: str, timeout_s: int = 2) -> bool:
 
 
 def apply_runtime_config(payload: dict) -> dict:
-    global SCAN_INTERVAL, IP_RANGE, NMAP_ARGS, OS_CONFIDENCE_THRESHOLD, OFFLINE_MISS_THRESHOLD, SNIFFER_WORKERS, NUCLEI_TEMPLATE_UPDATE_INTERVAL
+    global SCAN_INTERVAL, IP_RANGE, OFFLINE_MISS_THRESHOLD, SNIFFER_WORKERS, NUCLEI_TEMPLATE_UPDATE_INTERVAL
+    global ARP_SCAN_RETRY
 
     changes = {}
 
@@ -121,12 +177,6 @@ def apply_runtime_config(payload: dict) -> dict:
     if "ip_range" in payload:
         IP_RANGE = str(payload["ip_range"]).strip()
         changes["ip_range"] = IP_RANGE
-    if "nmap_args" in payload:
-        NMAP_ARGS = str(payload["nmap_args"]).strip()
-        changes["nmap_args"] = NMAP_ARGS
-    if "os_confidence_threshold" in payload:
-        OS_CONFIDENCE_THRESHOLD = int(payload["os_confidence_threshold"])
-        changes["os_confidence_threshold"] = OS_CONFIDENCE_THRESHOLD
     if "offline_miss_threshold" in payload:
         OFFLINE_MISS_THRESHOLD = int(payload["offline_miss_threshold"])
         changes["offline_miss_threshold"] = OFFLINE_MISS_THRESHOLD
@@ -139,6 +189,9 @@ def apply_runtime_config(payload: dict) -> dict:
     if "nuclei_template_update_interval" in payload:
         NUCLEI_TEMPLATE_UPDATE_INTERVAL = str(payload["nuclei_template_update_interval"]).strip()
         changes["nuclei_template_update_interval"] = NUCLEI_TEMPLATE_UPDATE_INTERVAL
+    if "arp_scan_retry" in payload:
+        ARP_SCAN_RETRY = int(payload["arp_scan_retry"])
+        changes["arp_scan_retry"] = ARP_SCAN_RETRY
 
     return {
         "applied": True,
@@ -146,8 +199,6 @@ def apply_runtime_config(payload: dict) -> dict:
         "effective": {
             "scan_interval": SCAN_INTERVAL,
             "ip_range": IP_RANGE,
-            "nmap_args": NMAP_ARGS,
-            "os_confidence_threshold": OS_CONFIDENCE_THRESHOLD,
             "offline_miss_threshold": OFFLINE_MISS_THRESHOLD,
             "sniffer_workers": SNIFFER_WORKERS,
             "nuclei_template_update_interval": NUCLEI_TEMPLATE_UPDATE_INTERVAL,
@@ -163,7 +214,11 @@ def _is_valid_ip(ip: str) -> bool:
     import ipaddress
     try:
         addr = ipaddress.ip_address(ip.strip())
-        return not (addr.packed[0] == 0 or str(addr) == "255.255.255.255")
+        return not (
+            addr.packed[0] == 0
+            or str(addr) == "255.255.255.255"
+            or addr.is_link_local
+        )
     except ValueError:
         return False
 
@@ -188,11 +243,13 @@ class Device(Base):
     miss_count   = Column(Integer, default=0)
     is_important = Column(Boolean, default=False, nullable=False)
     is_ignored   = Column(Boolean, default=False, nullable=False)
+    status_changed_at       = Column(DateTime(timezone=True), nullable=True)
     device_type_override    = Column(String,  nullable=True)
     hostname_last_attempted = Column(DateTime(timezone=True), nullable=True)
     deep_scan_last_run      = Column(DateTime(timezone=True), nullable=True)
     baseline_ports          = Column(JSONB,   nullable=True)
     baseline_scan_count     = Column(Integer, default=0, nullable=False)
+    scan_type               = Column(String,  nullable=False, server_default='syn')
 
 class IPHistory(Base):
     __tablename__ = "ip_history"
@@ -259,6 +316,8 @@ def init_db() -> None:
             conn.execute(text("ALTER TABLE devices ADD COLUMN IF NOT EXISTS deep_scan_last_run TIMESTAMPTZ"))
             conn.execute(text("ALTER TABLE devices ADD COLUMN IF NOT EXISTS baseline_ports JSONB"))
             conn.execute(text("ALTER TABLE devices ADD COLUMN IF NOT EXISTS baseline_scan_count INTEGER NOT NULL DEFAULT 0"))
+            conn.execute(text("ALTER TABLE devices ADD COLUMN IF NOT EXISTS status_changed_at TIMESTAMPTZ"))
+            conn.execute(text("ALTER TABLE devices ADD COLUMN IF NOT EXISTS scan_type VARCHAR NOT NULL DEFAULT 'syn'"))
             conn.commit()
         except Exception as e:
             print(f"[DB] Column migration note: {e}", flush=True)
@@ -406,10 +465,7 @@ def _get_default_gateway() -> str | None:
     return None
 
 def _detect_dns_server() -> str | None:
-    if LAN_DNS_SERVER_ENV:
-        print(f"[hostname] DNS server from env (LAN_DNS_SERVER): {LAN_DNS_SERVER_ENV}", flush=True)
-        return LAN_DNS_SERVER_ENV
-
+    # 1. Real detection: non-loopback nameserver from /etc/resolv.conf
     try:
         with open("/etc/resolv.conf") as f:
             for line in f:
@@ -424,13 +480,19 @@ def _detect_dns_server() -> str | None:
     except Exception:
         pass
 
+    # 2. Default gateway (router is almost always a working DNS forwarder)
     gw = _get_default_gateway()
     if gw:
         print(f"[hostname] Using default gateway as DNS server: {gw}", flush=True)
         return gw
 
-    print("[hostname] WARNING: no usable DNS server found. "
-          "Set LAN_DNS_SERVER=<router_ip> in docker-compose.yml.", flush=True)
+    # 3. Last resort: LAN_DNS_SERVER env var
+    if LAN_DNS_SERVER_ENV:
+        print(f"[hostname] DNS server from LAN_DNS_SERVER env: {LAN_DNS_SERVER_ENV}", flush=True)
+        return LAN_DNS_SERVER_ENV
+
+    print("[hostname] WARNING: no DNS server found automatically. "
+          "Set LAN_DNS_SERVER=<router_ip> in docker-compose.yml if resolution fails.", flush=True)
     return None
 
 def resolve_hostname(ip: str) -> str | None:
@@ -794,18 +856,20 @@ def _apply_mdns_enrichment(mdns_data: dict[str, dict]) -> None:
 # ---------------------------------------------------------------------------
 def _mdns_loop() -> None:
     """Scheduled background thread: runs _mdns_browse every MDNS_INTERVAL_MINUTES minutes.
-    Independent of the main ARP sweep loop — never triggered per device join."""
+    Runs once immediately at startup (after a short settle delay) so that devices
+    advertising .local names are resolved on the first scan cycle."""
     interval_s = MDNS_INTERVAL_MINUTES * 60
     print(f"[mdns] Scheduled loop started (interval={MDNS_INTERVAL_MINUTES}m)", flush=True)
+    time.sleep(20)  # let sniffer/ARP settle first
     while True:
-        time.sleep(interval_s)
         try:
-            print(f"[mdns] Running scheduled browse (interval={MDNS_INTERVAL_MINUTES}m)", flush=True)
+            print(f"[mdns] Running browse", flush=True)
             mdns_data = _mdns_browse()
             if mdns_data:
                 _apply_mdns_enrichment(mdns_data)
         except Exception as e:
             print(f"[mdns] Loop error: {e}", flush=True)
+        time.sleep(interval_s)
 
 
 # ---------------------------------------------------------------------------
@@ -813,9 +877,7 @@ def _mdns_loop() -> None:
 # ---------------------------------------------------------------------------
 def arp_scan(interface: str, ip_range: str) -> list[dict]:
     pkt    = Ether(dst="ff:ff:ff:ff:ff:ff") / ARP(pdst=ip_range)
-    # Increased timeout from 3s → 5s and added retry=2 so slow/sleeping
-    # devices (IoT, phones, printers) have more time to respond.
-    result = srp(pkt, iface=interface, timeout=5, retry=2, verbose=0)[0]
+    result = srp(pkt, iface=interface, timeout=5, retry=ARP_SCAN_RETRY, verbose=0)[0]
     return [{"ip": rcv.psrc, "mac": rcv.hwsrc.lower()} for _, rcv in result]
 
 # ---------------------------------------------------------------------------
@@ -839,36 +901,40 @@ def _port_severity(device) -> str:
     return 'info'
 
 
-def _fast_port_sweep(ip: str) -> list[int]:
+def _tcp_connect_sweep(ip: str) -> list[int]:
     """
-    Pure-Python TCP connect sweep of all 65535 ports.
-    Uses a thread pool — no nmap, no raw sockets, no config file dependencies.
+    Primary port discovery: pure-Python TCP connect sweep of all 65535 ports.
     300 workers × 0.5 s timeout ≈ 60-120 s per host on a typical LAN.
+    Works correctly for all hosts including the local Docker host (no raw-socket
+    quirks), so no special scan_type distinction is needed.
     """
     import concurrent.futures
     import socket as _socket
 
+    WORKERS = 300
+    TIMEOUT = 0.5
+
     def _check(port: int) -> int | None:
         try:
-            s = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
-            s.settimeout(0.5)
-            result = s.connect_ex((ip, port))
-            s.close()
-            return port if result == 0 else None
+            with _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM) as s:
+                s.settimeout(TIMEOUT)
+                return port if s.connect_ex((ip, port)) == 0 else None
         except Exception:
             return None
 
     open_ports: list[int] = []
     try:
-        with concurrent.futures.ThreadPoolExecutor(max_workers=300) as ex:
-            for port in concurrent.futures.as_completed(
-                {ex.submit(_check, p): p for p in range(1, 65536)}
-            ):
-                r = port.result()
-                if r is not None:
-                    open_ports.append(r)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=WORKERS) as ex:
+            futs = {ex.submit(_check, p): p for p in range(1, 65536)}
+            for fut in concurrent.futures.as_completed(futs):
+                try:
+                    r = fut.result()
+                    if r is not None:
+                        open_ports.append(r)
+                except Exception:
+                    pass
     except Exception as exc:
-        print(f"[fast-scan] socket sweep error for {ip}: {exc}", flush=True)
+        print(f"[scan] TCP fallback error for {ip}: {exc}", flush=True)
     return sorted(open_ports)
 
 
@@ -951,19 +1017,26 @@ def _run_deep_scan_thread(ip: str, mac: str) -> None:
         try:
             t0 = time.monotonic()
             print(f"[scan] TCP sweep starting: {ip} ({mac})", flush=True)
-            fast_ports = _fast_port_sweep(ip)
+            fast_ports = _tcp_connect_sweep(ip)
+            service_map: dict[int, dict] = {}
+            os_matches: list[dict] = []
+            nmap_hostname: str | None = None
             elapsed = round(time.monotonic() - t0, 1)
             print(f"[scan] {len(fast_ports)} open TCP port(s) on {ip} in {elapsed}s", flush=True)
 
+            has_service_info = bool(service_map)
             scan_results = {
-                "scanned_at":    datetime.now(timezone.utc).isoformat(),
-                "open_ports":    [
-                    {"port": p, "proto": "tcp", "service": "", "product": "", "version": ""}
+                "scanned_at": datetime.now(timezone.utc).isoformat(),
+                "open_ports": [
+                    {
+                        "port": p, "proto": "tcp",
+                        **(service_map.get(p) or {"service": "", "product": "", "version": ""}),
+                    }
                     for p in fast_ports
                 ],
-                "os_matches":    [],
-                "hostnames":     [],
-                "pipeline_stage": "ports_done",
+                "os_matches":    os_matches,
+                "hostnames":     [nmap_hostname] if nmap_hostname else [],
+                "pipeline_stage": "full_scan" if has_service_info else "ports_done",
             }
 
             session = Session()
@@ -978,6 +1051,12 @@ def _run_deep_scan_thread(ip: str, mac: str) -> None:
                     device.scan_results     = scan_results
                     device.deep_scanned     = True
                     device.deep_scan_last_run = datetime.now(timezone.utc)
+
+                    # Use nmap's PTR resolution if the device has no hostname yet
+                    if nmap_hostname and not device.hostname:
+                        device.hostname = nmap_hostname
+                        print(f"[hostname] nmap resolved {ip} -> {nmap_hostname}", flush=True)
+
                     session.commit()
 
                     _write_event(mac, "scan_complete", {"ports": len(fast_ports), "os": None})
@@ -1087,7 +1166,9 @@ def upsert_seen_device(mac: str, ip: str, source: str) -> None:
                         hostname = None
                 vendor = existing.vendor
 
-            safe_hostname = (hostname or '').replace("'", "''")
+            # Use parameterized hostname to avoid SQL injection
+            # The CASE expression is constructed safely: hostname value goes via bindparam
+            hostname_val = hostname or ""
 
             if is_new:
                 stmt = (
@@ -1096,12 +1177,13 @@ def upsert_seen_device(mac: str, ip: str, source: str) -> None:
                         mac_address              = mac,
                         ip_address               = ip,
                         primary_ip               = ip,
-                        hostname                 = hostname,
+                        hostname                 = hostname_val or None,
                         vendor                   = vendor,
                         custom_name              = None,
                         is_online                = True,
                         first_seen               = now,
                         last_seen                = now,
+                        status_changed_at        = now,
                         deep_scanned             = False,
                         miss_count               = 0,
                         is_important             = False,
@@ -1116,12 +1198,14 @@ def upsert_seen_device(mac: str, ip: str, source: str) -> None:
                                 "CASE WHEN devices.primary_ip IS NOT NULL "
                                 "THEN devices.primary_ip ELSE EXCLUDED.primary_ip END"
                             ),
-                            is_online  = True,
-                            last_seen  = text("CASE WHEN devices.is_online = false THEN NOW() ELSE devices.last_seen END"),
+                            is_online         = True,
+                            last_seen         = text("CASE WHEN devices.is_online = false THEN NOW() ELSE devices.last_seen END"),
+                            status_changed_at = text("CASE WHEN devices.is_online = false THEN NOW() ELSE devices.status_changed_at END"),
                             miss_count = 0,
+                            # Use EXCLUDED.hostname (the value we inserted) which is already parameterized
                             hostname   = text(
                                 "CASE WHEN devices.hostname IS NOT NULL AND devices.hostname != '' "
-                                f"THEN devices.hostname ELSE '{safe_hostname}' END"
+                                "THEN devices.hostname ELSE EXCLUDED.hostname END"
                             ),
                         ),
                     )
@@ -1130,18 +1214,19 @@ def upsert_seen_device(mac: str, ip: str, source: str) -> None:
                 stmt = (
                     pg_insert(Device)
                     .values(
-                        mac_address  = mac,
-                        ip_address   = ip,
-                        primary_ip   = existing.primary_ip or ip,
-                        hostname     = hostname,
-                        vendor       = vendor,
-                        custom_name  = existing.custom_name,
-                        is_online    = True,
-                        first_seen   = existing.first_seen or now,
-                        last_seen    = now,
-                        deep_scanned = existing.deep_scanned,
-                        miss_count   = 0,
-                        is_important = existing.is_important,
+                        mac_address       = mac,
+                        ip_address        = ip,
+                        primary_ip        = existing.primary_ip or ip,
+                        hostname          = hostname_val or None,
+                        vendor            = vendor,
+                        custom_name       = existing.custom_name,
+                        is_online         = True,
+                        first_seen        = existing.first_seen or now,
+                        last_seen         = now,
+                        status_changed_at = now,
+                        deep_scanned      = existing.deep_scanned,
+                        miss_count        = 0,
+                        is_important      = existing.is_important,
                     )
                     .on_conflict_do_update(
                         index_elements=["mac_address"],
@@ -1156,12 +1241,13 @@ def upsert_seen_device(mac: str, ip: str, source: str) -> None:
                                 "WHEN devices.primary_ip IS NOT NULL THEN devices.primary_ip "
                                 "ELSE EXCLUDED.primary_ip END"
                             ),
-                            is_online  = True,
-                            last_seen  = text("CASE WHEN devices.is_online = false THEN NOW() ELSE devices.last_seen END"),
+                            is_online         = True,
+                            last_seen         = text("CASE WHEN devices.is_online = false THEN NOW() ELSE devices.last_seen END"),
+                            status_changed_at = text("CASE WHEN devices.is_online = false THEN NOW() ELSE devices.status_changed_at END"),
                             miss_count = 0,
                             hostname   = text(
                                 "CASE WHEN devices.hostname IS NOT NULL AND devices.hostname != '' "
-                                f"THEN devices.hostname ELSE '{safe_hostname}' END"
+                                "THEN devices.hostname ELSE EXCLUDED.hostname END"
                             ),
                         ),
                     )
@@ -1322,32 +1408,6 @@ def refresh_missing_hostnames() -> None:
     finally:
         session.close()
 
-def bulk_reresolve_all() -> None:
-    session = Session()
-    try:
-        all_devs = session.query(Device).all()
-        updated = 0
-        for dev in all_devs:
-            scan_ip = dev.primary_ip or dev.ip_address
-            if not _is_valid_ip(scan_ip):
-                continue
-            if dev.hostname:
-                continue
-            name = resolve_hostname(scan_ip)
-            if name and name != dev.hostname:
-                print(f"[hostname] Re-resolved: {scan_ip} -> {name}", flush=True)
-                dev.hostname = name
-                updated += 1
-            elif not name:
-                _hostname_failed.add(scan_ip)
-        if updated:
-            session.commit()
-        print(f"[hostname] Startup re-resolve complete: {updated}/{len(all_devs)} updated.", flush=True)
-    except Exception as e:
-        session.rollback()
-        print(f"[hostname] Bulk re-resolve error: {e}", flush=True)
-    finally:
-        session.close()
 
 # ---------------------------------------------------------------------------
 # Sniffer
@@ -1403,6 +1463,8 @@ def update_presence_from_sweep(session, active_macs: set) -> None:
 
     for dev in session.query(Device).all():
         if dev.mac_address in seen_this_cycle:
+            if not dev.is_online:
+                dev.status_changed_at = now
             dev.is_online = True
             dev.miss_count = 0
             continue
@@ -1423,6 +1485,7 @@ def update_presence_from_sweep(session, active_macs: set) -> None:
             continue
 
         dev.is_online = False
+        dev.status_changed_at = now
         print(
             f"[-] Offline: {confirm_ip or dev.ip_address} ({dev.mac_address}) "
             f"after {dev.miss_count} missed sweeps + ping confirm",
@@ -1672,83 +1735,6 @@ def _run_nerva_fingerprint(ip: str, mac: str, open_ports: list[int]) -> None:
     finally:
         session.close()
 
-    # Stage 3b: optional nmap -sV version enrichment
-    if open_ports:
-        threading.Thread(
-            target=_run_nmap_version_scan,
-            args=(ip, mac, open_ports),
-            daemon=True,
-            name=f"nmap-ver-{mac}",
-        ).start()
-
-
-# ---------------------------------------------------------------------------
-# nmap version scan (Stage 3b — runs after Nerva)
-# ---------------------------------------------------------------------------
-def _run_nmap_version_scan(ip: str, mac: str, open_ports: list[int]) -> None:
-    """Run nmap -sV on known open ports to get service banners and versions."""
-    if not open_ports:
-        return
-    port_str = ",".join(str(p) for p in open_ports[:50])
-    try:
-        result = subprocess.run(
-            ["nmap", "-sV", "--version-intensity", "5", "-T4",
-             "-p", port_str, "--open", "-oX", "-", ip],
-            capture_output=True, text=True, timeout=300,
-        )
-        if result.returncode != 0 or not result.stdout.strip():
-            return
-        import xml.etree.ElementTree as ET
-        root = ET.fromstring(result.stdout)
-        version_map: dict[int, dict] = {}
-        for host in root.findall("host"):
-            for port_el in host.findall("ports/port"):
-                portid = int(port_el.get("portid", 0))
-                svc = port_el.find("service")
-                if svc is not None:
-                    version_map[portid] = {
-                        "service":   svc.get("name", ""),
-                        "product":   svc.get("product", ""),
-                        "version":   svc.get("version", ""),
-                        "extrainfo": svc.get("extrainfo", ""),
-                        "cpe":       svc.get("cpe", ""),
-                    }
-        if not version_map:
-            return
-
-        session = Session()
-        try:
-            device = session.get(Device, mac)
-            if device and device.scan_results:
-                scan = dict(device.scan_results)
-                updated_ports = []
-                for p in (scan.get("open_ports") or []):
-                    port_num = p.get("port")
-                    if port_num in version_map:
-                        p = dict(p)
-                        p.update(version_map[port_num])
-                    updated_ports.append(p)
-                scan["open_ports"] = updated_ports
-                scan["pipeline_stage"] = "versions_done"
-                device.scan_results = scan
-                session.commit()
-                _write_event(mac, "version_scan_complete", {
-                    "versioned_ports": len(version_map)
-                })
-                print(f"[nmap-version] {ip} ({mac}): {len(version_map)} port(s) versioned", flush=True)
-        except Exception as e:
-            session.rollback()
-            print(f"[nmap-version] DB save error {mac}: {e}", flush=True)
-        finally:
-            session.close()
-
-    except FileNotFoundError:
-        print(f"[nmap-version] nmap not found — skipping version scan for {ip}", flush=True)
-    except subprocess.TimeoutExpired:
-        print(f"[nmap-version] Timeout for {ip}", flush=True)
-    except Exception as e:
-        print(f"[nmap-version] Error for {ip}: {e}", flush=True)
-
 
 # ---------------------------------------------------------------------------
 # Nuclei template updater
@@ -1838,15 +1824,18 @@ def _stream_subprocess(cmd: list[str]):
 
 @probe_api.get("/health")
 def probe_health():
+    scanning_count = 0
+    with _scan_lock:
+        scanning_count = len(_scanning)
     return {
+        "ok": True,
         "status": "ok",
+        "message": f"Probe running — scanning {IP_RANGE}, {scanning_count} active scan(s)",
         "version": VERSION,
         "dns_server": _DNS_SERVER,
         "config": {
             "scan_interval": SCAN_INTERVAL,
             "ip_range": IP_RANGE,
-            "nmap_args": NMAP_ARGS,
-            "os_confidence_threshold": OS_CONFIDENCE_THRESHOLD,
             "offline_miss_threshold": OFFLINE_MISS_THRESHOLD,
             "sniffer_workers": SNIFFER_WORKERS,
         },
@@ -1856,8 +1845,6 @@ def probe_health():
 class ConfigReloadRequest(BaseModel):
     scan_interval: int | None = None
     ip_range: str | None = None
-    nmap_args: str | None = None
-    os_confidence_threshold: int | None = None
     offline_miss_threshold: int | None = None
     sniffer_workers: int | None = None
     nuclei_template_update_interval: str | None = None
@@ -2349,12 +2336,60 @@ def probe_traffic_stream(mac: str):
 
 @probe_api.get("/network/info")
 def probe_network_info():
-    gateway_ip = _get_default_gateway()
-    return {
-        "interface":   INTERFACE,
-        "ip_range":    IP_RANGE,
-        "gateway_ip":  gateway_ip,
-    }
+    """Detect network configuration from the host. ENV vars used as last-resort only."""
+    import ipaddress as _ipaddress
+    info = {"interface": None, "ip_range": None, "gateway": None, "dns_server": None}
+
+    # 1. Gateway + interface from the host routing table
+    try:
+        out = subprocess.run(["ip", "route", "show", "default"],
+                             capture_output=True, text=True, timeout=3)
+        for line in out.stdout.splitlines():
+            parts = line.split()
+            if parts and parts[0] == "default" and "via" in parts:
+                info["gateway"] = parts[parts.index("via") + 1]
+                if "dev" in parts:
+                    info["interface"] = parts[parts.index("dev") + 1]
+                break
+    except Exception:
+        pass
+
+    # 2. Network CIDR from the detected interface
+    try:
+        iface = info["interface"] or INTERFACE
+        if iface:
+            out = subprocess.run(["ip", "addr", "show", iface],
+                                 capture_output=True, text=True, timeout=3)
+            for line in out.stdout.splitlines():
+                line = line.strip()
+                if line.startswith("inet ") and "/" in line:
+                    info["ip_range"] = str(_ipaddress.ip_interface(line.split()[1]).network)
+                    break
+    except Exception:
+        pass
+
+    # 3. DNS: real detection — resolv.conf, then gateway
+    try:
+        with open("/etc/resolv.conf") as f:
+            for line in f:
+                parts = line.strip().split()
+                if parts and parts[0] == "nameserver" and len(parts) >= 2:
+                    ip = parts[1]
+                    if not ip.startswith("127.") and not ip.startswith("169.254."):
+                        info["dns_server"] = ip
+                        break
+    except Exception:
+        pass
+    if not info["dns_server"]:
+        info["dns_server"] = info["gateway"]  # router is almost always a DNS forwarder
+
+    # ENV fallbacks — only applied when auto-detection produced nothing
+    if not info["interface"] and os.environ.get("INTERFACE", "").strip():
+        info["interface"] = os.environ.get("INTERFACE").strip()
+    if not info["dns_server"] and LAN_DNS_SERVER_ENV:
+        info["dns_server"] = LAN_DNS_SERVER_ENV
+
+    return info
 
 
 def start_probe_api() -> None:
@@ -2371,9 +2406,13 @@ def start_probe_api() -> None:
 # Startup Nerva backfill
 # ---------------------------------------------------------------------------
 def _startup_nerva_backfill() -> None:
-    """Re-fingerprint devices whose services are empty (Nerva was broken or scanned stale IP).
+    """Re-fingerprint devices whose services are empty AND whose last deep scan
+    was more than 24 hours ago (or never ran). This prevents re-running Nerva
+    on every container restart for recently-scanned devices.
     Always uses the device's CURRENT ip_address, not the historical primary_ip."""
-    time.sleep(5)  # let sniffer / ARP threads settle first
+    time.sleep(15)  # let sniffer / ARP threads settle first
+    now = datetime.now(timezone.utc)
+    backfill_threshold = now - timedelta(hours=24)
     active = {t.name for t in threading.enumerate()}
     session = Session()
     count = 0
@@ -2383,7 +2422,8 @@ def _startup_nerva_backfill() -> None:
             sr = dev.scan_results or {}
             pipeline_stage = sr.get("pipeline_stage")
             services       = sr.get("services")
-            # Backfill if: pipeline ran to services_done with empty result, OR stuck at ports_done
+
+            # Only backfill if services are empty AND pipeline is stuck/incomplete
             needs_backfill = (
                 pipeline_stage in ("services_done", "ports_done")
                 and not services  # catches [] and None
@@ -2391,17 +2431,31 @@ def _startup_nerva_backfill() -> None:
             )
             if not needs_backfill:
                 continue
+
+            # Cooldown: skip if scanned within the last 24 hours
+            last_run = dev.deep_scan_last_run
+            if last_run is not None and last_run > backfill_threshold:
+                print(
+                    f"[nerva] Backfill skipped (cooldown): {dev.mac_address} "
+                    f"last scanned {(now - last_run).total_seconds() / 3600:.1f}h ago",
+                    flush=True,
+                )
+                continue
+
             # Skip if a Nerva thread is already running for this device
             if (f"nerva-{dev.mac_address}" in active or
                     f"nerva-backfill-{dev.mac_address}" in active):
                 continue
+
             ports = [p["port"] for p in sr["open_ports"] if isinstance(p.get("port"), int)]
             if not ports:
                 continue
+
             # Use CURRENT ip_address — primary_ip may be a stale DHCP address
             scan_ip = dev.ip_address or dev.primary_ip
             if not _is_valid_ip(scan_ip):
                 continue
+
             threading.Thread(
                 target=_run_nerva_fingerprint,
                 args=(scan_ip, dev.mac_address, ports),
@@ -2415,7 +2469,6 @@ def _startup_nerva_backfill() -> None:
     finally:
         session.close()
     print(f"[nerva] Backfill: {count} device(s) queued for re-fingerprint", flush=True)
-
 
 # ---------------------------------------------------------------------------
 # Main
@@ -2443,10 +2496,10 @@ def main() -> None:
     init_db()
     _load_settings_from_db()
     threading.Thread(target=refresh_missing_vendors, daemon=True, name="vendor-refresh").start()
-
+    threading.Thread(target=_startup_nerva_backfill, daemon=True, name="nerva-backfill").start()
     print(
         f"[*] Scanning {IP_RANGE} on {INTERFACE} every {SCAN_INTERVAL}s\n"
-        f"[*] Offline threshold: {OFFLINE_MISS_THRESHOLD} missed sweeps | OS confidence: {OS_CONFIDENCE_THRESHOLD}%",
+        f"[*] Offline threshold: {OFFLINE_MISS_THRESHOLD} missed sweeps",
         flush=True,
     )
 
@@ -2464,6 +2517,22 @@ def main() -> None:
 
     while True:
         _load_settings_from_db()
+
+        # Don't scan until the user has completed the setup wizard.
+        try:
+            _chk = Session()
+            try:
+                _sc = _chk.execute(text("SELECT value FROM settings WHERE key='setup_complete'")).fetchone()
+                _setup_done = _sc and _sc[0] == "true"
+            finally:
+                _chk.close()
+        except Exception:
+            _setup_done = False
+
+        if not _setup_done:
+            print("[*] Waiting for setup wizard to complete before scanning…", flush=True)
+            time.sleep(10)
+            continue
 
         with _sniffer_seen_lock:
             _sniffer_seen_this_interval.clear()

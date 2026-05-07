@@ -1,3 +1,7 @@
+OFFLINE_RESCAN_HOURS = number to be a setting
+
+
+
 # InSpectre Roadmap
 
 InSpectre already has a solid foundation across probe, backend, and frontend components, with support for device discovery, metadata, event history, IP history, alert records, vulnerability reporting, fingerprinting, and user-maintained device context. This roadmap breaks the next stage of work into smaller batches so features can be delivered incrementally without losing product direction.

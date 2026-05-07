@@ -5,8 +5,9 @@
 1. [Getting Started](#1-getting-started)
    - 1.1 [Requirements](#11-requirements)
    - 1.2 [Installation](#12-installation)
-   - 1.3 [First Run](#13-first-run)
+   - 1.3 [First Run & Setup Wizard](#13-first-run--setup-wizard)
    - 1.4 [Accessing the UI](#14-accessing-the-ui)
+   - 1.5 [Authentication](#15-authentication)
 2. [Device Discovery](#2-device-discovery)
    - 2.1 [How Discovery Works](#21-how-discovery-works)
    - 2.2 [ARP Sweep vs Passive Sniffer](#22-arp-sweep-vs-passive-sniffer)
@@ -65,8 +66,18 @@
     - 11.1 [Backup and Restore](#111-backup-and-restore)
     - 11.2 [CSV Export](#112-csv-export)
     - 11.3 [Fingerprint Database](#113-fingerprint-database)
-12. [Troubleshooting](#12-troubleshooting)
-13. [FAQ](#13-faq)
+12. [Container Monitoring](#12-container-monitoring)
+    - 12.1 [Overview](#121-overview)
+    - 12.2 [Adding Container Hosts](#122-adding-container-hosts)
+    - 12.3 [Connecting to Docker (Local)](#123-connecting-to-docker-local)
+    - 12.4 [Connecting to Docker (Remote TCP)](#124-connecting-to-docker-remote-tcp)
+    - 12.5 [Connecting to Proxmox VE](#125-connecting-to-proxmox-ve)
+    - 12.6 [Containers Page](#126-containers-page)
+    - 12.7 [Container Drawer](#127-container-drawer)
+    - 12.8 [Container Vulnerability Scanning (Trivy)](#128-container-vulnerability-scanning-trivy)
+    - 12.9 [Container Vulns in the Security Dashboard](#129-container-vulns-in-the-security-dashboard)
+13. [Troubleshooting](#13-troubleshooting)
+14. [FAQ](#14-faq)
 
 ---
 
@@ -96,7 +107,7 @@ Open `docker-compose.yml` and set these three variables to match your network:
 | `INTERFACE` | The network interface the host uses to reach the LAN, e.g. `eth0` or `enp3s0`. Run `ip link` or `ifconfig` to find it. |
 | `LAN_DNS_SERVER` | Your local DNS server or router IP, e.g. `192.168.1.1`. Used for hostname resolution. |
 
-### 1.3 First Run
+### 1.3 First Run & Setup Wizard
 
 Use the `inspectre.sh` helper script to start the stack:
 
@@ -128,7 +139,34 @@ http://<host-ip>:3000
 
 If you are running InSpectre on the same machine as your browser, use `http://localhost:3000`.
 
-The UI is a single-page React application. There is no login screen by default — access control is managed at the network or reverse-proxy level if required.
+The UI is a single-page React application with built-in authentication. On first launch you will be taken through the **Setup Wizard** before reaching the main dashboard.
+
+### 1.5 Authentication
+
+InSpectre has built-in username and password authentication.
+
+**Setup Wizard (first run):**
+
+On first launch, the setup wizard guides you through six steps:
+
+| Step | What you configure |
+|---|---|
+| **Create Account** | Admin username (min 3 chars) and password (min 8 chars) |
+| **Network Settings** | Scan CIDR range, DNS server, and gateway IP — auto-detected from the host interface |
+| **Vuln Scans** | Whether to enable scheduled vulnerability scanning and the scan interval |
+| **Notifications** | Toast/browser notifications and any push notification provider (ntfy, Gotify, Pushbullet, webhook) |
+| **Container Monitoring** | Optional: add a Docker or Proxmox VE host for container visibility |
+| **Done** | Completes setup and goes to the dashboard |
+
+You can also choose **Restore from backup** at the start of the wizard to import a previous InSpectre JSON backup — this restores all devices, settings, and credentials without going through manual configuration.
+
+**Logging in:**
+
+After setup, every visit requires logging in with the credentials you created. Sessions are JWT-based and stored in the browser. If you are inactive for a while, you may be asked to log in again.
+
+**Changing your password:**
+
+Go to **Settings → Account → Change Password** to update your credentials at any time.
 
 ---
 
@@ -808,7 +846,204 @@ The highest-scoring fingerprint above a minimum threshold determines the automat
 
 ---
 
-## 12. Troubleshooting
+## 12. Container Monitoring
+
+### 12.1 Overview
+
+InSpectre can connect to one or more container hosts — local or remote Docker daemons, and Proxmox VE nodes — and display all their containers in a unified **Containers** page. Each container host is configured independently and can be enabled or disabled at any time. You can have any mix of Docker and Proxmox hosts active simultaneously.
+
+Container monitoring features include:
+- Viewing all running and stopped containers across all configured hosts
+- Starting, stopping, and restarting containers
+- Streaming live container logs (Docker only)
+- Scanning container images for known CVEs using Trivy (Docker only)
+- Monitoring Proxmox LXC containers with VMID, node, and resource data
+
+### 12.2 Adding Container Hosts
+
+Container hosts are managed in **Settings → Docker → Container Hosts**.
+
+Click **Add Host** to open the host form. Fill in the required fields (which vary by host type — see below) and click **Add Host** to save.
+
+Each configured host appears as a row with:
+- An **enable/disable toggle** — at least one host must be enabled for the Containers page to work
+- A **connection test** button (the wifi icon) — sends a test connection to verify credentials
+- **Edit** and **Remove** buttons
+
+You can add as many hosts as needed. During the first-run setup wizard, there is an optional step to add your first container host.
+
+### 12.3 Connecting to Docker (Local)
+
+Use **Docker — Local socket** for a Docker daemon running on the same machine as InSpectre (the most common setup for home servers).
+
+**Requirements:**
+- The Docker socket must be mounted into the InSpectre backend container. The default `docker-compose.yml` includes this mount:
+  ```yaml
+  volumes:
+    - /var/run/docker.sock:/var/run/docker.sock
+  ```
+
+**Configuration:**
+
+| Field | Value |
+|---|---|
+| Display Name | Any friendly name, e.g. `Home Server` |
+| Host Type | Docker — Local socket |
+| Socket Path | `unix:///var/run/docker.sock` (default) |
+
+No authentication is required for local socket connections.
+
+### 12.4 Connecting to Docker (Remote TCP)
+
+Use **Docker — Remote TCP** to connect to a Docker daemon on another machine via the Docker TCP API.
+
+**Requirements on the remote host:**
+- The Docker daemon must be configured to listen on a TCP port. This is typically done by adding `-H tcp://0.0.0.0:2375` to the Docker daemon options (`/etc/docker/daemon.json` or the systemd unit file).
+
+> **Security note:** Docker's TCP API with no TLS is only appropriate on a trusted private LAN. For remote access over an untrusted network, enable TLS on the Docker daemon and turn on **Verify TLS** in InSpectre.
+
+**Configuration:**
+
+| Field | Value |
+|---|---|
+| Display Name | Any friendly name, e.g. `NAS Docker` |
+| Host Type | Docker — Remote TCP |
+| Docker TCP URL | `tcp://192.168.1.x:2375` |
+| Verify TLS | Disable for self-signed certs on trusted LANs; enable for production |
+
+### 12.5 Connecting to Proxmox VE
+
+Use **Proxmox VE** to connect to a Proxmox node and monitor its LXC containers.
+
+**Authentication:** InSpectre uses Proxmox API Tokens (not username/password). API tokens are created in the Proxmox web UI.
+
+**Creating a Proxmox API token:**
+
+1. Log into your Proxmox web UI.
+2. Go to **Datacenter → Permissions → API Tokens**.
+3. Click **Add**.
+4. Select the user (e.g., `root@pam`), give the token an ID (e.g., `inspectre`), and optionally check **Privilege Separation** if you want to restrict what the token can do.
+5. Click **Add** — the token secret is shown once. Copy it.
+
+The token format InSpectre expects is `TOKENID=SECRET` — for example: `inspectre=xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx`.
+
+**Minimum required permissions for the token:**
+- `VM.Audit` on the relevant nodes/VMs (read-only monitoring)
+- `VM.PowerMgmt` if you want to start/stop/restart containers from InSpectre
+
+**Configuration:**
+
+| Field | Value |
+|---|---|
+| Display Name | Any friendly name, e.g. `Proxmox Node` |
+| Host Type | Proxmox VE |
+| Proxmox URL | `https://192.168.1.x:8006` |
+| API User | The Proxmox user the token belongs to, e.g. `root@pam` |
+| API Token | The token in `TOKENID=SECRET` format |
+| Default Node | The Proxmox node name to query (e.g. `pve`). Found in the Proxmox web UI left panel. |
+| Verify TLS | Disable for self-signed certs (common on home Proxmox installs) |
+
+> **Note:** Proxmox container log streaming and Trivy image scanning are not available for Proxmox LXC containers. These tabs are hidden in the container drawer for Proxmox containers.
+
+### 12.6 Containers Page
+
+The **Containers** page is accessible from the main navigation bar (the box/cube icon). It shows all containers from all enabled hosts.
+
+**Toolbar:**
+- **Search** — filter by container name, image, network, or short ID
+- **Status filter chips** — All, Running, Stopped, Paused, Restarting
+- **Host filter chips** — when more than one host is configured, per-host filter chips appear to narrow the list to containers from a specific host
+- **Layout toggle** — grid view (cards) or list view (compact table)
+- **Refresh** — manually reload all container data (auto-refreshes every 15 seconds)
+
+**Stat cards** at the top show total, running, stopped, and other container counts. Click a stat card to filter by that status.
+
+**Container cards** (grid view) show:
+- Container name and status colour
+- Image name
+- Short ID
+- Port bindings, networks, and restart policy
+- Host name (bottom-left of the card footer)
+- Time since started or stopped
+
+**Container rows** (list view) show name, status, image, port bindings, networks, host name, and uptime.
+
+### 12.7 Container Drawer
+
+Click any container to open its detail drawer. The drawer has up to four tabs depending on the host type:
+
+**Overview tab** (all containers):
+- Status badge and restart policy
+- Container ID, image, platform, hostname
+- Host name and (for Proxmox) node and VMID
+- Port bindings with direct-open links for HTTP/HTTPS ports
+- Networks, mounts, labels, and environment variables (secrets masked by default)
+
+**Logs tab** (Docker only):
+- Stream live logs from the container
+- Select how many lines to tail (50, 100, 200, 500)
+- Stop streaming with one click
+
+**Vuln Scan tab** (Docker only):
+- Scan the container image for CVEs using Trivy (see [Section 12.8](#128-container-vulnerability-scanning-trivy))
+
+**Admin tab** (all containers):
+- Start, stop, restart the container
+- View the full command and image ID
+
+### 12.8 Container Vulnerability Scanning (Trivy)
+
+InSpectre uses [Trivy](https://github.com/aquasecurity/trivy) to scan Docker container images for known CVEs. Trivy scans the image (not the running container) against the NVD/OSV vulnerability database.
+
+**Running a scan:**
+
+1. Open a container's drawer.
+2. Go to the **Vuln Scan** tab.
+3. Click **Scan Image**.
+
+Trivy progress messages stream in real time as the scan runs. When complete, results are displayed grouped by severity.
+
+**Understanding results:**
+
+Each CVE finding shows:
+- **Severity badge** — Critical, High, Medium, Low, or Unknown
+- **CVSS score** — numeric risk score (0–10) where available
+- **CVE ID** — the CVE identifier (e.g., `CVE-2024-1234`), with a link to the NVD entry
+- **Package** — the name of the affected package inside the image
+- **Installed version** — the version currently in the image
+- **Fixed in** — the version that resolves the issue (if a fix exists)
+- **Target** — which layer or component of the image the finding is in
+
+Click a finding to expand it for full details.
+
+**Summary badges** show the count per severity at the top of the results when the scan is complete.
+
+**Scan history:**
+
+When InSpectre runs a Trivy auto-scan for a container image (triggered by scheduled scanning), the result is stored. The next time you open the Vuln Scan tab for that container, the last stored result is loaded automatically without needing to re-scan.
+
+**Rescanning:**
+
+Click **Re-scan** to run a fresh Trivy scan at any time. The previous result is replaced.
+
+**Scheduled auto-scanning:**
+
+Configure automatic Trivy scans in **Settings → Docker → Image Vulnerability Scanning**. You can set the scan interval and enable/disable auto-scanning of new containers.
+
+### 12.9 Container Vulns in the Security Dashboard
+
+The **Security Dashboard** (shield icon in the navigation bar) includes container image vulnerability data alongside network device vulnerability data.
+
+The **Container Vulnerabilities** section at the bottom of the dashboard shows:
+- Total container images scanned
+- Total CVE count across all scanned images
+- Count of clean (no findings) images
+- CVE findings grouped by severity (Critical, High, Medium, Low) — click a severity group to expand the list of affected containers and their CVE counts
+- Click a container name in the expanded list to jump directly to that container's Vuln Scan tab
+
+---
+
+## 13. Troubleshooting
 
 **The probe container is not connecting / backend shows probe as unreachable**
 
@@ -867,14 +1102,36 @@ The highest-scoring fingerprint above a minimum threshold determines the automat
 
 - `./inspectre.sh rebuild` deletes `postgres_data/` and is intentionally destructive. Use `./inspectre.sh rebuild keep-data` to preserve the database, or take a JSON backup first via **Settings → Data → Backup database**.
 
+**The Containers page shows "No container hosts configured"**
+
+- Go to **Settings → Docker → Container Hosts** and add at least one host.
+- If you added a host but it still shows the disabled state, confirm the host's enabled toggle is on.
+- For local Docker, ensure the socket is mounted in `docker-compose.yml` (see [Section 12.3](#123-connecting-to-docker-local)).
+
+**Container host connection test fails**
+
+- For local Docker: confirm `docker-compose.yml` mounts `/var/run/docker.sock` into the backend container. Rebuild the stack if you just added the mount.
+- For remote Docker TCP: ensure the remote Docker daemon is listening on TCP (check daemon config) and the port is reachable from the InSpectre host.
+- For Proxmox: confirm the URL, username, and API token are correct. Verify the token has at least `VM.Audit` permission. If the Proxmox node uses a self-signed certificate, disable **Verify TLS**.
+
+**Trivy container scan says "no vulnerabilities" but later shows many**
+
+- Trivy downloads its vulnerability database on first use and on each update interval. If the database was not yet downloaded when the scan ran, results will be empty. Wait a few minutes and re-scan.
+- Check the backend container logs for Trivy database update messages: `docker compose logs backend`
+
+**Logs tab or Vuln Scan tab is missing for a container**
+
+- These tabs are only available for Docker containers. Proxmox LXC containers show only the Overview and Admin tabs.
+
 ---
 
-## 13. FAQ
+## 14. FAQ
 
 **Q: Does InSpectre send any data to the cloud?**
 
 No. All scanning, storage, and processing happens entirely within your local network and on your own hardware. The only outbound connections InSpectre makes are:
 - Nuclei template updates (downloads from GitHub)
+- Trivy vulnerability database updates (downloads from GitHub/ghcr.io, on a configurable interval)
 - Notification payloads to external services you explicitly configure (Pushbullet, ntfy.sh, Gotify cloud, webhooks)
 - Speed test measurements (to speedtest-cli servers, only when you click the speed test button)
 

@@ -1,20 +1,27 @@
-from fastapi import FastAPI, HTTPException, Depends, UploadFile, File, Query
+from fastapi import FastAPI, HTTPException, Depends, UploadFile, File, Query, Security, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse, Response
+from fastapi.responses import StreamingResponse, Response, JSONResponse
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker, Session
 from pydantic import BaseModel
 from typing import Optional, List
 import asyncio
+from collections import defaultdict
 import os
 import json
 import csv
 import io
+import re
+import shutil
 import socket
 import subprocess
+import threading
 from datetime import datetime, timezone, timedelta
 
 import httpx
+import bcrypt as _bcrypt
+from jose import JWTError, jwt
 
 from models import Base, Device, DeviceEvent, FingerprintEntry, Setting, TrafficStat, VulnReport
 
@@ -26,9 +33,24 @@ PROBE_URL    = (
     or "http://host.docker.internal:8666"
 )
 
+# ---------------------------------------------------------------------------
+# Auth configuration
+# ---------------------------------------------------------------------------
+SECRET_KEY   = os.environ.get("SECRET_KEY", "CHANGE_ME_IN_PRODUCTION_use_a_long_random_string")
+ALGORITHM    = "HS256"
+TOKEN_EXPIRE = 60 * 24  # minutes — 24 hours
+bearer_scheme = HTTPBearer(auto_error=False)
+
 engine       = create_engine(DATABASE_URL, pool_pre_ping=True)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base.metadata.create_all(bind=engine)
+
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
 
 # ---------------------------------------------------------------------------
 # DB migration
@@ -166,6 +188,55 @@ def _migrate(db: Session):
         )
         """,
         "CREATE INDEX IF NOT EXISTS ix_speedtest_results_tested ON speedtest_results(tested_at)",
+        # Users table for authentication
+        """
+        CREATE TABLE IF NOT EXISTS users (
+            id           SERIAL PRIMARY KEY,
+            username     VARCHAR(64) NOT NULL UNIQUE,
+            password_hash VARCHAR(256) NOT NULL,
+            is_admin     BOOLEAN NOT NULL DEFAULT TRUE,
+            created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            last_login   TIMESTAMPTZ
+        )
+        """,
+        "CREATE INDEX IF NOT EXISTS ix_users_username ON users(username)",
+        "ALTER TABLE users ADD COLUMN IF NOT EXISTS must_change_password BOOLEAN NOT NULL DEFAULT FALSE",
+        "ALTER TABLE devices ADD COLUMN IF NOT EXISTS status_changed_at TIMESTAMPTZ",
+        # Migrate old aggressive nmap defaults to safer values (including the interim --max-rate 300 default)
+        "UPDATE settings SET value = '-sS -T3 --max-rate 100' WHERE key = 'nmap_args' AND value IN ('-sT -O --osscan-limit -T4', '-sT -O --osscan-limit -T4 -p-', '-O --osscan-limit -sV --version-intensity 5 -T4 -p-', '-sS -T3 --max-rate 300')",
+        # Fix: --max-rate 100 with 65535 ports takes ~655s, exceeding the 900s subprocess timeout — raise to 200 (328s)
+        "UPDATE settings SET value = '-sS -T4' WHERE key = 'nmap_args' AND value IN ('-sS -T3 --max-rate 100', '-sS -T4 --max-rate 200', '-sS -T4 --max-rate 200 --host-timeout 360s')",
+        # scan_type: which nmap mode to use for this device (auto-detected at discovery)
+        "ALTER TABLE devices ADD COLUMN IF NOT EXISTS scan_type VARCHAR NOT NULL DEFAULT 'syn'",
+        # Container event timeline — tracks running/stopped events by container name
+        """CREATE TABLE IF NOT EXISTS container_events (
+            id     SERIAL PRIMARY KEY,
+            name   VARCHAR NOT NULL,
+            status VARCHAR NOT NULL,
+            ts     TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )""",
+        "CREATE INDEX IF NOT EXISTS ix_container_events_name ON container_events(name)",
+        "CREATE INDEX IF NOT EXISTS ix_container_events_ts   ON container_events(ts)",
+        # Multi-host container monitoring — Docker and Proxmox
+        """CREATE TABLE IF NOT EXISTS container_hosts (
+            id         SERIAL PRIMARY KEY,
+            name       TEXT NOT NULL,
+            type       TEXT NOT NULL DEFAULT 'docker_local',
+            url        TEXT,
+            auth_user  TEXT,
+            auth_token TEXT,
+            tls_verify BOOLEAN NOT NULL DEFAULT false,
+            enabled    BOOLEAN NOT NULL DEFAULT true,
+            node       TEXT NOT NULL DEFAULT 'pve',
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )""",
+        # Persistent Trivy scan results (survives backend restarts)
+        """CREATE TABLE IF NOT EXISTS container_vuln_results (
+            name       TEXT NOT NULL PRIMARY KEY,
+            image      TEXT NOT NULL,
+            vulns      JSONB NOT NULL DEFAULT '[]',
+            scanned_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )""",
     ]
     for sql in migrations:
         try:
@@ -181,10 +252,9 @@ def _migrate(db: Session):
 DEFAULT_SETTINGS = {
     "scan_interval":           ("60",    "How often to sweep the network, in seconds."),
     "offline_miss_threshold":  ("3",     "Number of missed sweeps before a device is marked offline."),
-    "os_confidence_threshold": ("85",    "Minimum nmap OS-match confidence (%) to record."),
     "sniffer_workers":         ("4",     "Number of parallel scanner threads."),
     "ip_range":                ("192.168.0.0/24", "CIDR range to scan."),
-    "nmap_args":               ("-O --osscan-limit -sV --version-intensity 5 -T4 -p-", "Extra arguments passed to nmap."),
+    "arp_scan_retry":          ("1", "ARP sweep retry rounds (0 = single pass, 1 = two rounds). Higher values increase broadcast traffic but may catch more sleeping devices. The passive sniffer catches most devices that miss sweeps."),
     "notifications_enabled":              ("true",  "Show popup toasts when new devices appear or go offline."),
     "browser_notifications_enabled":      ("false", "Show OS-level browser notifications for device events."),
     "pushbullet_api_key":                 ("",      "Pushbullet API access token for push notifications."),
@@ -223,6 +293,18 @@ DEFAULT_SETTINGS = {
     # Phase 8 — auto-block
     "auto_block_new_devices":    ("false", "Automatically ARP-block newly discovered devices until manually approved."),
     "auto_block_vuln_severity":  ("none",  "Minimum vuln severity to trigger auto-block. Options: none, medium, high, critical."),
+    # Network / probe identity
+    "dns_server":                ("",      "LAN DNS server IP (auto-detected if blank). Set this to your router's IP for best hostname resolution."),
+    "probe_interface":           ("",      "Network interface the probe uses for scanning (e.g. eth0, eno1). Requires probe restart to change."),
+    # Setup wizard
+    "setup_complete":            ("false", "Whether the initial setup wizard has been completed."),
+    # Docker monitoring
+    "docker_enabled":            ("false", "Enable Docker container monitoring."),
+    "docker_host":               ("unix:///var/run/docker.sock", "Docker host — socket path (unix:///var/run/docker.sock) or TCP URL (tcp://host:2375)."),
+    "docker_tls_verify":         ("false", "Enable TLS verification for Docker TCP connections."),
+    "trivy_db_update_hours":     ("24",   "How often (hours) to refresh the Trivy vulnerability database. Set to 0 to disable automatic updates."),
+    "docker_scan_on_new":        ("false", "Automatically run a Trivy vuln scan when a new container is created."),
+    "docker_scan_on_update":     ("false", "Automatically run a Trivy vuln scan when a container is recreated with an updated image."),
 }
 
 
@@ -231,6 +313,31 @@ def _seed_settings(db: Session):
         if not db.get(Setting, key):
             db.add(Setting(key=key, value=value, description=description))
     db.commit()
+
+
+def _migrate_legacy_docker_host(db: Session):
+    """One-time migration: if docker_enabled=true and no hosts exist, create a default host entry."""
+    try:
+        existing = db.execute(text("SELECT COUNT(*) FROM container_hosts")).scalar()
+        if existing and existing > 0:
+            return
+        s_enabled = db.get(Setting, "docker_enabled")
+        if not s_enabled or s_enabled.value != "true":
+            return
+        s_host = db.get(Setting, "docker_host")
+        s_tls  = db.get(Setting, "docker_tls_verify")
+        url    = (s_host.value if s_host else None) or "unix:///var/run/docker.sock"
+        htype  = "docker_remote" if url.startswith("tcp://") else "docker_local"
+        tls    = (s_tls and s_tls.value == "true")
+        db.execute(text("""
+            INSERT INTO container_hosts (name, type, url, tls_verify, enabled)
+            VALUES (:name, :type, :url, :tls, true)
+        """), {"name": "Local Docker", "type": htype, "url": url, "tls": tls})
+        db.commit()
+        print("[hosts] Migrated legacy docker settings to container_hosts table.", flush=True)
+    except Exception as e:
+        print(f"[hosts] Legacy migration failed (non-fatal): {e}", flush=True)
+        db.rollback()
 
 
 # ---------------------------------------------------------------------------
@@ -578,12 +685,53 @@ async def _alert_dispatch_loop():
 
 
 app = FastAPI(title="InSpectre API", version="1.0.0")
+
+_CORS_ORIGINS = [o.strip() for o in os.environ.get(
+    "CORS_ORIGINS",
+    "http://localhost:3000,http://localhost:5173,http://127.0.0.1:3000"
+).split(",") if o.strip()]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=_CORS_ORIGINS,
+    allow_credentials=True,
+    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type", "X-Requested-With"],
 )
+
+# Paths that do NOT require a valid JWT (auth + setup wizard + FastAPI docs)
+_PUBLIC_PATHS = frozenset([
+    "/",
+    "/health",
+    "/auth/login",
+    "/setup/status",
+    "/setup/create-user",
+    "/setup/network-info",
+    "/setup/apply-network",
+    "/setup/complete",
+    "/setup/restore-from-backup",
+    "/docs",
+    "/redoc",
+    "/openapi.json",
+])
+
+@app.middleware("http")
+async def _auth_middleware(request: Request, call_next):
+    """Reject unauthenticated requests to all non-public paths."""
+    # Always pass CORS preflight and public endpoints through
+    if request.method == "OPTIONS" or request.url.path in _PUBLIC_PATHS:
+        return await call_next(request)
+
+    auth_header = request.headers.get("Authorization", "")
+    if not auth_header.startswith("Bearer "):
+        return JSONResponse({"detail": "Not authenticated"}, status_code=401)
+
+    # _decode_token is defined later in this file — valid at call time
+    username = _decode_token(auth_header[7:])
+    if not username:
+        return JSONResponse({"detail": "Invalid or expired token"}, status_code=401)
+
+    return await call_next(request)
 
 
 # ---------------------------------------------------------------------------
@@ -689,8 +837,32 @@ def _flush_traffic_sessions(db, sessions: list) -> None:
         ip  = s.get("target_ip")
         if not mac:
             continue
-        # Flush completed historical buckets
-        for bucket in s.get("history", []):
+        # Batch-query existing timestamps to avoid N+1 queries
+        history = s.get("history", [])
+        if not history:
+            continue
+        ts_candidates = []
+        for bucket in history:
+            ts_str = bucket.get("ts")
+            if not ts_str:
+                continue
+            try:
+                ts_candidates.append((datetime.fromisoformat(ts_str), bucket))
+            except Exception:
+                continue
+        if not ts_candidates:
+            continue
+        existing_ts = set()
+        try:
+            rows = db.execute(
+                text("SELECT bucket_ts FROM traffic_stats WHERE mac_address=:mac AND bucket_ts = ANY(:ts)"),
+                {"mac": mac, "ts": [t for t, _ in ts_candidates]},
+            ).fetchall()
+            existing_ts = {r[0] for r in rows}
+        except Exception:
+            pass
+        # Flush completed historical buckets (use pre-fetched existing_ts to skip N+1 queries)
+        for bucket in history:
             ts_str = bucket.get("ts")
             if not ts_str:
                 continue
@@ -698,11 +870,12 @@ def _flush_traffic_sessions(db, sessions: list) -> None:
                 ts = datetime.fromisoformat(ts_str)
             except Exception:
                 continue
-            existing = db.execute(
-                text("SELECT id FROM traffic_stats WHERE mac_address=:mac AND bucket_ts=:ts LIMIT 1"),
-                {"mac": mac, "ts": ts},
-            ).fetchone()
-            if existing:
+            # Use timezone-aware comparison; strip tz if existing_ts has naive datetimes
+            ts_key = ts.replace(tzinfo=None) if ts.tzinfo else ts
+            if any(
+                (e.replace(tzinfo=None) if hasattr(e, 'replace') else e) == ts_key
+                for e in existing_ts
+            ):
                 continue
             row = TrafficStat(
                 mac_address   = mac,
@@ -727,12 +900,98 @@ def _flush_traffic_sessions(db, sessions: list) -> None:
     db.commit()
 
 
+# ---------------------------------------------------------------------------
+# Auth helpers
+# ---------------------------------------------------------------------------
+def _hash_password(password: str) -> str:
+    return _bcrypt.hashpw(password.encode(), _bcrypt.gensalt()).decode()
+
+def _verify_password(plain: str, hashed: str) -> bool:
+    return _bcrypt.checkpw(plain.encode(), hashed.encode())
+
+def _create_token(username: str) -> str:
+    expire = datetime.now(timezone.utc) + timedelta(minutes=TOKEN_EXPIRE)
+    return jwt.encode({"sub": username, "exp": expire}, SECRET_KEY, algorithm=ALGORITHM)
+
+def _decode_token(token: str) -> str | None:
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        return payload.get("sub")
+    except JWTError:
+        return None
+
+def _has_any_user(db: Session) -> bool:
+    try:
+        row = db.execute(text("SELECT id FROM users LIMIT 1")).fetchone()
+        return row is not None
+    except Exception:
+        return False
+
+def get_current_user(
+    credentials: HTTPAuthorizationCredentials | None = Security(bearer_scheme),
+    db: Session = Depends(get_db),
+) -> str:
+    """Dependency that returns the username of the authenticated user or raises 401."""
+    token = credentials.credentials if credentials else None
+    if not token:
+        raise HTTPException(401, "Not authenticated")
+    username = _decode_token(token)
+    if not username:
+        raise HTTPException(401, "Invalid or expired token")
+    row = db.execute(text("SELECT username FROM users WHERE username = :u"), {"u": username}).fetchone()
+    if not row:
+        raise HTTPException(401, "User not found")
+    return username
+
+def get_current_user_optional(
+    credentials: HTTPAuthorizationCredentials | None = Security(bearer_scheme),
+    db: Session = Depends(get_db),
+) -> str | None:
+    """Like get_current_user but returns None instead of raising (used for setup check)."""
+    if not _has_any_user(db):
+        return "__setup__"  # sentinel: setup not done, allow access
+    token = credentials.credentials if credentials else None
+    if not token:
+        return None
+    return _decode_token(token)
+
+
+def _seed_default_user(db: Session) -> None:
+    """
+    Fallback only: if setup is marked complete but no users exist (e.g. users table
+    was wiped, or the wizard was skipped on an older deployment), create admin/admin
+    so the instance isn't permanently locked out.
+
+    Does NOT run when setup_complete = false — in that case the wizard handles
+    user creation and this would conflict with it.
+    """
+    try:
+        if _has_any_user(db):
+            return
+        s = db.get(Setting, "setup_complete")
+        if not s or s.value != "true":
+            return  # Wizard hasn't run yet — let it create the first user
+        db.execute(
+            text("""INSERT INTO users (username, password_hash, is_admin, must_change_password)
+                    VALUES (:u, :h, TRUE, TRUE)
+                    ON CONFLICT (username) DO NOTHING"""),
+            {"u": "admin", "h": _hash_password("admin")},
+        )
+        db.commit()
+        print("[startup] No users found — created default admin/admin. Please change the password.", flush=True)
+    except Exception as e:
+        db.rollback()
+        print(f"[startup] Could not seed default user: {e}", flush=True)
+
+
 @app.on_event("startup")
 async def on_startup():
     db = SessionLocal()
     try:
         _migrate(db)
         _seed_settings(db)
+        _seed_default_user(db)
+        _migrate_legacy_docker_host(db)
     finally:
         db.close()
     asyncio.ensure_future(_scheduled_vuln_scan_loop())
@@ -740,19 +999,33 @@ async def on_startup():
     asyncio.ensure_future(_block_schedule_loop())
     asyncio.ensure_future(_traffic_flush_loop())
     asyncio.ensure_future(_speedtest_schedule_loop())
-
-
-def get_db():
-    db = SessionLocal()
-    try:
-        yield db
-    finally:
-        db.close()
+    asyncio.ensure_future(_trivy_db_update_loop())
+    asyncio.ensure_future(_docker_event_loop())
 
 
 # ---------------------------------------------------------------------------
 # Pydantic models
 # ---------------------------------------------------------------------------
+class ContainerHostCreate(BaseModel):
+    name:       str
+    type:       str = "docker_local"   # docker_local | docker_remote | proxmox
+    url:        Optional[str] = None
+    auth_user:  Optional[str] = None
+    auth_token: Optional[str] = None
+    tls_verify: bool = False
+    enabled:    bool = True
+    node:       str  = "pve"
+
+class ContainerHostUpdate(BaseModel):
+    name:       Optional[str]  = None
+    type:       Optional[str]  = None
+    url:        Optional[str]  = None
+    auth_user:  Optional[str]  = None
+    auth_token: Optional[str]  = None
+    tls_verify: Optional[bool] = None
+    enabled:    Optional[bool] = None
+    node:       Optional[str]  = None
+
 class DeviceUpdate(BaseModel):
     custom_name: Optional[str] = None
     hostname:    Optional[str] = None
@@ -802,6 +1075,33 @@ class BlockScheduleUpdate(BaseModel):
     enabled:       Optional[bool]      = None
     mac_addresses: Optional[List[str]] = None
     tags:          Optional[str]       = None
+
+class LoginRequest(BaseModel):
+    username: str
+    password: str
+
+class ChangePasswordRequest(BaseModel):
+    current_password: str
+    new_password: str
+
+class SetupUserRequest(BaseModel):
+    username: str
+    password: str
+
+class SetupNetworkRequest(BaseModel):
+    ip_range:    Optional[str] = None
+    dns_server:  Optional[str] = None
+    gateway:     Optional[str] = None
+
+class SetupCompleteRequest(BaseModel):
+    vuln_scan_enabled:    bool   = False
+    vuln_scan_schedule:   str    = "disabled"
+    vuln_scan_on_new:     bool   = False
+    notifications_enabled: bool  = True
+    ntfy_topic:           str    = ""
+    ntfy_url:             str    = "https://ntfy.sh"
+    docker_enabled:       bool   = False
+    docker_host:          str    = "unix:///var/run/docker.sock"
 
 
 # ---------------------------------------------------------------------------
@@ -937,6 +1237,7 @@ def _to_dict(d: Device) -> dict:
         "location":             getattr(d, 'location', None),
         "first_seen":           d.first_seen.isoformat()  if d.first_seen  else None,
         "last_seen":            d.last_seen.isoformat()   if d.last_seen   else None,
+        "status_changed_at":    d.status_changed_at.isoformat() if getattr(d, 'status_changed_at', None) else None,
         "scan_results":         d.scan_results,
         "services":             (d.scan_results or {}).get("services"),
         "pipeline_stage":       (d.scan_results or {}).get("pipeline_stage"),
@@ -1036,6 +1337,199 @@ def _add_event(db: Session, mac: str, event_type: str, detail: dict = None):
 @app.get("/")
 def root():
     return {"message": "InSpectre API", "version": "1.0.0"}
+
+
+# ---------------------------------------------------------------------------
+# Health check — no auth required
+# ---------------------------------------------------------------------------
+@app.get("/health")
+async def health_check(db: Session = Depends(get_db)):
+    """Return connectivity status of all platform components."""
+    result = {
+        "backend": {"ok": True, "message": "Running"},
+        "database": {"ok": False, "message": ""},
+        "probe":    {"ok": False, "message": ""},
+        "setup_complete": False,
+    }
+
+    # Check database
+    try:
+        row = db.execute(text("SELECT COUNT(*) FROM devices")).scalar()
+        result["database"] = {"ok": True, "message": f"{row} devices in DB"}
+    except Exception as e:
+        result["database"] = {"ok": False, "message": str(e)[:120]}
+
+    # Check probe
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            resp = await client.get(f"{PROBE_URL}/health")
+            if resp.status_code == 200:
+                probe_data = resp.json()
+                result["probe"] = {"ok": True, "message": probe_data.get("message", "Running")}
+            else:
+                result["probe"] = {"ok": False, "message": f"HTTP {resp.status_code}"}
+    except httpx.ConnectError:
+        result["probe"] = {"ok": False, "message": f"Cannot reach probe at {PROBE_URL}"}
+    except Exception as e:
+        result["probe"] = {"ok": False, "message": str(e)[:120]}
+
+    # Check setup complete
+    try:
+        s = db.get(Setting, "setup_complete")
+        result["setup_complete"] = (s.value if s else "false") == "true"
+    except Exception:
+        pass
+
+    result["all_ok"] = all(v["ok"] for v in [result["backend"], result["database"], result["probe"]])
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Auth routes
+# ---------------------------------------------------------------------------
+@app.post("/auth/login")
+def login(payload: LoginRequest, db: Session = Depends(get_db)):
+    row = db.execute(
+        text("SELECT username, password_hash, must_change_password FROM users WHERE username = :u"),
+        {"u": payload.username}
+    ).fetchone()
+    if not row or not _verify_password(payload.password, row[1]):
+        raise HTTPException(401, "Invalid username or password")
+    db.execute(
+        text("UPDATE users SET last_login = NOW() WHERE username = :u"),
+        {"u": payload.username}
+    )
+    db.commit()
+    token = _create_token(payload.username)
+    return {"token": token, "username": payload.username, "must_change_password": bool(row[2])}
+
+
+@app.get("/auth/me")
+def auth_me(username: str = Depends(get_current_user), db: Session = Depends(get_db)):
+    row = db.execute(
+        text("SELECT must_change_password FROM users WHERE username = :u"), {"u": username}
+    ).fetchone()
+    must_change = bool(row[0]) if row else False
+    return {"username": username, "authenticated": True, "must_change_password": must_change}
+
+
+@app.post("/auth/change-password")
+def change_password(
+    payload: ChangePasswordRequest,
+    username: str = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    row = db.execute(
+        text("SELECT password_hash FROM users WHERE username = :u"), {"u": username}
+    ).fetchone()
+    if not row or not _verify_password(payload.current_password, row[0]):
+        raise HTTPException(401, "Current password is incorrect")
+    if len(payload.new_password) < 8:
+        raise HTTPException(400, "New password must be at least 8 characters")
+    new_hash = _hash_password(payload.new_password)
+    db.execute(
+        text("UPDATE users SET password_hash = :h, must_change_password = FALSE WHERE username = :u"),
+        {"h": new_hash, "u": username}
+    )
+    db.commit()
+    return {"ok": True}
+
+
+# ---------------------------------------------------------------------------
+# Setup wizard routes (no auth required — only usable before setup is done)
+# ---------------------------------------------------------------------------
+@app.get("/setup/status")
+def setup_status(db: Session = Depends(get_db)):
+    """Returns whether setup is complete and whether any users exist."""
+    has_user = _has_any_user(db)
+    s = db.get(Setting, "setup_complete")
+    setup_done = (s.value if s else "false") == "true"
+    return {"setup_complete": setup_done, "has_user": has_user}
+
+
+@app.post("/setup/create-user")
+def setup_create_user(payload: SetupUserRequest, db: Session = Depends(get_db)):
+    """Create the first admin user. Only works if no users exist yet."""
+    if _has_any_user(db):
+        raise HTTPException(403, "Setup already completed — users exist")
+    if len(payload.username.strip()) < 3:
+        raise HTTPException(400, "Username must be at least 3 characters")
+    if len(payload.password) < 8:
+        raise HTTPException(400, "Password must be at least 8 characters")
+    pw_hash = _hash_password(payload.password)
+    try:
+        db.execute(
+            text("INSERT INTO users (username, password_hash, is_admin) VALUES (:u, :h, TRUE)"),
+            {"u": payload.username.strip().lower(), "h": pw_hash}
+        )
+        db.commit()
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(500, f"Could not create user: {e}")
+    token = _create_token(payload.username.strip().lower())
+    return {"ok": True, "token": token, "username": payload.username.strip().lower()}
+
+
+@app.get("/setup/network-info")
+async def setup_network_info():
+    """Proxy network detection to the probe — it runs on the host network so its
+    interface/route/IP info reflects the real LAN, not the Docker bridge."""
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            r = await client.get(f"{PROBE_URL}/network/info")
+            r.raise_for_status()
+            return r.json()
+    except Exception:
+        # Probe unreachable — return empty values; user can fill in manually
+        return {"ip_range": None, "gateway": None, "dns_server": None, "interface": None}
+
+
+@app.post("/setup/apply-network")
+def setup_apply_network(payload: SetupNetworkRequest, db: Session = Depends(get_db)):
+    """Save network settings confirmed in the wizard."""
+    updates: dict[str, str] = {}
+    if payload.ip_range:
+        updates["ip_range"] = payload.ip_range
+    if payload.dns_server:
+        updates["dns_server"] = payload.dns_server  # stored for reference
+    for key, value in updates.items():
+        s = db.get(Setting, key)
+        if s:
+            s.value = value
+        else:
+            db.add(Setting(key=key, value=value))
+    db.commit()
+    return {"ok": True, "applied": updates}
+
+
+@app.post("/setup/complete")
+def setup_complete(
+    payload: SetupCompleteRequest,
+    username: str = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Finalise setup: apply notification/vuln settings and mark setup complete."""
+    to_save = {
+        "setup_complete":            "true",
+        "notifications_enabled":     "true" if payload.notifications_enabled else "false",
+        "vuln_scan_on_new_device":   "true" if payload.vuln_scan_on_new else "false",
+        "vuln_scan_schedule":        payload.vuln_scan_schedule if payload.vuln_scan_enabled else "disabled",
+        "docker_enabled":            "true" if payload.docker_enabled else "false",
+    }
+    if payload.ntfy_topic:
+        to_save["ntfy_topic"] = payload.ntfy_topic
+    if payload.ntfy_url:
+        to_save["ntfy_url"] = payload.ntfy_url
+    if payload.docker_host:
+        to_save["docker_host"] = payload.docker_host
+    for key, value in to_save.items():
+        s = db.get(Setting, key)
+        if s:
+            s.value = value
+        else:
+            db.add(Setting(key=key, value=value))
+    db.commit()
+    return {"ok": True, "setup_complete": True}
 
 
 # ---------------------------------------------------------------------------
@@ -1237,12 +1731,18 @@ def resolve_name(mac: str, db: Session = Depends(get_db)):
 
 
 @app.post("/devices/{mac}/rescan")
-def rescan_device(mac: str, db: Session = Depends(get_db)):
+async def rescan_device(mac: str, db: Session = Depends(get_db)):
     d = db.get(Device, mac.lower())
     if not d:
         raise HTTPException(404, "Device not found")
     d.deep_scanned = False
     db.commit()
+    # Ask the probe to start scanning immediately rather than waiting for the next sweep
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            await client.post(f"{PROBE_URL}/rescan/{mac.lower()}")
+    except Exception:
+        pass  # probe will pick it up on next sweep if unreachable
     return {"mac": mac, "queued": True}
 
 
@@ -1900,7 +2400,6 @@ def get_vuln_trend(days: int = Query(default=30, le=90), db: Session = Depends(g
             GROUP BY day, severity
             ORDER BY day ASC, severity
         """), {"days": days}).fetchall()
-        from collections import defaultdict
         by_day: dict = defaultdict(dict)
         for row in rows:
             by_day[str(row[0])][row[1]] = int(row[2])
@@ -2098,14 +2597,10 @@ async def apply_settings(db: Session = Depends(get_db)):
         payload["scan_interval"] = int(settings["scan_interval"])
     if "offline_miss_threshold" in settings:
         payload["offline_miss_threshold"] = int(settings["offline_miss_threshold"])
-    if "os_confidence_threshold" in settings:
-        payload["os_confidence_threshold"] = int(settings["os_confidence_threshold"])
     if "sniffer_workers" in settings:
         payload["sniffer_workers"] = int(settings["sniffer_workers"])
     if "ip_range" in settings:
         payload["ip_range"] = settings["ip_range"]
-    if "nmap_args" in settings:
-        payload["nmap_args"] = settings["nmap_args"]
     if "nuclei_template_update_interval" in settings:
         payload["nuclei_template_update_interval"] = settings["nuclei_template_update_interval"]
 
@@ -2353,19 +2848,127 @@ async def import_fingerprints_json(file: UploadFile = File(...), db: Session = D
 # ---------------------------------------------------------------------------
 @app.get("/export/backup")
 def export_backup(db: Session = Depends(get_db)):
-    """Export all user data as a portable JSON backup."""
+    """Export all user data as a portable JSON backup (version 2)."""
+
+    def _rows(sql, *params):
+        return db.execute(text(sql), *params).fetchall()
+
+    # Devices
     devices = [_to_dict(d) for d in db.query(Device).all()]
+
+    # Device events
+    events = [
+        {"id": r[0], "mac_address": r[1], "type": r[2],
+         "detail": r[3], "created_at": r[4].isoformat() if r[4] else None}
+        for r in _rows(
+            "SELECT id, mac_address, type, detail, created_at "
+            "FROM device_events ORDER BY created_at"
+        )
+    ]
+
+    # Vulnerability reports
+    vuln_reports = [
+        {"id": r[0], "mac_address": r[1], "ip_address": r[2],
+         "scanned_at": r[3].isoformat() if r[3] else None,
+         "duration_s": r[4], "severity": r[5], "vuln_count": r[6],
+         "findings": r[7], "raw_output": r[8], "scan_args": r[9]}
+        for r in _rows(
+            "SELECT id, mac_address, ip_address, scanned_at, duration_s, "
+            "severity, vuln_count, findings, raw_output, scan_args "
+            "FROM vuln_reports ORDER BY scanned_at"
+        )
+    ]
+
+    # IP history
+    ip_history = [
+        {"id": r[0], "mac_address": r[1], "ip_address": r[2],
+         "first_seen": r[3].isoformat() if r[3] else None,
+         "last_seen": r[4].isoformat() if r[4] else None}
+        for r in _rows(
+            "SELECT id, mac_address, ip_address, first_seen, last_seen FROM ip_history"
+        )
+    ]
+
+    # Settings
     settings = [{"key": s.key, "value": s.value} for s in db.query(Setting).all()]
-    fps = [{"oui_prefix": f.oui_prefix, "device_type": f.device_type, "vendor_name": f.vendor_name,
-            "open_ports": f.open_ports, "hostname_pattern": f.hostname_pattern,
-            "confidence_score": f.confidence_score, "source": f.source}
-           for f in db.query(FingerprintEntry).all()]
+
+    # Fingerprints
+    fps = [
+        {"oui_prefix": f.oui_prefix, "device_type": f.device_type,
+         "vendor_name": f.vendor_name, "open_ports": f.open_ports,
+         "hostname_pattern": f.hostname_pattern,
+         "confidence_score": f.confidence_score, "source": f.source}
+        for f in db.query(FingerprintEntry).all()
+    ]
+
+    # Users (password hashes included so credentials survive restore)
+    users = [
+        {"username": r[0], "password_hash": r[1],
+         "is_admin": r[2], "must_change_password": r[3]}
+        for r in _rows(
+            "SELECT username, password_hash, is_admin, must_change_password FROM users"
+        )
+    ]
+
+    # Alert suppressions
+    suppressions = []
+    try:
+        suppressions = [
+            {"id": r[0], "mac_address": r[1], "event_type": r[2],
+             "reason": r[3],
+             "expires_at": r[4].isoformat() if r[4] else None,
+             "created_at": r[5].isoformat() if r[5] else None}
+            for r in _rows(
+                "SELECT id, mac_address, event_type, reason, expires_at, created_at "
+                "FROM alert_suppressions"
+            )
+        ]
+    except Exception:
+        pass
+
+    # Saved views
+    saved_views = []
+    try:
+        saved_views = [
+            {"id": r[0], "name": r[1], "description": r[2], "filters": r[3],
+             "created_at": r[4].isoformat() if r[4] else None,
+             "updated_at": r[5].isoformat() if r[5] else None}
+            for r in _rows(
+                "SELECT id, name, description, filters, created_at, updated_at "
+                "FROM saved_views"
+            )
+        ]
+    except Exception:
+        pass
+
+    # Block schedules
+    block_schedules = []
+    try:
+        block_schedules = [
+            {"id": r[0], "mac_address": r[1], "label": r[2],
+             "days_of_week": r[3], "start_time": r[4], "end_time": r[5],
+             "enabled": r[6], "mac_addresses": r[7], "tags": r[8]}
+            for r in _rows(
+                "SELECT id, mac_address, label, days_of_week, start_time, end_time, "
+                "enabled, mac_addresses, tags FROM block_schedules"
+            )
+        ]
+    except Exception:
+        pass
+
     payload = {
-        "version": 1,
+        "version": 2,
         "exported_at": datetime.now(timezone.utc).isoformat(),
         "devices": devices,
+        "device_events": events,
+        "vuln_reports": vuln_reports,
+        "ip_history": ip_history,
         "settings": settings,
         "fingerprints": fps,
+        "users": users,
+        "alert_suppressions": suppressions,
+        "saved_views": saved_views,
+        "block_schedules": block_schedules,
     }
     content = json.dumps(payload, indent=2, default=str)
     return Response(
@@ -2375,35 +2978,47 @@ def export_backup(db: Session = Depends(get_db)):
     )
 
 
-@app.post("/import/restore")
-async def import_restore(file: UploadFile = File(...), db: Session = Depends(get_db)):
-    """Restore settings and fingerprints from a backup JSON (devices are merged, not overwritten)."""
-    content = await file.read()
-    try:
-        payload = json.loads(content)
-    except Exception as exc:
-        raise HTTPException(400, f"Invalid JSON: {exc}")
-    if not isinstance(payload, dict) or payload.get("version") != 1:
-        raise HTTPException(400, "Unrecognised backup format")
+def _do_restore(payload: dict, db: Session) -> dict:
+    """Full restore from a v1 or v2 backup payload. Returns stats dict."""
+    from datetime import datetime as _dt_cls
 
-    stats = {"settings": 0, "fingerprints_merged": 0, "devices_skipped": 0}
+    def _dt(val):
+        if not val:
+            return None
+        try:
+            return _dt_cls.fromisoformat(val)
+        except Exception:
+            return None
 
-    # Restore settings (skip sensitive delivery keys)
-    SKIP_KEYS = {"pushbullet_api_key", "gotify_token", "alert_webhook_url", "ntfy_topic"}
+    def _json(val):
+        if val is None:
+            return None
+        return val if isinstance(val, str) else json.dumps(val)
+
+    stats = {
+        "version": payload.get("version", 1),
+        "settings": 0, "fingerprints": 0, "devices": 0,
+        "device_events": 0, "vuln_reports": 0, "ip_history": 0,
+        "users": 0, "alert_suppressions": 0, "saved_views": 0,
+        "block_schedules": 0,
+    }
+
+    # Settings — restore ALL keys without skipping
     for s in payload.get("settings", []):
         key, value = s.get("key"), s.get("value")
-        if not key or key in SKIP_KEYS:
+        if not key:
             continue
         existing = db.get(Setting, key)
         if existing:
-            existing.value = value
+            existing.value = str(value) if value is not None else ""
         else:
-            db.add(Setting(key=key, value=value, description="Restored from backup"))
+            db.add(Setting(key=key, value=str(value) if value is not None else "",
+                           description="Restored from backup"))
         stats["settings"] += 1
 
-    # Restore fingerprints (merge)
+    # Fingerprints — merge by (oui_prefix, device_type)
     for fp in payload.get("fingerprints", []):
-        device_type = fp.get("device_type", "").strip()
+        device_type = (fp.get("device_type") or "").strip()
         if not device_type:
             continue
         oui = (fp.get("oui_prefix") or "").strip().lower() or None
@@ -2411,24 +3026,285 @@ async def import_restore(file: UploadFile = File(...), db: Session = Depends(get
         if oui:
             existing = db.query(FingerprintEntry).filter(
                 FingerprintEntry.oui_prefix == oui,
-                FingerprintEntry.device_type == device_type
+                FingerprintEntry.device_type == device_type,
             ).first()
         if not existing:
             db.add(FingerprintEntry(
-                oui_prefix=oui,
-                device_type=device_type,
+                oui_prefix=oui, device_type=device_type,
                 vendor_name=fp.get("vendor_name"),
                 open_ports=fp.get("open_ports"),
                 hostname_pattern=fp.get("hostname_pattern"),
                 confidence_score=float(fp.get("confidence_score", 1.0)),
-                source=fp.get("source", "backup"),
-                hit_count=1,
+                source=fp.get("source", "backup"), hit_count=1,
             ))
-            stats["fingerprints_merged"] += 1
+            stats["fingerprints"] += 1
+
+    # Devices — upsert by mac_address (ORM)
+    for d in payload.get("devices", []):
+        mac = (d.get("mac_address") or "").strip().lower()
+        if not mac:
+            continue
+        fields = dict(
+            ip_address=d.get("ip_address"),
+            hostname=d.get("hostname"),
+            vendor=d.get("vendor"),
+            custom_name=d.get("custom_name"),
+            device_type_override=d.get("device_type_override"),
+            vendor_override=d.get("vendor_override"),
+            is_online=bool(d.get("is_online", False)),
+            first_seen=_dt(d.get("first_seen")),
+            last_seen=_dt(d.get("last_seen")),
+            status_changed_at=_dt(d.get("status_changed_at")),
+            scan_results=d.get("scan_results"),
+            deep_scanned=bool(d.get("deep_scanned", False)),
+            miss_count=int(d.get("miss_count") or 0),
+            is_important=bool(d.get("is_important", False)),
+            notes=d.get("notes"),
+            tags=d.get("tags"),
+            location=d.get("location"),
+            vuln_last_scanned=_dt(d.get("vuln_last_scanned")),
+            vuln_severity=d.get("vuln_severity"),
+            is_blocked=bool(d.get("is_blocked", False)),
+            zone=d.get("zone"),
+            is_ignored=bool(d.get("is_ignored", False)),
+            deep_scan_last_run=_dt(d.get("deep_scan_last_run")),
+            baseline_ports=d.get("baseline_ports"),
+            baseline_scan_count=int(d.get("baseline_scan_count") or 0),
+        )
+        existing = db.get(Device, mac)
+        if existing:
+            for k, v in fields.items():
+                setattr(existing, k, v)
+        else:
+            db.add(Device(mac_address=mac, **fields))
+        stats["devices"] += 1
+
+    db.flush()  # devices must be visible for FK checks below
+
+    # Device events — insert by id, skip unknown MACs
+    for ev in payload.get("device_events", []):
+        ev_id = ev.get("id")
+        mac = (ev.get("mac_address") or "").strip().lower()
+        ev_type = ev.get("type")
+        if not mac or not ev_type:
+            continue
+        sp = db.begin_nested()
+        try:
+            if ev_id is not None:
+                db.execute(text(
+                    "INSERT INTO device_events (id, mac_address, type, detail, created_at) "
+                    "SELECT :id, :mac, :etype, :detail::jsonb, :ts "
+                    "WHERE EXISTS (SELECT 1 FROM devices WHERE mac_address = :mac) "
+                    "ON CONFLICT (id) DO NOTHING"
+                ), {"id": ev_id, "mac": mac, "etype": ev_type,
+                    "detail": _json(ev.get("detail")), "ts": ev.get("created_at")})
+            else:
+                db.execute(text(
+                    "INSERT INTO device_events (mac_address, type, detail, created_at) "
+                    "SELECT :mac, :etype, :detail::jsonb, :ts "
+                    "WHERE EXISTS (SELECT 1 FROM devices WHERE mac_address = :mac)"
+                ), {"mac": mac, "etype": ev_type,
+                    "detail": _json(ev.get("detail")), "ts": ev.get("created_at")})
+            sp.commit()
+            stats["device_events"] += 1
+        except Exception:
+            sp.rollback()
+
+    # Vuln reports — insert by id, skip unknown MACs
+    for vr in payload.get("vuln_reports", []):
+        vr_id = vr.get("id")
+        mac = (vr.get("mac_address") or "").strip().lower()
+        if not mac or vr_id is None:
+            continue
+        sp = db.begin_nested()
+        try:
+            db.execute(text(
+                "INSERT INTO vuln_reports "
+                "(id, mac_address, ip_address, scanned_at, duration_s, severity, "
+                " vuln_count, findings, raw_output, scan_args) "
+                "SELECT :id, :mac, :ip, :scanned_at, :duration_s, :severity, "
+                "       :vuln_count, :findings::jsonb, :raw_output, :scan_args "
+                "WHERE EXISTS (SELECT 1 FROM devices WHERE mac_address = :mac) "
+                "ON CONFLICT (id) DO NOTHING"
+            ), {"id": vr_id, "mac": mac, "ip": vr.get("ip_address"),
+                "scanned_at": vr.get("scanned_at"), "duration_s": vr.get("duration_s"),
+                "severity": vr.get("severity", "clean"),
+                "vuln_count": int(vr.get("vuln_count") or 0),
+                "findings": _json(vr.get("findings")),
+                "raw_output": vr.get("raw_output"), "scan_args": vr.get("scan_args")})
+            sp.commit()
+            stats["vuln_reports"] += 1
+        except Exception:
+            sp.rollback()
+
+    # IP history — insert by id, skip unknown MACs
+    for ih in payload.get("ip_history", []):
+        ih_id = ih.get("id")
+        mac = (ih.get("mac_address") or "").strip().lower()
+        ip = ih.get("ip_address")
+        if not mac or not ip or ih_id is None:
+            continue
+        sp = db.begin_nested()
+        try:
+            db.execute(text(
+                "INSERT INTO ip_history (id, mac_address, ip_address, first_seen, last_seen) "
+                "SELECT :id, :mac, :ip, :first_seen, :last_seen "
+                "WHERE EXISTS (SELECT 1 FROM devices WHERE mac_address = :mac) "
+                "ON CONFLICT (id) DO NOTHING"
+            ), {"id": ih_id, "mac": mac, "ip": ip,
+                "first_seen": ih.get("first_seen"), "last_seen": ih.get("last_seen")})
+            sp.commit()
+            stats["ip_history"] += 1
+        except Exception:
+            sp.rollback()
+
+    # Users — upsert by username, restoring password hash
+    for u in payload.get("users", []):
+        username = (u.get("username") or "").strip()
+        password_hash = u.get("password_hash")
+        if not username or not password_hash:
+            continue
+        sp = db.begin_nested()
+        try:
+            db.execute(text(
+                "INSERT INTO users (username, password_hash, is_admin, must_change_password) "
+                "VALUES (:u, :h, :admin, :mcp) "
+                "ON CONFLICT (username) DO UPDATE "
+                "SET password_hash = EXCLUDED.password_hash, "
+                "    is_admin = EXCLUDED.is_admin, "
+                "    must_change_password = EXCLUDED.must_change_password"
+            ), {"u": username, "h": password_hash,
+                "admin": bool(u.get("is_admin", False)),
+                "mcp": bool(u.get("must_change_password", False))})
+            sp.commit()
+            stats["users"] += 1
+        except Exception:
+            sp.rollback()
+
+    # Alert suppressions
+    for sup in payload.get("alert_suppressions", []):
+        sup_id = sup.get("id")
+        event_type = sup.get("event_type")
+        if not event_type or sup_id is None:
+            continue
+        sp = db.begin_nested()
+        try:
+            db.execute(text(
+                "INSERT INTO alert_suppressions "
+                "(id, mac_address, event_type, reason, expires_at, created_at) "
+                "VALUES (:id, :mac, :event_type, :reason, :expires_at, :created_at) "
+                "ON CONFLICT (id) DO NOTHING"
+            ), {"id": sup_id,
+                "mac": (sup.get("mac_address") or "").strip().lower() or None,
+                "event_type": event_type, "reason": sup.get("reason"),
+                "expires_at": sup.get("expires_at"), "created_at": sup.get("created_at")})
+            sp.commit()
+            stats["alert_suppressions"] += 1
+        except Exception:
+            sp.rollback()
+
+    # Saved views — upsert by name
+    for sv in payload.get("saved_views", []):
+        sv_name = (sv.get("name") or "").strip()
+        if not sv_name:
+            continue
+        sp = db.begin_nested()
+        try:
+            db.execute(text(
+                "INSERT INTO saved_views (name, description, filters, created_at, updated_at) "
+                "VALUES (:name, :desc, :filters::jsonb, :created_at, :updated_at) "
+                "ON CONFLICT (name) DO UPDATE "
+                "SET description = EXCLUDED.description, filters = EXCLUDED.filters, "
+                "    updated_at = EXCLUDED.updated_at"
+            ), {"name": sv_name, "desc": sv.get("description"),
+                "filters": _json(sv.get("filters") or {}),
+                "created_at": sv.get("created_at"), "updated_at": sv.get("updated_at")})
+            sp.commit()
+            stats["saved_views"] += 1
+        except Exception:
+            sp.rollback()
+
+    # Block schedules
+    for bs in payload.get("block_schedules", []):
+        bs_id = bs.get("id")
+        if bs_id is None:
+            continue
+        sp = db.begin_nested()
+        try:
+            db.execute(text(
+                "INSERT INTO block_schedules "
+                "(id, mac_address, label, days_of_week, start_time, end_time, "
+                " enabled, mac_addresses, tags) "
+                "VALUES (:id, :mac, :label, :dow, :start_time, :end_time, "
+                "        :enabled, :mac_addresses, :tags) "
+                "ON CONFLICT (id) DO NOTHING"
+            ), {"id": bs_id, "mac": bs.get("mac_address"), "label": bs.get("label"),
+                "dow": bs.get("days_of_week", "mon,tue,wed,thu,fri,sat,sun"),
+                "start_time": bs.get("start_time", "00:00"),
+                "end_time": bs.get("end_time", "00:00"),
+                "enabled": bool(bs.get("enabled", True)),
+                "mac_addresses": bs.get("mac_addresses"),
+                "tags": bs.get("tags", "")})
+            sp.commit()
+            stats["block_schedules"] += 1
+        except Exception:
+            sp.rollback()
 
     db.commit()
-    stats["devices_skipped"] = len(payload.get("devices", []))
+
+    # Reset SERIAL sequences so new inserts don't collide with restored IDs
+    for tbl, col in [
+        ("device_events", "id"), ("vuln_reports", "id"), ("ip_history", "id"),
+        ("alert_suppressions", "id"), ("saved_views", "id"), ("block_schedules", "id"),
+    ]:
+        try:
+            db.execute(text(
+                f"SELECT setval(pg_get_serial_sequence('{tbl}', '{col}'), "
+                f"COALESCE((SELECT MAX({col}) FROM {tbl}), 0) + 1, false)"
+            ))
+        except Exception:
+            pass
+    db.commit()
+
     return stats
+
+
+@app.post("/import/restore")
+async def import_restore(file: UploadFile = File(...), db: Session = Depends(get_db)):
+    """Full restore from a v1 or v2 backup JSON."""
+    content = await file.read()
+    try:
+        payload = json.loads(content)
+    except Exception as exc:
+        raise HTTPException(400, f"Invalid JSON: {exc}")
+    if not isinstance(payload, dict) or payload.get("version") not in (1, 2):
+        raise HTTPException(400, "Unrecognised backup format (expected version 1 or 2)")
+    return _do_restore(payload, db)
+
+
+@app.post("/setup/restore-from-backup")
+async def setup_restore_from_backup(file: UploadFile = File(...), db: Session = Depends(get_db)):
+    """Public endpoint: restore from backup during initial setup wizard.
+    Restores all data including credentials and marks setup_complete = true."""
+    content = await file.read()
+    try:
+        payload = json.loads(content)
+    except Exception as exc:
+        raise HTTPException(400, f"Invalid JSON: {exc}")
+    if not isinstance(payload, dict) or payload.get("version") not in (1, 2):
+        raise HTTPException(400, "Unrecognised backup format (expected version 1 or 2)")
+
+    stats = _do_restore(payload, db)
+
+    # Mark setup complete so the wizard doesn't reappear
+    s = db.get(Setting, "setup_complete")
+    if s:
+        s.value = "true"
+    else:
+        db.add(Setting(key="setup_complete", value="true"))
+    db.commit()
+
+    return {"ok": True, "restored": stats}
 
 
 # ---------------------------------------------------------------------------
@@ -2440,10 +3316,12 @@ async def stream_ping(mac: str, db: Session = Depends(get_db)):
     if not d:
         raise HTTPException(404, "Device not found")
 
+    target_ip = getattr(d, 'primary_ip', None) or d.ip_address
+
     async def _gen():
         try:
             async with httpx.AsyncClient(timeout=None) as client:
-                async with client.stream("GET", f"{PROBE_URL}/stream/ping/{d.ip_address}") as resp:
+                async with client.stream("GET", f"{PROBE_URL}/stream/ping/{target_ip}") as resp:
                     async for line in resp.aiter_lines():
                         yield f"{line}\n"
         except httpx.ConnectError:
@@ -2499,10 +3377,12 @@ async def stream_traceroute(mac: str, db: Session = Depends(get_db)):
     if not d:
         raise HTTPException(404, "Device not found")
 
+    trace_ip = getattr(d, 'primary_ip', None) or d.ip_address
+
     async def _gen():
         try:
             async with httpx.AsyncClient(timeout=None) as client:
-                async with client.stream("GET", f"{PROBE_URL}/stream/traceroute/{d.ip_address}") as resp:
+                async with client.stream("GET", f"{PROBE_URL}/stream/traceroute/{trace_ip}") as resp:
                     async for line in resp.aiter_lines():
                         yield f"{line}\n"
         except httpx.ConnectError:
@@ -3843,11 +4723,6 @@ async def traffic_summary(db: Session = Depends(get_db)):
         """),
         {"cutoff": cutoff},
     ).fetchone()
-    try:
-        active_resp = await (httpx.AsyncClient(timeout=5.0).__aenter__())
-    except Exception:
-        active_resp = None
-
     active_count = 0
     try:
         async with httpx.AsyncClient(timeout=5.0) as client:
@@ -3886,3 +4761,1024 @@ async def traffic_stream(mac: str):
             yield f"data: {{\"error\": \"{exc}\"}}\n\n"
 
     return StreamingResponse(_generate(), media_type="text/event-stream")
+
+
+# ---------------------------------------------------------------------------
+# Docker container monitoring
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# Container Hosts — CRUD + helpers
+# ---------------------------------------------------------------------------
+
+def _row_to_host(row) -> dict:
+    return {
+        "id":         row.id,
+        "name":       row.name,
+        "type":       row.type,
+        "url":        row.url,
+        "auth_user":  row.auth_user,
+        "auth_token": "***" if row.auth_token else None,  # never expose token
+        "tls_verify": row.tls_verify,
+        "enabled":    row.enabled,
+        "node":       row.node,
+        "created_at": row.created_at.isoformat() if row.created_at else None,
+    }
+
+
+@app.get("/container-hosts")
+async def list_container_hosts(db: Session = Depends(get_db)):
+    rows = db.execute(text("SELECT * FROM container_hosts ORDER BY id")).fetchall()
+    return [_row_to_host(r) for r in rows]
+
+
+@app.post("/container-hosts", status_code=201)
+async def create_container_host(body: ContainerHostCreate, db: Session = Depends(get_db)):
+    row = db.execute(text("""
+        INSERT INTO container_hosts (name, type, url, auth_user, auth_token, tls_verify, enabled, node)
+        VALUES (:name, :type, :url, :au, :at, :tls, :enabled, :node)
+        RETURNING *
+    """), {
+        "name": body.name, "type": body.type, "url": body.url or None,
+        "au": body.auth_user or None, "at": body.auth_token or None,
+        "tls": body.tls_verify, "enabled": body.enabled, "node": body.node or "pve",
+    }).fetchone()
+    db.commit()
+    return _row_to_host(row)
+
+
+@app.put("/container-hosts/{host_id}")
+async def update_container_host(host_id: int, body: ContainerHostUpdate, db: Session = Depends(get_db)):
+    row = db.execute(text("SELECT * FROM container_hosts WHERE id = :id"), {"id": host_id}).fetchone()
+    if not row:
+        raise HTTPException(404, "Host not found.")
+    fields = {}
+    if body.name       is not None: fields["name"]       = body.name
+    if body.type       is not None: fields["type"]       = body.type
+    if body.url        is not None: fields["url"]        = body.url or None
+    if body.auth_user  is not None: fields["auth_user"]  = body.auth_user or None
+    if body.tls_verify is not None: fields["tls_verify"] = body.tls_verify
+    if body.enabled    is not None: fields["enabled"]    = body.enabled
+    if body.node       is not None: fields["node"]       = body.node or "pve"
+    # Only update auth_token if explicitly supplied and not masked
+    if body.auth_token is not None and body.auth_token != "***":
+        fields["auth_token"] = body.auth_token or None
+    if not fields:
+        return _row_to_host(row)
+    set_clause = ", ".join(f"{k} = :{k}" for k in fields)
+    fields["id"] = host_id
+    updated = db.execute(text(f"UPDATE container_hosts SET {set_clause} WHERE id = :id RETURNING *"), fields).fetchone()
+    db.commit()
+    return _row_to_host(updated)
+
+
+@app.delete("/container-hosts/{host_id}", status_code=204)
+async def delete_container_host(host_id: int, db: Session = Depends(get_db)):
+    db.execute(text("DELETE FROM container_hosts WHERE id = :id"), {"id": host_id})
+    db.commit()
+
+
+@app.post("/container-hosts/{host_id}/test")
+async def test_container_host(host_id: int, db: Session = Depends(get_db)):
+    row = db.execute(text("SELECT * FROM container_hosts WHERE id = :id"), {"id": host_id}).fetchone()
+    if not row:
+        raise HTTPException(404, "Host not found.")
+
+    def _do_test():
+        if row.type == "proxmox":
+            resp = _proxmox_request(row, "GET", "/api2/json/version")
+            return {"ok": True, "detail": f"Proxmox VE {resp.get('data', {}).get('version', '?')}"}
+        else:
+            client = _make_docker_client(row.url or "unix:///var/run/docker.sock")
+            try:
+                v = client.version()
+                return {"ok": True, "detail": f"Docker {v.get('Version','?')} (API {v.get('ApiVersion','?')})"}
+            finally:
+                client.close()
+
+    try:
+        return await asyncio.to_thread(_do_test)
+    except Exception as e:
+        return {"ok": False, "detail": str(e)}
+
+
+def _get_enabled_hosts(db: Session) -> list:
+    """Return all enabled container_hosts rows as dicts (with real auth_token)."""
+    rows = db.execute(text("SELECT * FROM container_hosts WHERE enabled = true ORDER BY id")).fetchall()
+    return [
+        {
+            "id":         r.id, "name": r.name, "type": r.type,
+            "url":        r.url, "auth_user": r.auth_user, "auth_token": r.auth_token,
+            "tls_verify": r.tls_verify, "node": r.node,
+        }
+        for r in rows
+    ]
+
+
+# ---------------------------------------------------------------------------
+# Proxmox helpers
+# ---------------------------------------------------------------------------
+
+def _proxmox_request(host, method: str, path: str, **kwargs):
+    """Make an authenticated httpx request to a Proxmox VE API.
+    host may be a dict or an SQLAlchemy row-like object."""
+    if isinstance(host, dict):
+        base   = (host.get("url") or "").rstrip("/")
+        user   = host.get("auth_user") or ""
+        token  = host.get("auth_token") or ""
+        verify = host.get("tls_verify", False)
+    else:
+        base   = (getattr(host, "url",        None) or "").rstrip("/")
+        user   = getattr(host, "auth_user",   None) or ""
+        token  = getattr(host, "auth_token",  None) or ""
+        verify = getattr(host, "tls_verify",  False)
+    if not base:
+        raise ValueError("Proxmox URL not configured.")
+    headers = {}
+    if user and token:
+        headers["Authorization"] = f"PVEAPIToken={user}!{token}"
+    with httpx.Client(verify=verify, timeout=15) as client:
+        resp = client.request(method, f"{base}{path}", headers=headers, **kwargs)
+        resp.raise_for_status()
+        return resp.json()
+
+# Keep alias for backward compat within this file
+_proxmox_request_row = _proxmox_request
+
+
+def _fmt_proxmox_container(data: dict, vmid: int, node: str, host: dict, vm_type: str = "lxc") -> dict:
+    """Normalise a Proxmox LXC/QEMU container to the same shape as a Docker container."""
+    status = data.get("status", "stopped")
+    docker_status = "running" if status == "running" else ("paused" if status == "paused" else "exited")
+    uptime_secs = data.get("uptime", 0)
+    uptime_str = ""
+    if uptime_secs:
+        h, m = divmod(uptime_secs // 60, 60)
+        d, h = divmod(h, 24)
+        uptime_str = (f"{d}d " if d else "") + (f"{h}h " if h else "") + f"{m}m"
+    template = data.get("ostemplate", data.get("template", ""))
+    image = template.split(":")[0].split("/")[-1] if template else f"{vm_type}-{vmid}"
+    return {
+        "id":             f"px-{host['id']}-{node}-{vmid}",
+        "short_id":       str(vmid),
+        "name":           data.get("name", f"ct-{vmid}"),
+        "image":          image,
+        "image_id":       template,
+        "status":         docker_status,
+        "state": {
+            "status":      status,
+            "running":     status == "running",
+            "paused":      status == "paused",
+            "restarting":  False,
+            "started_at":  "",
+            "finished_at": "",
+            "exit_code":   0,
+        },
+        "ports":          [],
+        "networks":       [],
+        "mounts":         [],
+        "env":            [],
+        "labels":         {"proxmox.vmid": str(vmid), "proxmox.node": node, "proxmox.type": vm_type},
+        "created":        "",
+        "restart_policy": "",
+        "platform":       "linux",
+        "command":        [],
+        "hostname":       data.get("hostname", data.get("name", "")),
+        "working_dir":    "",
+        "uptime":         uptime_str,
+        "host_id":        host["id"],
+        "host_name":      host["name"],
+        "host_type":      "proxmox",
+        "vmid":           vmid,
+        "node":           node,
+    }
+
+
+def _fetch_containers_for_host(host: dict) -> list:
+    """Fetch and normalise containers from a single host (Docker or Proxmox)."""
+    htype = host["type"]
+    host_url = host["url"] or "unix:///var/run/docker.sock"
+
+    if htype == "proxmox":
+        containers = []
+        try:
+            nodes_resp = _proxmox_request(host, "GET", "/api2/json/nodes")
+            nodes = [n["node"] for n in nodes_resp.get("data", [])]
+        except Exception:
+            nodes = [host.get("node", "pve")]
+        for node in nodes:
+            try:
+                lxc_resp = _proxmox_request(host, "GET", f"/api2/json/nodes/{node}/lxc")
+                for item in lxc_resp.get("data", []):
+                    vmid = int(item.get("vmid", 0))
+                    if vmid:
+                        containers.append(_fmt_proxmox_container(item, vmid, node, host, "lxc"))
+            except Exception:
+                pass
+        return containers
+
+    # Docker (local or remote)
+    client = _make_docker_client(host_url)
+    try:
+        result = []
+        for c in client.containers.list(all=True):
+            d = _fmt_container(c)
+            d["host_id"]   = host["id"]
+            d["host_name"] = host["name"]
+            d["host_type"] = htype
+            result.append(d)
+        return result
+    finally:
+        client.close()
+
+
+def _docker_enabled(db: Session) -> bool:
+    """Returns True if any container host is enabled (hosts table or legacy setting)."""
+    try:
+        count = db.execute(text("SELECT COUNT(*) FROM container_hosts WHERE enabled = true")).scalar()
+        if count and count > 0:
+            return True
+    except Exception:
+        pass
+    s = db.get(Setting, "docker_enabled")
+    return (s.value if s else "false") == "true"
+
+def _get_docker_host(db: Session) -> str:
+    s = db.get(Setting, "docker_host")
+    return (s.value if s else None) or "unix:///var/run/docker.sock"
+
+def _make_docker_client(host: str):
+    try:
+        import docker as _docker
+        return _docker.DockerClient(base_url=host)
+    except ImportError:
+        raise HTTPException(503, "Docker SDK not installed in backend.")
+    except Exception as e:
+        raise HTTPException(503, f"Cannot connect to Docker at '{host}': {e}")
+
+def _fmt_container(c) -> dict:
+    attrs      = c.attrs or {}
+    state      = attrs.get("State", {})
+    config     = attrs.get("Config", {})
+    host_cfg   = attrs.get("HostConfig", {})
+    net        = attrs.get("NetworkSettings", {})
+
+    ports = []
+    for cport, bindings in (net.get("Ports") or {}).items():
+        if bindings:
+            for b in bindings:
+                ports.append({"host_ip": b.get("HostIp",""), "host_port": b.get("HostPort",""), "container_port": cport})
+        else:
+            ports.append({"host_ip": "", "host_port": "", "container_port": cport})
+
+    mounts = [
+        {"type": m.get("Type",""), "source": m.get("Source",""), "destination": m.get("Destination",""), "mode": m.get("Mode","")}
+        for m in (attrs.get("Mounts") or [])
+    ]
+
+    finished = state.get("FinishedAt","")
+
+    return {
+        "id":             c.id,
+        "short_id":       c.short_id,
+        "name":           c.name.lstrip("/"),
+        "image":          (config.get("Image") or ""),
+        "image_id":       attrs.get("Image",""),
+        "status":         c.status,
+        "state": {
+            "status":      state.get("Status",""),
+            "running":     state.get("Running", False),
+            "paused":      state.get("Paused", False),
+            "restarting":  state.get("Restarting", False),
+            "started_at":  state.get("StartedAt",""),
+            "finished_at": finished if finished and finished != "0001-01-01T00:00:00Z" else "",
+            "exit_code":   state.get("ExitCode", 0),
+        },
+        "ports":          ports,
+        "networks":       list((net.get("Networks") or {}).keys()),
+        "mounts":         mounts,
+        "env":            config.get("Env") or [],
+        "created":        attrs.get("Created",""),
+        "labels":         config.get("Labels") or {},
+        "restart_policy": (host_cfg.get("RestartPolicy") or {}).get("Name",""),
+        "platform":       attrs.get("Platform",""),
+        "command":        config.get("Cmd") or [],
+        "hostname":       config.get("Hostname",""),
+        "working_dir":    config.get("WorkingDir",""),
+    }
+
+
+@app.get("/docker/stats")
+async def docker_stats(db: Session = Depends(get_db)):
+    hosts = _get_enabled_hosts(db)
+    if not hosts:
+        raise HTTPException(503, "No container hosts configured. Add one in Settings → Containers.")
+
+    def _do_host(h):
+        return _fetch_containers_for_host(h)
+
+    tasks = [asyncio.to_thread(_do_host, h) for h in hosts]
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    all_containers = []
+    for r in results:
+        if not isinstance(r, Exception):
+            all_containers.extend(r)
+
+    counts = {}
+    for c in all_containers:
+        st = c.get("status", "exited")
+        counts[st] = counts.get(st, 0) + 1
+
+    return {
+        "total":          len(all_containers),
+        "running":        counts.get("running", 0),
+        "stopped":        counts.get("exited", 0) + counts.get("created", 0) + counts.get("dead", 0),
+        "paused":         counts.get("paused", 0),
+        "restarting":     counts.get("restarting", 0),
+        "hosts":          len(hosts),
+        "connected":      True,
+    }
+
+
+@app.get("/docker/containers")
+async def list_docker_containers(db: Session = Depends(get_db)):
+    hosts = _get_enabled_hosts(db)
+    if not hosts:
+        raise HTTPException(503, "No container hosts configured. Add one in Settings → Containers.")
+
+    tasks = [asyncio.to_thread(_fetch_containers_for_host, h) for h in hosts]
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    all_containers = []
+    for r in results:
+        if not isinstance(r, Exception):
+            all_containers.extend(r)
+
+    return all_containers
+
+
+def _parse_proxmox_id(container_id: str):
+    """Parse 'px-{host_id}-{node}-{vmid}' → (host_id, node, vmid) or None."""
+    if not container_id.startswith("px-"):
+        return None
+    parts = container_id.split("-", 3)
+    if len(parts) != 4:
+        return None
+    try:
+        return int(parts[1]), parts[2], int(parts[3])
+    except ValueError:
+        return None
+
+
+def _get_host_row(db: Session, host_id: int) -> dict:
+    row = db.execute(text("SELECT * FROM container_hosts WHERE id = :id"), {"id": host_id}).fetchone()
+    if not row:
+        raise HTTPException(404, f"Container host {host_id} not found.")
+    return {"id": row.id, "name": row.name, "type": row.type, "url": row.url,
+            "auth_user": row.auth_user, "auth_token": row.auth_token,
+            "tls_verify": row.tls_verify, "node": row.node}
+
+
+def _proxmox_action(host: dict, node: str, vmid: int, action: str) -> dict:
+    """Run a lifecycle action on a Proxmox LXC and return updated container info."""
+    import time
+    pve_action = "reboot" if action == "restart" else action
+    _proxmox_request(host, "POST", f"/api2/json/nodes/{node}/lxc/{vmid}/status/{pve_action}")
+    time.sleep(1)
+    status_resp = _proxmox_request(host, "GET", f"/api2/json/nodes/{node}/lxc/{vmid}/status/current")
+    return _fmt_proxmox_container(status_resp.get("data", {}), vmid, node, host)
+
+
+@app.get("/docker/containers/{container_id}")
+async def get_docker_container(container_id: str, db: Session = Depends(get_db)):
+    px = _parse_proxmox_id(container_id)
+    if px:
+        host_id, node, vmid = px
+        host = _get_host_row(db, host_id)
+        def _do():
+            r = _proxmox_request(host, "GET", f"/api2/json/nodes/{node}/lxc/{vmid}/status/current")
+            return _fmt_proxmox_container(r.get("data", {}), vmid, node, host)
+        try:
+            return await asyncio.to_thread(_do)
+        except Exception as e:
+            raise HTTPException(503, str(e))
+
+    hosts = _get_enabled_hosts(db)
+    docker_hosts = [h for h in hosts if h["type"] != "proxmox"]
+    if not docker_hosts:
+        raise HTTPException(503, "No Docker hosts configured.")
+    host_url = docker_hosts[0]["url"] or "unix:///var/run/docker.sock"
+
+    def _do():
+        client = _make_docker_client(host_url)
+        try:
+            c = client.containers.get(container_id)
+            d = _fmt_container(c)
+            d["host_id"] = docker_hosts[0]["id"]; d["host_name"] = docker_hosts[0]["name"]
+            return d
+        finally:
+            client.close()
+
+    try:
+        return await asyncio.to_thread(_do)
+    except HTTPException:
+        raise
+    except Exception as e:
+        code = 404 if "404" in str(e) or "Not Found" in str(e) else 503
+        raise HTTPException(code, str(e))
+
+
+@app.post("/docker/containers/{container_id}/start")
+async def docker_start(container_id: str, db: Session = Depends(get_db)):
+    px = _parse_proxmox_id(container_id)
+    if px:
+        host_id, node, vmid = px
+        host = _get_host_row(db, host_id)
+        try:
+            return await asyncio.to_thread(_proxmox_action, host, node, vmid, "start")
+        except Exception as e:
+            raise HTTPException(400, str(e))
+
+    hosts = _get_enabled_hosts(db)
+    docker_hosts = [h for h in hosts if h["type"] != "proxmox"]
+    if not docker_hosts:
+        raise HTTPException(503, "No Docker hosts.")
+    host_url = docker_hosts[0]["url"] or "unix:///var/run/docker.sock"
+
+    def _do():
+        client = _make_docker_client(host_url)
+        try:
+            c = client.containers.get(container_id)
+            c.start(); c.reload()
+            return _fmt_container(c)
+        finally:
+            client.close()
+
+    try:
+        return await asyncio.to_thread(_do)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(400, str(e))
+
+
+@app.post("/docker/containers/{container_id}/stop")
+async def docker_stop(container_id: str, db: Session = Depends(get_db)):
+    px = _parse_proxmox_id(container_id)
+    if px:
+        host_id, node, vmid = px
+        host = _get_host_row(db, host_id)
+        try:
+            return await asyncio.to_thread(_proxmox_action, host, node, vmid, "stop")
+        except Exception as e:
+            raise HTTPException(400, str(e))
+
+    hosts = _get_enabled_hosts(db)
+    docker_hosts = [h for h in hosts if h["type"] != "proxmox"]
+    if not docker_hosts:
+        raise HTTPException(503, "No Docker hosts.")
+    host_url = docker_hosts[0]["url"] or "unix:///var/run/docker.sock"
+
+    def _do():
+        client = _make_docker_client(host_url)
+        try:
+            c = client.containers.get(container_id)
+            c.stop(timeout=10); c.reload()
+            return _fmt_container(c)
+        finally:
+            client.close()
+
+    try:
+        return await asyncio.to_thread(_do)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(400, str(e))
+
+
+@app.post("/docker/containers/{container_id}/restart")
+async def docker_restart(container_id: str, db: Session = Depends(get_db)):
+    px = _parse_proxmox_id(container_id)
+    if px:
+        host_id, node, vmid = px
+        host = _get_host_row(db, host_id)
+        try:
+            return await asyncio.to_thread(_proxmox_action, host, node, vmid, "restart")
+        except Exception as e:
+            raise HTTPException(400, str(e))
+
+    hosts = _get_enabled_hosts(db)
+    docker_hosts = [h for h in hosts if h["type"] != "proxmox"]
+    if not docker_hosts:
+        raise HTTPException(503, "No Docker hosts.")
+    host_url = docker_hosts[0]["url"] or "unix:///var/run/docker.sock"
+
+    def _do():
+        client = _make_docker_client(host_url)
+        try:
+            c = client.containers.get(container_id)
+            c.restart(timeout=10); c.reload()
+            return _fmt_container(c)
+        finally:
+            client.close()
+
+    try:
+        return await asyncio.to_thread(_do)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(400, str(e))
+
+
+@app.get("/docker/containers/{container_id}/logs")
+async def stream_docker_logs(container_id: str, tail: int = 100, db: Session = Depends(get_db)):
+    """Stream container logs as SSE."""
+    if container_id.startswith("px-"):
+        raise HTTPException(400, "Log streaming is not yet available for Proxmox containers.")
+    if not _docker_enabled(db):
+        raise HTTPException(503, "No container hosts configured.")
+    docker_hosts = [h for h in _get_enabled_hosts(db) if h["type"] != "proxmox"]
+    host = docker_hosts[0]["url"] if docker_hosts else _get_docker_host(db)
+
+    line_queue: asyncio.Queue = asyncio.Queue()
+    loop = asyncio.get_event_loop()
+
+    def _stream():
+        try:
+            client = _make_docker_client(host)
+            c = client.containers.get(container_id)
+            for raw in c.logs(stream=True, follow=True, tail=tail, timestamps=True):
+                line = raw.decode("utf-8", errors="replace").rstrip("\n")
+                loop.call_soon_threadsafe(line_queue.put_nowait, line)
+        except Exception as exc:
+            loop.call_soon_threadsafe(line_queue.put_nowait, f"[ERROR] {exc}")
+        finally:
+            loop.call_soon_threadsafe(line_queue.put_nowait, None)
+
+    threading.Thread(target=_stream, daemon=True).start()
+
+    async def _gen():
+        while True:
+            try:
+                line = await asyncio.wait_for(line_queue.get(), timeout=120)
+            except asyncio.TimeoutError:
+                break
+            if line is None:
+                break
+            yield f"data: {line}\n\n"
+
+    return StreamingResponse(_gen(), media_type="text/event-stream",
+                             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+
+def _parse_trivy_json(data: dict) -> list:
+    """Flatten Trivy JSON output into a list of structured vulnerability dicts."""
+    vulns = []
+    for result in data.get("Results", []):
+        target = result.get("Target", "")
+        for v in (result.get("Vulnerabilities") or []):
+            cvss_score = None
+            for src in (v.get("CVSS") or {}).values():
+                score = src.get("V3Score") or src.get("V2Score")
+                if score:
+                    cvss_score = score
+                    break
+            vulns.append({
+                "id":        v.get("VulnerabilityID", ""),
+                "severity":  v.get("Severity", "UNKNOWN").lower(),
+                "pkg":       v.get("PkgName", ""),
+                "installed": v.get("InstalledVersion", ""),
+                "fixed":     v.get("FixedVersion", ""),
+                "title":     v.get("Title", ""),
+                "cvss":      cvss_score,
+                "target":    target,
+            })
+    return vulns
+
+
+@app.get("/docker/containers/{container_id}/trivy-scan")
+async def stream_docker_trivy_scan(container_id: str, db: Session = Depends(get_db)):
+    """Stream a Trivy vulnerability scan of the container image as SSE."""
+    if container_id.startswith("px-"):
+        raise HTTPException(400, "Trivy image scanning is not available for Proxmox containers.")
+    if not _docker_enabled(db):
+        raise HTTPException(503, "No container hosts configured.")
+    # Resolve the Docker host for this container
+    hosts = _get_enabled_hosts(db)
+    docker_hosts = [h for h in hosts if h["type"] != "proxmox"]
+    host = docker_hosts[0]["url"] if docker_hosts else _get_docker_host(db)
+
+    def _get_container_info():
+        client = _make_docker_client(host)
+        try:
+            c = client.containers.get(container_id)
+            image = (c.attrs.get("Config") or {}).get("Image", "")
+            name  = c.name.lstrip("/")
+            return image, name
+        finally:
+            client.close()
+
+    try:
+        image, container_name = await asyncio.to_thread(_get_container_info)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(400, str(e))
+
+    if not image:
+        raise HTTPException(400, "Could not determine container image.")
+
+    line_queue: asyncio.Queue = asyncio.Queue()
+    loop = asyncio.get_event_loop()
+
+    def _run():
+        if not shutil.which("trivy"):
+            loop.call_soon_threadsafe(line_queue.put_nowait,
+                "LOG: [ERROR] Trivy is not installed in this container.")
+            loop.call_soon_threadsafe(line_queue.put_nowait, "TRIVY_DONE")
+            loop.call_soon_threadsafe(line_queue.put_nowait, None)
+            return
+        try:
+            proc = subprocess.Popen(
+                ["trivy", "image", "--format", "json", "--no-progress", "--scanners", "vuln", image],
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
+            )
+            stdout_data = proc.stdout.read()
+            proc.wait()
+
+            scanned_at = datetime.now(timezone.utc).isoformat()
+            if proc.returncode == 0 and stdout_data.strip():
+                try:
+                    vulns = _parse_trivy_json(json.loads(stdout_data))
+                except Exception as parse_err:
+                    vulns = []
+                    loop.call_soon_threadsafe(line_queue.put_nowait,
+                        f"LOG: [ERROR] Could not parse Trivy output: {parse_err}")
+            else:
+                vulns = []
+                if proc.returncode != 0:
+                    loop.call_soon_threadsafe(line_queue.put_nowait,
+                        f"LOG: [ERROR] Trivy exited with code {proc.returncode}")
+
+            _save_trivy_result(container_name, image, vulns, scanned_at)
+            result_payload = json.dumps({"vulns": vulns, "image": image, "scanned_at": scanned_at})
+            loop.call_soon_threadsafe(line_queue.put_nowait, f"TRIVY_RESULT:{result_payload}")
+        except Exception as exc:
+            loop.call_soon_threadsafe(line_queue.put_nowait, f"LOG: [ERROR] {exc}")
+        finally:
+            loop.call_soon_threadsafe(line_queue.put_nowait, "TRIVY_DONE")
+            loop.call_soon_threadsafe(line_queue.put_nowait, None)
+
+    threading.Thread(target=_run, daemon=True).start()
+
+    async def _gen():
+        while True:
+            try:
+                line = await asyncio.wait_for(line_queue.get(), timeout=300)
+            except asyncio.TimeoutError:
+                yield "data: TRIVY_DONE\n\n"
+                break
+            if line is None:
+                break
+            yield f"data: {line}\n\n"
+
+    return StreamingResponse(_gen(), media_type="text/event-stream",
+                             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+
+# ---------------------------------------------------------------------------
+# Trivy DB update background loop
+# ---------------------------------------------------------------------------
+async def _trivy_db_update_loop():
+    """Periodically refreshes the Trivy vulnerability database."""
+    await asyncio.sleep(60)  # startup grace
+    while True:
+        db = SessionLocal()
+        try:
+            s = db.get(Setting, "trivy_db_update_hours")
+            hours = int(s.value) if s and s.value else 24
+        except Exception:
+            hours = 24
+        finally:
+            db.close()
+
+        if hours > 0 and shutil.which("trivy"):
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    "trivy", "image", "--download-db-only", "--no-progress",
+                    stdout=asyncio.subprocess.DEVNULL,
+                    stderr=asyncio.subprocess.DEVNULL,
+                )
+                await proc.wait()
+                print("[trivy_db] Vulnerability DB updated.", flush=True)
+            except Exception as e:
+                print(f"[trivy_db] Update failed: {e}", flush=True)
+
+        await asyncio.sleep(max(hours, 1) * 3600 if hours > 0 else 86400)
+
+
+# ---------------------------------------------------------------------------
+# Docker event watcher (auto-scan on new/updated containers)
+# ---------------------------------------------------------------------------
+_container_vuln_scans: dict = {}   # name -> {scanning: bool, image: str} (in-memory scan state only)
+
+
+def _save_trivy_result(name: str, image: str, vulns: list, scanned_at: str):
+    """Persist a Trivy scan result to the database so it survives restarts."""
+    try:
+        db = SessionLocal()
+        db.execute(text("""
+            INSERT INTO container_vuln_results (name, image, vulns, scanned_at)
+            VALUES (:name, :image, cast(:vulns as jsonb), :scanned_at)
+            ON CONFLICT (name) DO UPDATE
+                SET image = EXCLUDED.image,
+                    vulns = EXCLUDED.vulns,
+                    scanned_at = EXCLUDED.scanned_at
+        """), {"name": name, "image": image, "vulns": json.dumps(vulns), "scanned_at": scanned_at})
+        db.commit()
+    except Exception as e:
+        print(f"[trivy] DB save failed for {name}: {e}", flush=True)
+    finally:
+        db.close()
+
+
+def _run_trivy_for_container(name: str, image: str):
+    """Run Trivy synchronously and persist results to the database."""
+    _container_vuln_scans[name] = {"scanning": True, "image": image}
+    if not shutil.which("trivy"):
+        _container_vuln_scans[name]["scanning"] = False
+        return
+    try:
+        proc = subprocess.Popen(
+            ["trivy", "image", "--format", "json", "--no-progress", "--scanners", "vuln", image],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
+        )
+        stdout_data = proc.stdout.read()
+        proc.wait()
+        scanned_at = datetime.now(timezone.utc).isoformat()
+        if proc.returncode == 0 and stdout_data.strip():
+            try:
+                vulns = _parse_trivy_json(json.loads(stdout_data))
+            except Exception:
+                vulns = []
+        else:
+            vulns = []
+        _save_trivy_result(name, image, vulns, scanned_at)
+    except Exception as exc:
+        print(f"[trivy] {name}: {exc}", flush=True)
+    finally:
+        _container_vuln_scans[name]["scanning"] = False
+
+
+def _record_container_event(name: str, status: str):
+    """Persist a container start/stop event to the DB for timeline tracking."""
+    try:
+        db = SessionLocal()
+        db.execute(text("INSERT INTO container_events (name, status) VALUES (:n, :s)"),
+                   {"n": name, "s": status})
+        db.commit()
+    except Exception as e:
+        print(f"[container_events] DB write failed: {e}", flush=True)
+    finally:
+        db.close()
+
+
+async def _docker_event_loop():
+    """Watch Docker events: auto-scan containers and record timeline events."""
+    await asyncio.sleep(45)  # startup grace
+    while True:
+        db = SessionLocal()
+        try:
+            enabled = _docker_enabled(db)
+            scan_on_new    = db.get(Setting, "docker_scan_on_new")
+            scan_on_update = db.get(Setting, "docker_scan_on_update")
+            do_new    = enabled and scan_on_new    and scan_on_new.value    == "true"
+            do_update = enabled and scan_on_update and scan_on_update.value == "true"
+            if enabled:
+                docker_hosts = [h for h in _get_enabled_hosts(db) if h["type"] != "proxmox"]
+                host = docker_hosts[0]["url"] if docker_hosts else _get_docker_host(db)
+            else:
+                host = None
+        except Exception:
+            enabled = False
+            host = None
+            do_new = do_update = False
+        finally:
+            db.close()
+
+        if not enabled:
+            await asyncio.sleep(30)
+            continue
+
+        try:
+            def _watch():
+                client = _make_docker_client(host)
+                seen_images: dict = {}
+
+                # Record current state as baseline
+                try:
+                    for c in client.containers.list(all=True):
+                        cname  = c.name.lstrip("/")
+                        seen_images[cname] = c.image.tags[0] if c.image.tags else c.image.id
+                except Exception:
+                    pass
+
+                try:
+                    for event in client.events(decode=True):
+                        action = event.get("Action", "")
+                        actor  = event.get("Actor", {})
+                        attrs  = actor.get("Attributes", {})
+                        cname  = attrs.get("name", "")
+                        image  = attrs.get("image", "")
+
+                        # Timeline recording
+                        if action == "start":
+                            threading.Thread(target=_record_container_event,
+                                             args=(cname, "running"), daemon=True).start()
+                        elif action in ("die", "stop", "kill", "pause"):
+                            status = "paused" if action == "pause" else "stopped"
+                            threading.Thread(target=_record_container_event,
+                                             args=(cname, status), daemon=True).start()
+
+                        # Auto-scan logic
+                        if action == "create" and do_new:
+                            threading.Thread(target=_run_trivy_for_container,
+                                             args=(cname, image), daemon=True).start()
+                        elif action == "start" and do_update:
+                            prev = seen_images.get(cname)
+                            if prev and prev != image:
+                                threading.Thread(target=_run_trivy_for_container,
+                                                 args=(cname, image), daemon=True).start()
+
+                        if action in ("create", "start"):
+                            seen_images[cname] = image
+                except Exception:
+                    pass
+                finally:
+                    client.close()
+
+            await asyncio.to_thread(_watch)
+        except Exception as e:
+            print(f"[docker_events] {e}", flush=True)
+
+        await asyncio.sleep(10)
+
+
+@app.get("/docker/auto-scan/{name}")
+async def docker_auto_scan_result(name: str, db: Session = Depends(get_db)):
+    """Return the stored Trivy scan result for a container name."""
+    # If a scan is actively running, report that
+    mem = _container_vuln_scans.get(name)
+    if mem and mem.get("scanning"):
+        return {"scanning": True, "vulns": [], "image": mem.get("image", ""), "scanned_at": None}
+    # Read persisted result from DB
+    row = db.execute(
+        text("SELECT image, vulns, scanned_at FROM container_vuln_results WHERE name = :name"),
+        {"name": name},
+    ).fetchone()
+    if row is None:
+        raise HTTPException(404, "No scan data for this container.")
+    vulns = row.vulns if isinstance(row.vulns, list) else json.loads(row.vulns or "[]")
+    return {
+        "scanning": False,
+        "image": row.image,
+        "vulns": vulns,
+        "scanned_at": row.scanned_at.isoformat() if row.scanned_at else None,
+    }
+
+
+@app.get("/docker/vuln-summary")
+async def docker_vuln_summary(db: Session = Depends(get_db)):
+    """Return aggregated Trivy scan results for all containers (in-memory)."""
+    if not _docker_enabled(db):
+        raise HTTPException(503, "Docker monitoring is disabled.")
+
+    rows = db.execute(
+        text("SELECT name, image, vulns, scanned_at FROM container_vuln_results ORDER BY scanned_at DESC")
+    ).fetchall()
+    result = []
+    for row in rows:
+        vulns = row.vulns if isinstance(row.vulns, list) else json.loads(row.vulns or "[]")
+        scanning = _container_vuln_scans.get(row.name, {}).get("scanning", False)
+        scanned_at = row.scanned_at.isoformat() if row.scanned_at else None
+        counts = {"critical": 0, "high": 0, "medium": 0, "low": 0}
+        for v in vulns:
+            sev = v.get("severity", "").lower()
+            if sev in counts:
+                counts[sev] += 1
+        if counts["critical"] > 0:        severity = "critical"
+        elif counts["high"] > 0:          severity = "high"
+        elif counts["medium"] > 0:        severity = "medium"
+        elif counts["low"] > 0:           severity = "low"
+        elif scanned_at:                  severity = "clean"
+        else:                             severity = None
+        result.append({
+            "name":       row.name,
+            "image":      row.image,
+            "scanning":   scanning,
+            "severity":   severity,
+            "counts":     counts,
+            "vulns":      vulns,
+            "scanned_at": scanned_at,
+        })
+    return result
+
+
+@app.post("/docker/scan-all")
+async def docker_scan_all(db: Session = Depends(get_db)):
+    """Trigger Trivy scans on all running containers."""
+    if not _docker_enabled(db):
+        raise HTTPException(503, "Docker monitoring is disabled.")
+    host = _get_docker_host(db)
+
+    def _get_containers():
+        client = _make_docker_client(host)
+        try:
+            return [(c.name.lstrip("/"), (c.image.tags[0] if c.image.tags else c.image.id))
+                    for c in client.containers.list()]
+        finally:
+            client.close()
+
+    try:
+        containers = await asyncio.to_thread(_get_containers)
+    except Exception as e:
+        raise HTTPException(503, str(e))
+
+    for name, image in containers:
+        threading.Thread(target=_run_trivy_for_container, args=(name, image), daemon=True).start()
+
+    return {"started": len(containers), "containers": [n for n, _ in containers]}
+
+
+@app.get("/docker/timeline")
+async def docker_timeline(days: int = Query(7, ge=1, le=365), db: Session = Depends(get_db)):
+    """Return container uptime timeline data keyed by container NAME."""
+    if not _docker_enabled(db):
+        raise HTTPException(503, "Docker monitoring is disabled.")
+
+    now = datetime.now(timezone.utc)
+    window_start = now - timedelta(days=days)
+
+    rows = db.execute(
+        text("SELECT name, status, ts FROM container_events WHERE ts >= :start ORDER BY name, ts"),
+        {"start": window_start},
+    ).fetchall()
+
+    # Also get current state from Docker daemon
+    host = _get_docker_host(db)
+    current_states: dict = {}
+    try:
+        def _get_states():
+            client = _make_docker_client(host)
+            try:
+                return {c.name.lstrip("/"): c.status for c in client.containers.list(all=True)}
+            finally:
+                client.close()
+        current_states = await asyncio.to_thread(_get_states)
+    except Exception:
+        pass
+
+    # Group events by name
+    events_by_name: dict = defaultdict(list)
+    for name, status, ts in rows:
+        events_by_name[name].append({"status": status, "ts": ts})
+
+    # Build segments from events
+    containers_out = []
+    all_names = set(events_by_name.keys()) | set(current_states.keys())
+
+    for name in sorted(all_names):
+        evts = sorted(events_by_name.get(name, []), key=lambda e: e["ts"])
+        segs = []
+
+        # If we have events, build segments
+        if evts:
+            # Segment before first event
+            first_ts = evts[0]["ts"]
+            if first_ts > window_start:
+                segs.append({"from": window_start.isoformat(), "to": first_ts.isoformat(), "status": "unknown"})
+
+            for i, ev in enumerate(evts):
+                seg_start = ev["ts"]
+                seg_end   = evts[i + 1]["ts"] if i + 1 < len(evts) else now
+                seg_status = "running" if ev["status"] == "running" else "stopped"
+                segs.append({"from": seg_start.isoformat(), "to": seg_end.isoformat(), "status": seg_status})
+        else:
+            # No history — use current state for whole window
+            cur = current_states.get(name, "unknown")
+            seg_status = "running" if cur == "running" else "stopped" if cur in ("exited","created","dead","paused") else "unknown"
+            segs.append({"from": window_start.isoformat(), "to": now.isoformat(), "status": seg_status})
+
+        cur_status = current_states.get(name, "unknown")
+        containers_out.append({
+            "name":       name,
+            "is_running": cur_status == "running",
+            "segments":   segs,
+        })
+
+    return {
+        "window_start": window_start.isoformat(),
+        "window_end":   now.isoformat(),
+        "containers":   containers_out,
+    }
