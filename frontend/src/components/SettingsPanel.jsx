@@ -1,10 +1,11 @@
 import { useState, useEffect, useRef } from 'react'
 import {
   Save, RotateCcw, Settings2, X, Download, Upload, FileText,
-  Database, Bell, ScanLine, Eye, EyeOff, Send, Globe, User, Key,
+  Database, Bell, ScanLine, Eye, EyeOff, Send, Globe, User, Key, Box,
   AlertTriangle, ChevronDown, ChevronRight,
 } from 'lucide-react'
 import { api } from '../api'
+import { HostsManager } from './HostsManager'
 
 // ── Setting definitions ────────────────────────────────────────────────────────
 const SETTING_META = {
@@ -75,6 +76,22 @@ const SETTING_META = {
   alert_on_vuln:       { label: 'Alert on Vulnerability',   type: 'toggle', tab: 'notifications',
     description: 'Send an external alert when a vulnerability scan finds issues.' },
 
+  // Delivery channels — handled as special sections in the UI, referenced here for tab routing
+  alert_webhook_url: { tab: 'notifications' },
+  ntfy_url:          { tab: 'notifications' },
+  ntfy_topic:        { tab: 'notifications' },
+  gotify_url:        { tab: 'notifications' },
+  gotify_token:      { tab: 'notifications' },
+  pushbullet_api_key:{ tab: 'notifications' },
+
+  // Docker monitoring — handled as custom cards, referenced here for tab routing
+  docker_enabled:        { tab: 'docker' },
+  docker_host:           { tab: 'docker' },
+  docker_tls_verify:     { tab: 'docker' },
+  trivy_db_update_hours: { tab: 'docker' },
+  docker_scan_on_new:    { tab: 'docker' },
+  docker_scan_on_update: { tab: 'docker' },
+
   // Here Be Dragons — advanced probe pipeline controls
   enable_arp_sweep: { label: 'Enable Active ARP Sweep', type: 'toggle', tab: 'scanner',
     description: 'Send active ARP broadcast packets to discover devices on the configured subnet. Disable to rely on the passive sniffer only — note that without the sweep, device online/offline state will no longer be tracked.' },
@@ -98,22 +115,18 @@ const SETTING_META = {
     description: 'Re-scan all online devices during the configured nightly scan window. Disable to prevent automatic overnight port scan storms.' },
   enable_unscanned_retry: { label: 'Retry Unscanned Devices Each Cycle', type: 'toggle', tab: 'scanner',
     description: 'On each sweep cycle, trigger a port scan for any device that has never been scanned. Disable if new devices are causing too many simultaneous scans.' },
-
-  // Delivery channels — handled as special sections in the UI, referenced here for tab routing
-  alert_webhook_url: { tab: 'notifications' },
-  ntfy_url:          { tab: 'notifications' },
-  ntfy_topic:        { tab: 'notifications' },
-  gotify_url:        { tab: 'notifications' },
-  gotify_token:      { tab: 'notifications' },
-  pushbullet_api_key:{ tab: 'notifications' },
 }
 
 // Keys rendered as custom delivery-channel cards, not through SettingRow
 const DELIVERY_KEYS = new Set(['alert_webhook_url','ntfy_url','ntfy_topic','gotify_url','gotify_token','pushbullet_api_key'])
 
+// Docker keys handled as custom cards
+const DOCKER_KEYS = new Set(['docker_enabled','docker_host','docker_tls_verify','trivy_db_update_hours','docker_scan_on_new','docker_scan_on_update'])
+
 const TABS = [
   { id: 'scanner',       label: 'Scanner',       Icon: ScanLine },
   { id: 'notifications', label: 'Notifications', Icon: Bell     },
+  { id: 'docker',        label: 'Docker',        Icon: Box      },
   { id: 'data',          label: 'Data',          Icon: Database },
   { id: 'account',       label: 'Account',       Icon: User     },
 ]
@@ -288,7 +301,7 @@ export function SettingsPanel({ onClose, onSettingChange }) {
   }
 
   const hasDirty   = Object.keys(dirty).length > 0
-  const showFooter = activeTab !== 'data' && activeTab !== 'account'
+  const showFooter = activeTab !== 'data' && activeTab !== 'account' && activeTab !== 'docker'
 
   // Returns current value for a key (dirty-aware)
   function val(key) {
@@ -305,7 +318,6 @@ export function SettingsPanel({ onClose, onSettingChange }) {
   // ── Scanner tab grouping ────────────────────────────────────────────────────
   const networkScanKeys   = ['scan_interval','offline_miss_threshold','sniffer_workers','arp_scan_retry']
   const networkConfigKeys = ['ip_range','dns_server','probe_interface']
-
 
   // ── Notifications tab grouping ──────────────────────────────────────────────
   const inAppKeys   = ['notifications_enabled','browser_notifications_enabled']
@@ -583,6 +595,89 @@ export function SettingsPanel({ onClose, onSettingChange }) {
                   {pbTestStatus === 'ok'    && <span className="text-xs" style={{ color: 'var(--color-success)' }}>✓ {pbTestMsg}</span>}
                   {pbTestStatus === 'error' && <span className="text-xs" style={{ color: '#ef4444' }}>{pbTestMsg}</span>}
                 </div>
+              </div>
+            </>
+          )}
+
+          {/* ── Docker tab ──────────────────────────────────────────────────── */}
+          {activeTab === 'docker' && (
+            <>
+              <p className="text-xs" style={{ color: 'var(--color-text-faint)' }}>
+                Connect to Docker hosts and Proxmox VE servers to monitor and manage containers.
+                Enable individual hosts with their toggle — at least one must be active for the Containers page to work.
+              </p>
+
+              <SectionHeader label="Container Hosts" Icon={Box} />
+              <HostsManager />
+
+              <SectionHeader label="Image Vulnerability Scanning (Trivy)" Icon={Box} />
+              <div className="card p-4 space-y-4">
+                <p className="text-xs" style={{ color: 'var(--color-text-faint)' }}>
+                  Trivy scans container images for known CVEs. The vulnerability database is pre-downloaded
+                  during the backend build and refreshed automatically at the interval below. Rebuild with{' '}
+                  <code className="font-mono text-[10px] px-1 py-0.5 rounded"
+                    style={{ background: 'var(--color-surface-offset)' }}>./inspectre.sh rebuild keep-data</code> to update Trivy itself.
+                </p>
+
+                {/* DB update interval */}
+                <div className="space-y-1.5">
+                  <label className="text-xs font-medium" style={{ color: 'var(--color-text-muted)' }}>
+                    Vulnerability DB update interval (hours)
+                  </label>
+                  <input
+                    type="number" min="0" className="input text-sm w-28"
+                    value={val('trivy_db_update_hours')}
+                    onChange={e => handleChange('trivy_db_update_hours', e.target.value)}
+                    style={dirty['trivy_db_update_hours'] !== undefined ? { borderColor: 'color-mix(in srgb, var(--color-brand) 50%, transparent)' } : {}}
+                  />
+                  <p className="text-xs" style={{ color: 'var(--color-text-faint)' }}>
+                    How often the backend refreshes the Trivy CVE database. Set to 0 to disable automatic updates.
+                  </p>
+                </div>
+
+                {/* Auto-scan on new container */}
+                {(() => {
+                  const isOn = val('docker_scan_on_new') === 'true'
+                  return (
+                    <div className="flex items-center justify-between">
+                      <div>
+                        <p className="text-sm font-medium" style={{ color: 'var(--color-text)' }}>Scan on new container</p>
+                        <p className="text-xs mt-0.5" style={{ color: 'var(--color-text-faint)' }}>
+                          Automatically run a Trivy scan when a new container is created.
+                        </p>
+                      </div>
+                      <button type="button" role="switch" aria-checked={isOn}
+                        onClick={() => handleChange('docker_scan_on_new', isOn ? 'false' : 'true')}
+                        className="relative inline-flex h-6 w-11 items-center rounded-full transition-colors duration-200 focus:outline-none shrink-0"
+                        style={{ background: isOn ? 'var(--color-brand)' : 'var(--color-border)' }}>
+                        <span className="inline-block h-4 w-4 rounded-full bg-white shadow transition-transform duration-200"
+                          style={{ transform: isOn ? 'translateX(22px)' : 'translateX(4px)' }} />
+                      </button>
+                    </div>
+                  )
+                })()}
+
+                {/* Auto-scan on container update */}
+                {(() => {
+                  const isOn = val('docker_scan_on_update') === 'true'
+                  return (
+                    <div className="flex items-center justify-between">
+                      <div>
+                        <p className="text-sm font-medium" style={{ color: 'var(--color-text)' }}>Scan on image update</p>
+                        <p className="text-xs mt-0.5" style={{ color: 'var(--color-text-faint)' }}>
+                          Automatically scan when a container restarts with a different image (updated version).
+                        </p>
+                      </div>
+                      <button type="button" role="switch" aria-checked={isOn}
+                        onClick={() => handleChange('docker_scan_on_update', isOn ? 'false' : 'true')}
+                        className="relative inline-flex h-6 w-11 items-center rounded-full transition-colors duration-200 focus:outline-none shrink-0"
+                        style={{ background: isOn ? 'var(--color-brand)' : 'var(--color-border)' }}>
+                        <span className="inline-block h-4 w-4 rounded-full bg-white shadow transition-transform duration-200"
+                          style={{ transform: isOn ? 'translateX(22px)' : 'translateX(4px)' }} />
+                      </button>
+                    </div>
+                  )
+                })()}
               </div>
             </>
           )}

@@ -7,12 +7,16 @@ from sqlalchemy.orm import sessionmaker, Session
 from pydantic import BaseModel
 from typing import Optional, List
 import asyncio
+from collections import defaultdict
 import os
 import json
 import csv
 import io
+import re
+import shutil
 import socket
 import subprocess
+import threading
 from datetime import datetime, timezone, timedelta
 
 import httpx
@@ -204,6 +208,35 @@ def _migrate(db: Session):
         "UPDATE settings SET value = '-sS -T4' WHERE key = 'nmap_args' AND value IN ('-sS -T3 --max-rate 100', '-sS -T4 --max-rate 200', '-sS -T4 --max-rate 200 --host-timeout 360s')",
         # scan_type: which nmap mode to use for this device (auto-detected at discovery)
         "ALTER TABLE devices ADD COLUMN IF NOT EXISTS scan_type VARCHAR NOT NULL DEFAULT 'syn'",
+        # Container event timeline — tracks running/stopped events by container name
+        """CREATE TABLE IF NOT EXISTS container_events (
+            id     SERIAL PRIMARY KEY,
+            name   VARCHAR NOT NULL,
+            status VARCHAR NOT NULL,
+            ts     TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )""",
+        "CREATE INDEX IF NOT EXISTS ix_container_events_name ON container_events(name)",
+        "CREATE INDEX IF NOT EXISTS ix_container_events_ts   ON container_events(ts)",
+        # Multi-host container monitoring — Docker and Proxmox
+        """CREATE TABLE IF NOT EXISTS container_hosts (
+            id         SERIAL PRIMARY KEY,
+            name       TEXT NOT NULL,
+            type       TEXT NOT NULL DEFAULT 'docker_local',
+            url        TEXT,
+            auth_user  TEXT,
+            auth_token TEXT,
+            tls_verify BOOLEAN NOT NULL DEFAULT false,
+            enabled    BOOLEAN NOT NULL DEFAULT true,
+            node       TEXT NOT NULL DEFAULT 'pve',
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )""",
+        # Persistent Trivy scan results (survives backend restarts)
+        """CREATE TABLE IF NOT EXISTS container_vuln_results (
+            name       TEXT NOT NULL PRIMARY KEY,
+            image      TEXT NOT NULL,
+            vulns      JSONB NOT NULL DEFAULT '[]',
+            scanned_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )""",
     ]
     for sql in migrations:
         try:
@@ -265,6 +298,13 @@ DEFAULT_SETTINGS = {
     "probe_interface":           ("",      "Network interface the probe uses for scanning (e.g. eth0, eno1). Requires probe restart to change."),
     # Setup wizard
     "setup_complete":            ("false", "Whether the initial setup wizard has been completed."),
+    # Docker monitoring
+    "docker_enabled":            ("false", "Enable Docker container monitoring."),
+    "docker_host":               ("unix:///var/run/docker.sock", "Docker host — socket path (unix:///var/run/docker.sock) or TCP URL (tcp://host:2375)."),
+    "docker_tls_verify":         ("false", "Enable TLS verification for Docker TCP connections."),
+    "trivy_db_update_hours":     ("24",   "How often (hours) to refresh the Trivy vulnerability database. Set to 0 to disable automatic updates."),
+    "docker_scan_on_new":        ("false", "Automatically run a Trivy vuln scan when a new container is created."),
+    "docker_scan_on_update":     ("false", "Automatically run a Trivy vuln scan when a container is recreated with an updated image."),
     # Here Be Dragons — advanced probe pipeline controls
     "enable_arp_sweep":              ("true",  "Run active ARP broadcast sweeps to discover devices on the configured subnet."),
     "enable_passive_sniffer":        ("true",  "Run the passive ARP sniffer that listens for ARP traffic. Disable to stop all passive packet capture. Takes effect immediately."),
@@ -285,6 +325,31 @@ def _seed_settings(db: Session):
         if not db.get(Setting, key):
             db.add(Setting(key=key, value=value, description=description))
     db.commit()
+
+
+def _migrate_legacy_docker_host(db: Session):
+    """One-time migration: if docker_enabled=true and no hosts exist, create a default host entry."""
+    try:
+        existing = db.execute(text("SELECT COUNT(*) FROM container_hosts")).scalar()
+        if existing and existing > 0:
+            return
+        s_enabled = db.get(Setting, "docker_enabled")
+        if not s_enabled or s_enabled.value != "true":
+            return
+        s_host = db.get(Setting, "docker_host")
+        s_tls  = db.get(Setting, "docker_tls_verify")
+        url    = (s_host.value if s_host else None) or "unix:///var/run/docker.sock"
+        htype  = "docker_remote" if url.startswith("tcp://") else "docker_local"
+        tls    = (s_tls and s_tls.value == "true")
+        db.execute(text("""
+            INSERT INTO container_hosts (name, type, url, tls_verify, enabled)
+            VALUES (:name, :type, :url, :tls, true)
+        """), {"name": "Local Docker", "type": htype, "url": url, "tls": tls})
+        db.commit()
+        print("[hosts] Migrated legacy docker settings to container_hosts table.", flush=True)
+    except Exception as e:
+        print(f"[hosts] Legacy migration failed (non-fatal): {e}", flush=True)
+        db.rollback()
 
 
 # ---------------------------------------------------------------------------
@@ -938,6 +1003,7 @@ async def on_startup():
         _migrate(db)
         _seed_settings(db)
         _seed_default_user(db)
+        _migrate_legacy_docker_host(db)
     finally:
         db.close()
     asyncio.ensure_future(_scheduled_vuln_scan_loop())
@@ -945,11 +1011,33 @@ async def on_startup():
     asyncio.ensure_future(_block_schedule_loop())
     asyncio.ensure_future(_traffic_flush_loop())
     asyncio.ensure_future(_speedtest_schedule_loop())
+    asyncio.ensure_future(_trivy_db_update_loop())
+    asyncio.ensure_future(_docker_event_loop())
 
 
 # ---------------------------------------------------------------------------
 # Pydantic models
 # ---------------------------------------------------------------------------
+class ContainerHostCreate(BaseModel):
+    name:       str
+    type:       str = "docker_local"   # docker_local | docker_remote | proxmox
+    url:        Optional[str] = None
+    auth_user:  Optional[str] = None
+    auth_token: Optional[str] = None
+    tls_verify: bool = False
+    enabled:    bool = True
+    node:       str  = "pve"
+
+class ContainerHostUpdate(BaseModel):
+    name:       Optional[str]  = None
+    type:       Optional[str]  = None
+    url:        Optional[str]  = None
+    auth_user:  Optional[str]  = None
+    auth_token: Optional[str]  = None
+    tls_verify: Optional[bool] = None
+    enabled:    Optional[bool] = None
+    node:       Optional[str]  = None
+
 class DeviceUpdate(BaseModel):
     custom_name: Optional[str] = None
     hostname:    Optional[str] = None
@@ -1024,6 +1112,8 @@ class SetupCompleteRequest(BaseModel):
     notifications_enabled: bool  = True
     ntfy_topic:           str    = ""
     ntfy_url:             str    = "https://ntfy.sh"
+    docker_enabled:       bool   = False
+    docker_host:          str    = "unix:///var/run/docker.sock"
 
 
 # ---------------------------------------------------------------------------
@@ -1366,6 +1456,16 @@ def setup_status(db: Session = Depends(get_db)):
     has_user = _has_any_user(db)
     s = db.get(Setting, "setup_complete")
     setup_done = (s.value if s else "false") == "true"
+    # Auto-heal: a user already exists but setup_complete was never set to true.
+    # This happens when restoring a DB or if the wizard flow was interrupted.
+    if has_user and not setup_done:
+        if s:
+            s.value = "true"
+        else:
+            db.add(Setting(key="setup_complete", value="true",
+                           description="Whether the initial setup wizard has been completed."))
+        db.commit()
+        setup_done = True
     return {"setup_complete": setup_done, "has_user": has_user}
 
 
@@ -1436,11 +1536,14 @@ def setup_complete(
         "notifications_enabled":     "true" if payload.notifications_enabled else "false",
         "vuln_scan_on_new_device":   "true" if payload.vuln_scan_on_new else "false",
         "vuln_scan_schedule":        payload.vuln_scan_schedule if payload.vuln_scan_enabled else "disabled",
+        "docker_enabled":            "true" if payload.docker_enabled else "false",
     }
     if payload.ntfy_topic:
         to_save["ntfy_topic"] = payload.ntfy_topic
     if payload.ntfy_url:
         to_save["ntfy_url"] = payload.ntfy_url
+    if payload.docker_host:
+        to_save["docker_host"] = payload.docker_host
     for key, value in to_save.items():
         s = db.get(Setting, key)
         if s:
@@ -2319,7 +2422,6 @@ def get_vuln_trend(days: int = Query(default=30, le=90), db: Session = Depends(g
             GROUP BY day, severity
             ORDER BY day ASC, severity
         """), {"days": days}).fetchall()
-        from collections import defaultdict
         by_day: dict = defaultdict(dict)
         for row in rows:
             by_day[str(row[0])][row[1]] = int(row[2])
@@ -4691,3 +4793,1024 @@ async def traffic_stream(mac: str):
             yield f"data: {{\"error\": \"{exc}\"}}\n\n"
 
     return StreamingResponse(_generate(), media_type="text/event-stream")
+
+
+# ---------------------------------------------------------------------------
+# Docker container monitoring
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# Container Hosts — CRUD + helpers
+# ---------------------------------------------------------------------------
+
+def _row_to_host(row) -> dict:
+    return {
+        "id":         row.id,
+        "name":       row.name,
+        "type":       row.type,
+        "url":        row.url,
+        "auth_user":  row.auth_user,
+        "auth_token": "***" if row.auth_token else None,  # never expose token
+        "tls_verify": row.tls_verify,
+        "enabled":    row.enabled,
+        "node":       row.node,
+        "created_at": row.created_at.isoformat() if row.created_at else None,
+    }
+
+
+@app.get("/container-hosts")
+async def list_container_hosts(db: Session = Depends(get_db)):
+    rows = db.execute(text("SELECT * FROM container_hosts ORDER BY id")).fetchall()
+    return [_row_to_host(r) for r in rows]
+
+
+@app.post("/container-hosts", status_code=201)
+async def create_container_host(body: ContainerHostCreate, db: Session = Depends(get_db)):
+    row = db.execute(text("""
+        INSERT INTO container_hosts (name, type, url, auth_user, auth_token, tls_verify, enabled, node)
+        VALUES (:name, :type, :url, :au, :at, :tls, :enabled, :node)
+        RETURNING *
+    """), {
+        "name": body.name, "type": body.type, "url": body.url or None,
+        "au": body.auth_user or None, "at": body.auth_token or None,
+        "tls": body.tls_verify, "enabled": body.enabled, "node": body.node or "pve",
+    }).fetchone()
+    db.commit()
+    return _row_to_host(row)
+
+
+@app.put("/container-hosts/{host_id}")
+async def update_container_host(host_id: int, body: ContainerHostUpdate, db: Session = Depends(get_db)):
+    row = db.execute(text("SELECT * FROM container_hosts WHERE id = :id"), {"id": host_id}).fetchone()
+    if not row:
+        raise HTTPException(404, "Host not found.")
+    fields = {}
+    if body.name       is not None: fields["name"]       = body.name
+    if body.type       is not None: fields["type"]       = body.type
+    if body.url        is not None: fields["url"]        = body.url or None
+    if body.auth_user  is not None: fields["auth_user"]  = body.auth_user or None
+    if body.tls_verify is not None: fields["tls_verify"] = body.tls_verify
+    if body.enabled    is not None: fields["enabled"]    = body.enabled
+    if body.node       is not None: fields["node"]       = body.node or "pve"
+    # Only update auth_token if explicitly supplied and not masked
+    if body.auth_token is not None and body.auth_token != "***":
+        fields["auth_token"] = body.auth_token or None
+    if not fields:
+        return _row_to_host(row)
+    set_clause = ", ".join(f"{k} = :{k}" for k in fields)
+    fields["id"] = host_id
+    updated = db.execute(text(f"UPDATE container_hosts SET {set_clause} WHERE id = :id RETURNING *"), fields).fetchone()
+    db.commit()
+    return _row_to_host(updated)
+
+
+@app.delete("/container-hosts/{host_id}", status_code=204)
+async def delete_container_host(host_id: int, db: Session = Depends(get_db)):
+    db.execute(text("DELETE FROM container_hosts WHERE id = :id"), {"id": host_id})
+    db.commit()
+
+
+@app.post("/container-hosts/{host_id}/test")
+async def test_container_host(host_id: int, db: Session = Depends(get_db)):
+    row = db.execute(text("SELECT * FROM container_hosts WHERE id = :id"), {"id": host_id}).fetchone()
+    if not row:
+        raise HTTPException(404, "Host not found.")
+
+    def _do_test():
+        if row.type == "proxmox":
+            resp = _proxmox_request(row, "GET", "/api2/json/version")
+            return {"ok": True, "detail": f"Proxmox VE {resp.get('data', {}).get('version', '?')}"}
+        else:
+            client = _make_docker_client(row.url or "unix:///var/run/docker.sock")
+            try:
+                v = client.version()
+                return {"ok": True, "detail": f"Docker {v.get('Version','?')} (API {v.get('ApiVersion','?')})"}
+            finally:
+                client.close()
+
+    try:
+        return await asyncio.to_thread(_do_test)
+    except Exception as e:
+        return {"ok": False, "detail": str(e)}
+
+
+def _get_enabled_hosts(db: Session) -> list:
+    """Return all enabled container_hosts rows as dicts (with real auth_token)."""
+    rows = db.execute(text("SELECT * FROM container_hosts WHERE enabled = true ORDER BY id")).fetchall()
+    return [
+        {
+            "id":         r.id, "name": r.name, "type": r.type,
+            "url":        r.url, "auth_user": r.auth_user, "auth_token": r.auth_token,
+            "tls_verify": r.tls_verify, "node": r.node,
+        }
+        for r in rows
+    ]
+
+
+# ---------------------------------------------------------------------------
+# Proxmox helpers
+# ---------------------------------------------------------------------------
+
+def _proxmox_request(host, method: str, path: str, **kwargs):
+    """Make an authenticated httpx request to a Proxmox VE API.
+    host may be a dict or an SQLAlchemy row-like object."""
+    if isinstance(host, dict):
+        base   = (host.get("url") or "").rstrip("/")
+        user   = host.get("auth_user") or ""
+        token  = host.get("auth_token") or ""
+        verify = host.get("tls_verify", False)
+    else:
+        base   = (getattr(host, "url",        None) or "").rstrip("/")
+        user   = getattr(host, "auth_user",   None) or ""
+        token  = getattr(host, "auth_token",  None) or ""
+        verify = getattr(host, "tls_verify",  False)
+    if not base:
+        raise ValueError("Proxmox URL not configured.")
+    headers = {}
+    if user and token:
+        headers["Authorization"] = f"PVEAPIToken={user}!{token}"
+    with httpx.Client(verify=verify, timeout=15) as client:
+        resp = client.request(method, f"{base}{path}", headers=headers, **kwargs)
+        resp.raise_for_status()
+        return resp.json()
+
+# Keep alias for backward compat within this file
+_proxmox_request_row = _proxmox_request
+
+
+def _fmt_proxmox_container(data: dict, vmid: int, node: str, host: dict, vm_type: str = "lxc") -> dict:
+    """Normalise a Proxmox LXC/QEMU container to the same shape as a Docker container."""
+    status = data.get("status", "stopped")
+    docker_status = "running" if status == "running" else ("paused" if status == "paused" else "exited")
+    uptime_secs = data.get("uptime", 0)
+    uptime_str = ""
+    if uptime_secs:
+        h, m = divmod(uptime_secs // 60, 60)
+        d, h = divmod(h, 24)
+        uptime_str = (f"{d}d " if d else "") + (f"{h}h " if h else "") + f"{m}m"
+    template = data.get("ostemplate", data.get("template", ""))
+    image = template.split(":")[0].split("/")[-1] if template else f"{vm_type}-{vmid}"
+    return {
+        "id":             f"px-{host['id']}-{node}-{vmid}",
+        "short_id":       str(vmid),
+        "name":           data.get("name", f"ct-{vmid}"),
+        "image":          image,
+        "image_id":       template,
+        "status":         docker_status,
+        "state": {
+            "status":      status,
+            "running":     status == "running",
+            "paused":      status == "paused",
+            "restarting":  False,
+            "started_at":  "",
+            "finished_at": "",
+            "exit_code":   0,
+        },
+        "ports":          [],
+        "networks":       [],
+        "mounts":         [],
+        "env":            [],
+        "labels":         {"proxmox.vmid": str(vmid), "proxmox.node": node, "proxmox.type": vm_type},
+        "created":        "",
+        "restart_policy": "",
+        "platform":       "linux",
+        "command":        [],
+        "hostname":       data.get("hostname", data.get("name", "")),
+        "working_dir":    "",
+        "uptime":         uptime_str,
+        "host_id":        host["id"],
+        "host_name":      host["name"],
+        "host_type":      "proxmox",
+        "vmid":           vmid,
+        "node":           node,
+    }
+
+
+def _fetch_containers_for_host(host: dict) -> list:
+    """Fetch and normalise containers from a single host (Docker or Proxmox)."""
+    htype = host["type"]
+    host_url = host["url"] or "unix:///var/run/docker.sock"
+
+    if htype == "proxmox":
+        containers = []
+        try:
+            nodes_resp = _proxmox_request(host, "GET", "/api2/json/nodes")
+            nodes = [n["node"] for n in nodes_resp.get("data", [])]
+        except Exception:
+            nodes = [host.get("node", "pve")]
+        for node in nodes:
+            try:
+                lxc_resp = _proxmox_request(host, "GET", f"/api2/json/nodes/{node}/lxc")
+                for item in lxc_resp.get("data", []):
+                    vmid = int(item.get("vmid", 0))
+                    if vmid:
+                        containers.append(_fmt_proxmox_container(item, vmid, node, host, "lxc"))
+            except Exception:
+                pass
+        return containers
+
+    # Docker (local or remote)
+    client = _make_docker_client(host_url)
+    try:
+        result = []
+        for c in client.containers.list(all=True):
+            d = _fmt_container(c)
+            d["host_id"]   = host["id"]
+            d["host_name"] = host["name"]
+            d["host_type"] = htype
+            result.append(d)
+        return result
+    finally:
+        client.close()
+
+
+def _docker_enabled(db: Session) -> bool:
+    """Returns True if any container host is enabled (hosts table or legacy setting)."""
+    try:
+        count = db.execute(text("SELECT COUNT(*) FROM container_hosts WHERE enabled = true")).scalar()
+        if count and count > 0:
+            return True
+    except Exception:
+        pass
+    s = db.get(Setting, "docker_enabled")
+    return (s.value if s else "false") == "true"
+
+def _get_docker_host(db: Session) -> str:
+    s = db.get(Setting, "docker_host")
+    return (s.value if s else None) or "unix:///var/run/docker.sock"
+
+def _make_docker_client(host: str):
+    try:
+        import docker as _docker
+        return _docker.DockerClient(base_url=host)
+    except ImportError:
+        raise HTTPException(503, "Docker SDK not installed in backend.")
+    except Exception as e:
+        raise HTTPException(503, f"Cannot connect to Docker at '{host}': {e}")
+
+def _fmt_container(c) -> dict:
+    attrs      = c.attrs or {}
+    state      = attrs.get("State", {})
+    config     = attrs.get("Config", {})
+    host_cfg   = attrs.get("HostConfig", {})
+    net        = attrs.get("NetworkSettings", {})
+
+    ports = []
+    for cport, bindings in (net.get("Ports") or {}).items():
+        if bindings:
+            for b in bindings:
+                ports.append({"host_ip": b.get("HostIp",""), "host_port": b.get("HostPort",""), "container_port": cport})
+        else:
+            ports.append({"host_ip": "", "host_port": "", "container_port": cport})
+
+    mounts = [
+        {"type": m.get("Type",""), "source": m.get("Source",""), "destination": m.get("Destination",""), "mode": m.get("Mode","")}
+        for m in (attrs.get("Mounts") or [])
+    ]
+
+    finished = state.get("FinishedAt","")
+
+    return {
+        "id":             c.id,
+        "short_id":       c.short_id,
+        "name":           c.name.lstrip("/"),
+        "image":          (config.get("Image") or ""),
+        "image_id":       attrs.get("Image",""),
+        "status":         c.status,
+        "state": {
+            "status":      state.get("Status",""),
+            "running":     state.get("Running", False),
+            "paused":      state.get("Paused", False),
+            "restarting":  state.get("Restarting", False),
+            "started_at":  state.get("StartedAt",""),
+            "finished_at": finished if finished and finished != "0001-01-01T00:00:00Z" else "",
+            "exit_code":   state.get("ExitCode", 0),
+        },
+        "ports":          ports,
+        "networks":       list((net.get("Networks") or {}).keys()),
+        "mounts":         mounts,
+        "env":            config.get("Env") or [],
+        "created":        attrs.get("Created",""),
+        "labels":         config.get("Labels") or {},
+        "restart_policy": (host_cfg.get("RestartPolicy") or {}).get("Name",""),
+        "platform":       attrs.get("Platform",""),
+        "command":        config.get("Cmd") or [],
+        "hostname":       config.get("Hostname",""),
+        "working_dir":    config.get("WorkingDir",""),
+    }
+
+
+@app.get("/docker/stats")
+async def docker_stats(db: Session = Depends(get_db)):
+    hosts = _get_enabled_hosts(db)
+    if not hosts:
+        raise HTTPException(503, "No container hosts configured. Add one in Settings → Containers.")
+
+    def _do_host(h):
+        return _fetch_containers_for_host(h)
+
+    tasks = [asyncio.to_thread(_do_host, h) for h in hosts]
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    all_containers = []
+    for r in results:
+        if not isinstance(r, Exception):
+            all_containers.extend(r)
+
+    counts = {}
+    for c in all_containers:
+        st = c.get("status", "exited")
+        counts[st] = counts.get(st, 0) + 1
+
+    return {
+        "total":          len(all_containers),
+        "running":        counts.get("running", 0),
+        "stopped":        counts.get("exited", 0) + counts.get("created", 0) + counts.get("dead", 0),
+        "paused":         counts.get("paused", 0),
+        "restarting":     counts.get("restarting", 0),
+        "hosts":          len(hosts),
+        "connected":      True,
+    }
+
+
+@app.get("/docker/containers")
+async def list_docker_containers(db: Session = Depends(get_db)):
+    hosts = _get_enabled_hosts(db)
+    if not hosts:
+        raise HTTPException(503, "No container hosts configured. Add one in Settings → Containers.")
+
+    tasks = [asyncio.to_thread(_fetch_containers_for_host, h) for h in hosts]
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    all_containers = []
+    for r in results:
+        if not isinstance(r, Exception):
+            all_containers.extend(r)
+
+    return all_containers
+
+
+def _parse_proxmox_id(container_id: str):
+    """Parse 'px-{host_id}-{node}-{vmid}' → (host_id, node, vmid) or None."""
+    if not container_id.startswith("px-"):
+        return None
+    parts = container_id.split("-", 3)
+    if len(parts) != 4:
+        return None
+    try:
+        return int(parts[1]), parts[2], int(parts[3])
+    except ValueError:
+        return None
+
+
+def _get_host_row(db: Session, host_id: int) -> dict:
+    row = db.execute(text("SELECT * FROM container_hosts WHERE id = :id"), {"id": host_id}).fetchone()
+    if not row:
+        raise HTTPException(404, f"Container host {host_id} not found.")
+    return {"id": row.id, "name": row.name, "type": row.type, "url": row.url,
+            "auth_user": row.auth_user, "auth_token": row.auth_token,
+            "tls_verify": row.tls_verify, "node": row.node}
+
+
+def _proxmox_action(host: dict, node: str, vmid: int, action: str) -> dict:
+    """Run a lifecycle action on a Proxmox LXC and return updated container info."""
+    import time
+    pve_action = "reboot" if action == "restart" else action
+    _proxmox_request(host, "POST", f"/api2/json/nodes/{node}/lxc/{vmid}/status/{pve_action}")
+    time.sleep(1)
+    status_resp = _proxmox_request(host, "GET", f"/api2/json/nodes/{node}/lxc/{vmid}/status/current")
+    return _fmt_proxmox_container(status_resp.get("data", {}), vmid, node, host)
+
+
+@app.get("/docker/containers/{container_id}")
+async def get_docker_container(container_id: str, db: Session = Depends(get_db)):
+    px = _parse_proxmox_id(container_id)
+    if px:
+        host_id, node, vmid = px
+        host = _get_host_row(db, host_id)
+        def _do():
+            r = _proxmox_request(host, "GET", f"/api2/json/nodes/{node}/lxc/{vmid}/status/current")
+            return _fmt_proxmox_container(r.get("data", {}), vmid, node, host)
+        try:
+            return await asyncio.to_thread(_do)
+        except Exception as e:
+            raise HTTPException(503, str(e))
+
+    hosts = _get_enabled_hosts(db)
+    docker_hosts = [h for h in hosts if h["type"] != "proxmox"]
+    if not docker_hosts:
+        raise HTTPException(503, "No Docker hosts configured.")
+    host_url = docker_hosts[0]["url"] or "unix:///var/run/docker.sock"
+
+    def _do():
+        client = _make_docker_client(host_url)
+        try:
+            c = client.containers.get(container_id)
+            d = _fmt_container(c)
+            d["host_id"] = docker_hosts[0]["id"]; d["host_name"] = docker_hosts[0]["name"]
+            return d
+        finally:
+            client.close()
+
+    try:
+        return await asyncio.to_thread(_do)
+    except HTTPException:
+        raise
+    except Exception as e:
+        code = 404 if "404" in str(e) or "Not Found" in str(e) else 503
+        raise HTTPException(code, str(e))
+
+
+@app.post("/docker/containers/{container_id}/start")
+async def docker_start(container_id: str, db: Session = Depends(get_db)):
+    px = _parse_proxmox_id(container_id)
+    if px:
+        host_id, node, vmid = px
+        host = _get_host_row(db, host_id)
+        try:
+            return await asyncio.to_thread(_proxmox_action, host, node, vmid, "start")
+        except Exception as e:
+            raise HTTPException(400, str(e))
+
+    hosts = _get_enabled_hosts(db)
+    docker_hosts = [h for h in hosts if h["type"] != "proxmox"]
+    if not docker_hosts:
+        raise HTTPException(503, "No Docker hosts.")
+    host_url = docker_hosts[0]["url"] or "unix:///var/run/docker.sock"
+
+    def _do():
+        client = _make_docker_client(host_url)
+        try:
+            c = client.containers.get(container_id)
+            c.start(); c.reload()
+            return _fmt_container(c)
+        finally:
+            client.close()
+
+    try:
+        return await asyncio.to_thread(_do)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(400, str(e))
+
+
+@app.post("/docker/containers/{container_id}/stop")
+async def docker_stop(container_id: str, db: Session = Depends(get_db)):
+    px = _parse_proxmox_id(container_id)
+    if px:
+        host_id, node, vmid = px
+        host = _get_host_row(db, host_id)
+        try:
+            return await asyncio.to_thread(_proxmox_action, host, node, vmid, "stop")
+        except Exception as e:
+            raise HTTPException(400, str(e))
+
+    hosts = _get_enabled_hosts(db)
+    docker_hosts = [h for h in hosts if h["type"] != "proxmox"]
+    if not docker_hosts:
+        raise HTTPException(503, "No Docker hosts.")
+    host_url = docker_hosts[0]["url"] or "unix:///var/run/docker.sock"
+
+    def _do():
+        client = _make_docker_client(host_url)
+        try:
+            c = client.containers.get(container_id)
+            c.stop(timeout=10); c.reload()
+            return _fmt_container(c)
+        finally:
+            client.close()
+
+    try:
+        return await asyncio.to_thread(_do)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(400, str(e))
+
+
+@app.post("/docker/containers/{container_id}/restart")
+async def docker_restart(container_id: str, db: Session = Depends(get_db)):
+    px = _parse_proxmox_id(container_id)
+    if px:
+        host_id, node, vmid = px
+        host = _get_host_row(db, host_id)
+        try:
+            return await asyncio.to_thread(_proxmox_action, host, node, vmid, "restart")
+        except Exception as e:
+            raise HTTPException(400, str(e))
+
+    hosts = _get_enabled_hosts(db)
+    docker_hosts = [h for h in hosts if h["type"] != "proxmox"]
+    if not docker_hosts:
+        raise HTTPException(503, "No Docker hosts.")
+    host_url = docker_hosts[0]["url"] or "unix:///var/run/docker.sock"
+
+    def _do():
+        client = _make_docker_client(host_url)
+        try:
+            c = client.containers.get(container_id)
+            c.restart(timeout=10); c.reload()
+            return _fmt_container(c)
+        finally:
+            client.close()
+
+    try:
+        return await asyncio.to_thread(_do)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(400, str(e))
+
+
+@app.get("/docker/containers/{container_id}/logs")
+async def stream_docker_logs(container_id: str, tail: int = 100, db: Session = Depends(get_db)):
+    """Stream container logs as SSE."""
+    if container_id.startswith("px-"):
+        raise HTTPException(400, "Log streaming is not yet available for Proxmox containers.")
+    if not _docker_enabled(db):
+        raise HTTPException(503, "No container hosts configured.")
+    docker_hosts = [h for h in _get_enabled_hosts(db) if h["type"] != "proxmox"]
+    host = docker_hosts[0]["url"] if docker_hosts else _get_docker_host(db)
+
+    line_queue: asyncio.Queue = asyncio.Queue()
+    loop = asyncio.get_event_loop()
+
+    def _stream():
+        try:
+            client = _make_docker_client(host)
+            c = client.containers.get(container_id)
+            for raw in c.logs(stream=True, follow=True, tail=tail, timestamps=True):
+                line = raw.decode("utf-8", errors="replace").rstrip("\n")
+                loop.call_soon_threadsafe(line_queue.put_nowait, line)
+        except Exception as exc:
+            loop.call_soon_threadsafe(line_queue.put_nowait, f"[ERROR] {exc}")
+        finally:
+            loop.call_soon_threadsafe(line_queue.put_nowait, None)
+
+    threading.Thread(target=_stream, daemon=True).start()
+
+    async def _gen():
+        while True:
+            try:
+                line = await asyncio.wait_for(line_queue.get(), timeout=120)
+            except asyncio.TimeoutError:
+                break
+            if line is None:
+                break
+            yield f"data: {line}\n\n"
+
+    return StreamingResponse(_gen(), media_type="text/event-stream",
+                             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+
+def _parse_trivy_json(data: dict) -> list:
+    """Flatten Trivy JSON output into a list of structured vulnerability dicts."""
+    vulns = []
+    for result in data.get("Results", []):
+        target = result.get("Target", "")
+        for v in (result.get("Vulnerabilities") or []):
+            cvss_score = None
+            for src in (v.get("CVSS") or {}).values():
+                score = src.get("V3Score") or src.get("V2Score")
+                if score:
+                    cvss_score = score
+                    break
+            vulns.append({
+                "id":        v.get("VulnerabilityID", ""),
+                "severity":  v.get("Severity", "UNKNOWN").lower(),
+                "pkg":       v.get("PkgName", ""),
+                "installed": v.get("InstalledVersion", ""),
+                "fixed":     v.get("FixedVersion", ""),
+                "title":     v.get("Title", ""),
+                "cvss":      cvss_score,
+                "target":    target,
+            })
+    return vulns
+
+
+@app.get("/docker/containers/{container_id}/trivy-scan")
+async def stream_docker_trivy_scan(container_id: str, db: Session = Depends(get_db)):
+    """Stream a Trivy vulnerability scan of the container image as SSE."""
+    if container_id.startswith("px-"):
+        raise HTTPException(400, "Trivy image scanning is not available for Proxmox containers.")
+    if not _docker_enabled(db):
+        raise HTTPException(503, "No container hosts configured.")
+    # Resolve the Docker host for this container
+    hosts = _get_enabled_hosts(db)
+    docker_hosts = [h for h in hosts if h["type"] != "proxmox"]
+    host = docker_hosts[0]["url"] if docker_hosts else _get_docker_host(db)
+
+    def _get_container_info():
+        client = _make_docker_client(host)
+        try:
+            c = client.containers.get(container_id)
+            image = (c.attrs.get("Config") or {}).get("Image", "")
+            name  = c.name.lstrip("/")
+            return image, name
+        finally:
+            client.close()
+
+    try:
+        image, container_name = await asyncio.to_thread(_get_container_info)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(400, str(e))
+
+    if not image:
+        raise HTTPException(400, "Could not determine container image.")
+
+    line_queue: asyncio.Queue = asyncio.Queue()
+    loop = asyncio.get_event_loop()
+
+    def _run():
+        if not shutil.which("trivy"):
+            loop.call_soon_threadsafe(line_queue.put_nowait,
+                "LOG: [ERROR] Trivy is not installed in this container.")
+            loop.call_soon_threadsafe(line_queue.put_nowait, "TRIVY_DONE")
+            loop.call_soon_threadsafe(line_queue.put_nowait, None)
+            return
+        try:
+            proc = subprocess.Popen(
+                ["trivy", "image", "--format", "json", "--no-progress", "--scanners", "vuln", image],
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
+            )
+            stdout_data = proc.stdout.read()
+            proc.wait()
+
+            scanned_at = datetime.now(timezone.utc).isoformat()
+            if proc.returncode == 0 and stdout_data.strip():
+                try:
+                    vulns = _parse_trivy_json(json.loads(stdout_data))
+                except Exception as parse_err:
+                    vulns = []
+                    loop.call_soon_threadsafe(line_queue.put_nowait,
+                        f"LOG: [ERROR] Could not parse Trivy output: {parse_err}")
+            else:
+                vulns = []
+                if proc.returncode != 0:
+                    loop.call_soon_threadsafe(line_queue.put_nowait,
+                        f"LOG: [ERROR] Trivy exited with code {proc.returncode}")
+
+            _save_trivy_result(container_name, image, vulns, scanned_at)
+            result_payload = json.dumps({"vulns": vulns, "image": image, "scanned_at": scanned_at})
+            loop.call_soon_threadsafe(line_queue.put_nowait, f"TRIVY_RESULT:{result_payload}")
+        except Exception as exc:
+            loop.call_soon_threadsafe(line_queue.put_nowait, f"LOG: [ERROR] {exc}")
+        finally:
+            loop.call_soon_threadsafe(line_queue.put_nowait, "TRIVY_DONE")
+            loop.call_soon_threadsafe(line_queue.put_nowait, None)
+
+    threading.Thread(target=_run, daemon=True).start()
+
+    async def _gen():
+        while True:
+            try:
+                line = await asyncio.wait_for(line_queue.get(), timeout=300)
+            except asyncio.TimeoutError:
+                yield "data: TRIVY_DONE\n\n"
+                break
+            if line is None:
+                break
+            yield f"data: {line}\n\n"
+
+    return StreamingResponse(_gen(), media_type="text/event-stream",
+                             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+
+# ---------------------------------------------------------------------------
+# Trivy DB update background loop
+# ---------------------------------------------------------------------------
+async def _trivy_db_update_loop():
+    """Periodically refreshes the Trivy vulnerability database."""
+    await asyncio.sleep(60)  # startup grace
+    while True:
+        db = SessionLocal()
+        try:
+            s = db.get(Setting, "trivy_db_update_hours")
+            hours = int(s.value) if s and s.value else 24
+        except Exception:
+            hours = 24
+        finally:
+            db.close()
+
+        if hours > 0 and shutil.which("trivy"):
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    "trivy", "image", "--download-db-only", "--no-progress",
+                    stdout=asyncio.subprocess.DEVNULL,
+                    stderr=asyncio.subprocess.DEVNULL,
+                )
+                await proc.wait()
+                print("[trivy_db] Vulnerability DB updated.", flush=True)
+            except Exception as e:
+                print(f"[trivy_db] Update failed: {e}", flush=True)
+
+        await asyncio.sleep(max(hours, 1) * 3600 if hours > 0 else 86400)
+
+
+# ---------------------------------------------------------------------------
+# Docker event watcher (auto-scan on new/updated containers)
+# ---------------------------------------------------------------------------
+_container_vuln_scans: dict = {}   # name -> {scanning: bool, image: str} (in-memory scan state only)
+
+
+def _save_trivy_result(name: str, image: str, vulns: list, scanned_at: str):
+    """Persist a Trivy scan result to the database so it survives restarts."""
+    try:
+        db = SessionLocal()
+        db.execute(text("""
+            INSERT INTO container_vuln_results (name, image, vulns, scanned_at)
+            VALUES (:name, :image, cast(:vulns as jsonb), :scanned_at)
+            ON CONFLICT (name) DO UPDATE
+                SET image = EXCLUDED.image,
+                    vulns = EXCLUDED.vulns,
+                    scanned_at = EXCLUDED.scanned_at
+        """), {"name": name, "image": image, "vulns": json.dumps(vulns), "scanned_at": scanned_at})
+        db.commit()
+    except Exception as e:
+        print(f"[trivy] DB save failed for {name}: {e}", flush=True)
+    finally:
+        db.close()
+
+
+def _run_trivy_for_container(name: str, image: str):
+    """Run Trivy synchronously and persist results to the database."""
+    _container_vuln_scans[name] = {"scanning": True, "image": image}
+    if not shutil.which("trivy"):
+        _container_vuln_scans[name]["scanning"] = False
+        return
+    try:
+        proc = subprocess.Popen(
+            ["trivy", "image", "--format", "json", "--no-progress", "--scanners", "vuln", image],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
+        )
+        stdout_data = proc.stdout.read()
+        proc.wait()
+        scanned_at = datetime.now(timezone.utc).isoformat()
+        if proc.returncode == 0 and stdout_data.strip():
+            try:
+                vulns = _parse_trivy_json(json.loads(stdout_data))
+            except Exception:
+                vulns = []
+        else:
+            vulns = []
+        _save_trivy_result(name, image, vulns, scanned_at)
+    except Exception as exc:
+        print(f"[trivy] {name}: {exc}", flush=True)
+    finally:
+        _container_vuln_scans[name]["scanning"] = False
+
+
+def _record_container_event(name: str, status: str):
+    """Persist a container start/stop event to the DB for timeline tracking."""
+    try:
+        db = SessionLocal()
+        db.execute(text("INSERT INTO container_events (name, status) VALUES (:n, :s)"),
+                   {"n": name, "s": status})
+        db.commit()
+    except Exception as e:
+        print(f"[container_events] DB write failed: {e}", flush=True)
+    finally:
+        db.close()
+
+
+async def _docker_event_loop():
+    """Watch Docker events: auto-scan containers and record timeline events."""
+    await asyncio.sleep(45)  # startup grace
+    while True:
+        db = SessionLocal()
+        try:
+            enabled = _docker_enabled(db)
+            scan_on_new    = db.get(Setting, "docker_scan_on_new")
+            scan_on_update = db.get(Setting, "docker_scan_on_update")
+            do_new    = enabled and scan_on_new    and scan_on_new.value    == "true"
+            do_update = enabled and scan_on_update and scan_on_update.value == "true"
+            if enabled:
+                docker_hosts = [h for h in _get_enabled_hosts(db) if h["type"] != "proxmox"]
+                host = docker_hosts[0]["url"] if docker_hosts else _get_docker_host(db)
+            else:
+                host = None
+        except Exception:
+            enabled = False
+            host = None
+            do_new = do_update = False
+        finally:
+            db.close()
+
+        if not enabled:
+            await asyncio.sleep(30)
+            continue
+
+        try:
+            def _watch():
+                client = _make_docker_client(host)
+                seen_images: dict = {}
+
+                # Record current state as baseline
+                try:
+                    for c in client.containers.list(all=True):
+                        cname  = c.name.lstrip("/")
+                        seen_images[cname] = c.image.tags[0] if c.image.tags else c.image.id
+                except Exception:
+                    pass
+
+                try:
+                    for event in client.events(decode=True):
+                        action = event.get("Action", "")
+                        actor  = event.get("Actor", {})
+                        attrs  = actor.get("Attributes", {})
+                        cname  = attrs.get("name", "")
+                        image  = attrs.get("image", "")
+
+                        # Timeline recording
+                        if action == "start":
+                            threading.Thread(target=_record_container_event,
+                                             args=(cname, "running"), daemon=True).start()
+                        elif action in ("die", "stop", "kill", "pause"):
+                            status = "paused" if action == "pause" else "stopped"
+                            threading.Thread(target=_record_container_event,
+                                             args=(cname, status), daemon=True).start()
+
+                        # Auto-scan logic
+                        if action == "create" and do_new:
+                            threading.Thread(target=_run_trivy_for_container,
+                                             args=(cname, image), daemon=True).start()
+                        elif action == "start" and do_update:
+                            prev = seen_images.get(cname)
+                            if prev and prev != image:
+                                threading.Thread(target=_run_trivy_for_container,
+                                                 args=(cname, image), daemon=True).start()
+
+                        if action in ("create", "start"):
+                            seen_images[cname] = image
+                except Exception:
+                    pass
+                finally:
+                    client.close()
+
+            await asyncio.to_thread(_watch)
+        except Exception as e:
+            print(f"[docker_events] {e}", flush=True)
+
+        await asyncio.sleep(10)
+
+
+@app.get("/docker/auto-scan/{name}")
+async def docker_auto_scan_result(name: str, db: Session = Depends(get_db)):
+    """Return the stored Trivy scan result for a container name."""
+    # If a scan is actively running, report that
+    mem = _container_vuln_scans.get(name)
+    if mem and mem.get("scanning"):
+        return {"scanning": True, "vulns": [], "image": mem.get("image", ""), "scanned_at": None}
+    # Read persisted result from DB
+    row = db.execute(
+        text("SELECT image, vulns, scanned_at FROM container_vuln_results WHERE name = :name"),
+        {"name": name},
+    ).fetchone()
+    if row is None:
+        raise HTTPException(404, "No scan data for this container.")
+    vulns = row.vulns if isinstance(row.vulns, list) else json.loads(row.vulns or "[]")
+    return {
+        "scanning": False,
+        "image": row.image,
+        "vulns": vulns,
+        "scanned_at": row.scanned_at.isoformat() if row.scanned_at else None,
+    }
+
+
+@app.get("/docker/vuln-summary")
+async def docker_vuln_summary(db: Session = Depends(get_db)):
+    """Return aggregated Trivy scan results for all containers (in-memory)."""
+    if not _docker_enabled(db):
+        raise HTTPException(503, "Docker monitoring is disabled.")
+
+    rows = db.execute(
+        text("SELECT name, image, vulns, scanned_at FROM container_vuln_results ORDER BY scanned_at DESC")
+    ).fetchall()
+    result = []
+    for row in rows:
+        vulns = row.vulns if isinstance(row.vulns, list) else json.loads(row.vulns or "[]")
+        scanning = _container_vuln_scans.get(row.name, {}).get("scanning", False)
+        scanned_at = row.scanned_at.isoformat() if row.scanned_at else None
+        counts = {"critical": 0, "high": 0, "medium": 0, "low": 0}
+        for v in vulns:
+            sev = v.get("severity", "").lower()
+            if sev in counts:
+                counts[sev] += 1
+        if counts["critical"] > 0:        severity = "critical"
+        elif counts["high"] > 0:          severity = "high"
+        elif counts["medium"] > 0:        severity = "medium"
+        elif counts["low"] > 0:           severity = "low"
+        elif scanned_at:                  severity = "clean"
+        else:                             severity = None
+        result.append({
+            "name":       row.name,
+            "image":      row.image,
+            "scanning":   scanning,
+            "severity":   severity,
+            "counts":     counts,
+            "vulns":      vulns,
+            "scanned_at": scanned_at,
+        })
+    return result
+
+
+@app.post("/docker/scan-all")
+async def docker_scan_all(db: Session = Depends(get_db)):
+    """Trigger Trivy scans on all running containers."""
+    if not _docker_enabled(db):
+        raise HTTPException(503, "Docker monitoring is disabled.")
+    host = _get_docker_host(db)
+
+    def _get_containers():
+        client = _make_docker_client(host)
+        try:
+            return [(c.name.lstrip("/"), (c.image.tags[0] if c.image.tags else c.image.id))
+                    for c in client.containers.list()]
+        finally:
+            client.close()
+
+    try:
+        containers = await asyncio.to_thread(_get_containers)
+    except Exception as e:
+        raise HTTPException(503, str(e))
+
+    for name, image in containers:
+        threading.Thread(target=_run_trivy_for_container, args=(name, image), daemon=True).start()
+
+    return {"started": len(containers), "containers": [n for n, _ in containers]}
+
+
+@app.get("/docker/timeline")
+async def docker_timeline(days: int = Query(7, ge=1, le=365), db: Session = Depends(get_db)):
+    """Return container uptime timeline data keyed by container NAME."""
+    if not _docker_enabled(db):
+        raise HTTPException(503, "Docker monitoring is disabled.")
+
+    now = datetime.now(timezone.utc)
+    window_start = now - timedelta(days=days)
+
+    rows = db.execute(
+        text("SELECT name, status, ts FROM container_events WHERE ts >= :start ORDER BY name, ts"),
+        {"start": window_start},
+    ).fetchall()
+
+    # Also get current state from Docker daemon
+    host = _get_docker_host(db)
+    current_states: dict = {}
+    try:
+        def _get_states():
+            client = _make_docker_client(host)
+            try:
+                return {c.name.lstrip("/"): c.status for c in client.containers.list(all=True)}
+            finally:
+                client.close()
+        current_states = await asyncio.to_thread(_get_states)
+    except Exception:
+        pass
+
+    # Group events by name
+    events_by_name: dict = defaultdict(list)
+    for name, status, ts in rows:
+        events_by_name[name].append({"status": status, "ts": ts})
+
+    # Build segments from events
+    containers_out = []
+    all_names = set(events_by_name.keys()) | set(current_states.keys())
+
+    for name in sorted(all_names):
+        evts = sorted(events_by_name.get(name, []), key=lambda e: e["ts"])
+        segs = []
+
+        # If we have events, build segments
+        if evts:
+            # Segment before first event
+            first_ts = evts[0]["ts"]
+            if first_ts > window_start:
+                segs.append({"from": window_start.isoformat(), "to": first_ts.isoformat(), "status": "unknown"})
+
+            for i, ev in enumerate(evts):
+                seg_start = ev["ts"]
+                seg_end   = evts[i + 1]["ts"] if i + 1 < len(evts) else now
+                seg_status = "running" if ev["status"] == "running" else "stopped"
+                segs.append({"from": seg_start.isoformat(), "to": seg_end.isoformat(), "status": seg_status})
+        else:
+            # No history — use current state for whole window
+            cur = current_states.get(name, "unknown")
+            seg_status = "running" if cur == "running" else "stopped" if cur in ("exited","created","dead","paused") else "unknown"
+            segs.append({"from": window_start.isoformat(), "to": now.isoformat(), "status": seg_status})
+
+        cur_status = current_states.get(name, "unknown")
+        containers_out.append({
+            "name":       name,
+            "is_running": cur_status == "running",
+            "segments":   segs,
+        })
+
+    return {
+        "window_start": window_start.isoformat(),
+        "window_end":   now.isoformat(),
+        "containers":   containers_out,
+    }
