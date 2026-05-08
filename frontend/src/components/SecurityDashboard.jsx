@@ -439,9 +439,8 @@ export function SecurityDashboard({ onDeviceClick, onContainerClick }) {
   const [containerVulns,  setContainerVulns]  = useState([])
   const [scanningContainers, setScanningContainers] = useState(false)
 
-  async function load() {
-    setLoading(true)
-    setError(null)
+  async function load(silent = false) {
+    if (!silent) { setLoading(true); setError(null) }
     try {
       const [d, t] = await Promise.all([
         api.getVulnSummary(),
@@ -450,9 +449,9 @@ export function SecurityDashboard({ onDeviceClick, onContainerClick }) {
       setData(d)
       setTrend(t)
     } catch (e) {
-      setError(e.message)
+      if (!silent) setError(e.message)
     } finally {
-      setLoading(false)
+      if (!silent) setLoading(false)
     }
     // Load docker container vuln data if available
     api.dockerVulnSummary().then(rows => {
@@ -464,7 +463,11 @@ export function SecurityDashboard({ onDeviceClick, onContainerClick }) {
     })
   }
 
-  useEffect(() => { load() }, [])
+  useEffect(() => {
+    load()
+    const id = setInterval(() => load(true), 60_000)
+    return () => clearInterval(id)
+  }, [])
 
   async function handleScanAll() {
     setScanning(true)

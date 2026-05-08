@@ -1,10 +1,10 @@
 import { useState, useEffect, useRef } from 'react'
 import {
   Save, RotateCcw, Settings2, X, Download, Upload, FileText,
-  Database, Bell, ScanLine, Eye, EyeOff, Send, Globe, User, Key, Box,
+  Database, Bell, ScanLine, Eye, EyeOff, Send, Globe, User, Key,
+  AlertTriangle, ChevronDown, ChevronRight,
 } from 'lucide-react'
 import { api } from '../api'
-import { HostsManager } from './HostsManager'
 
 // ── Setting definitions ────────────────────────────────────────────────────────
 const SETTING_META = {
@@ -75,6 +75,30 @@ const SETTING_META = {
   alert_on_vuln:       { label: 'Alert on Vulnerability',   type: 'toggle', tab: 'notifications',
     description: 'Send an external alert when a vulnerability scan finds issues.' },
 
+  // Here Be Dragons — advanced probe pipeline controls
+  enable_arp_sweep: { label: 'Enable Active ARP Sweep', type: 'toggle', tab: 'scanner',
+    description: 'Send active ARP broadcast packets to discover devices on the configured subnet. Disable to rely on the passive sniffer only — note that without the sweep, device online/offline state will no longer be tracked.' },
+  enable_passive_sniffer: { label: 'Enable Passive ARP Sniffer', type: 'toggle', tab: 'scanner',
+    description: 'Listen passively for ARP traffic on the network interface. Disable to stop all passive packet capture. Takes effect on the next probe restart.' },
+  sniffer_subnet_filter: { label: 'Filter Sniffer to Configured Subnet', type: 'toggle', tab: 'scanner',
+    description: 'By default the sniffer captures ALL ARP traffic on the wire — including devices from other subnets your router may forward. Enable this to restrict it to the configured IP range only. This is the most likely cause of unexpected devices appearing or DNS overload from multiple subnets.' },
+  enable_hostname_resolution: { label: 'Enable DNS Hostname Resolution', type: 'toggle', tab: 'scanner',
+    description: 'Attempt reverse-DNS lookups to resolve device hostnames. Disable to stop all DNS queries from the probe — useful if hostname lookups are hammering your DNS server.' },
+  hostname_cooldown_hours: { label: 'Hostname Resolution Cooldown', unit: 'hours', type: 'number', min: 1, max: 168, tab: 'scanner',
+    description: 'Minimum hours between DNS resolution retries for each unresolved device. Lower values mean more frequent DNS queries.' },
+  enable_port_scanning: { label: 'Enable Port Scanning', type: 'toggle', tab: 'scanner',
+    description: 'Run TCP port scans on discovered devices to identify open services. Disable to stop all port scanning and deep scan activity.' },
+  port_scan_workers: { label: 'Port Scan Worker Threads', unit: 'threads', type: 'number', min: 10, max: 600, tab: 'scanner',
+    description: 'Number of concurrent TCP connection threads used per port scan. Lower values reduce network and CPU load but make each scan take longer. Default is 300.' },
+  enable_service_fingerprinting: { label: 'Enable Service Fingerprinting', type: 'toggle', tab: 'scanner',
+    description: 'Run Nerva service fingerprinting after each port scan to identify the service running on each open port. Disable to skip this stage.' },
+  enable_mdns: { label: 'Enable mDNS Discovery', type: 'toggle', tab: 'scanner',
+    description: 'Probe the mDNS/Bonjour multicast group to discover device names and advertised services. Runs every 2 hours in the background.' },
+  enable_nightly_scan: { label: 'Enable Nightly Rescan Window', type: 'toggle', tab: 'scanner',
+    description: 'Re-scan all online devices during the configured nightly scan window. Disable to prevent automatic overnight port scan storms.' },
+  enable_unscanned_retry: { label: 'Retry Unscanned Devices Each Cycle', type: 'toggle', tab: 'scanner',
+    description: 'On each sweep cycle, trigger a port scan for any device that has never been scanned. Disable if new devices are causing too many simultaneous scans.' },
+
   // Delivery channels — handled as special sections in the UI, referenced here for tab routing
   alert_webhook_url: { tab: 'notifications' },
   ntfy_url:          { tab: 'notifications' },
@@ -82,23 +106,14 @@ const SETTING_META = {
   gotify_url:        { tab: 'notifications' },
   gotify_token:      { tab: 'notifications' },
   pushbullet_api_key:{ tab: 'notifications' },
-
-  // Docker monitoring — handled as custom cards, referenced here for tab routing
-  docker_enabled:        { tab: 'docker' },
-  docker_host:           { tab: 'docker' },
-  docker_tls_verify:     { tab: 'docker' },
 }
 
 // Keys rendered as custom delivery-channel cards, not through SettingRow
 const DELIVERY_KEYS = new Set(['alert_webhook_url','ntfy_url','ntfy_topic','gotify_url','gotify_token','pushbullet_api_key'])
 
-// Docker keys handled as custom cards
-const DOCKER_KEYS = new Set(['docker_enabled','docker_host','docker_tls_verify'])
-
 const TABS = [
   { id: 'scanner',       label: 'Scanner',       Icon: ScanLine },
   { id: 'notifications', label: 'Notifications', Icon: Bell     },
-  { id: 'docker',        label: 'Docker',        Icon: Box      },
   { id: 'data',          label: 'Data',          Icon: Database },
   { id: 'account',       label: 'Account',       Icon: User     },
 ]
@@ -126,6 +141,7 @@ export function SettingsPanel({ onClose, onSettingChange }) {
   const [backingUp,     setBackingUp]     = useState(false)
   const [restoreStatus, setRestoreStatus] = useState(null)
   const restoreInputRef = useRef(null)
+  const [dragonsOpen,   setDragonsOpen]   = useState(false)
   const [showPbKey,     setShowPbKey]     = useState(false)
   const [showGotifyToken, setShowGotifyToken] = useState(false)
   const [pbTestStatus,  setPbTestStatus]  = useState(null)
@@ -268,7 +284,7 @@ export function SettingsPanel({ onClose, onSettingChange }) {
   }
 
   const hasDirty   = Object.keys(dirty).length > 0
-  const showFooter = activeTab !== 'data' && activeTab !== 'account' && activeTab !== 'docker'
+  const showFooter = activeTab !== 'data' && activeTab !== 'account'
 
   // Returns current value for a key (dirty-aware)
   function val(key) {
@@ -285,6 +301,7 @@ export function SettingsPanel({ onClose, onSettingChange }) {
   // ── Scanner tab grouping ────────────────────────────────────────────────────
   const networkScanKeys   = ['scan_interval','offline_miss_threshold','sniffer_workers','arp_scan_retry']
   const networkConfigKeys = ['ip_range','dns_server','probe_interface']
+
 
   // ── Notifications tab grouping ──────────────────────────────────────────────
   const inAppKeys   = ['notifications_enabled','browser_notifications_enabled']
@@ -362,6 +379,58 @@ export function SettingsPanel({ onClose, onSettingChange }) {
               {settingsByKeys(networkConfigKeys).map(s => (
                 <SettingRow key={s.key} s={s} dirty={dirty} onchange={handleChange} />
               ))}
+
+              {/* ── Here Be Dragons ─────────────────────────────────────── */}
+              <button
+                type="button"
+                onClick={() => setDragonsOpen(o => !o)}
+                className="w-full flex items-center gap-2 pt-3 pb-1 text-left"
+                style={{ color: 'var(--color-text-muted)' }}
+              >
+                {dragonsOpen ? <ChevronDown size={13} /> : <ChevronRight size={13} />}
+                <AlertTriangle size={13} style={{ color: '#f59e0b' }} />
+                <span className="text-sm font-semibold" style={{ color: '#f59e0b' }}>Here Be Dragons</span>
+                <span className="text-xs ml-1" style={{ color: 'var(--color-text-faint)' }}>— advanced probe pipeline controls</span>
+              </button>
+
+              {dragonsOpen && (
+                <div className="space-y-3">
+                  <div className="rounded-lg p-3 text-xs space-y-1"
+                    style={{ background: 'rgba(245,158,11,0.08)', border: '1px solid rgba(245,158,11,0.3)', color: '#d97706' }}>
+                    <p className="font-semibold">Warning — these settings affect probe behaviour directly.</p>
+                    <p style={{ color: 'var(--color-text-muted)' }}>
+                      Changing them can stop device discovery, halt DNS lookups, or reduce network load depending on what you disable.
+                      If you are troubleshooting network or DNS overload, start by enabling <strong>Filter Sniffer to Configured Subnet</strong>
+                      — by default the passive sniffer captures all ARP traffic on the interface, including devices on other subnets.
+                    </p>
+                  </div>
+
+                  <p className="text-xs font-semibold" style={{ color: 'var(--color-text-muted)', paddingTop: '4px' }}>Active ARP Sweep</p>
+                  {settingsByKeys(['enable_arp_sweep']).map(s => (
+                    <SettingRow key={s.key} s={s} dirty={dirty} onchange={handleChange} />
+                  ))}
+
+                  <p className="text-xs font-semibold" style={{ color: 'var(--color-text-muted)', paddingTop: '4px' }}>Passive Sniffer</p>
+                  {settingsByKeys(['enable_passive_sniffer','sniffer_subnet_filter']).map(s => (
+                    <SettingRow key={s.key} s={s} dirty={dirty} onchange={handleChange} />
+                  ))}
+
+                  <p className="text-xs font-semibold" style={{ color: 'var(--color-text-muted)', paddingTop: '4px' }}>Hostname / DNS Resolution</p>
+                  {settingsByKeys(['enable_hostname_resolution','hostname_cooldown_hours']).map(s => (
+                    <SettingRow key={s.key} s={s} dirty={dirty} onchange={handleChange} />
+                  ))}
+
+                  <p className="text-xs font-semibold" style={{ color: 'var(--color-text-muted)', paddingTop: '4px' }}>Port Scanning</p>
+                  {settingsByKeys(['enable_port_scanning','port_scan_workers','enable_service_fingerprinting']).map(s => (
+                    <SettingRow key={s.key} s={s} dirty={dirty} onchange={handleChange} />
+                  ))}
+
+                  <p className="text-xs font-semibold" style={{ color: 'var(--color-text-muted)', paddingTop: '4px' }}>Periodic Activity</p>
+                  {settingsByKeys(['enable_mdns','enable_nightly_scan','enable_unscanned_retry']).map(s => (
+                    <SettingRow key={s.key} s={s} dirty={dirty} onchange={handleChange} />
+                  ))}
+                </div>
+              )}
 
             </>
           )}
@@ -511,19 +580,6 @@ export function SettingsPanel({ onClose, onSettingChange }) {
                   {pbTestStatus === 'error' && <span className="text-xs" style={{ color: '#ef4444' }}>{pbTestMsg}</span>}
                 </div>
               </div>
-            </>
-          )}
-
-          {/* ── Docker tab ──────────────────────────────────────────────────── */}
-          {activeTab === 'docker' && (
-            <>
-              <p className="text-xs" style={{ color: 'var(--color-text-faint)' }}>
-                Connect to Docker hosts and Proxmox VE servers to monitor and manage containers.
-                Enable individual hosts with their toggle — at least one must be active for the Containers page to work.
-              </p>
-
-              <SectionHeader label="Container Hosts" Icon={Box} />
-              <HostsManager />
             </>
           )}
 
