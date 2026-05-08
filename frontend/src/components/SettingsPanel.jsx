@@ -88,9 +88,6 @@ const SETTING_META = {
   docker_enabled:        { tab: 'docker' },
   docker_host:           { tab: 'docker' },
   docker_tls_verify:     { tab: 'docker' },
-  trivy_db_update_hours: { tab: 'docker' },
-  docker_scan_on_new:    { tab: 'docker' },
-  docker_scan_on_update: { tab: 'docker' },
 
   // Here Be Dragons — advanced probe pipeline controls
   enable_arp_sweep: { label: 'Enable Active ARP Sweep', type: 'toggle', tab: 'scanner',
@@ -121,7 +118,7 @@ const SETTING_META = {
 const DELIVERY_KEYS = new Set(['alert_webhook_url','ntfy_url','ntfy_topic','gotify_url','gotify_token','pushbullet_api_key'])
 
 // Docker keys handled as custom cards
-const DOCKER_KEYS = new Set(['docker_enabled','docker_host','docker_tls_verify','trivy_db_update_hours','docker_scan_on_new','docker_scan_on_update'])
+const DOCKER_KEYS = new Set(['docker_enabled','docker_host','docker_tls_verify'])
 
 const TABS = [
   { id: 'scanner',       label: 'Scanner',       Icon: ScanLine },
@@ -610,75 +607,6 @@ export function SettingsPanel({ onClose, onSettingChange }) {
               <SectionHeader label="Container Hosts" Icon={Box} />
               <HostsManager />
 
-              <SectionHeader label="Image Vulnerability Scanning (Trivy)" Icon={Box} />
-              <div className="card p-4 space-y-4">
-                <p className="text-xs" style={{ color: 'var(--color-text-faint)' }}>
-                  Trivy scans container images for known CVEs. The vulnerability database is pre-downloaded
-                  during the backend build and refreshed automatically at the interval below. Rebuild with{' '}
-                  <code className="font-mono text-[10px] px-1 py-0.5 rounded"
-                    style={{ background: 'var(--color-surface-offset)' }}>./inspectre.sh rebuild keep-data</code> to update Trivy itself.
-                </p>
-
-                {/* DB update interval */}
-                <div className="space-y-1.5">
-                  <label className="text-xs font-medium" style={{ color: 'var(--color-text-muted)' }}>
-                    Vulnerability DB update interval (hours)
-                  </label>
-                  <input
-                    type="number" min="0" className="input text-sm w-28"
-                    value={val('trivy_db_update_hours')}
-                    onChange={e => handleChange('trivy_db_update_hours', e.target.value)}
-                    style={dirty['trivy_db_update_hours'] !== undefined ? { borderColor: 'color-mix(in srgb, var(--color-brand) 50%, transparent)' } : {}}
-                  />
-                  <p className="text-xs" style={{ color: 'var(--color-text-faint)' }}>
-                    How often the backend refreshes the Trivy CVE database. Set to 0 to disable automatic updates.
-                  </p>
-                </div>
-
-                {/* Auto-scan on new container */}
-                {(() => {
-                  const isOn = val('docker_scan_on_new') === 'true'
-                  return (
-                    <div className="flex items-center justify-between">
-                      <div>
-                        <p className="text-sm font-medium" style={{ color: 'var(--color-text)' }}>Scan on new container</p>
-                        <p className="text-xs mt-0.5" style={{ color: 'var(--color-text-faint)' }}>
-                          Automatically run a Trivy scan when a new container is created.
-                        </p>
-                      </div>
-                      <button type="button" role="switch" aria-checked={isOn}
-                        onClick={() => handleChange('docker_scan_on_new', isOn ? 'false' : 'true')}
-                        className="relative inline-flex h-6 w-11 items-center rounded-full transition-colors duration-200 focus:outline-none shrink-0"
-                        style={{ background: isOn ? 'var(--color-brand)' : 'var(--color-border)' }}>
-                        <span className="inline-block h-4 w-4 rounded-full bg-white shadow transition-transform duration-200"
-                          style={{ transform: isOn ? 'translateX(22px)' : 'translateX(4px)' }} />
-                      </button>
-                    </div>
-                  )
-                })()}
-
-                {/* Auto-scan on container update */}
-                {(() => {
-                  const isOn = val('docker_scan_on_update') === 'true'
-                  return (
-                    <div className="flex items-center justify-between">
-                      <div>
-                        <p className="text-sm font-medium" style={{ color: 'var(--color-text)' }}>Scan on image update</p>
-                        <p className="text-xs mt-0.5" style={{ color: 'var(--color-text-faint)' }}>
-                          Automatically scan when a container restarts with a different image (updated version).
-                        </p>
-                      </div>
-                      <button type="button" role="switch" aria-checked={isOn}
-                        onClick={() => handleChange('docker_scan_on_update', isOn ? 'false' : 'true')}
-                        className="relative inline-flex h-6 w-11 items-center rounded-full transition-colors duration-200 focus:outline-none shrink-0"
-                        style={{ background: isOn ? 'var(--color-brand)' : 'var(--color-border)' }}>
-                        <span className="inline-block h-4 w-4 rounded-full bg-white shadow transition-transform duration-200"
-                          style={{ transform: isOn ? 'translateX(22px)' : 'translateX(4px)' }} />
-                      </button>
-                    </div>
-                  )
-                })()}
-              </div>
             </>
           )}
 

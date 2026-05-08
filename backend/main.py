@@ -4928,7 +4928,7 @@ def _proxmox_request(host, method: str, path: str, **kwargs):
         raise ValueError("Proxmox URL not configured.")
     headers = {}
     if user and token:
-        headers["Authorization"] = f"PVEAPIToken={user}!{token}"
+        headers["Authorization"] = f"PVEAPIToken={user}={token}"
     with httpx.Client(verify=verify, timeout=15) as client:
         resp = client.request(method, f"{base}{path}", headers=headers, **kwargs)
         resp.raise_for_status()
