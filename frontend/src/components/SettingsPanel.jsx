@@ -350,13 +350,13 @@ export function SettingsPanel({ onClose, onSettingChange }) {
         </div>
 
         {/* Tab bar */}
-        <div className="flex px-6 gap-1"
+        <div className="flex overflow-x-auto px-6 gap-1"
           style={{ borderBottom: '1px solid var(--color-border)', paddingTop: '12px' }}>
           {TABS.map(({ id, label, Icon }) => {
             const isActive = activeTab === id
             return (
               <button key={id} onClick={() => setActiveTab(id)}
-                className="flex items-center gap-1.5 px-3 pb-3 text-sm font-medium transition-colors relative"
+                className="flex shrink-0 whitespace-nowrap items-center gap-1.5 px-2 pb-3 text-xs sm:px-3 sm:text-sm font-medium transition-colors relative"
                 style={{
                   color: isActive ? 'var(--color-brand)' : 'var(--color-text-muted)',
                   borderBottom: isActive ? '2px solid var(--color-brand)' : '2px solid transparent',

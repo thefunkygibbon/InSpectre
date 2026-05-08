@@ -2584,8 +2584,8 @@ def main() -> None:
     threading.Thread(target=_nuclei_template_update_loop, daemon=True, name="nuclei-updater").start()
     time.sleep(2)
 
-    threading.Thread(target=start_arp_sniffer, daemon=True, name="arp-sniffer").start()
-    threading.Thread(target=_mdns_loop, daemon=True, name="mdns-loop").start()
+    _sniffer_started = False
+    _mdns_started    = False
 
     while True:
         _load_settings_from_db()
@@ -2605,6 +2605,17 @@ def main() -> None:
             print("[*] Waiting for setup wizard to complete before scanning…", flush=True)
             time.sleep(10)
             continue
+
+        # Start network threads once, after setup is confirmed.
+        if not _sniffer_started:
+            threading.Thread(target=start_arp_sniffer, daemon=True, name="arp-sniffer").start()
+            _sniffer_started = True
+        if not _mdns_started:
+            def _delayed_mdns():
+                time.sleep(120)
+                _mdns_loop()
+            threading.Thread(target=_delayed_mdns, daemon=True, name="mdns-loop").start()
+            _mdns_started = True
 
         with _sniffer_seen_lock:
             _sniffer_seen_this_interval.clear()
