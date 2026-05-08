@@ -2,18 +2,33 @@ import { useState, useEffect } from 'react'
 import {
   User, Lock, Network, Shield, Bell, ArrowRight,
   CheckCircle, Eye, EyeOff, Upload, RotateCcw, Database,
+  Box, Server, Plus, Loader2, Check,
 } from 'lucide-react'
 import { Logo } from './Logo'
 import { api, setToken } from '../api'
 
 // Steps for the "fresh setup" path only (restore path bypasses all of these)
 const FRESH_STEPS = [
-  { id: 'user',    label: 'Create Account',     Icon: User        },
-  { id: 'network', label: 'Network Settings',   Icon: Network     },
-  { id: 'vuln',    label: 'Vuln Scans',         Icon: Shield      },
-  { id: 'notify',  label: 'Notifications',      Icon: Bell        },
-  { id: 'done',    label: 'All Set!',           Icon: CheckCircle },
+  { id: 'user',       label: 'Create Account',   Icon: User        },
+  { id: 'network',    label: 'Network Settings', Icon: Network     },
+  { id: 'vuln',       label: 'Vuln Scans',       Icon: Shield      },
+  { id: 'notify',     label: 'Notifications',    Icon: Bell        },
+  { id: 'containers', label: 'Container Hosts',  Icon: Box         },
+  { id: 'done',       label: 'All Set!',         Icon: CheckCircle },
 ]
+
+const WIZARD_HOST_TYPES = [
+  { value: 'docker_local',  label: 'Docker — Local socket',  hint: 'Connects via unix socket (requires socket mount).' },
+  { value: 'docker_remote', label: 'Docker — Remote TCP',    hint: 'Connects to a remote Docker daemon over TCP.' },
+  { value: 'proxmox',       label: 'Proxmox VE',            hint: 'Connects to a Proxmox VE node via REST API.' },
+]
+
+function wizardDefaultUrl(type) {
+  if (type === 'docker_local')  return 'unix:///var/run/docker.sock'
+  if (type === 'docker_remote') return 'tcp://192.168.1.x:2375'
+  if (type === 'proxmox')       return 'https://192.168.1.x:8006'
+  return ''
+}
 
 function StepDot({ step, current, completed }) {
   const isDone = completed > step
@@ -497,6 +512,174 @@ function StepNotify({ onNext }) {
   )
 }
 
+function StepContainers({ onNext }) {
+  const [hosts,     setHosts]     = useState([])
+  const [type,      setType]      = useState('docker_local')
+  const [name,      setName]      = useState('')
+  const [url,       setUrl]       = useState(wizardDefaultUrl('docker_local'))
+  const [authUser,  setAuthUser]  = useState('')
+  const [authToken, setAuthToken] = useState('')
+  const [tlsVerify, setTlsVerify] = useState(false)
+  const [node,      setNode]      = useState('pve')
+  const [adding,    setAdding]    = useState(false)
+  const [error,     setError]     = useState('')
+
+  function handleTypeChange(t) {
+    setType(t)
+    setUrl(wizardDefaultUrl(t))
+  }
+
+  async function handleAdd() {
+    setError('')
+    if (!name.trim()) { setError('Name is required.'); return }
+    if (type !== 'docker_local' && !url.trim()) { setError('URL is required.'); return }
+    if (type === 'proxmox' && !authUser.trim()) { setError('Token ID is required.'); return }
+    const body = {
+      name: name.trim(), type, url: url.trim() || null,
+      auth_user: authUser.trim() || null,
+      tls_verify: tlsVerify, node: node.trim() || 'pve', enabled: true,
+    }
+    if (authToken) body.auth_token = authToken
+    setAdding(true)
+    try {
+      const created = await api.createContainerHost(body)
+      setHosts(prev => [...prev, created])
+      setName(''); setAuthUser(''); setAuthToken('')
+      setTlsVerify(false); setNode('pve')
+      setUrl(wizardDefaultUrl(type))
+    } catch (e) {
+      setError(`Failed to add host: ${e.message}`)
+    } finally {
+      setAdding(false)
+    }
+  }
+
+  const TypeIcon = type === 'docker_local' ? Box : Server
+
+  return (
+    <div className="space-y-4">
+      <p className="text-sm" style={{ color: 'var(--color-text-muted)' }}>
+        Optionally connect Docker or Proxmox hosts to monitor running containers.
+        You can add or change these later in Settings → Docker.
+      </p>
+
+      {/* Added hosts list */}
+      {hosts.length > 0 && (
+        <div className="space-y-1.5">
+          {hosts.map(h => (
+            <div key={h.id} className="flex items-center gap-2 px-3 py-2 rounded-xl text-xs"
+              style={{ background: 'var(--color-surface-offset)', border: '1px solid var(--color-border)' }}>
+              <Check size={12} style={{ color: '#10b981' }} />
+              <span style={{ color: 'var(--color-text)' }}>{h.name}</span>
+              <span style={{ color: 'var(--color-text-faint)' }}>
+                ({WIZARD_HOST_TYPES.find(t => t.value === h.type)?.label})
+              </span>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {/* Add host form */}
+      <div className="space-y-3 p-4 rounded-xl border"
+        style={{ background: 'var(--color-surface-offset)', borderColor: 'var(--color-border)' }}>
+
+        <div className="space-y-1">
+          <label className="text-xs font-medium" style={{ color: 'var(--color-text-muted)' }}>Host Type</label>
+          <select className="input w-full text-sm" value={type} onChange={e => handleTypeChange(e.target.value)}>
+            {WIZARD_HOST_TYPES.map(t => <option key={t.value} value={t.value}>{t.label}</option>)}
+          </select>
+          <p className="text-[11px]" style={{ color: 'var(--color-text-faint)' }}>
+            {WIZARD_HOST_TYPES.find(t => t.value === type)?.hint}
+          </p>
+        </div>
+
+        <div className="space-y-1">
+          <label className="text-xs font-medium" style={{ color: 'var(--color-text-muted)' }}>Display Name</label>
+          <input className="input w-full text-sm" placeholder="e.g. Home Server"
+            value={name} onChange={e => setName(e.target.value)} />
+        </div>
+
+        {type === 'docker_local' && (
+          <div className="space-y-1">
+            <label className="text-xs font-medium" style={{ color: 'var(--color-text-muted)' }}>Socket Path</label>
+            <input className="input w-full font-mono text-sm" value={url}
+              onChange={e => setUrl(e.target.value)} placeholder="unix:///var/run/docker.sock" />
+          </div>
+        )}
+
+        {type !== 'docker_local' && (
+          <div className="space-y-1">
+            <label className="text-xs font-medium" style={{ color: 'var(--color-text-muted)' }}>
+              {type === 'proxmox' ? 'Proxmox URL' : 'Docker TCP URL'}
+            </label>
+            <input className="input w-full font-mono text-sm" value={url}
+              onChange={e => setUrl(e.target.value)} placeholder={wizardDefaultUrl(type)} />
+          </div>
+        )}
+
+        {type === 'proxmox' && (
+          <>
+            <div className="space-y-1">
+              <label className="text-xs font-medium" style={{ color: 'var(--color-text-muted)' }}>
+                Token ID <span className="font-mono">(user@realm!tokenname)</span>
+              </label>
+              <input className="input w-full font-mono text-sm" value={authUser}
+                onChange={e => setAuthUser(e.target.value)} placeholder="root@pam!mytoken" />
+            </div>
+            <div className="space-y-1">
+              <label className="text-xs font-medium" style={{ color: 'var(--color-text-muted)' }}>
+                Token Secret <span className="font-mono">(UUID)</span>
+              </label>
+              <input className="input w-full font-mono text-sm" type="password"
+                value={authToken} onChange={e => setAuthToken(e.target.value)}
+                placeholder="xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" />
+            </div>
+            <div className="space-y-1">
+              <label className="text-xs font-medium" style={{ color: 'var(--color-text-muted)' }}>Default Node</label>
+              <input className="input w-full font-mono text-sm" value={node}
+                onChange={e => setNode(e.target.value)} placeholder="pve" />
+            </div>
+          </>
+        )}
+
+        {(type === 'docker_remote' || type === 'proxmox') && (
+          <div className="flex items-center justify-between">
+            <div>
+              <p className="text-sm font-medium" style={{ color: 'var(--color-text)' }}>Verify TLS</p>
+              <p className="text-[11px]" style={{ color: 'var(--color-text-faint)' }}>
+                Disable for self-signed certs on trusted LANs.
+              </p>
+            </div>
+            <button type="button" role="switch" aria-checked={tlsVerify}
+              onClick={() => setTlsVerify(v => !v)}
+              className="relative inline-flex h-5 w-9 items-center rounded-full transition-colors shrink-0"
+              style={{ background: tlsVerify ? 'var(--color-brand)' : 'var(--color-border)' }}>
+              <span className="inline-block h-3.5 w-3.5 rounded-full bg-white shadow transition-transform"
+                style={{ transform: tlsVerify ? 'translateX(19px)' : 'translateX(3px)' }} />
+            </button>
+          </div>
+        )}
+
+        {error && <p className="text-xs" style={{ color: '#ef4444' }}>{error}</p>}
+
+        <button onClick={handleAdd} disabled={adding}
+          className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold text-white disabled:opacity-50"
+          style={{ background: 'var(--color-brand)' }}>
+          {adding
+            ? <><Loader2 size={12} className="animate-spin" /> Adding…</>
+            : <><Plus size={12} /> Add Host</>}
+        </button>
+      </div>
+
+      <button onClick={() => onNext({})}
+        className="w-full py-2.5 rounded-xl font-semibold text-sm flex items-center justify-center gap-2"
+        style={{ background: 'var(--color-brand)', color: 'white' }}>
+        {hosts.length > 0 ? 'Continue' : 'Skip'} <ArrowRight size={14} />
+      </button>
+    </div>
+  )
+}
+
 function StepDone({ onFinish }) {
   return (
     <div className="space-y-6 text-center">
@@ -615,11 +798,12 @@ export function SetupWizard({ onComplete }) {
           )}
 
           {/* Fresh setup steps */}
-          {isFresh && step === 0 && <StepUser    onNext={handleNext} />}
-          {isFresh && step === 1 && <StepNetwork onNext={handleNext} />}
-          {isFresh && step === 2 && <StepVuln    onNext={handleNext} />}
-          {isFresh && step === 3 && <StepNotify  onNext={handleNext} />}
-          {isFresh && step === 4 && <StepDone    onFinish={handleFinish} />}
+          {isFresh && step === 0 && <StepUser       onNext={handleNext} />}
+          {isFresh && step === 1 && <StepNetwork    onNext={handleNext} />}
+          {isFresh && step === 2 && <StepVuln       onNext={handleNext} />}
+          {isFresh && step === 3 && <StepNotify     onNext={handleNext} />}
+          {isFresh && step === 4 && <StepContainers onNext={handleNext} />}
+          {isFresh && step === 5 && <StepDone       onFinish={handleFinish} />}
         </div>
       </div>
     </div>
