@@ -81,7 +81,7 @@ const SETTING_META = {
   enable_passive_sniffer: { label: 'Enable Passive ARP Sniffer', type: 'toggle', tab: 'scanner',
     description: 'Listen passively for ARP traffic on the network interface. Disable to stop all passive packet capture. Takes effect on the next probe restart.' },
   sniffer_subnet_filter: { label: 'Filter Sniffer to Configured Subnet', type: 'toggle', tab: 'scanner',
-    description: 'By default the sniffer captures ALL ARP traffic on the wire — including devices from other subnets your router may forward. Enable this to restrict it to the configured IP range only. This is the most likely cause of unexpected devices appearing or DNS overload from multiple subnets.' },
+    description: 'Restrict the passive sniffer to the configured IP range only. Disable if you intentionally want to track devices from other subnets on the same interface — but note that the active ARP sweep will still only cover the configured range.' },
   enable_hostname_resolution: { label: 'Enable DNS Hostname Resolution', type: 'toggle', tab: 'scanner',
     description: 'Attempt reverse-DNS lookups to resolve device hostnames. Disable to stop all DNS queries from the probe — useful if hostname lookups are hammering your DNS server.' },
   hostname_cooldown_hours: { label: 'Hostname Resolution Cooldown', unit: 'hours', type: 'number', min: 1, max: 168, tab: 'scanner',
@@ -400,8 +400,8 @@ export function SettingsPanel({ onClose, onSettingChange }) {
                     <p className="font-semibold">Warning — these settings affect probe behaviour directly.</p>
                     <p style={{ color: 'var(--color-text-muted)' }}>
                       Changing them can stop device discovery, halt DNS lookups, or reduce network load depending on what you disable.
-                      If you are troubleshooting network or DNS overload, start by enabling <strong>Filter Sniffer to Configured Subnet</strong>
-                      — by default the passive sniffer captures all ARP traffic on the interface, including devices on other subnets.
+                      If unexpected devices are appearing or DNS queries are high, check that <strong>Filter Sniffer to Configured Subnet</strong> is on
+                      — if disabled, the sniffer will process ARP traffic from every subnet visible on the interface.
                     </p>
                   </div>
 

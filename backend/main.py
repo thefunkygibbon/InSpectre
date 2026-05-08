@@ -268,7 +268,7 @@ DEFAULT_SETTINGS = {
     # Here Be Dragons — advanced probe pipeline controls
     "enable_arp_sweep":              ("true",  "Run active ARP broadcast sweeps to discover devices on the configured subnet."),
     "enable_passive_sniffer":        ("true",  "Run the passive ARP sniffer that listens for ARP traffic. Disable to stop all passive packet capture. Takes effect on the next probe restart."),
-    "sniffer_subnet_filter":         ("false", "Restrict the passive sniffer to the configured IP range only. By default the sniffer captures all ARP packets on the wire, including devices on other subnets. Enable this if the sniffer is picking up unwanted devices."),
+    "sniffer_subnet_filter":         ("true",  "Restrict the passive sniffer to the configured IP range only. Disable if you want the sniffer to capture ARP traffic from all subnets on the interface."),
     "enable_hostname_resolution":    ("true",  "Attempt DNS hostname resolution for discovered devices. Disable to stop all reverse-DNS lookups."),
     "hostname_cooldown_hours":       ("24",    "Minimum hours between hostname resolution retries for each device. Lower values increase DNS query frequency."),
     "enable_port_scanning":          ("true",  "Run TCP port scans on discovered devices. Disable to stop all port scanning activity."),

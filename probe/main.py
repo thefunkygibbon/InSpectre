@@ -93,7 +93,7 @@ HOSTNAME_COOLDOWN_HOURS = 24
 # Here Be Dragons — advanced pipeline feature flags (loaded from DB each cycle)
 ENABLE_ARP_SWEEP              = True
 ENABLE_PASSIVE_SNIFFER        = True
-SNIFFER_SUBNET_FILTER         = False
+SNIFFER_SUBNET_FILTER         = True
 ENABLE_HOSTNAME_RESOLUTION    = True
 ENABLE_PORT_SCANNING          = True
 PORT_SCAN_WORKERS             = 300
