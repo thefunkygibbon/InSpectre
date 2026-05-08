@@ -79,7 +79,7 @@ const SETTING_META = {
   enable_arp_sweep: { label: 'Enable Active ARP Sweep', type: 'toggle', tab: 'scanner',
     description: 'Send active ARP broadcast packets to discover devices on the configured subnet. Disable to rely on the passive sniffer only — note that without the sweep, device online/offline state will no longer be tracked.' },
   enable_passive_sniffer: { label: 'Enable Passive ARP Sniffer', type: 'toggle', tab: 'scanner',
-    description: 'Listen passively for ARP traffic on the network interface. Disable to stop all passive packet capture. Takes effect on the next probe restart.' },
+    description: 'Listen passively for ARP traffic on the network interface. Disable to stop all passive packet capture. Takes effect immediately.' },
   sniffer_subnet_filter: { label: 'Filter Sniffer to Configured Subnet', type: 'toggle', tab: 'scanner',
     description: 'Restrict the passive sniffer to the configured IP range only. Disable if you intentionally want to track devices from other subnets on the same interface — but note that the active ARP sweep will still only cover the configured range.' },
   enable_hostname_resolution: { label: 'Enable DNS Hostname Resolution', type: 'toggle', tab: 'scanner',
@@ -166,6 +166,10 @@ export function SettingsPanel({ onClose, onSettingChange }) {
     await Promise.all(
       Object.entries(dirty).map(([key, value]) => api.updateSetting(key, value))
     )
+    // Push scanner settings to the probe immediately (no need to wait for next scan cycle)
+    if (activeTab === 'scanner') {
+      api.applySettings().catch(() => {})
+    }
     setSaving(false)
     setDirty({})
     setSaved(true)

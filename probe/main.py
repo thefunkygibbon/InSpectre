@@ -196,6 +196,10 @@ def ping_once(ip: str, timeout_s: int = 2) -> bool:
 def apply_runtime_config(payload: dict) -> dict:
     global SCAN_INTERVAL, IP_RANGE, OFFLINE_MISS_THRESHOLD, SNIFFER_WORKERS, NUCLEI_TEMPLATE_UPDATE_INTERVAL
     global ARP_SCAN_RETRY
+    global ENABLE_ARP_SWEEP, ENABLE_PASSIVE_SNIFFER, SNIFFER_SUBNET_FILTER
+    global ENABLE_HOSTNAME_RESOLUTION, HOSTNAME_COOLDOWN_HOURS
+    global ENABLE_PORT_SCANNING, PORT_SCAN_WORKERS
+    global ENABLE_SERVICE_FINGERPRINTING, ENABLE_MDNS, ENABLE_NIGHTLY_SCAN, ENABLE_UNSCANNED_RETRY
 
     changes = {}
 
@@ -220,6 +224,29 @@ def apply_runtime_config(payload: dict) -> dict:
     if "arp_scan_retry" in payload:
         ARP_SCAN_RETRY = int(payload["arp_scan_retry"])
         changes["arp_scan_retry"] = ARP_SCAN_RETRY
+    # Here Be Dragons — applied immediately
+    for bool_key, var_name in [
+        ("enable_arp_sweep",              "ENABLE_ARP_SWEEP"),
+        ("enable_passive_sniffer",        "ENABLE_PASSIVE_SNIFFER"),
+        ("sniffer_subnet_filter",         "SNIFFER_SUBNET_FILTER"),
+        ("enable_hostname_resolution",    "ENABLE_HOSTNAME_RESOLUTION"),
+        ("enable_port_scanning",          "ENABLE_PORT_SCANNING"),
+        ("enable_service_fingerprinting", "ENABLE_SERVICE_FINGERPRINTING"),
+        ("enable_mdns",                   "ENABLE_MDNS"),
+        ("enable_nightly_scan",           "ENABLE_NIGHTLY_SCAN"),
+        ("enable_unscanned_retry",        "ENABLE_UNSCANNED_RETRY"),
+    ]:
+        if bool_key in payload:
+            val = payload[bool_key]
+            new_val = (val == "true" or val is True)
+            globals()[var_name] = new_val
+            changes[bool_key] = new_val
+    if "hostname_cooldown_hours" in payload:
+        HOSTNAME_COOLDOWN_HOURS = int(payload["hostname_cooldown_hours"])
+        changes["hostname_cooldown_hours"] = HOSTNAME_COOLDOWN_HOURS
+    if "port_scan_workers" in payload:
+        PORT_SCAN_WORKERS = max(1, int(payload["port_scan_workers"]))
+        changes["port_scan_workers"] = PORT_SCAN_WORKERS
 
     return {
         "applied": True,

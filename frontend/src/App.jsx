@@ -4,9 +4,10 @@ import {
   Search, AlertCircle, Activity,
   LayoutGrid, List, Sun, Moon, ChevronDown,
   Bell, X, Layers, Star, ShieldAlert, Wrench, Ban, BarChart2,
-  ArrowLeft, SlidersHorizontal, LogOut, Eye, EyeOff,
+  ArrowLeft, SlidersHorizontal, LogOut, Eye, EyeOff, Box,
 } from 'lucide-react'
 import { TrafficPage } from './components/TrafficPage'
+import { ContainersPage } from './components/ContainersPage'
 import { useDevices }          from './hooks/useDevices'
 import { useTheme }            from './hooks/useTheme'
 import { useSmartFilters }     from './hooks/useSmartFilters'
@@ -45,11 +46,12 @@ const TOAST_DURATION = 2500
 
 // Page definitions for the nav
 const PAGES = [
-  { id: 'tools',    label: 'Network Tools',       Icon: Wrench,     title: 'Network Tools' },
-  { id: 'security', label: 'Vulnerability Report', Icon: ShieldAlert, title: 'Vulnerability Report' },
-  { id: 'blocking', label: 'Device Blocking',      Icon: Ban,        title: 'Device Blocking' },
-  { id: 'timeline', label: 'Device Timeline',      Icon: BarChart2,  title: 'Device Timeline' },
-  { id: 'traffic',  label: 'Traffic Monitor',      Icon: Activity,   title: 'Traffic Monitor' },
+  { id: 'tools',      label: 'Network Tools',       Icon: Wrench,      title: 'Network Tools' },
+  { id: 'security',   label: 'Vulnerability Report', Icon: ShieldAlert, title: 'Vulnerability Report' },
+  { id: 'blocking',   label: 'Device Blocking',      Icon: Ban,         title: 'Device Blocking' },
+  { id: 'timeline',   label: 'Device Timeline',      Icon: BarChart2,   title: 'Device Timeline' },
+  { id: 'traffic',    label: 'Traffic Monitor',      Icon: Activity,    title: 'Traffic Monitor' },
+  { id: 'containers', label: 'Docker Containers',    Icon: Box,         title: 'Docker Containers' },
 ]
 
 function ipToNum(ip) {
@@ -182,6 +184,48 @@ function NotificationToasts({ newAlerts, offlineAlerts, onDismissNew, onDismissO
   )
 }
 
+// ── Mobile nav dropdown ──────────────────────────────────────────────────────────────────
+function MobileNavMenu({ pages, onSelect }) {
+  const [open, setOpen] = useState(false)
+  const ref = useRef(null)
+
+  useEffect(() => {
+    if (!open) return
+    function handler(e) {
+      if (ref.current && !ref.current.contains(e.target)) setOpen(false)
+    }
+    document.addEventListener('mousedown', handler)
+    return () => document.removeEventListener('mousedown', handler)
+  }, [open])
+
+  return (
+    <div ref={ref} className="relative">
+      <button
+        onClick={() => setOpen(o => !o)}
+        className="btn-ghost p-2 flex items-center gap-1"
+        aria-label="Pages menu"
+        title="Pages">
+        <LayoutGrid size={16} />
+        <ChevronDown size={12} style={{ opacity: 0.6 }} />
+      </button>
+      {open && (
+        <div className="absolute left-0 top-full mt-1 z-50 rounded-xl shadow-xl py-1 min-w-[180px]"
+          style={{ background: 'var(--color-surface)', border: '1px solid var(--color-border)' }}>
+          {pages.map(p => (
+            <button key={p.id}
+              onClick={() => { onSelect(p.id); setOpen(false) }}
+              className="w-full flex items-center gap-3 px-4 py-2.5 text-sm text-left transition-colors hover:opacity-80"
+              style={{ color: 'var(--color-text)' }}>
+              <p.Icon size={15} style={{ color: 'var(--color-brand)', flexShrink: 0 }} />
+              {p.label}
+            </button>
+          ))}
+        </div>
+      )}
+    </div>
+  )
+}
+
 // ── Main App ────────────────────────────────────────────────────────────────────────────
 function MainApp({ onLogout }) {
   const [notificationsEnabled,  setNotificationsEnabled]  = useState(true)
@@ -234,9 +278,14 @@ function MainApp({ onLogout }) {
   const [selected,         setSelected]         = useState(null)
   const [drawerInitialTab, setDrawerInitialTab] = useState('overview')
   const [showSettings,     setShowSettings]     = useState(false)
-  const [activePage,       setActivePage]       = useState(null) // null | 'tools' | 'security' | 'blocking' | 'timeline'
+  const [activePage,       setActivePage]       = useState(null)
   const [showAlertDrop,    setShowAlertDrop]    = useState(false)
   const [showFilters,      setShowFilters]      = useState(false)
+  const [containerToOpen,  setContainerToOpen]  = useState(null)
+
+  useEffect(() => {
+    if (activePage !== 'containers') setContainerToOpen(null)
+  }, [activePage])
 
   useEffect(() => {
     api.getSettings().then(s => {
@@ -363,19 +412,26 @@ function MainApp({ onLogout }) {
               )}
             </div>
 
-            {/* Page nav icons — left of clock */}
+            {/* Page nav — icon row on md+, dropdown on small screens */}
             {!activePage && (
-              <div className="flex items-center gap-0.5 ml-2">
-                {PAGES.map(p => (
-                  <button key={p.id}
-                    onClick={() => setActivePage(p.id)}
-                    className="btn-ghost p-2 relative"
-                    aria-label={p.label}
-                    title={p.label}>
-                    <p.Icon size={16} />
-                  </button>
-                ))}
-              </div>
+              <>
+                {/* Desktop: icon row */}
+                <div className="hidden md:flex items-center gap-0.5 ml-2">
+                  {PAGES.map(p => (
+                    <button key={p.id}
+                      onClick={() => setActivePage(p.id)}
+                      className="btn-ghost p-2 relative shrink-0"
+                      aria-label={p.label}
+                      title={p.label}>
+                      <p.Icon size={16} />
+                    </button>
+                  ))}
+                </div>
+                {/* Mobile: dropdown */}
+                <div className="md:hidden ml-2 relative">
+                  <MobileNavMenu pages={PAGES} onSelect={setActivePage} />
+                </div>
+              </>
             )}
 
             {/* Page title when on a page */}
@@ -529,6 +585,10 @@ function MainApp({ onLogout }) {
                 const dev = devices.find(d => d.mac_address === mac)
                 if (dev) openDevice(dev, tab || 'overview')
               }}
+              onContainerClick={name => {
+                setContainerToOpen(name)
+                setActivePage('containers')
+              }}
             />
           )}
 
@@ -549,6 +609,10 @@ function MainApp({ onLogout }) {
 
           {activePage === 'traffic' && (
             <TrafficPage />
+          )}
+
+          {activePage === 'containers' && (
+            <ContainersPage openContainer={containerToOpen} />
           )}
 
           {/* ── Main dashboard ── */}
