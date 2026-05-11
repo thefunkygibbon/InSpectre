@@ -35,7 +35,12 @@ export function DeviceRow({ device, onClick, striped, onStarToggle, isVulnScanni
 
       <div className="min-w-0">
         <p className="text-sm font-medium truncate" style={{ color: 'var(--color-text)' }}>{name}</p>
-        <p className="text-xs font-mono truncate" style={{ color: 'var(--color-text-faint)' }}>{device.ip_address}</p>
+        <p className="text-xs font-mono truncate" style={{ color: 'var(--color-text-faint)' }}>{device.primary_ip || device.ip_address}</p>
+        {(device.secondary_ips || []).length > 0 && (
+          <p className="text-[10px] font-mono truncate" style={{ color: 'var(--color-text-faint)', opacity: 0.7 }}>
+            +{(device.secondary_ips).join(', ')}
+          </p>
+        )}
       </div>
 
       <span className="hidden sm:block font-mono text-xs truncate" style={{ color: 'var(--color-text-muted)' }}>

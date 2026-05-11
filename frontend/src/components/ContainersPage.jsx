@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback, useMemo } from 'react'
-import { Box, RefreshCw, Search, AlertCircle, Play, Square, Loader2, LayoutGrid, List, ArrowUpDown } from 'lucide-react'
+import { Box, RefreshCw, Search, AlertCircle, Play, Square, Loader2, LayoutGrid, List, ArrowUpDown, ShieldAlert, Network, GitBranch } from 'lucide-react'
 import { api } from '../api'
 import { ContainerCard } from './ContainerCard'
 import { ContainerDrawer } from './ContainerDrawer'
@@ -20,6 +20,7 @@ const SORT_OPTIONS = [
   { value: 'name-desc', label: 'Name (Z → A)' },
   { value: 'status',    label: 'Status' },
   { value: 'host',      label: 'Host' },
+  { value: 'newest',    label: 'Newest First' },
 ]
 
 const STATUS_SORT_ORDER = ['running', 'restarting', 'paused', 'created', 'exited', 'dead']
@@ -148,18 +149,20 @@ function ContainerRow({ container, onClick }) {
 }
 
 export function ContainersPage({ openContainer }) {
-  const [containers,  setContainers]  = useState([])
-  const [stats,       setStats]       = useState(null)
-  const [loading,     setLoading]     = useState(true)
-  const [error,       setError]       = useState(null)
-  const [disabled,    setDisabled]    = useState(false)
-  const [selected,    setSelected]    = useState(null)
-  const [search,      setSearch]      = useState('')
-  const [filter,      setFilter]      = useState('all')
-  const [hostFilter,  setHostFilter]  = useState('all')
-  const [sort,        setSort]        = useState('name-asc')
-  const [layout,      setLayout]      = useState('grid')
-  const [refreshing,  setRefreshing]  = useState(false)
+  const [containers,    setContainers]    = useState([])
+  const [stats,         setStats]         = useState(null)
+  const [vulnSummary,   setVulnSummary]   = useState([])
+  const [loading,       setLoading]       = useState(true)
+  const [error,         setError]         = useState(null)
+  const [disabled,      setDisabled]      = useState(false)
+  const [selected,      setSelected]      = useState(null)
+  const [search,        setSearch]        = useState('')
+  const [filter,        setFilter]        = useState('all')
+  const [smartFilter,   setSmartFilter]   = useState(null)
+  const [hostFilter,    setHostFilter]    = useState('all')
+  const [sort,          setSort]          = useState('name-asc')
+  const [layout,        setLayout]        = useState('grid')
+  const [refreshing,    setRefreshing]    = useState(false)
 
   // Vuln scan state keyed by container ID — persists across drawer open/close
   const [trivyScansByContainer, setTrivyScansByContainer] = useState({})
@@ -177,12 +180,14 @@ export function ContainersPage({ openContainer }) {
     setError(null)
     setDisabled(false)
     try {
-      const [statsData, containerList] = await Promise.all([
+      const [statsData, containerList, vulnData] = await Promise.all([
         api.dockerStats(),
         api.dockerContainers(),
+        api.dockerVulnSummary().catch(() => []),
       ])
       setStats(statsData)
       setContainers(containerList)
+      setVulnSummary(Array.isArray(vulnData) ? vulnData : [])
     } catch (e) {
       if (e.message?.includes('503') || e.message?.toLowerCase().includes('disabled')) {
         setDisabled(true)
@@ -226,10 +231,22 @@ export function ContainersPage({ openContainer }) {
     return [...seen.values()]
   }, [containers])
 
+  const vulnNameSet = useMemo(() => {
+    const s = new Set()
+    for (const v of vulnSummary) {
+      if (v.severity && v.severity !== 'clean') s.add(v.name)
+    }
+    return s
+  }, [vulnSummary])
+
   const filtered = containers.filter(c => {
     if (hostFilter !== 'all' && c.host_id !== hostFilter) return false
     if (filter === 'stopped' && !STOPPED_STATES.includes(c.status)) return false
-    if (filter !== 'all' && filter !== 'stopped' && c.status !== filter) return false
+    if (filter === 'other' && !['paused', 'restarting'].includes(c.status)) return false
+    if (filter !== 'all' && filter !== 'stopped' && filter !== 'other' && c.status !== filter) return false
+    if (smartFilter === 'vulnerable' && !vulnNameSet.has(c.name)) return false
+    if (smartFilter === 'host_net' && !(c.networks || []).includes('host')) return false
+    if (smartFilter === 'bridge_net' && !(c.networks || []).includes('bridge')) return false
     if (search.trim()) {
       const q = search.toLowerCase()
       return c.name.toLowerCase().includes(q)
@@ -251,6 +268,14 @@ export function ContainersPage({ openContainer }) {
       }
       case 'host':
         return (a.host_name || '').localeCompare(b.host_name || '') || a.name.localeCompare(b.name)
+      case 'newest': {
+        const at = a.state?.started_at || ''
+        const bt = b.state?.started_at || ''
+        if (at && bt) return bt.localeCompare(at)
+        if (at) return -1
+        if (bt) return 1
+        return a.name.localeCompare(b.name)
+      }
       default:
         return a.name.localeCompare(b.name)
     }
@@ -263,14 +288,14 @@ export function ContainersPage({ openContainer }) {
       {stats && (
         <section>
           <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
-            <StatCard label="Total"     value={stats.total}     icon={Box}     color="brand"
+            <StatCard label="Total Containers"    value={stats.total}     icon={Box}     color="brand"
               onClick={() => setFilter('all')}      active={filter === 'all'} />
-            <StatCard label="Running"   value={stats.running}   icon={Play}    color="emerald"
+            <StatCard label="Running Containers"   value={stats.running}   icon={Play}    color="emerald"
               onClick={() => setFilter('running')}  active={filter === 'running'} />
-            <StatCard label="Stopped"   value={stats.stopped}   icon={Square}  color="red"
+            <StatCard label="Stopped Containers"   value={stats.stopped}   icon={Square}  color="red"
               onClick={() => setFilter('stopped')}  active={filter === 'stopped'} />
-            <StatCard label="Other"     value={(stats.paused || 0) + (stats.restarting || 0)} icon={Loader2} color="amber"
-              onClick={() => setFilter('all')} active={false} />
+            <StatCard label="Paused / Restarting"  value={(stats.paused || 0) + (stats.restarting || 0)} icon={Loader2} color="amber"
+              onClick={() => setFilter(filter === 'other' ? 'all' : 'other')} active={filter === 'other'} />
           </div>
           {stats.docker_version && (
             <p className="text-xs mt-2" style={{ color: 'var(--color-text-faint)' }}>
@@ -308,6 +333,25 @@ export function ContainersPage({ openContainer }) {
                   ? { background: 'var(--color-brand)', color: 'white', borderColor: 'transparent' }
                   : { background: 'var(--color-surface-offset)', color: 'var(--color-text-muted)', borderColor: 'var(--color-border)' }}>
                 {f.label}
+              </button>
+            ))}
+          </div>
+
+          {/* Smart filters */}
+          <div className="flex items-center gap-1 flex-wrap">
+            {[
+              { key: 'vulnerable',  label: 'Vulnerable', icon: ShieldAlert },
+              { key: 'host_net',    label: 'Host Network', icon: Network },
+              { key: 'bridge_net',  label: 'Bridge Network', icon: GitBranch },
+            ].map(({ key, label, icon: Icon }) => (
+              <button key={key}
+                onClick={() => setSmartFilter(smartFilter === key ? null : key)}
+                className="flex items-center gap-1 px-3 py-1.5 rounded-xl text-xs font-medium border transition-colors"
+                style={smartFilter === key
+                  ? { background: 'var(--color-brand)', color: 'white', borderColor: 'transparent' }
+                  : { background: 'var(--color-surface-offset)', color: 'var(--color-text-muted)', borderColor: 'var(--color-border)' }}>
+                <Icon size={11} />
+                {label}
               </button>
             ))}
           </div>

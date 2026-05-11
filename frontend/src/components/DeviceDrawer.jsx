@@ -6,7 +6,7 @@ import {
   ChevronDown, ChevronRight, Square, Tag, CheckCircle2,
   FileText, Star as StarIcon, ShieldAlert, EyeOff, Eye, Layers,
   AlertTriangle, Network, Loader2, GitMerge, Radio, BellOff, Plus, Trash2,
-  TrendingUp, TrendingDown,
+  TrendingUp, TrendingDown, Power,
 } from 'lucide-react'
 import { OnlineDot }      from './OnlineDot'
 import { StarButton }     from './StarButton'
@@ -85,16 +85,30 @@ function Collapsible({ title, icon: Icon, defaultOpen = false, children }) {
   )
 }
 
-function IpHistorySection({ mac }) {
-  const [history, setHistory] = useState(null)
-  const [error,   setError]   = useState(null)
-  const [loaded,  setLoaded]  = useState(false)
+function IpHistorySection({ mac, primaryIp, primaryIpLocked, currentIp, onPrimaryChanged }) {
+  const [history,  setHistory]  = useState(null)
+  const [error,    setError]    = useState(null)
+  const [loaded,   setLoaded]   = useState(false)
+  const [setting,  setSetting]  = useState(null) // IP being set as primary
 
   useEffect(() => {
     if (loaded) return
     setLoaded(true)
     api.getIpHistory(mac).then(setHistory).catch(e => { setError(e.message); setHistory([]) })
   }, [mac, loaded])
+
+  async function handleSetPrimary(ip) {
+    setSetting(ip)
+    try {
+      const res = await api.setPrimaryIp(mac, ip)
+      if (onPrimaryChanged) onPrimaryChanged(res.device)
+      setLoaded(false) // force refresh
+    } catch (e) {
+      alert('Failed to set primary IP: ' + e.message)
+    } finally {
+      setSetting(null)
+    }
+  }
 
   if (history === null) return (
     <div className="space-y-2">
@@ -104,20 +118,69 @@ function IpHistorySection({ mac }) {
   if (error)            return <p className="text-xs text-red-400">{error}</p>
   if (history.length === 0) return <p className="text-xs text-text-muted italic">No IP history recorded yet.</p>
 
+  // Two-hour window: IPs seen within this period are "currently active"
+  const ACTIVE_MS = 2 * 60 * 60 * 1000
+
+  function rowRole(row) {
+    if (primaryIpLocked && primaryIp && row.ip === primaryIp) return 'pinned'
+    if (row.ip === currentIp || (!primaryIpLocked && primaryIp && row.ip === primaryIp)) return 'primary'
+    // Device has a pinned IP, and this is the most-recently-seen ARP IP (different from pin)
+    if (primaryIpLocked && primaryIp && row.ip === currentIp)  return 'active_secondary'
+    // Seen while device was already online at another IP = genuinely multi-homed
+    if (row.seen_while_online === true) {
+      const recentEnough = row.last_seen && (Date.now() - new Date(row.last_seen).getTime()) < ACTIVE_MS
+      return recentEnough ? 'active_secondary' : 'past_secondary'
+    }
+    // Appeared after reconnect (DHCP rotation) or first-ever IP — just history
+    return 'dhcp_history'
+  }
+
+  const ROLE_BADGE = {
+    pinned:          { label: 'Pinned',     color: 'var(--color-brand)',       bg: 'rgba(99,102,241,0.12)', border: 'rgba(99,102,241,0.3)' },
+    primary:         { label: 'Current',    color: '#22c55e',                  bg: 'rgba(34,197,94,0.12)',  border: 'rgba(34,197,94,0.3)'  },
+    active_secondary:{ label: 'Secondary',  color: '#f59e0b',                  bg: 'rgba(245,158,11,0.12)', border: 'rgba(245,158,11,0.3)' },
+    past_secondary:  { label: 'Was secondary', color: 'var(--color-text-faint)', bg: 'rgba(255,255,255,0.04)', border: 'rgba(255,255,255,0.08)' },
+    dhcp_history:    { label: 'DHCP history', color: 'var(--color-text-faint)', bg: 'rgba(255,255,255,0.04)', border: 'rgba(255,255,255,0.08)' },
+  }
+
   return (
-    <div className="space-y-0">
-      <div className="grid grid-cols-[1fr_1fr_1fr] gap-2 pb-1.5 border-b border-border">
-        <span className="text-[10px] font-semibold uppercase tracking-wider text-text-faint">IP Address</span>
-        <span className="text-[10px] font-semibold uppercase tracking-wider text-text-faint">First seen</span>
-        <span className="text-[10px] font-semibold uppercase tracking-wider text-text-faint">Last seen</span>
-      </div>
-      {history.map((row, i) => (
-        <div key={i} className="grid grid-cols-[1fr_1fr_1fr] gap-2 py-1.5 border-b border-border last:border-0 items-center">
-          <span className="font-mono text-xs text-brand">{row.ip}</span>
-          <span className="text-xs text-text-muted">{fmtDate(row.first_seen)}</span>
-          <span className="text-xs text-text-muted">{fmtDate(row.last_seen)}</span>
-        </div>
-      ))}
+    <div className="space-y-1">
+      {history.map((row, i) => {
+        const role  = rowRole(row)
+        const badge = ROLE_BADGE[role]
+        const isPinnable = role === 'active_secondary' && row.ip !== primaryIp
+        const isActive   = role === 'pinned' || role === 'primary' || role === 'active_secondary'
+        return (
+          <div key={i} className="flex items-center gap-2 py-1.5 border-b border-border last:border-0"
+            style={{ opacity: isActive ? 1 : 0.6 }}>
+            <div className="flex-1 min-w-0">
+              <div className="flex items-center gap-1.5 flex-wrap">
+                <span className="font-mono text-xs" style={{ color: isActive ? 'var(--color-text)' : 'var(--color-text-faint)' }}>
+                  {row.ip}
+                </span>
+                <span className="inline-flex items-center px-1 py-0.5 rounded text-[9px] font-semibold"
+                  style={{ color: badge.color, background: badge.bg, border: `1px solid ${badge.border}` }}>
+                  {badge.label}
+                </span>
+              </div>
+              <p className="text-[10px] mt-0.5" style={{ color: 'var(--color-text-faint)' }}>
+                {role === 'dhcp_history' ? 'DHCP rotation · last seen ' : 'Last seen '}
+                {fmtDate(row.last_seen)}
+              </p>
+            </div>
+            {isPinnable && (
+              <button
+                onClick={() => handleSetPrimary(row.ip)}
+                disabled={setting !== null}
+                className="shrink-0 text-[10px] px-2 py-1 rounded border font-medium transition-colors"
+                style={{ borderColor: 'rgba(245,158,11,0.4)', color: '#f59e0b' }}
+                title="Pin this as the primary IP for scanning">
+                {setting === row.ip ? '…' : 'Pin'}
+              </button>
+            )}
+          </div>
+        )
+      })}
     </div>
   )
 }
@@ -208,17 +271,71 @@ function IdentityForm({ device, onSaved }) {
 
 // Service label display helper (maps Nerva scheme names to readable labels)
 const SERVICE_LABELS = {
-  http: 'HTTP',         https: 'HTTPS',         ssh: 'SSH',
-  ftp: 'FTP',           telnet: 'Telnet',        smtp: 'SMTP',
-  pop3: 'POP3',         imap: 'IMAP',            imaps: 'IMAPS',
-  mysql: 'MySQL',       postgresql: 'PostgreSQL', mssql: 'MSSQL',
-  redis: 'Redis',       mongodb: 'MongoDB',       elasticsearch: 'Elasticsearch',
-  mqtt: 'MQTT',         mqtts: 'MQTT/TLS',       smb: 'SMB',
-  rdp: 'RDP',           vnc: 'VNC',              ldap: 'LDAP',
-  ldaps: 'LDAPS',       ftps: 'FTPS',
-  dns: 'DNS',           ntp: 'NTP',              amqp: 'AMQP',
-  amqps: 'AMQPS',       cassandra: 'Cassandra',   memcached: 'Memcached',
-  ws: 'WebSocket',      wss: 'WebSocket/TLS',
+  // Standard protocols
+  http: 'HTTP',               https: 'HTTPS',               ssh: 'SSH',
+  ftp: 'FTP',                 telnet: 'Telnet',              smtp: 'SMTP',
+  pop3: 'POP3',               imap: 'IMAP',                  imaps: 'IMAPS',
+  mysql: 'MySQL',             postgresql: 'PostgreSQL',      mssql: 'MSSQL',
+  redis: 'Redis',             mongodb: 'MongoDB',            elasticsearch: 'Elasticsearch',
+  mqtt: 'MQTT',               mqtts: 'MQTT/TLS',             smb: 'SMB',
+  rdp: 'RDP',                 vnc: 'VNC',                    ldap: 'LDAP',
+  ldaps: 'LDAPS',             ftps: 'FTPS',
+  dns: 'DNS',                 ntp: 'NTP',                    amqp: 'AMQP',
+  amqps: 'AMQPS',             cassandra: 'Cassandra',        memcached: 'Memcached',
+  ws: 'WebSocket',            wss: 'WebSocket/TLS',
+  // Nerva 1.4+ HTTP fingerprints — security appliances
+  'checkpoint-firewall':         'Check Point Firewall',
+  'checkpoint-smartconsole':     'Check Point SmartConsole',
+  'fortinet-fortigate':          'Fortinet FortiGate',
+  'cisco-asa':                   'Cisco ASA',
+  'cisco-ios':                   'Cisco IOS Web',
+  'cisco-router':                'Cisco Router',
+  'palo-alto':                   'Palo Alto',
+  'sonicwall':                   'SonicWall',
+  'watchguard':                  'WatchGuard',
+  'juniper':                     'Juniper',
+  'opnsense':                    'OPNsense',
+  'pfsense':                     'pfSense',
+  'mikrotik':                    'MikroTik',
+  // Virtualisation & infrastructure
+  'proxmox':                     'Proxmox VE',
+  'esxi':                        'VMware ESXi',
+  'vcenter':                     'VMware vCenter',
+  'idrac':                       'Dell iDRAC',
+  'ilo':                         'HP iLO',
+  'ipmi':                        'IPMI',
+  // Network / storage
+  'unifi':                       'Ubiquiti UniFi',
+  'synology':                    'Synology NAS',
+  'qnap':                        'QNAP NAS',
+  'freenas':                     'TrueNAS / FreeNAS',
+  // Media & home automation
+  'plex':                        'Plex Media Server',
+  'emby':                        'Emby',
+  'jellyfin':                    'Jellyfin',
+  'homeassistant':               'Home Assistant',
+  'openhab':                     'openHAB',
+  'nodered':                     'Node-RED',
+  // Dev & monitoring
+  'jenkins':                     'Jenkins',
+  'grafana':                     'Grafana',
+  'kibana':                      'Kibana',
+  'prometheus':                  'Prometheus',
+  'sonarqube':                   'SonarQube',
+  'portainer':                   'Portainer',
+  'gitlab':                      'GitLab',
+  'gitea':                       'Gitea',
+  'nextcloud':                   'Nextcloud',
+  // CMS / web apps
+  'wordpress':                   'WordPress',
+  'joomla':                      'Joomla',
+  'drupal':                      'Drupal',
+  // Web servers
+  'apache':                      'Apache httpd',
+  'nginx':                       'nginx',
+  'iis':                         'Microsoft IIS',
+  'tomcat':                      'Apache Tomcat',
+  'lighttpd':                    'lighttpd',
 }
 function svcLabel(scheme) {
   return SERVICE_LABELS[scheme] || scheme
@@ -309,6 +426,7 @@ export function DeviceDrawer({ device, onClose, onRename, onResolveName, onRefre
   const [blocking,     setBlocking]     = useState(false)
   const [ignoring,     setIgnoring]     = useState(false)
   const [deleting,     setDeleting]     = useState(false)
+  const [waking,       setWaking]       = useState(false)
 
   // Vuln scan state is owned by the parent (App.jsx) so it survives drawer close/reopen.
   // Proxy setters propagate functional updaters so rapid SSE lines don't get lost to stale closures.
@@ -411,6 +529,21 @@ export function DeviceDrawer({ device, onClose, onRename, onResolveName, onRefre
       setLocalDevice(prev => ({ ...prev, is_ignored: !newVal }))
     } finally {
       setIgnoring(false)
+    }
+  }
+
+  async function handleWakeOnLan() {
+    setWaking(true)
+    stream.stop()
+    stream.clear()
+    setStaticLines([])
+    try {
+      await api.toolsWakeOnLan(mac)
+      setStaticLines([`[OK] Magic packet sent to ${mac} — device should wake within a few seconds if Wake on LAN is enabled in its BIOS/firmware.`])
+    } catch (e) {
+      setStaticLines([`[ERROR] ${e.message}`])
+    } finally {
+      setWaking(false)
     }
   }
 
@@ -544,6 +677,18 @@ export function DeviceDrawer({ device, onClose, onRename, onResolveName, onRefre
                   <ActionBtn icon={ShieldAlert} label="Vuln scan"     active={activeTab   === 'vulns'}
                     onClick={() => setActiveTab('vulns')} />
                 </div>
+                {!localDevice.is_online && (
+                  <button
+                    onClick={handleWakeOnLan}
+                    disabled={waking}
+                    className={`mt-2 w-full flex items-center justify-center gap-2 py-2 rounded-lg
+                               border text-xs font-medium transition-colors duration-150
+                               border-blue-500/40 bg-blue-500/10 text-blue-400 hover:bg-blue-500/20
+                               ${waking ? 'opacity-60 cursor-wait' : ''}`}>
+                    <Power size={12} className={waking ? 'animate-pulse' : ''} />
+                    {waking ? 'Sending magic packet…' : 'Wake on LAN'}
+                  </button>
+                )}
                 <button
                   onClick={handleBlockToggle}
                   disabled={blocking}
@@ -583,7 +728,33 @@ export function DeviceDrawer({ device, onClose, onRename, onResolveName, onRefre
 
               {/* Network */}
               <Collapsible title="Network" icon={Globe} defaultOpen={true}>
-                <Row label="IP Address"  value={localDevice.ip_address} mono />
+                <Row label="IP Address"
+                  value={
+                    <span className="flex items-center gap-2 flex-wrap">
+                      <span className="font-mono">{localDevice.primary_ip || localDevice.ip_address || '--'}</span>
+                      {localDevice.primary_ip_locked && (
+                        <button
+                          onClick={async () => {
+                            try {
+                              const res = await api.unpinPrimaryIp(mac)
+                              setLocalDevice(prev => ({ ...prev, ...res.device }))
+                              if (onRefresh) onRefresh()
+                            } catch (e) { alert('Failed to unpin: ' + e.message) }
+                          }}
+                          className="text-[10px] px-1 py-0.5 rounded font-semibold cursor-pointer hover:opacity-70 transition-opacity"
+                          title="Click to unpin"
+                          style={{ background: 'rgba(var(--brand-rgb,99,102,241),0.15)', color: 'var(--color-brand)', border: '1px solid rgba(var(--brand-rgb,99,102,241),0.3)' }}>
+                          pinned ✕
+                        </button>
+                      )}
+                      {localDevice.primary_ip_locked && localDevice.primary_ip && localDevice.ip_address && localDevice.primary_ip !== localDevice.ip_address && (
+                        <span className="text-[10px]" style={{ color: 'var(--color-text-faint)' }}>
+                          (last ARP: {localDevice.ip_address})
+                        </span>
+                      )}
+                    </span>
+                  }
+                />
                 <Row label="MAC Address" value={mac} mono />
                 <Row label="Vendor"      value={localDevice.vendor_override || localDevice.vendor || 'Unknown'} />
                 <Row
@@ -611,7 +782,16 @@ export function DeviceDrawer({ device, onClose, onRename, onResolveName, onRefre
 
               {/* IP History */}
               <Collapsible title="IP History" icon={History} defaultOpen={false}>
-                <IpHistorySection mac={mac} />
+                <IpHistorySection
+                  mac={mac}
+                  primaryIp={localDevice.primary_ip}
+                  primaryIpLocked={localDevice.primary_ip_locked}
+                  currentIp={localDevice.ip_address}
+                  onPrimaryChanged={updated => {
+                    setLocalDevice(prev => ({ ...prev, ...updated }))
+                    if (onRefresh) onRefresh()
+                  }}
+                />
               </Collapsible>
 
               {/* Timeline summary */}
@@ -683,16 +863,8 @@ export function DeviceDrawer({ device, onClose, onRename, onResolveName, onRefre
                                 TLS
                               </span>
                             )}
-                            {(p.product || p.version) && (
-                              <span className="text-xs text-text-muted truncate max-w-[110px]">
-                                {[p.product, p.version].filter(Boolean).join(' ')}
-                              </span>
-                            )}
                           </div>
                         </div>
-                        {p.cpe && (
-                          <p className="font-mono text-[10px] text-text-faint pl-20 truncate" title={p.cpe}>{p.cpe}</p>
-                        )}
                       </div>
                     )
                   })}

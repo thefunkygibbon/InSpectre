@@ -92,6 +92,8 @@ export const api = {
   resetBaseline:   (mac)        => request('POST',  `/devices/${mac}/reset-baseline`),
   getScanResults:  (mac)        => request('GET',   `/devices/${mac}/scan`),
   getIpHistory:    (mac)        => request('GET',   `/devices/${mac}/ip-history`),
+  setPrimaryIp:    (mac, ip)    => request('POST',  `/devices/${mac}/set-primary-ip`, { ip_address: ip }),
+  unpinPrimaryIp:  (mac)        => request('POST',  `/devices/${mac}/unpin-ip`),
   getDeviceEvents: (mac, limit, type) => {
     const p = new URLSearchParams()
     if (limit) p.set('limit', limit)
@@ -124,6 +126,8 @@ export const api = {
   updateSetting:   (key, value) => request('PUT',  `/settings/${key}`, { value: String(value) }),
   resetSettings:   ()           => request('POST', '/settings/reset'),
   applySettings:   ()           => request('POST', '/settings/apply'),
+  restartProbe:    ()           => request('POST', '/settings/restart-probe'),
+  restartBackend:  ()           => request('POST', '/settings/restart-backend'),
 
   // Export (include auth header so the global middleware allows through)
   exportDevicesCsv: () => {

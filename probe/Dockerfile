@@ -1,9 +1,8 @@
 FROM python:3.12-slim
 
-# nmap + network tools + wget/unzip for Nuclei
+# Network tools + wget/unzip for Nuclei
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libpcap-dev gcc \
-    nmap \
     avahi-utils \
     samba-common-bin \
     dnsutils \
@@ -17,7 +16,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 # Install Nuclei vulnerability scanner (fetch latest release, fall back to known-good version)
 RUN NUCLEI_VERSION=$(wget -qO- https://api.github.com/repos/projectdiscovery/nuclei/releases/latest \
-        | grep '"tag_name"' | sed 's/.*"v\([^"]*\)".*/\1/' || echo "3.4.4") \
+        | grep '"tag_name"' | sed 's/.*"v\([^"]*\)".*/\1/' || echo "3.5.0") \
     && wget -q "https://github.com/projectdiscovery/nuclei/releases/download/v${NUCLEI_VERSION}/nuclei_${NUCLEI_VERSION}_linux_amd64.zip" \
          -O /tmp/nuclei.zip \
     && unzip -q /tmp/nuclei.zip -d /tmp/nuclei_unzip \
@@ -26,7 +25,7 @@ RUN NUCLEI_VERSION=$(wget -qO- https://api.github.com/repos/projectdiscovery/nuc
     && rm -rf /tmp/nuclei.zip /tmp/nuclei_unzip
 
 # Install Nerva service fingerprinting tool (graceful failure — probe handles absence)
-ARG NERVA_VERSION=1.3.0
+ARG NERVA_VERSION=1.4.0
 RUN wget -q "https://github.com/praetorian-inc/nerva/releases/download/v${NERVA_VERSION}/nerva-linux-amd64.tar.gz" \
          -O /tmp/nerva.tar.gz \
     && tar -xzf /tmp/nerva.tar.gz -C /tmp/ \

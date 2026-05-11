@@ -515,7 +515,7 @@ function StepNotify({ onNext }) {
 function StepContainers({ onNext }) {
   const [hosts,     setHosts]     = useState([])
   const [type,      setType]      = useState('docker_local')
-  const [name,      setName]      = useState('')
+  const [name,      setName]      = useState('Docker 1')
   const [url,       setUrl]       = useState(wizardDefaultUrl('docker_local'))
   const [authUser,  setAuthUser]  = useState('')
   const [authToken, setAuthToken] = useState('')
@@ -524,9 +524,17 @@ function StepContainers({ onNext }) {
   const [adding,    setAdding]    = useState(false)
   const [error,     setError]     = useState('')
 
+  function autoName(t) {
+    return t === 'proxmox' ? 'Proxmox 1' : 'Docker 1'
+  }
+
   function handleTypeChange(t) {
     setType(t)
     setUrl(wizardDefaultUrl(t))
+    setName(prev => {
+      const isAuto = prev === '' || prev === autoName(type)
+      return isAuto ? autoName(t) : prev
+    })
   }
 
   async function handleAdd() {
@@ -544,7 +552,7 @@ function StepContainers({ onNext }) {
     try {
       const created = await api.createContainerHost(body)
       setHosts(prev => [...prev, created])
-      setName(''); setAuthUser(''); setAuthToken('')
+      setName(autoName(type)); setAuthUser(''); setAuthToken('')
       setTlsVerify(false); setNode('pve')
       setUrl(wizardDefaultUrl(type))
     } catch (e) {

@@ -237,6 +237,10 @@ def _migrate(db: Session):
             vulns      JSONB NOT NULL DEFAULT '[]',
             scanned_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
         )""",
+        # IP history: differentiate DHCP rotation from multi-homed
+        "ALTER TABLE ip_history ADD COLUMN IF NOT EXISTS seen_while_online BOOLEAN",
+        # Prevent probe from overriding user-pinned primary IPs
+        "ALTER TABLE devices ADD COLUMN IF NOT EXISTS primary_ip_locked BOOLEAN NOT NULL DEFAULT FALSE",
     ]
     for sql in migrations:
         try:
@@ -312,7 +316,9 @@ DEFAULT_SETTINGS = {
     "enable_hostname_resolution":    ("true",  "Attempt DNS hostname resolution for discovered devices. Disable to stop all reverse-DNS lookups."),
     "hostname_cooldown_hours":       ("24",    "Minimum hours between hostname resolution retries for each device. Lower values increase DNS query frequency."),
     "enable_port_scanning":          ("true",  "Run TCP port scans on discovered devices. Disable to stop all port scanning activity."),
-    "port_scan_workers":             ("300",   "Number of concurrent TCP threads used per port scan. Lower values reduce network load but increase scan time. Requires no restart."),
+    "port_scan_method":              ("tcp_connect", "Port scan method: tcp_connect (standard socket, no special privileges) or scapy_syn (raw SYN packets, requires CAP_NET_RAW — already granted in the default probe container)."),
+    "port_scan_workers":             ("200",   "Number of concurrent TCP threads used per port scan (tcp_connect method only). Lower values reduce network load but increase scan time."),
+    "gateway_scan_workers":          ("50",    "Number of concurrent TCP threads when port scanning the default gateway. Kept lower than regular scans to avoid overwhelming the gateway device."),
     "enable_service_fingerprinting": ("true",  "Run Nerva service fingerprinting after each port scan to identify services on open ports."),
     "enable_mdns":                   ("true",  "Run mDNS discovery to find device names and services advertised over the local mDNS/Bonjour multicast group."),
     "enable_nightly_scan":           ("true",  "Rescan all online devices during the configured nightly scan window."),
@@ -1266,9 +1272,11 @@ def _to_dict(d: Device) -> dict:
         "is_blocked":            bool(getattr(d, 'is_blocked', False)),
         "zone":                  getattr(d, 'zone', None),
         "is_ignored":            bool(getattr(d, 'is_ignored', False)),
+        "primary_ip_locked":     bool(getattr(d, 'primary_ip_locked', False)),
         # Populated by list_devices; single-device endpoints return defaults
         "is_virtual_interface":  False,
         "virtual_of":            None,
+        "secondary_ips":         [],
     }
 
 
@@ -1663,11 +1671,39 @@ def list_devices(
             if d.mac_address in virtual_of:
                 break
 
+    # Collect active secondary IPs (multi-homed: seen while device was online at another IP)
+    try:
+        sec_rows = db.execute(text("""
+            SELECT mac_address, ip_address
+            FROM ip_history
+            WHERE seen_while_online = true
+              AND last_seen > NOW() - INTERVAL '7 days'
+        """)).fetchall()
+    except Exception:
+        sec_rows = []
+    secondary_ip_map: dict[str, list[str]] = {}
+    for row in sec_rows:
+        secondary_ip_map.setdefault(row[0], []).append(row[1])
+
+    # Build a set of IPs "owned" by virtual interfaces for each real MAC, so those
+    # IPs are excluded from the real device's secondary_ips (fixes macvlan/switch ghost IPs).
+    virtual_ips_for: dict[str, set] = {}
+    for v_mac, real_mac in virtual_of.items():
+        for ip, macs in ip_to_macs.items():
+            if v_mac in macs:
+                virtual_ips_for.setdefault(real_mac, set()).add(ip)
+
     result = []
     for d in devices:
         dct = _to_dict(d)
         dct['is_virtual_interface'] = d.mac_address in virtual_of
         dct['virtual_of']           = virtual_of.get(d.mac_address)
+        primary   = dct.get('primary_ip') or d.ip_address
+        excl_virt = virtual_ips_for.get(d.mac_address, set())
+        dct['secondary_ips'] = [
+            ip for ip in secondary_ip_map.get(d.mac_address, [])
+            if ip != primary and ip not in excl_virt
+        ]
         result.append(dct)
     return result
 
@@ -1835,6 +1871,7 @@ def set_primary_ip(mac: str, payload: PrimaryIPUpdate, db: Session = Depends(get
 
     old_primary = getattr(d, 'primary_ip', None) or d.ip_address
     d.primary_ip = target_ip
+    d.primary_ip_locked = True
     d.ip_address = target_ip
     d.deep_scanned = False
     d.scan_results = None
@@ -1847,6 +1884,17 @@ def set_primary_ip(mac: str, payload: PrimaryIPUpdate, db: Session = Depends(get
     except Exception:
         pass
 
+    return {"ok": True, "device": _to_dict(d)}
+
+
+@app.post("/devices/{mac}/unpin-ip")
+def unpin_primary_ip(mac: str, db: Session = Depends(get_db)):
+    d = db.get(Device, mac.lower())
+    if not d:
+        raise HTTPException(404, "Device not found")
+    d.primary_ip_locked = False
+    db.commit()
+    db.refresh(d)
     return {"ok": True, "device": _to_dict(d)}
 
 
@@ -2629,7 +2677,7 @@ async def apply_settings(db: Session = Depends(get_db)):
     for key in (
         "enable_arp_sweep", "enable_passive_sniffer", "sniffer_subnet_filter",
         "enable_hostname_resolution", "hostname_cooldown_hours",
-        "enable_port_scanning", "port_scan_workers",
+        "enable_port_scanning", "port_scan_method", "port_scan_workers", "gateway_scan_workers",
         "enable_service_fingerprinting", "enable_mdns",
         "enable_nightly_scan", "enable_unscanned_retry",
     ):
@@ -2645,6 +2693,33 @@ async def apply_settings(db: Session = Depends(get_db)):
             return {"applied": True, "probe_response": body}
     except httpx.ConnectError:
         raise HTTPException(502, f"Cannot reach probe at {PROBE_URL}")
+
+
+@app.post("/settings/restart-probe")
+async def restart_probe(username: str = Depends(get_current_user)):
+    """Tell the probe to exit — Docker restart policy brings it back."""
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            r = await client.post(f"{PROBE_URL}/restart")
+            r.raise_for_status()
+            return {"ok": True}
+    except httpx.ConnectError:
+        raise HTTPException(502, f"Cannot reach probe at {PROBE_URL}")
+    except Exception as exc:
+        raise HTTPException(500, str(exc))
+
+
+@app.post("/settings/restart-backend")
+async def restart_backend(username: str = Depends(get_current_user)):
+    """Exit this process — Docker restart policy brings it back."""
+    import signal as _sig
+    def _do():
+        import time as _t
+        _t.sleep(0.5)
+        os.kill(os.getpid(), _sig.SIGTERM)
+    import threading as _th
+    _th.Thread(target=_do, daemon=True).start()
+    return {"ok": True, "restarting": True}
 
 
 # ---------------------------------------------------------------------------
@@ -5018,6 +5093,7 @@ def _fetch_containers_for_host(host: dict) -> list:
             d["host_id"]   = host["id"]
             d["host_name"] = host["name"]
             d["host_type"] = htype
+            d["host_url"]  = host_url
             result.append(d)
         return result
     finally:

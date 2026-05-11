@@ -102,8 +102,16 @@ const SETTING_META = {
     description: 'Minimum hours between DNS resolution retries for each unresolved device. Lower values mean more frequent DNS queries.' },
   enable_port_scanning: { label: 'Enable Port Scanning', type: 'toggle', tab: 'scanner',
     description: 'Run TCP port scans on discovered devices to identify open services. Disable to stop all port scanning and deep scan activity.' },
-  port_scan_workers: { label: 'Port Scan Worker Threads', unit: 'threads', type: 'number', min: 10, max: 600, tab: 'scanner',
-    description: 'Number of concurrent TCP connection threads used per port scan. Lower values reduce network and CPU load but make each scan take longer. Default is 300.' },
+  port_scan_method: { label: 'Port Scan Method', type: 'select', tab: 'scanner',
+    options: [
+      { value: 'tcp_connect', label: 'TCP Connect (default — no special privileges)' },
+      { value: 'scapy_syn',   label: 'Scapy SYN Scan (raw packets, faster on LAN)' },
+    ],
+    description: 'TCP Connect uses standard socket connections and works without root. Scapy SYN sends raw TCP SYN packets — often faster on LAN since closed ports return RST immediately rather than waiting for a timeout. Requires CAP_NET_RAW, already granted in the default Docker configuration.' },
+  port_scan_workers: { label: 'Port Scan Worker Threads', unit: 'threads', type: 'number', min: 10, max: 500, tab: 'scanner',
+    description: 'Concurrent TCP connect threads per port scan (applies to TCP Connect method only, default 200).' },
+  gateway_scan_workers: { label: 'Gateway Scan Worker Threads', unit: 'threads', type: 'number', min: 5, max: 200, tab: 'scanner',
+    description: 'Concurrent TCP connect threads when scanning the default gateway (default 50). Kept lower than regular scans to avoid overwhelming the gateway device.' },
   enable_service_fingerprinting: { label: 'Enable Service Fingerprinting', type: 'toggle', tab: 'scanner',
     description: 'Run Nerva service fingerprinting after each port scan to identify the service running on each open port. Disable to skip this stage.' },
   enable_mdns: { label: 'Enable mDNS Discovery', type: 'toggle', tab: 'scanner',
@@ -152,6 +160,7 @@ export function SettingsPanel({ onClose, onSettingChange }) {
   const [restoreStatus, setRestoreStatus] = useState(null)
   const restoreInputRef = useRef(null)
   const [dragonsOpen,   setDragonsOpen]   = useState(false)
+  const [restarting,    setRestarting]    = useState({})  // { probe: bool, backend: bool }
   const [showPbKey,     setShowPbKey]     = useState(false)
   const [showGotifyToken, setShowGotifyToken] = useState(false)
   const [pbTestStatus,  setPbTestStatus]  = useState(null)
@@ -160,10 +169,14 @@ export function SettingsPanel({ onClose, onSettingChange }) {
     typeof Notification !== 'undefined' ? Notification.permission : 'unsupported'
   )
   const fileInputRef = useRef(null)
+  const [detectedInterface, setDetectedInterface] = useState('')
 
   useEffect(() => {
     api.getSettings().then(setSettings).catch(() => {})
     api.getFingerprintStats().then(setFpStats).catch(() => {})
+    api.setupNetworkInfo().then(info => {
+      if (info?.interface) setDetectedInterface(info.interface)
+    }).catch(() => {})
   }, [])
 
   function handleChange(key, value) {
@@ -185,6 +198,16 @@ export function SettingsPanel({ onClose, onSettingChange }) {
     setSaved(true)
     setTimeout(() => setSaved(false), 2000)
     api.getSettings().then(setSettings)
+  }
+
+  async function handleRestart(target) {
+    if (!confirm(`Restart the ${target} container? It will be back online in a few seconds (Docker restart policy).`)) return
+    setRestarting(r => ({ ...r, [target]: true }))
+    try {
+      if (target === 'probe')   await api.restartProbe()
+      if (target === 'backend') await api.restartBackend()
+    } catch { /* container disappears before it can reply — that's expected */ }
+    setTimeout(() => setRestarting(r => ({ ...r, [target]: false })), 5000)
   }
 
   async function handleReset() {
@@ -313,7 +336,7 @@ export function SettingsPanel({ onClose, onSettingChange }) {
   const bnEnabled = val('browser_notifications_enabled') === 'true'
 
   // ── Scanner tab grouping ────────────────────────────────────────────────────
-  const networkScanKeys   = ['scan_interval','offline_miss_threshold','sniffer_workers','arp_scan_retry']
+  const networkScanKeys   = ['scan_interval','offline_miss_threshold']
   const networkConfigKeys = ['ip_range','dns_server','probe_interface']
 
   // ── Notifications tab grouping ──────────────────────────────────────────────
@@ -389,8 +412,12 @@ export function SettingsPanel({ onClose, onSettingChange }) {
 
               {/* Network configuration */}
               <SectionHeader label="Network Configuration" Icon={ScanLine} />
-              {settingsByKeys(networkConfigKeys).map(s => (
+              {settingsByKeys(['ip_range','dns_server']).map(s => (
                 <SettingRow key={s.key} s={s} dirty={dirty} onchange={handleChange} />
+              ))}
+              {settingsByKeys(['probe_interface']).map(s => (
+                <SettingRow key={s.key} s={s} dirty={dirty} onchange={handleChange}
+                  placeholder={detectedInterface || 'auto-detect'} />
               ))}
 
               {/* ── Here Be Dragons ─────────────────────────────────────── */}
@@ -418,6 +445,11 @@ export function SettingsPanel({ onClose, onSettingChange }) {
                     </p>
                   </div>
 
+                  <p className="text-xs font-semibold" style={{ color: 'var(--color-text-muted)', paddingTop: '4px' }}>Advanced Scanning</p>
+                  {settingsByKeys(['sniffer_workers','arp_scan_retry']).map(s => (
+                    <SettingRow key={s.key} s={s} dirty={dirty} onchange={handleChange} />
+                  ))}
+
                   <p className="text-xs font-semibold" style={{ color: 'var(--color-text-muted)', paddingTop: '4px' }}>Active ARP Sweep</p>
                   {settingsByKeys(['enable_arp_sweep']).map(s => (
                     <SettingRow key={s.key} s={s} dirty={dirty} onchange={handleChange} />
@@ -434,7 +466,7 @@ export function SettingsPanel({ onClose, onSettingChange }) {
                   ))}
 
                   <p className="text-xs font-semibold" style={{ color: 'var(--color-text-muted)', paddingTop: '4px' }}>Port Scanning</p>
-                  {settingsByKeys(['enable_port_scanning','port_scan_workers','enable_service_fingerprinting']).map(s => (
+                  {settingsByKeys(['enable_port_scanning','port_scan_method','port_scan_workers','gateway_scan_workers','enable_service_fingerprinting']).map(s => (
                     <SettingRow key={s.key} s={s} dirty={dirty} onchange={handleChange} />
                   ))}
 
@@ -442,6 +474,28 @@ export function SettingsPanel({ onClose, onSettingChange }) {
                   {settingsByKeys(['enable_mdns','enable_nightly_scan','enable_unscanned_retry']).map(s => (
                     <SettingRow key={s.key} s={s} dirty={dirty} onchange={handleChange} />
                   ))}
+
+                  <p className="text-xs font-semibold" style={{ color: 'var(--color-text-muted)', paddingTop: '4px' }}>Container Restart</p>
+                  <div className="card p-4 space-y-3">
+                    <p className="text-xs" style={{ color: 'var(--color-text-faint)' }}>
+                      Force-restart individual containers. Docker brings them back immediately.
+                      Required after changing Probe Interface or Sniffer Workers.
+                    </p>
+                    <div className="flex gap-2 flex-wrap">
+                      <button onClick={() => handleRestart('probe')} disabled={restarting.probe}
+                        className="btn-secondary flex items-center gap-2 text-sm"
+                        style={{ opacity: restarting.probe ? 0.5 : 1 }}>
+                        <AlertTriangle size={12} style={{ color: '#f59e0b' }} />
+                        {restarting.probe ? 'Restarting…' : 'Restart Probe'}
+                      </button>
+                      <button onClick={() => handleRestart('backend')} disabled={restarting.backend}
+                        className="btn-secondary flex items-center gap-2 text-sm"
+                        style={{ opacity: restarting.backend ? 0.5 : 1 }}>
+                        <AlertTriangle size={12} style={{ color: '#f59e0b' }} />
+                        {restarting.backend ? 'Restarting…' : 'Restart Backend'}
+                      </button>
+                    </div>
+                  </div>
                 </div>
               )}
 
@@ -855,7 +909,7 @@ function SkeletonRows({ count }) {
   )
 }
 
-function SettingRow({ s, dirty, onchange }) {
+function SettingRow({ s, dirty, onchange, placeholder }) {
   const meta    = SETTING_META[s.key] || { label: s.key, type: 'text', unit: '' }
   const value   = dirty[s.key] ?? s.value
   const isDirty = dirty[s.key] !== undefined
@@ -904,6 +958,7 @@ function SettingRow({ s, dirty, onchange }) {
       </div>
       <input type={meta.type || 'text'} min={meta.min} max={meta.max}
         className="input" style={dirtyStyle} value={value}
+        placeholder={placeholder || ''}
         onChange={e => onchange(s.key, e.target.value)} />
       {(meta.description || s.description) && (
         <p className="text-xs" style={{ color: 'var(--color-text-faint)' }}>{meta.description || s.description}</p>

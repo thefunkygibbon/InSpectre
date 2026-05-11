@@ -4,7 +4,7 @@ import {
   Search, AlertCircle, Activity,
   LayoutGrid, List, Sun, Moon, ChevronDown,
   Bell, X, Layers, Star, ShieldAlert, Wrench, Ban, BarChart2,
-  ArrowLeft, SlidersHorizontal, LogOut, Eye, EyeOff, Box,
+  ArrowLeft, SlidersHorizontal, LogOut, Eye, EyeOff, Box, Download,
 } from 'lucide-react'
 import { TrafficPage } from './components/TrafficPage'
 import { ContainersPage } from './components/ContainersPage'
@@ -375,6 +375,17 @@ function MainApp({ onLogout }) {
     await refresh()
   }
 
+  async function handleExportCsv() {
+    try {
+      const res = await api.exportDevicesCsv()
+      const blob = await res.blob()
+      const url = URL.createObjectURL(blob)
+      const a = document.createElement('a')
+      a.href = url; a.download = 'devices.csv'; a.click()
+      URL.revokeObjectURL(url)
+    } catch (e) { console.error('CSV export failed', e) }
+  }
+
   const isDark = theme === 'dark'
   const isCategoryMode = layout === 'category'
   const hasActiveSmartFilters = Object.keys(activeFilters).length > 0
@@ -672,6 +683,14 @@ function MainApp({ onLogout }) {
                       style={{ color: 'var(--color-text-muted)' }} />
                   </div>
                 )}
+
+                <button
+                  onClick={handleExportCsv}
+                  className="p-2 rounded-xl glass transition-all duration-150"
+                  style={{ color: 'var(--color-text-muted)' }}
+                  aria-label="Export devices as CSV" title="Export devices as CSV">
+                  <Download size={15} />
+                </button>
 
                 <div className="flex items-center gap-1 glass rounded-xl p-1 ml-auto">
                   <button onClick={() => setLayout('grid')}
@@ -1027,7 +1046,17 @@ export default function App() {
   }
 
   if (authState === 'loading')         return <AppLoadingScreen />
-  if (authState === 'setup')           return <SetupWizard onComplete={() => setAuthState('login')} />
+  if (authState === 'setup')           return <SetupWizard onComplete={async () => {
+    const token = getToken()
+    if (token) {
+      try {
+        const me = await api.authMe()
+        setAuthState(me.must_change_password ? 'change_password' : 'app')
+        return
+      } catch { clearToken() }
+    }
+    setAuthState('login')
+  }} />
   if (authState === 'login')           return <LoginPage onLogin={handleLogin} />
   if (authState === 'change_password') return <ForcePasswordChange onDone={() => setAuthState('app')} />
   return <MainApp onLogout={handleLogout} />
