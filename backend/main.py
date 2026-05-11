@@ -2669,6 +2669,8 @@ async def apply_settings(db: Session = Depends(get_db)):
         payload["offline_miss_threshold"] = int(settings["offline_miss_threshold"])
     if "sniffer_workers" in settings:
         payload["sniffer_workers"] = int(settings["sniffer_workers"])
+    if "arp_scan_retry" in settings:
+        payload["arp_scan_retry"] = int(settings["arp_scan_retry"])
     if "ip_range" in settings:
         payload["ip_range"] = settings["ip_range"]
     if "nuclei_template_update_interval" in settings:

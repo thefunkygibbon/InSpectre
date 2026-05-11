@@ -43,6 +43,7 @@ PORT_SCAN_METHOD        = os.environ.get("PORT_SCAN_METHOD", "tcp_connect")
 OS_CONFIDENCE_THRESHOLD = int(os.environ.get("OS_CONFIDENCE_THRESHOLD", 85))
 OFFLINE_MISS_THRESHOLD  = int(os.environ.get("OFFLINE_MISS_THRESHOLD",   3))
 SNIFFER_WORKERS         = int(os.environ.get("SNIFFER_WORKERS",          4))
+ARP_SCAN_RETRY          = int(os.environ.get("ARP_SCAN_RETRY",           1))
 PROBE_API_PORT          = int(os.environ.get("PROBE_API_PORT",         8001))
 LAN_DNS_SERVER_ENV      = os.environ.get("LAN_DNS_SERVER", "").strip()
 MDNS_INTERVAL_MINUTES   = int(os.environ.get("MDNS_INTERVAL_MINUTES", 120))  # default: 2 hours
@@ -72,7 +73,7 @@ def _load_settings_from_db() -> None:
     Silently skips any key that is missing from the DB.
     """
     global SCAN_INTERVAL, IP_RANGE, PORT_SCAN_WORKERS, GATEWAY_SCAN_WORKERS, PORT_SCAN_METHOD, OS_CONFIDENCE_THRESHOLD
-    global OFFLINE_MISS_THRESHOLD, SNIFFER_WORKERS, NUCLEI_TEMPLATE_UPDATE_INTERVAL
+    global OFFLINE_MISS_THRESHOLD, SNIFFER_WORKERS, ARP_SCAN_RETRY, NUCLEI_TEMPLATE_UPDATE_INTERVAL
     global NIGHTLY_SCAN_START, NIGHTLY_SCAN_END, OFFLINE_RESCAN_HOURS, BASELINE_SCAN_COUNT_THRESHOLD
     try:
         session = Session()
@@ -89,6 +90,7 @@ def _load_settings_from_db() -> None:
         if "os_confidence_threshold" in db: OS_CONFIDENCE_THRESHOLD = int(db["os_confidence_threshold"])
         if "offline_miss_threshold"  in db: OFFLINE_MISS_THRESHOLD  = int(db["offline_miss_threshold"])
         if "sniffer_workers"         in db: SNIFFER_WORKERS         = int(db["sniffer_workers"])
+        if "arp_scan_retry"          in db: ARP_SCAN_RETRY          = int(db["arp_scan_retry"])
         if "nuclei_template_update_interval" in db:
             NUCLEI_TEMPLATE_UPDATE_INTERVAL = db["nuclei_template_update_interval"]
         if "nightly_scan_start"            in db: NIGHTLY_SCAN_START            = int(db["nightly_scan_start"])
@@ -115,7 +117,7 @@ def ping_once(ip: str, timeout_s: int = 2) -> bool:
 
 
 def apply_runtime_config(payload: dict) -> dict:
-    global SCAN_INTERVAL, IP_RANGE, PORT_SCAN_WORKERS, GATEWAY_SCAN_WORKERS, PORT_SCAN_METHOD, OS_CONFIDENCE_THRESHOLD, OFFLINE_MISS_THRESHOLD, SNIFFER_WORKERS, NUCLEI_TEMPLATE_UPDATE_INTERVAL
+    global SCAN_INTERVAL, IP_RANGE, PORT_SCAN_WORKERS, GATEWAY_SCAN_WORKERS, PORT_SCAN_METHOD, OS_CONFIDENCE_THRESHOLD, OFFLINE_MISS_THRESHOLD, SNIFFER_WORKERS, ARP_SCAN_RETRY, NUCLEI_TEMPLATE_UPDATE_INTERVAL
 
     changes = {}
 
@@ -146,6 +148,9 @@ def apply_runtime_config(payload: dict) -> dict:
             "applied": SNIFFER_WORKERS,
             "note": "worker count changes require probe restart",
         }
+    if "arp_scan_retry" in payload:
+        ARP_SCAN_RETRY = int(payload["arp_scan_retry"])
+        changes["arp_scan_retry"] = ARP_SCAN_RETRY
     if "nuclei_template_update_interval" in payload:
         NUCLEI_TEMPLATE_UPDATE_INTERVAL = str(payload["nuclei_template_update_interval"]).strip()
         changes["nuclei_template_update_interval"] = NUCLEI_TEMPLATE_UPDATE_INTERVAL
@@ -846,9 +851,7 @@ def _mdns_loop() -> None:
 # ---------------------------------------------------------------------------
 def arp_scan(interface: str, ip_range: str) -> list[dict]:
     pkt    = Ether(dst="ff:ff:ff:ff:ff:ff") / ARP(pdst=ip_range)
-    # Increased timeout from 3s → 5s and added retry=2 so slow/sleeping
-    # devices (IoT, phones, printers) have more time to respond.
-    result = srp(pkt, iface=interface, timeout=5, retry=2, verbose=0)[0]
+    result = srp(pkt, iface=interface, timeout=5, retry=ARP_SCAN_RETRY, verbose=0)[0]
     return [{"ip": rcv.psrc, "mac": rcv.hwsrc.lower()} for _, rcv in result]
 
 # ---------------------------------------------------------------------------
