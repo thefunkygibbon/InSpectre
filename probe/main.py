@@ -2551,8 +2551,7 @@ def main() -> None:
     threading.Thread(target=_nuclei_template_update_loop, daemon=True, name="nuclei-updater").start()
     time.sleep(2)
 
-    threading.Thread(target=start_arp_sniffer, daemon=True, name="arp-sniffer").start()
-    threading.Thread(target=_mdns_loop, daemon=True, name="mdns-loop").start()
+    _background_started = False
 
     while True:
         _load_settings_from_db()
@@ -2572,6 +2571,11 @@ def main() -> None:
             print("[*] Waiting for setup wizard to complete before scanning…", flush=True)
             time.sleep(10)
             continue
+
+        if not _background_started:
+            threading.Thread(target=start_arp_sniffer, daemon=True, name="arp-sniffer").start()
+            threading.Thread(target=_mdns_loop, daemon=True, name="mdns-loop").start()
+            _background_started = True
 
         with _sniffer_seen_lock:
             _sniffer_seen_this_interval.clear()
