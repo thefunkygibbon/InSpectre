@@ -30,6 +30,10 @@ services:
       SECRET_KEY: d3689ad87d9ee61a507399d6224c5c1039d7eaddedc1eea2d80b92e68130b4c6
       # Comma-separated list of allowed frontend origins
       CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:3000,http://localhost:5173}
+    # Remove or comment this out if you are monitoring a remote Docker host via TCP
+    # (configure docker_host in Settings → Docker to tcp://host:2375 instead).
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
     extra_hosts:
       - "host.docker.internal:host-gateway"
     depends_on:
