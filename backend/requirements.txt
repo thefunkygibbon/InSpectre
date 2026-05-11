@@ -8,3 +8,4 @@ dnspython==2.7.0
 bcrypt==4.2.1
 python-jose[cryptography]==3.3.0
 python-multipart==0.0.20
+docker==7.1.0
