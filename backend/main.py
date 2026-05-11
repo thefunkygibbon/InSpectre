@@ -259,6 +259,7 @@ DEFAULT_SETTINGS = {
     "sniffer_workers":         ("4",     "Number of parallel scanner threads."),
     "ip_range":                ("192.168.0.0/24", "CIDR range to scan."),
     "arp_scan_retry":          ("1", "ARP sweep retry rounds (0 = single pass, 1 = two rounds). Higher values increase broadcast traffic but may catch more sleeping devices. The passive sniffer catches most devices that miss sweeps."),
+    "primary_ip_mode":         ("locked", "How the probe updates a device's primary IP. locked: respects the per-device IP lock flag — locked devices never have their primary IP auto-changed. dynamic: always adopts the current IP as primary when a device returns from offline (mirrors InSpectre-main behaviour)."),
     "notifications_enabled":              ("true",  "Show popup toasts when new devices appear or go offline."),
     "browser_notifications_enabled":      ("false", "Show OS-level browser notifications for device events."),
     "pushbullet_api_key":                 ("",      "Pushbullet API access token for push notifications."),
@@ -299,7 +300,7 @@ DEFAULT_SETTINGS = {
     "auto_block_vuln_severity":  ("none",  "Minimum vuln severity to trigger auto-block. Options: none, medium, high, critical."),
     # Network / probe identity
     "dns_server":                ("",      "LAN DNS server IP (auto-detected if blank). Set this to your router's IP for best hostname resolution."),
-    "probe_interface":           ("",      "Network interface the probe uses for scanning (e.g. eth0, eno1). Requires probe restart to change."),
+    "probe_interface":           ("",      "Network interface the probe uses for scanning (e.g. eth0, eno1). Auto-detected on startup if blank; changes apply immediately via Settings → Apply."),
     # Setup wizard
     "setup_complete":            ("false", "Whether the initial setup wizard has been completed."),
     # Docker monitoring
@@ -2671,6 +2672,8 @@ async def apply_settings(db: Session = Depends(get_db)):
         payload["sniffer_workers"] = int(settings["sniffer_workers"])
     if "arp_scan_retry" in settings:
         payload["arp_scan_retry"] = int(settings["arp_scan_retry"])
+    if "primary_ip_mode" in settings:
+        payload["primary_ip_mode"] = settings["primary_ip_mode"]
     if "ip_range" in settings:
         payload["ip_range"] = settings["ip_range"]
     if "nuclei_template_update_interval" in settings:
@@ -2682,6 +2685,7 @@ async def apply_settings(db: Session = Depends(get_db)):
         "enable_port_scanning", "port_scan_method", "port_scan_workers", "gateway_scan_workers",
         "enable_service_fingerprinting", "enable_mdns",
         "enable_nightly_scan", "enable_unscanned_retry",
+        "probe_interface", "dns_server",
     ):
         if key in settings:
             payload[key] = settings[key]
@@ -4695,12 +4699,27 @@ async def _block_schedule_loop():
 @app.post("/traffic/start/{mac}")
 async def traffic_start(mac: str, db: Session = Depends(get_db)):
     mac = mac.lower()
+    te = db.get(Setting, "traffic_enabled")
+    if te and te.value == "false":
+        raise HTTPException(403, "Traffic monitoring is disabled in settings")
     device = db.get(Device, mac)
     if not device:
         raise HTTPException(404, "Device not found")
     ip = device.ip_address
     if not ip:
         raise HTTPException(422, "Device has no IP address")
+    # Enforce max concurrent sessions
+    max_s = db.get(Setting, "traffic_max_sessions")
+    max_sessions = int(max_s.value) if max_s and max_s.value else 10
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            active_resp = await client.get(f"{PROBE_URL}/traffic/stats")
+        if active_resp.status_code == 200:
+            active_count = len(active_resp.json().get("sessions", []))
+            if active_count >= max_sessions:
+                raise HTTPException(429, f"Max concurrent traffic sessions ({max_sessions}) reached")
+    except (httpx.ConnectError, httpx.TimeoutException):
+        pass
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
             resp = await client.post(f"{PROBE_URL}/traffic/start/{ip}")

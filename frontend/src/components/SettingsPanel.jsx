@@ -18,6 +18,12 @@ const SETTING_META = {
     description: 'Number of parallel packet capture threads. Requires probe restart to take effect.' },
   arp_scan_retry:          { label: 'ARP Sweep Retries',   unit: 'extra rounds',  type: 'number', min: 0,  max: 3,    tab: 'scanner',
     description: 'Extra ARP broadcast rounds per sweep (0 = single pass, 1 = two rounds). Each retry wakes sleeping mobile devices and adds broadcast traffic. The passive sniffer catches most devices that miss sweeps.' },
+  primary_ip_mode: { label: 'Primary IP Update Mode', type: 'select', tab: 'scanner',
+    options: [
+      { value: 'locked',  label: 'Locked — respect per-device IP lock (default)' },
+      { value: 'dynamic', label: 'Dynamic — always adopt new IP on offline return (main-style)' },
+    ],
+    description: 'Controls how the primary IP is updated when a device returns from offline at a different IP. Locked: honours the per-device lock flag set in the device drawer. Dynamic: always updates primary IP to track DHCP changes, ignoring any lock.' },
   ip_range:                { label: 'IP Range',            unit: '',              type: 'text',              tab: 'scanner' },
   dns_server:              { label: 'LAN DNS Server',      unit: 'IP',            type: 'text',              tab: 'scanner',
     description: 'DNS server used for hostname resolution. Leave blank to auto-detect from host.' },
@@ -69,11 +75,13 @@ const SETTING_META = {
     description: 'Show OS-level notifications even when the tab is in the background. Requires browser permission.' },
 
   // Notifications tab — alert triggers (control the backend dispatch loop)
-  alert_on_new_device: { label: 'Alert on New Device',      type: 'toggle', tab: 'notifications',
+  alert_on_new_device:  { label: 'Alert on New Device',      type: 'toggle', tab: 'notifications',
     description: 'Send an external alert when a new device is discovered.' },
-  alert_on_offline:    { label: 'Alert on Device Offline',  type: 'toggle', tab: 'notifications',
+  alert_on_offline:     { label: 'Alert on Device Offline',  type: 'toggle', tab: 'notifications',
     description: 'Send an external alert when a watched device goes offline.' },
-  alert_on_vuln:       { label: 'Alert on Vulnerability',   type: 'toggle', tab: 'notifications',
+  alert_on_port_change: { label: 'Alert on Port Change',     type: 'toggle', tab: 'notifications',
+    description: 'Send an external alert when a device\'s open ports change.' },
+  alert_on_vuln:        { label: 'Alert on Vulnerability',   type: 'toggle', tab: 'notifications',
     description: 'Send an external alert when a vulnerability scan finds issues.' },
 
   // Delivery channels — handled as special sections in the UI, referenced here for tab routing
@@ -88,6 +96,43 @@ const SETTING_META = {
   docker_enabled:        { tab: 'docker' },
   docker_host:           { tab: 'docker' },
   docker_tls_verify:     { tab: 'docker' },
+  trivy_db_update_hours: { label: 'Trivy DB Update Interval', unit: 'hours', type: 'number', min: 0, max: 168, tab: 'docker',
+    description: 'How often to refresh the Trivy vulnerability database (hours). Set to 0 to disable automatic updates.' },
+  docker_scan_on_new:    { label: 'Scan New Containers',     type: 'toggle', tab: 'docker',
+    description: 'Automatically run a Trivy vulnerability scan when a new container is created.' },
+  docker_scan_on_update: { label: 'Scan Updated Containers', type: 'toggle', tab: 'docker',
+    description: 'Automatically run a Trivy vulnerability scan when a container is recreated with an updated image.' },
+
+  // Data tab — traffic monitoring
+  traffic_enabled:        { label: 'Enable Traffic Monitoring',  type: 'toggle', tab: 'data',
+    description: 'Allow per-device traffic capture sessions. Disable to prevent all traffic monitoring.' },
+  traffic_retention_days: { label: 'Traffic Data Retention', unit: 'days',     type: 'number', min: 1, max: 365, tab: 'data',
+    description: 'How many days to keep traffic statistics before automatic deletion.' },
+  traffic_max_sessions:   { label: 'Max Concurrent Sessions', unit: 'sessions', type: 'number', min: 1, max: 50, tab: 'data',
+    description: 'Maximum number of simultaneous traffic monitoring sessions allowed.' },
+
+  // Data tab — speed test
+  speedtest_schedule: { label: 'Scheduled Speed Tests', type: 'select', tab: 'data',
+    options: [
+      { value: 'disabled', label: 'Disabled' },
+      { value: '30m',      label: 'Every 30 minutes' },
+      { value: '1h',       label: 'Hourly' },
+      { value: '6h',       label: 'Every 6 hours' },
+      { value: '24h',      label: 'Daily' },
+    ],
+    description: 'How often to run automatic speed tests in the background.' },
+
+  // Scanner tab — auto-block security responses
+  auto_block_new_devices:   { label: 'Auto-Block New Devices', type: 'toggle', tab: 'scanner',
+    description: 'Automatically ARP-block any newly discovered device until it is manually approved.' },
+  auto_block_vuln_severity: { label: 'Auto-Block on Vulnerability', type: 'select', tab: 'scanner',
+    options: [
+      { value: 'none',     label: 'Disabled' },
+      { value: 'medium',   label: 'Medium and above' },
+      { value: 'high',     label: 'High and above' },
+      { value: 'critical', label: 'Critical only' },
+    ],
+    description: 'Automatically ARP-block a device when a vulnerability scan finds issues at or above the selected severity.' },
 
   // Here Be Dragons — advanced probe pipeline controls
   enable_arp_sweep: { label: 'Enable Active ARP Sweep', type: 'toggle', tab: 'scanner',
@@ -321,7 +366,7 @@ export function SettingsPanel({ onClose, onSettingChange }) {
   }
 
   const hasDirty   = Object.keys(dirty).length > 0
-  const showFooter = activeTab !== 'data' && activeTab !== 'account' && activeTab !== 'docker'
+  const showFooter = activeTab !== 'account'
 
   // Returns current value for a key (dirty-aware)
   function val(key) {
@@ -341,7 +386,7 @@ export function SettingsPanel({ onClose, onSettingChange }) {
 
   // ── Notifications tab grouping ──────────────────────────────────────────────
   const inAppKeys   = ['notifications_enabled','browser_notifications_enabled']
-  const triggerKeys = ['alert_on_new_device','alert_on_offline','alert_on_vuln']
+  const triggerKeys = ['alert_on_new_device','alert_on_offline','alert_on_port_change','alert_on_vuln']
 
   function settingsByKeys(keys) {
     return keys.map(k => settings.find(s => s.key === k)).filter(Boolean)
@@ -420,6 +465,24 @@ export function SettingsPanel({ onClose, onSettingChange }) {
                   placeholder={detectedInterface || 'auto-detect'} />
               ))}
 
+              {/* Vulnerability Scanning */}
+              <SectionHeader label="Vulnerability Scanning" Icon={AlertTriangle} />
+              {settingsByKeys(['vuln_scan_schedule','vuln_scan_targets','vuln_scan_templates','nuclei_template_update_interval','vuln_scan_on_new_device','vuln_scan_on_port_change']).map(s => (
+                <SettingRow key={s.key} s={s} dirty={dirty} onchange={handleChange} />
+              ))}
+
+              {/* Scan Scheduling */}
+              <SectionHeader label="Scan Scheduling" Icon={ScanLine} />
+              {settingsByKeys(['nightly_scan_start','nightly_scan_end','offline_rescan_hours','baseline_scan_count_threshold']).map(s => (
+                <SettingRow key={s.key} s={s} dirty={dirty} onchange={handleChange} />
+              ))}
+
+              {/* Security Responses */}
+              <SectionHeader label="Security Responses" Icon={AlertTriangle} />
+              {settingsByKeys(['auto_block_new_devices','auto_block_vuln_severity']).map(s => (
+                <SettingRow key={s.key} s={s} dirty={dirty} onchange={handleChange} />
+              ))}
+
               {/* ── Here Be Dragons ─────────────────────────────────────── */}
               <button
                 type="button"
@@ -446,7 +509,7 @@ export function SettingsPanel({ onClose, onSettingChange }) {
                   </div>
 
                   <p className="text-xs font-semibold" style={{ color: 'var(--color-text-muted)', paddingTop: '4px' }}>Advanced Scanning</p>
-                  {settingsByKeys(['sniffer_workers','arp_scan_retry']).map(s => (
+                  {settingsByKeys(['sniffer_workers','arp_scan_retry','primary_ip_mode']).map(s => (
                     <SettingRow key={s.key} s={s} dirty={dirty} onchange={handleChange} />
                   ))}
 
@@ -661,12 +724,26 @@ export function SettingsPanel({ onClose, onSettingChange }) {
               <SectionHeader label="Container Hosts" Icon={Box} />
               <HostsManager />
 
+              <SectionHeader label="Vulnerability Scanning" Icon={AlertTriangle} />
+              {settingsByKeys(['trivy_db_update_hours','docker_scan_on_new','docker_scan_on_update']).map(s => (
+                <SettingRow key={s.key} s={s} dirty={dirty} onchange={handleChange} />
+              ))}
             </>
           )}
 
           {/* ── Data tab ────────────────────────────────────────────────────── */}
           {activeTab === 'data' && (
             <>
+              <SectionHeader label="Traffic Monitoring" Icon={Eye} />
+              {settingsByKeys(['traffic_enabled','traffic_max_sessions','traffic_retention_days']).map(s => (
+                <SettingRow key={s.key} s={s} dirty={dirty} onchange={handleChange} />
+              ))}
+
+              <SectionHeader label="Speed Tests" Icon={Globe} />
+              {settingsByKeys(['speedtest_schedule']).map(s => (
+                <SettingRow key={s.key} s={s} dirty={dirty} onchange={handleChange} />
+              ))}
+
               <SectionHeader label="Database Backup & Restore" Icon={Database} />
               <div className="card p-4 space-y-3">
                 <p className="text-xs" style={{ color: 'var(--color-text-faint)' }}>
