@@ -466,22 +466,25 @@ export function SettingsPanel({ onClose, onSettingChange }) {
               ))}
 
               {/* Vulnerability Scanning */}
-              <SectionHeader label="Vulnerability Scanning" Icon={AlertTriangle} />
-              {settingsByKeys(['vuln_scan_schedule','vuln_scan_targets','vuln_scan_templates','nuclei_template_update_interval','vuln_scan_on_new_device','vuln_scan_on_port_change']).map(s => (
-                <SettingRow key={s.key} s={s} dirty={dirty} onchange={handleChange} />
-              ))}
+              <CollapsibleSection label="Vulnerability Scanning" Icon={AlertTriangle} defaultOpen={false}>
+                {settingsByKeys(['vuln_scan_schedule','vuln_scan_targets','vuln_scan_templates','nuclei_template_update_interval','vuln_scan_on_new_device','vuln_scan_on_port_change']).map(s => (
+                  <SettingRow key={s.key} s={s} dirty={dirty} onchange={handleChange} />
+                ))}
+              </CollapsibleSection>
 
               {/* Scan Scheduling */}
-              <SectionHeader label="Scan Scheduling" Icon={ScanLine} />
-              {settingsByKeys(['nightly_scan_start','nightly_scan_end','offline_rescan_hours','baseline_scan_count_threshold']).map(s => (
-                <SettingRow key={s.key} s={s} dirty={dirty} onchange={handleChange} />
-              ))}
+              <CollapsibleSection label="Scan Scheduling" Icon={ScanLine} defaultOpen={false}>
+                {settingsByKeys(['nightly_scan_start','nightly_scan_end','offline_rescan_hours','baseline_scan_count_threshold']).map(s => (
+                  <SettingRow key={s.key} s={s} dirty={dirty} onchange={handleChange} />
+                ))}
+              </CollapsibleSection>
 
               {/* Security Responses */}
-              <SectionHeader label="Security Responses" Icon={AlertTriangle} />
-              {settingsByKeys(['auto_block_new_devices','auto_block_vuln_severity']).map(s => (
-                <SettingRow key={s.key} s={s} dirty={dirty} onchange={handleChange} />
-              ))}
+              <CollapsibleSection label="Security Responses" Icon={AlertTriangle} defaultOpen={false}>
+                {settingsByKeys(['auto_block_new_devices','auto_block_vuln_severity']).map(s => (
+                  <SettingRow key={s.key} s={s} dirty={dirty} onchange={handleChange} />
+                ))}
+              </CollapsibleSection>
 
               {/* ── Here Be Dragons ─────────────────────────────────────── */}
               <button
@@ -724,25 +727,28 @@ export function SettingsPanel({ onClose, onSettingChange }) {
               <SectionHeader label="Container Hosts" Icon={Box} />
               <HostsManager />
 
-              <SectionHeader label="Vulnerability Scanning" Icon={AlertTriangle} />
-              {settingsByKeys(['trivy_db_update_hours','docker_scan_on_new','docker_scan_on_update']).map(s => (
-                <SettingRow key={s.key} s={s} dirty={dirty} onchange={handleChange} />
-              ))}
+              <CollapsibleSection label="Vulnerability Scanning" Icon={AlertTriangle} defaultOpen={false}>
+                {settingsByKeys(['trivy_db_update_hours','docker_scan_on_new','docker_scan_on_update']).map(s => (
+                  <SettingRow key={s.key} s={s} dirty={dirty} onchange={handleChange} />
+                ))}
+              </CollapsibleSection>
             </>
           )}
 
           {/* ── Data tab ────────────────────────────────────────────────────── */}
           {activeTab === 'data' && (
             <>
-              <SectionHeader label="Traffic Monitoring" Icon={Eye} />
-              {settingsByKeys(['traffic_enabled','traffic_max_sessions','traffic_retention_days']).map(s => (
-                <SettingRow key={s.key} s={s} dirty={dirty} onchange={handleChange} />
-              ))}
+              <CollapsibleSection label="Traffic Monitoring" Icon={Eye} defaultOpen={false}>
+                {settingsByKeys(['traffic_enabled','traffic_max_sessions','traffic_retention_days']).map(s => (
+                  <SettingRow key={s.key} s={s} dirty={dirty} onchange={handleChange} />
+                ))}
+              </CollapsibleSection>
 
-              <SectionHeader label="Speed Tests" Icon={Globe} />
-              {settingsByKeys(['speedtest_schedule']).map(s => (
-                <SettingRow key={s.key} s={s} dirty={dirty} onchange={handleChange} />
-              ))}
+              <CollapsibleSection label="Speed Tests" Icon={Globe} defaultOpen={false}>
+                {settingsByKeys(['speedtest_schedule']).map(s => (
+                  <SettingRow key={s.key} s={s} dirty={dirty} onchange={handleChange} />
+                ))}
+              </CollapsibleSection>
 
               <SectionHeader label="Database Backup & Restore" Icon={Database} />
               <div className="card p-4 space-y-3">
@@ -957,6 +963,22 @@ function SectionHeader({ label, Icon }) {
     <div className="flex items-center gap-2 pt-1">
       {Icon && <Icon size={13} style={{ color: 'var(--color-text-muted)' }} />}
       <h3 className="text-sm font-semibold" style={{ color: 'var(--color-text)' }}>{label}</h3>
+    </div>
+  )
+}
+
+function CollapsibleSection({ label, Icon, defaultOpen = true, children }) {
+  const [open, setOpen] = useState(defaultOpen)
+  return (
+    <div>
+      <button type="button" onClick={() => setOpen(o => !o)}
+        className="w-full flex items-center gap-2 pt-1 pb-0.5 text-left group">
+        {open ? <ChevronDown size={12} style={{ color: 'var(--color-text-muted)' }} />
+               : <ChevronRight size={12} style={{ color: 'var(--color-text-muted)' }} />}
+        {Icon && <Icon size={13} style={{ color: 'var(--color-text-muted)' }} />}
+        <h3 className="text-sm font-semibold" style={{ color: 'var(--color-text)' }}>{label}</h3>
+      </button>
+      {open && <div className="space-y-2 pt-1">{children}</div>}
     </div>
   )
 }

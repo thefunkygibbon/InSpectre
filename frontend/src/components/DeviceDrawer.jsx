@@ -788,7 +788,7 @@ export function DeviceDrawer({ device, onClose, onRename, onResolveName, onRefre
                   const dhcpConf  = localDevice.scan_results?.device_type_source === 'dhcp' ? localDevice.scan_results.device_type_conf : null
                   if (!hasDhcp) return (
                     <p className="text-xs italic leading-relaxed" style={{ color: 'var(--color-text-faint)' }}>
-                      No DHCP packet seen yet. To capture one, trigger a full DHCP discovery cycle — not just a renewal (renewals are unicast and won't reach the probe). Disconnect and reconnect the device to the network, or on Windows run <code className="font-mono">ipconfig /release</code> then <code className="font-mono">/renew</code>; on Linux <code className="font-mono">sudo dhclient -r && sudo dhclient</code>.
+                      No DHCP packet seen yet. Disconnect and reconnect the device, or force a full DHCP cycle: Windows — <code className="font-mono">ipconfig /release</code> then <code className="font-mono">/renew</code>; Linux — <code className="font-mono">sudo dhclient -r && sudo dhclient</code>. Mid-lease background renewals are unicast and bypass the probe.
                     </p>
                   )
                   return (
