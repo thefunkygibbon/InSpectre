@@ -69,12 +69,15 @@ InSpectre is a self-hosted home network monitor and security scanner that automa
 
 ### Fingerprinting & Identity
 - **OUI lookup** — MAC vendor resolution from the IEEE OUI database
+- **DHCP passive capture** — the probe passively captures DHCP packets to collect hostname (Option 12), vendor class ID (Option 60), and parameter request list (Option 55) from every device that broadcasts a lease request
+- **Local DHCP classification** — collected DHCP data is matched against known vendor class patterns to infer device type and OS without sending data anywhere
+- **Fingerbank cloud lookup** — optionally send DHCP fingerprint data to [Fingerbank](https://fingerbank.org/) (free tier, 600 lookups/hour) for deeper device identification; results include device name, hierarchy, and a confidence score
 - **Port pattern matching** — classify device type from open port signature
 - **Manual + community + auto fingerprints** — all stored locally, importable/exportable
 
 ### Authentication & Setup
 - **Built-in authentication** — username and password login with JWT session tokens
-- **First-run setup wizard** — guided configuration of network settings, vulnerability scanning, notifications, and container hosts on first launch
+- **First-run setup wizard** — guided 7-step configuration of network settings, vulnerability scanning, notifications, container hosts, and Fingerbank device identification on first launch
 - **Backup/restore** — full JSON backup of all data, restorable from within the setup wizard or settings
 
 ---

@@ -24,6 +24,7 @@
    - 3.9 [Watched Devices](#39-watched-devices)
    - 3.10 [Ignoring Devices](#310-ignoring-devices)
    - 3.11 [Zones](#311-zones)
+   - 3.12 [DHCP Fingerprinting & Fingerbank](#312-dhcp-fingerprinting--fingerbank)
 4. [Network Scanning](#4-network-scanning)
    - 4.1 [Port Scanning](#41-port-scanning)
    - 4.2 [OS Detection](#42-os-detection)
@@ -147,7 +148,7 @@ InSpectre has built-in username and password authentication.
 
 **Setup Wizard (first run):**
 
-On first launch, the setup wizard guides you through six steps:
+On first launch, the setup wizard guides you through seven steps:
 
 | Step | What you configure |
 |---|---|
@@ -156,6 +157,7 @@ On first launch, the setup wizard guides you through six steps:
 | **Vuln Scans** | Whether to enable scheduled vulnerability scanning and the scan interval |
 | **Notifications** | Toast/browser notifications and any push notification provider (ntfy, Gotify, Pushbullet, webhook) |
 | **Container Monitoring** | Optional: add a Docker or Proxmox VE host for container visibility |
+| **Device Identification** | Optional: enter a [Fingerbank](https://fingerbank.org/) API key for cloud-based DHCP device identification (free account, 600 lookups/hour) |
 | **Done** | Completes setup and goes to the dashboard |
 
 You can also choose **Restore from backup** at the start of the wizard to import a previous InSpectre JSON backup — this restores all devices, settings, and credentials without going through manual configuration.
@@ -200,6 +202,7 @@ For each discovered device, the probe attempts to resolve a hostname using:
 1. **Reverse DNS** — PTR lookup against the configured `LAN_DNS_SERVER`
 2. **mDNS / Bonjour** — `.local` name resolution for Apple and other mDNS-advertising devices
 3. **NetBIOS** — Windows machine names broadcast over the local network
+4. **DHCP Option 12** — the hostname a device self-reports in its DHCP lease request; this replaces IP-derived placeholder names (such as `192-168-0-15.lan`) whenever a better name arrives
 
 The best available name is stored in the `hostname` field. If none is found, the field is left blank and only the IP and MAC are shown.
 
@@ -243,11 +246,12 @@ Switch views using the grid/list/category icons in the top toolbar. Your prefere
 | Not scanned | Have never had a port scan completed |
 | Vulnerable | Have at least one vulnerability finding |
 | Vuln scanned | Have had a vulnerability scan completed |
-| Not vuln scanned | Have never had a vulnerability scan |
 | Blocked | Are currently blocked from the internet |
 | Has notes | Have a non-empty notes field |
 | Tagged | Have at least one tag assigned |
 | Ignored | Are flagged as ignored (hidden by default — enable this filter to see them) |
+| New (14d) | Were first seen within the last 14 days |
+| DHCP seen | Have broadcast a DHCP packet that the probe captured |
 
 **Saved views** — While one or more filters are active, a **Save View** button appears. Click it to name and save the current filter combination. Saved views appear in the filter bar for instant recall.
 
@@ -261,11 +265,12 @@ It shows:
 - **Vulnerability severity badge** — highest severity across all current findings (Critical, High, Medium, Low, or Clean)
 - **IP address** — current IP, with copy button
 - **MAC address** — with copy button
-- **Vendor** — resolved from OUI database; shows override if set
+- **Vendor** — resolved from OUI database; falls back to Fingerbank parent hierarchy when no OUI entry exists; shows override if set
 - **Hostname** — resolved name, or blank
 - **Operating system** — from nmap OS detection, if available
 - **Open ports** — list of open TCP ports with service names and version info where known
 - **Last seen / First seen** timestamps
+- **DHCP Fingerprint** — a collapsible section (shown when DHCP data has been collected) displaying the device's self-reported hostname, vendor class ID, DHCP option list, and any Fingerbank cloud identification result; see [Section 3.12](#312-dhcp-fingerprinting--fingerbank)
 
 ### 3.4 Device Drawer — Actions Tab
 
@@ -368,6 +373,48 @@ Zones are named network segments or logical groupings (e.g., "IoT VLAN", "Guest 
 
 Zones currently serve as an organisational label and filter dimension. They appear in search results and can be used in saved views.
 
+### 3.12 DHCP Fingerprinting & Fingerbank
+
+Every time a device renews its IP lease it broadcasts a DHCP packet that the probe captures passively (no extra traffic generated). Three fields are extracted:
+
+| Field | DHCP Option | Example |
+|---|---|---|
+| **Hostname** | Option 12 | `OnePlus-15` |
+| **Vendor class ID** | Option 60 | `dhcpcd-9.4.1:Linux-6.6` |
+| **Option 55 list** | Option 55 | `1,3,6,15,26,28,51,58,59,43` |
+
+**How it is used:**
+
+1. **Hostname promotion** — if the device's current hostname is an IP-derived placeholder (e.g., `192-168-0-15.lan`), the DHCP hostname replaces it automatically.
+2. **Local classification** — the vendor class ID and option 55 list are matched against known patterns to infer the device type (e.g., `android-dhcp-13` → Phone) before any cloud lookup is made.
+3. **Fingerbank lookup** — if a Fingerbank API key is configured, the probe's background loop sends the DHCP data to the [Fingerbank](https://fingerbank.org/) cloud database (free, 600 lookups/hour). Each device is queried **once** automatically; after a successful result or a permanent "no match" response, the device is never re-queried unless you click **Re-fetch** in the drawer.
+
+**DHCP Fingerprint panel (in the device drawer Overview tab):**
+
+- Shown only when at least one DHCP field has been collected.
+- Displays hostname, vendor class, and option 55 list.
+- If Fingerbank returned a result, shows the **device name**, **parent hierarchy** (e.g., `OnePlus Android › Android › Mobile`), **mapped device type**, and a **confidence score** (colour-coded: green ≥ 70, amber ≥ 40, red < 40).
+- A **Re-fetch** button triggers an immediate new lookup against Fingerbank regardless of prior status.
+
+**Status messages when no Fingerbank result is shown:**
+
+| Message | Meaning |
+|---|---|
+| *Fingerbank lookup pending — will run automatically within a minute.* | The background loop has not yet processed this device. |
+| *No match found in Fingerbank database.* | Fingerbank has no entry for this device; the device will not be automatically re-queried. |
+| *API key rejected — check Settings → Scanner → Device Identification.* | The configured API key was rejected (401). |
+| *Lookup failed: [message]* | A transient error occurred; the loop will retry on the next cycle. |
+
+**No DHCP data yet?**
+
+DHCP packets are only captured when the device actively requests or renews its lease. If a device obtained its lease before InSpectre was started, no DHCP data will be present until the lease expires or you force a renewal. The panel shows a hint with the relevant commands:
+- **Windows:** `ipconfig /release` then `ipconfig /renew`
+- **Linux:** `sudo dhclient -r && sudo dhclient`
+
+**Configuring Fingerbank:**
+
+Enter your API key in **Settings → Scanner → Device Identification → Fingerbank API Key**. Register for a free account at [fingerbank.org](https://fingerbank.org/).
+
 ---
 
 ## 4. Network Scanning
@@ -395,7 +442,7 @@ OS detection accuracy varies and is sometimes wrong, especially for IoT devices 
 
 ### 4.3 Service Fingerprinting
 
-InSpectre uses **Nerva** service fingerprinting on top of nmap's `-sV` (version detection) results to match open ports and detected services against known product signatures.
+InSpectre combines nmap's `-sV` (service version detection) results with a local fingerprint database to match open ports and detected services against known product signatures.
 
 Fingerprints are stored in the local `fingerprints` table with three source types:
 
@@ -744,6 +791,7 @@ Access settings via the gear icon in the main navigation bar. Settings are organ
 | **Baseline Confirmation** | When enabled, port changes require manual confirmation before the new port set becomes the baseline. When disabled, baselines update automatically after each scan. |
 | **Auto-scan new devices** | When enabled, a vulnerability scan is triggered automatically the first time a new device is discovered. |
 | **Nuclei Template Update Interval** | How often Nuclei templates are refreshed from the upstream template repository, in hours. Default: 24. |
+| **Fingerbank API Key** | Free API key from [fingerbank.org](https://fingerbank.org/). When set, DHCP fingerprint data is sent to Fingerbank for cloud device identification. Leave blank to disable. Results appear in the DHCP Fingerprint section of each device drawer. |
 
 ### 10.2 Notification Settings
 
@@ -1102,6 +1150,22 @@ The **Container Vulnerabilities** section at the bottom of the dashboard shows:
 
 - `./inspectre.sh rebuild` deletes `postgres_data/` and is intentionally destructive. Use `./inspectre.sh rebuild keep-data` to preserve the database, or take a JSON backup first via **Settings → Data → Backup database**.
 
+**Fingerbank shows "API key rejected"**
+
+- Verify the key in **Settings → Scanner → Device Identification → Fingerbank API Key** matches the key shown at [fingerbank.org](https://fingerbank.org/) under your account settings.
+- Keys are case-sensitive. Copy-paste rather than typing by hand.
+
+**DHCP Fingerprint section shows "No DHCP packet seen yet"**
+
+- The probe only captures DHCP packets that are broadcast on the LAN. Unicast renewals mid-lease are not captured. Force a full DHCP cycle to generate a broadcast: Windows — `ipconfig /release` then `ipconfig /renew`; Linux — `sudo dhclient -r && sudo dhclient`.
+- Ensure the probe is running on the same Layer 2 segment as the device.
+
+**Fingerbank lookup is stuck as "pending" for a long time**
+
+- The background loop runs every 60 seconds. Check the backend logs for `[fingerbank]` lines: `docker compose logs backend | grep fingerbank`.
+- If no API key is configured, lookups never run. Add a key in **Settings → Scanner → Device Identification**.
+- If the API key is valid but lookups still don't appear, check whether the backend container can reach the internet: `docker compose exec backend curl -s https://api.fingerbank.org/` should return JSON.
+
 **The Containers page shows "No container hosts configured"**
 
 - Go to **Settings → Docker → Container Hosts** and add at least one host.
@@ -1129,11 +1193,12 @@ The **Container Vulnerabilities** section at the bottom of the dashboard shows:
 
 **Q: Does InSpectre send any data to the cloud?**
 
-No. All scanning, storage, and processing happens entirely within your local network and on your own hardware. The only outbound connections InSpectre makes are:
+All scanning, storage, and processing happens within your local network and on your own hardware. The only outbound connections InSpectre makes are:
 - Nuclei template updates (downloads from GitHub)
 - Trivy vulnerability database updates (downloads from GitHub/ghcr.io, on a configurable interval)
 - Notification payloads to external services you explicitly configure (Pushbullet, ntfy.sh, Gotify cloud, webhooks)
 - Speed test measurements (to speedtest-cli servers, only when you click the speed test button)
+- **Fingerbank lookups** — DHCP fingerprint data (option 55 list, vendor class, hostname, and MAC) is sent to [fingerbank.org](https://fingerbank.org/) only if you configure an API key. Disable by leaving the key blank.
 
 **Q: Will scanning damage or disrupt my devices?**
 
@@ -1173,12 +1238,13 @@ git pull
 
 This pulls the latest code and rebuilds the containers while preserving your database.
 
-**Q: Can I add authentication to the web UI?**
+**Q: Is the web UI protected by authentication?**
 
-InSpectre does not include built-in authentication. Recommended approaches:
-- Run it on a machine that is not accessible from outside your LAN (the typical home setup).
-- Place it behind a reverse proxy (nginx, Caddy, Traefik) with HTTP Basic Auth or SSO.
-- Use a VPN to restrict access to the host.
+Yes. InSpectre has built-in username and password authentication using JWT session tokens. You create your admin account during the first-run setup wizard. After that, every visit requires login.
+
+For additional network-level protection (e.g., if you want to expose InSpectre beyond your LAN):
+- Place it behind a reverse proxy (nginx, Caddy, Traefik) with HTTPS.
+- Use a VPN to restrict access to the host rather than exposing port 3000 directly.
 
 **Q: Where are the logs?**
 
