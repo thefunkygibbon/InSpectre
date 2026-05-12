@@ -17,14 +17,16 @@ from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
-from scapy.all import ARP, Ether, IP, TCP, sniff, sr, srp, sendp
+from scapy.all import ARP, BOOTP, DHCP, Ether, IP, TCP, UDP, sniff, sr, srp, sendp
 from sqlalchemy import (
     Boolean, Column, DateTime, Integer, JSON, String, UniqueConstraint,
     cast, create_engine, text,
 )
 from sqlalchemy.dialects.postgresql import JSONB, insert as pg_insert
 from sqlalchemy.orm import declarative_base, sessionmaker
+from sqlalchemy.orm.attributes import flag_modified
 import traffic_monitor as _tm
+import dhcp_classify as _dhcp_cls
 
 # ---------------------------------------------------------------------------
 # Version
@@ -342,6 +344,9 @@ class Device(Base):
     baseline_ports          = Column(JSONB,   nullable=True)
     baseline_scan_count     = Column(Integer, default=0, nullable=False)
     primary_ip_locked       = Column(Boolean, default=False, nullable=False)
+    dhcp_hostname           = Column(String,  nullable=True)
+    dhcp_vendor_class       = Column(String,  nullable=True)
+    dhcp_fingerprint        = Column(String,  nullable=True)
 
 class IPHistory(Base):
     __tablename__ = "ip_history"
@@ -357,6 +362,7 @@ engine  = create_engine(DATABASE_URL, pool_pre_ping=True)
 Session = sessionmaker(bind=engine)
 
 _sniffer_queue: queue.Queue = queue.Queue()
+_dhcp_queue:    queue.Queue = queue.Queue(maxsize=500)
 _upsert_locks: dict[str, threading.Lock] = {}
 _upsert_locks_lock = threading.Lock()
 
@@ -1253,6 +1259,18 @@ def upsert_seen_device(mac: str, ip: str, source: str) -> None:
             was_online = None if is_new else existing.is_online
             ip_changed = (not is_new) and (old_ip != ip)
 
+            # Guard against macvlan/proxy-ARP artifacts: if this IP is already the
+            # primary IP of a *different* device, skip rather than polluting that
+            # device's record with a spurious secondary-IP association.
+            if not is_new and ip_changed:
+                owner = session.execute(
+                    text("SELECT mac_address FROM devices WHERE primary_ip = :ip AND mac_address != :mac"),
+                    {"ip": ip, "mac": mac},
+                ).fetchone()
+                if owner:
+                    print(f"[upsert] Skipping IP {ip} for {mac} — already primary IP of {owner[0]}", flush=True)
+                    return
+
             # Track how long device was offline (used after commit to decide rescan)
             offline_duration_s = 0.0
             if not is_new and not was_online and existing.last_seen:
@@ -1575,11 +1593,141 @@ def _sniffer_worker() -> None:
         except Exception as e:
             print(f"[sniffer-worker] {e}", flush=True)
 
+
+# ---------------------------------------------------------------------------
+# DHCP fingerprinting (passive — zero extra network traffic)
+# ---------------------------------------------------------------------------
+def process_dhcp_packet(packet) -> None:
+    """Extract DHCP Options 12/55/60 from client broadcasts and queue for DB write."""
+    if not ENABLE_PASSIVE_SNIFFER:
+        return
+    if not packet.haslayer(BOOTP) or not packet.haslayer(DHCP):
+        return
+    bootp = packet[BOOTP]
+    if bootp.op != 1:
+        return  # only client requests (op=1); ignore server replies
+
+    # MAC from BOOTP hardware address field (more reliable than Ethernet src)
+    mac_bytes = bytes(bootp.chaddr)[:6]
+    mac = ':'.join(f'{b:02x}' for b in mac_bytes)
+    if not mac or mac == '00:00:00:00:00:00' or mac == 'ff:ff:ff:ff:ff:ff':
+        return
+
+    opts: dict = {}
+    for opt in packet[DHCP].options:
+        if isinstance(opt, tuple) and len(opt) == 2:
+            opts[opt[0]] = opt[1]
+
+    msg_type = opts.get('message-type', 0)
+    if msg_type not in (1, 3):  # Discover or Request only
+        return
+
+    def _decode(v) -> str | None:
+        if v is None:
+            return None
+        if isinstance(v, bytes):
+            return v.decode('utf-8', errors='replace').strip() or None
+        return str(v).strip() or None
+
+    hostname     = _decode(opts.get('hostname'))
+    vendor_class = _decode(opts.get('vendor_class_id'))
+
+    raw_pl = opts.get('param_req_list')
+    if isinstance(raw_pl, bytes):
+        opt55 = list(raw_pl)
+    elif isinstance(raw_pl, (list, tuple)):
+        opt55 = [int(x) for x in raw_pl]
+    else:
+        opt55 = []
+
+    print(f"[dhcp] {mac}  type={'Discover' if msg_type==1 else 'Request'}"
+          f"  vc={vendor_class!r}  host={hostname!r}  opt55_len={len(opt55)}", flush=True)
+    try:
+        _dhcp_queue.put_nowait((mac, hostname, vendor_class, opt55 if opt55 else None))
+    except queue.Full:
+        pass
+
+
+def _upsert_dhcp_info(mac: str, hostname: str | None, vendor_class: str | None, opt55: list[int] | None) -> None:
+    """Write DHCP fingerprint data to the device row and optionally refine device_type."""
+    fingerprint_str = ','.join(str(x) for x in opt55) if opt55 else None
+    dtype, conf = _dhcp_cls.classify_from_dhcp(vendor_class, opt55)
+
+    session = Session()
+    try:
+        device = session.get(Device, mac)
+        if device is None:
+            return  # device not seen by ARP yet; skip (no orphan rows)
+
+        changed = False
+
+        if hostname and not device.dhcp_hostname:
+            device.dhcp_hostname = hostname
+            # Also fill in DNS hostname if still missing
+            if not device.hostname:
+                device.hostname = hostname
+            changed = True
+
+        if vendor_class and device.dhcp_vendor_class != vendor_class:
+            device.dhcp_vendor_class = vendor_class
+            changed = True
+
+        if fingerprint_str and device.dhcp_fingerprint != fingerprint_str:
+            device.dhcp_fingerprint = fingerprint_str
+            changed = True
+
+        # Apply DHCP-inferred type only if no user override and confidence is sufficient
+        if dtype != "unknown" and conf >= 0.75 and not device.device_type_override:
+            # Don't overwrite an already-correct inference stored in scan_results
+            current_sr_type = (device.scan_results or {}).get("device_type")
+            if current_sr_type != dtype:
+                sr = dict(device.scan_results or {})
+                sr["device_type"]        = dtype
+                sr["device_type_source"] = "dhcp"
+                sr["device_type_conf"]   = conf
+                device.scan_results = sr
+                flag_modified(device, "scan_results")
+                changed = True
+
+        if changed:
+            session.commit()
+            dtype_msg = f"  → type={dtype}({conf:.0%})" if dtype != "unknown" else ""
+            print(f"[dhcp] saved {mac}  vc={vendor_class!r}  host={hostname!r}{dtype_msg}", flush=True)
+    except Exception as exc:
+        session.rollback()
+        print(f"[dhcp-worker] DB error for {mac}: {exc}", flush=True)
+    finally:
+        session.close()
+
+
+def _dhcp_worker() -> None:
+    while True:
+        try:
+            mac, hostname, vendor_class, opt55 = _dhcp_queue.get(timeout=1)
+            _upsert_dhcp_info(mac, hostname, vendor_class, opt55)
+            _dhcp_queue.task_done()
+        except queue.Empty:
+            continue
+        except Exception as exc:
+            print(f"[dhcp-worker] {exc}", flush=True)
+
+
+def _dispatch_packet(packet) -> None:
+    """Route captured packets to ARP or DHCP handler."""
+    if packet.haslayer(ARP):
+        process_arp_packet(packet)
+    elif packet.haslayer(DHCP):
+        process_dhcp_packet(packet)
+
+
 def start_arp_sniffer() -> None:
     for i in range(SNIFFER_WORKERS):
         threading.Thread(target=_sniffer_worker, name=f"sniffer-worker-{i}", daemon=True).start()
-    print(f"[*] Passive ARP sniffer on {INTERFACE} ({SNIFFER_WORKERS} workers)", flush=True)
-    sniff(iface=INTERFACE, filter="arp", store=False, prn=process_arp_packet)
+    # One DHCP worker is plenty — DHCP traffic is very infrequent
+    threading.Thread(target=_dhcp_worker, name="dhcp-worker", daemon=True).start()
+    print(f"[*] Passive ARP+DHCP sniffer on {INTERFACE} ({SNIFFER_WORKERS} ARP workers)", flush=True)
+    sniff(iface=INTERFACE, filter="arp or (udp and (port 67 or port 68))",
+          store=False, prn=_dispatch_packet)
 
 # ---------------------------------------------------------------------------
 # Presence sweep

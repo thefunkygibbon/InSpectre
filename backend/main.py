@@ -241,6 +241,10 @@ def _migrate(db: Session):
         "ALTER TABLE ip_history ADD COLUMN IF NOT EXISTS seen_while_online BOOLEAN",
         # Prevent probe from overriding user-pinned primary IPs
         "ALTER TABLE devices ADD COLUMN IF NOT EXISTS primary_ip_locked BOOLEAN NOT NULL DEFAULT FALSE",
+        # DHCP fingerprinting — passively captured by probe sniffer
+        "ALTER TABLE devices ADD COLUMN IF NOT EXISTS dhcp_hostname     VARCHAR",
+        "ALTER TABLE devices ADD COLUMN IF NOT EXISTS dhcp_vendor_class VARCHAR",
+        "ALTER TABLE devices ADD COLUMN IF NOT EXISTS dhcp_fingerprint  VARCHAR",
     ]
     for sql in migrations:
         try:
@@ -1183,6 +1187,8 @@ def _identity_score(d: Device) -> dict:
         score += 15; reasons.append("ports_identified")
     if scan.get("os_matches"):
         score += 15; reasons.append("os_identified")
+    if getattr(d, 'dhcp_vendor_class', None) or getattr(d, 'dhcp_fingerprint', None):
+        score += 10; reasons.append("dhcp_fingerprinted")
     return {"score": min(score, 100), "reasons": reasons}
 
 
@@ -1229,6 +1235,10 @@ def _infer_device_type(d: Device) -> str | None:
         return "computer"
     if "linux" in os_guess and {22} & ports and len(ports) > 3:
         return "server"
+    # Fall back to DHCP-inferred type (written by probe sniffer)
+    dhcp_type = scan.get("device_type")
+    if dhcp_type and scan.get("device_type_source") == "dhcp":
+        return dhcp_type
     return None
 
 
@@ -1274,6 +1284,9 @@ def _to_dict(d: Device) -> dict:
         "zone":                  getattr(d, 'zone', None),
         "is_ignored":            bool(getattr(d, 'is_ignored', False)),
         "primary_ip_locked":     bool(getattr(d, 'primary_ip_locked', False)),
+        "dhcp_hostname":         getattr(d, 'dhcp_hostname', None),
+        "dhcp_vendor_class":     getattr(d, 'dhcp_vendor_class', None),
+        "dhcp_fingerprint":      getattr(d, 'dhcp_fingerprint', None),
         # Populated by list_devices; single-device endpoints return defaults
         "is_virtual_interface":  False,
         "virtual_of":            None,

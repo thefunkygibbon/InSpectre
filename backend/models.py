@@ -53,6 +53,11 @@ class Device(Base):
     # When True, probe never overwrites primary_ip (user has pinned it)
     primary_ip_locked       = Column(Boolean, server_default='false', nullable=False)
 
+    # DHCP fingerprinting (populated passively by probe sniffer)
+    dhcp_hostname           = Column(String, nullable=True)
+    dhcp_vendor_class       = Column(String, nullable=True)
+    dhcp_fingerprint        = Column(String, nullable=True)
+
     ip_history   = relationship("IPHistory",    back_populates="device",
                                 order_by="IPHistory.first_seen.desc()")
     events       = relationship("DeviceEvent",  back_populates="device",

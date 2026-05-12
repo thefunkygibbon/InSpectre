@@ -650,6 +650,13 @@ function MainApp({ onLogout }) {
                     style={{ color: 'var(--color-text-muted)' }} />
                   <input className="input pl-9 w-full" placeholder="Search…"
                     value={search} onChange={e => setSearch(e.target.value)} />
+                  {search && (
+                    <button onClick={() => setSearch('')}
+                      className="absolute right-2 top-1/2 -translate-y-1/2 rounded p-0.5 transition-colors hover:opacity-70"
+                      style={{ color: 'var(--color-text-muted)' }} aria-label="Clear search">
+                      <X size={13} />
+                    </button>
+                  )}
                 </div>
 
                 {/* Filters toggle */}

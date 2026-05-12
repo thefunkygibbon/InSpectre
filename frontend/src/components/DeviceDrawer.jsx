@@ -780,6 +780,32 @@ export function DeviceDrawer({ device, onClose, onRename, onResolveName, onRefre
                 <MdnsRow mac={mac} scan={scan} onRefreshed={updated => setLocalDevice(prev => ({ ...prev, scan_results: { ...(prev.scan_results || {}), mdns_services: updated } }))} />
               </Collapsible>
 
+              {/* DHCP Fingerprinting */}
+              <Collapsible title="DHCP Fingerprint" icon={Radio} defaultOpen={false}>
+                {(() => {
+                  const hasDhcp = localDevice.dhcp_hostname || localDevice.dhcp_vendor_class || localDevice.dhcp_fingerprint
+                  const dhcpType  = localDevice.scan_results?.device_type_source === 'dhcp' ? localDevice.scan_results.device_type  : null
+                  const dhcpConf  = localDevice.scan_results?.device_type_source === 'dhcp' ? localDevice.scan_results.device_type_conf : null
+                  if (!hasDhcp) return (
+                    <p className="text-xs italic leading-relaxed" style={{ color: 'var(--color-text-faint)' }}>
+                      No DHCP packet seen yet. To capture one, trigger a full DHCP discovery cycle — not just a renewal (renewals are unicast and won't reach the probe). Disconnect and reconnect the device to the network, or on Windows run <code className="font-mono">ipconfig /release</code> then <code className="font-mono">/renew</code>; on Linux <code className="font-mono">sudo dhclient -r && sudo dhclient</code>.
+                    </p>
+                  )
+                  return (
+                    <>
+                      {localDevice.dhcp_hostname    && <Row label="DHCP hostname"  value={localDevice.dhcp_hostname} mono />}
+                      {localDevice.dhcp_vendor_class && <Row label="Vendor class"   value={localDevice.dhcp_vendor_class} mono />}
+                      {localDevice.dhcp_fingerprint  && <Row label="Option 55"      value={localDevice.dhcp_fingerprint} mono />}
+                      {dhcpType && (
+                        <Row label="Inferred type" value={
+                          <span>{dhcpType}{dhcpConf ? <span className="ml-1 text-[10px]" style={{ color: 'var(--color-text-faint)' }}>({Math.round(dhcpConf * 100)}% conf)</span> : null}</span>
+                        } />
+                      )}
+                    </>
+                  )
+                })()}
+              </Collapsible>
+
               {/* IP History */}
               <Collapsible title="IP History" icon={History} defaultOpen={false}>
                 <IpHistorySection

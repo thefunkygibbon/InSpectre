@@ -88,6 +88,13 @@ function baselineDrift(device) {
   return { newPorts, closedPorts }
 }
 
+const NEW_DEVICE_DAYS = 7
+
+function isNewDevice(device) {
+  if (!device.first_seen) return false
+  return Date.now() - new Date(device.first_seen).getTime() < NEW_DEVICE_DAYS * 24 * 60 * 60 * 1000
+}
+
 export function DeviceCard({ device, onClick, onStarToggle, isVulnScanning }) {
   const name     = deviceDisplayName(device)
   const vendor   = cleanVendor(device.vendor_override || device.vendor)
@@ -96,6 +103,7 @@ export function DeviceCard({ device, onClick, onStarToggle, isVulnScanning }) {
   const ports    = openPortCount(device)
   const scanning = !device.deep_scanned
   const drift    = baselineDrift(device)
+  const isNew    = isNewDevice(device)
 
 // Show vendor only when it adds info the title doesn't already give
   const showVendorSubtitle = vendor && vendor !== name && !device.ip_address?.startsWith(name)
@@ -130,6 +138,12 @@ export function DeviceCard({ device, onClick, onStarToggle, isVulnScanning }) {
           </div>
         </div>
         <div className="flex flex-col gap-1 items-end shrink-0">
+          {isNew && (
+            <span className="text-[10px] font-bold rounded-full px-2 py-0.5"
+              style={{ color: '#10b981', background: 'rgba(16,185,129,0.12)', border: '1px solid rgba(16,185,129,0.35)' }}>
+              NEW
+            </span>
+          )}
           {scanning && (
             <span className="text-[10px] font-medium text-amber-400 bg-amber-400/10
                              border border-amber-400/20 rounded-full px-2 py-0.5">

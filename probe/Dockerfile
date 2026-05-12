@@ -43,6 +43,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY main.py .
 COPY vuln_scanner.py .
 COPY traffic_monitor.py .
+COPY dhcp_classify.py .
 COPY mac-vendors-export.csv .
 
 # Download GeoLite2-Country database if MAXMIND_LICENSE_KEY is provided at build time.

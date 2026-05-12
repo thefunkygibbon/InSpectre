@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback, useMemo } from 'react'
-import { Box, RefreshCw, Search, AlertCircle, Play, Square, Loader2, LayoutGrid, List, ArrowUpDown, ShieldAlert, Network, GitBranch } from 'lucide-react'
+import { Box, RefreshCw, Search, AlertCircle, Play, Square, Loader2, LayoutGrid, List, ArrowUpDown, ShieldAlert, Network, GitBranch, X } from 'lucide-react'
 import { api } from '../api'
 import { ContainerCard } from './ContainerCard'
 import { ContainerDrawer } from './ContainerDrawer'
@@ -158,7 +158,7 @@ export function ContainersPage({ openContainer }) {
   const [selected,      setSelected]      = useState(null)
   const [search,        setSearch]        = useState('')
   const [filter,        setFilter]        = useState('all')
-  const [smartFilter,   setSmartFilter]   = useState(null)
+  const [smartFilters,  setSmartFilters]  = useState({})
   const [hostFilter,    setHostFilter]    = useState('all')
   const [sort,          setSort]          = useState('name-asc')
   const [layout,        setLayout]        = useState('grid')
@@ -244,9 +244,17 @@ export function ContainersPage({ openContainer }) {
     if (filter === 'stopped' && !STOPPED_STATES.includes(c.status)) return false
     if (filter === 'other' && !['paused', 'restarting'].includes(c.status)) return false
     if (filter !== 'all' && filter !== 'stopped' && filter !== 'other' && c.status !== filter) return false
-    if (smartFilter === 'vulnerable' && !vulnNameSet.has(c.name)) return false
-    if (smartFilter === 'host_net' && !(c.networks || []).includes('host')) return false
-    if (smartFilter === 'bridge_net' && !(c.networks || []).includes('bridge')) return false
+    const _sfMatch = {
+      vulnerable: () => vulnNameSet.has(c.name),
+      host_net:   () => (c.networks || []).includes('host'),
+      bridge_net: () => (c.networks || []).includes('bridge'),
+    }
+    for (const [key, mode] of Object.entries(smartFilters)) {
+      const fn = _sfMatch[key]
+      if (!fn) continue
+      if (mode === 'include' && !fn()) return false
+      if (mode === 'exclude' &&  fn()) return false
+    }
     if (search.trim()) {
       const q = search.toLowerCase()
       return c.name.toLowerCase().includes(q)
@@ -322,6 +330,13 @@ export function ContainersPage({ openContainer }) {
               style={{ color: 'var(--color-text-muted)' }} />
             <input className="input pl-9 w-full" placeholder="Search containers…"
               value={search} onChange={e => setSearch(e.target.value)} />
+            {search && (
+              <button onClick={() => setSearch('')}
+                className="absolute right-2 top-1/2 -translate-y-1/2 rounded p-0.5 transition-colors hover:opacity-70"
+                style={{ color: 'var(--color-text-muted)' }} aria-label="Clear search">
+                <X size={13} />
+              </button>
+            )}
           </div>
 
           <div className="flex items-center gap-1 flex-wrap">
@@ -337,23 +352,42 @@ export function ContainersPage({ openContainer }) {
             ))}
           </div>
 
-          {/* Smart filters */}
+          {/* Smart filters — click to cycle: off → include (green) → exclude (red) → off */}
           <div className="flex items-center gap-1 flex-wrap">
             {[
-              { key: 'vulnerable',  label: 'Vulnerable', icon: ShieldAlert },
-              { key: 'host_net',    label: 'Host Network', icon: Network },
+              { key: 'vulnerable',  label: 'Vulnerable',     icon: ShieldAlert },
+              { key: 'host_net',    label: 'Host Network',   icon: Network },
               { key: 'bridge_net',  label: 'Bridge Network', icon: GitBranch },
-            ].map(({ key, label, icon: Icon }) => (
-              <button key={key}
-                onClick={() => setSmartFilter(smartFilter === key ? null : key)}
-                className="flex items-center gap-1 px-3 py-1.5 rounded-xl text-xs font-medium border transition-colors"
-                style={smartFilter === key
-                  ? { background: 'var(--color-brand)', color: 'white', borderColor: 'transparent' }
-                  : { background: 'var(--color-surface-offset)', color: 'var(--color-text-muted)', borderColor: 'var(--color-border)' }}>
-                <Icon size={11} />
-                {label}
+            ].map(({ key, label, icon: Icon }) => {
+              const state = smartFilters[key] || null
+              const style = state === 'include'
+                ? { background: 'rgba(34,197,94,0.18)',  color: '#22c55e', borderColor: 'rgba(34,197,94,0.45)' }
+                : state === 'exclude'
+                  ? { background: 'rgba(239,68,68,0.15)', color: '#ef4444', borderColor: 'rgba(239,68,68,0.4)' }
+                  : { background: 'var(--color-surface-offset)', color: 'var(--color-text-muted)', borderColor: 'var(--color-border)' }
+              return (
+                <button key={key}
+                  onClick={() => setSmartFilters(prev => {
+                    const cur = prev[key]
+                    if (!cur)              return { ...prev, [key]: 'include' }
+                    if (cur === 'include') return { ...prev, [key]: 'exclude' }
+                    const next = { ...prev }; delete next[key]; return next
+                  })}
+                  title={state ? `${label}: ${state} — click to cycle` : `${label}: off — click to include`}
+                  className="flex items-center gap-1 px-3 py-1.5 rounded-xl text-xs font-medium border transition-colors"
+                  style={style}>
+                  <Icon size={11} />
+                  {label}{state && <span className="ml-0.5 opacity-70 text-[10px]">{state === 'include' ? '✓' : '✕'}</span>}
+                </button>
+              )
+            })}
+            {Object.keys(smartFilters).length > 0 && (
+              <button onClick={() => setSmartFilters({})}
+                className="px-2 py-1.5 rounded-xl text-xs border transition-colors"
+                style={{ color: 'var(--color-text-faint)', borderColor: 'var(--color-border)', background: 'transparent' }}>
+                Clear
               </button>
-            ))}
+            )}
           </div>
 
           {hostOptions.length > 1 && (
