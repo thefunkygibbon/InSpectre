@@ -245,6 +245,8 @@ def _migrate(db: Session):
         "ALTER TABLE devices ADD COLUMN IF NOT EXISTS dhcp_hostname     VARCHAR",
         "ALTER TABLE devices ADD COLUMN IF NOT EXISTS dhcp_vendor_class VARCHAR",
         "ALTER TABLE devices ADD COLUMN IF NOT EXISTS dhcp_fingerprint  VARCHAR",
+        # Fingerbank API identification result
+        "ALTER TABLE devices ADD COLUMN IF NOT EXISTS fingerbank_result JSONB",
     ]
     for sql in migrations:
         try:
@@ -305,6 +307,8 @@ DEFAULT_SETTINGS = {
     # Network / probe identity
     "dns_server":                ("",      "LAN DNS server IP (auto-detected if blank). Set this to your router's IP for best hostname resolution."),
     "probe_interface":           ("",      "Network interface the probe uses for scanning (e.g. eth0, eno1). Auto-detected on startup if blank; changes apply immediately via Settings → Apply."),
+    # Fingerbank device identification
+    "fingerbank_api_key":        ("",      "Fingerbank API key for cloud-based DHCP device identification. Get a free key at fingerbank.org. Leave blank to disable."),
     # Setup wizard
     "setup_complete":            ("false", "Whether the initial setup wizard has been completed."),
     # Docker monitoring
@@ -1007,6 +1011,205 @@ def _seed_default_user(db: Session) -> None:
         print(f"[startup] Could not seed default user: {e}", flush=True)
 
 
+# ---------------------------------------------------------------------------
+# Fingerbank device identification
+# ---------------------------------------------------------------------------
+_FB_URL = "https://api.fingerbank.org/api/v2/combinations/interrogate"
+
+_FB_TYPE_MAP: list[tuple[list[str], str]] = [
+    # Mobile — most specific first to avoid "android tv" matching android→phone
+    (["iphone"],                                                    "phone"),
+    (["ipad"],                                                      "tablet"),
+    (["android tablet", "galaxy tab", "kindle fire"],               "tablet"),
+    (["android", "mobile device", "smartphone"],                    "phone"),
+    # PCs
+    (["macbook", "imac", "mac mini", "mac pro"],                    "laptop"),
+    (["laptop", "notebook"],                                        "laptop"),
+    (["mac os", "macos", "os x"],                                   "laptop"),
+    (["windows", "microsoft windows"],                              "desktop"),
+    (["linux"],                                                     "desktop"),
+    # Network infrastructure
+    (["router", "gateway", "openwrt", "dd-wrt", "pfsense",
+      "opnsense", "mikrotik", "routeros", "firewall"],              "router"),
+    (["access point", "wireless ap", "wireless access point"],      "ap"),
+    (["network switch", "managed switch", "unmanaged switch",
+      "gigabit switch", "easy smart switch", "smart switch plus",
+      "poe switch"],                                                 "switch"),
+    # Streaming — before TV so "fire tv" etc match streamer not tv
+    (["roku", "fire tv", "firetv", "chromecast", "apple tv",
+      "streaming stick", "streaming device"],                       "streamer"),
+    # TVs
+    (["smart tv", "television", "android tv", "google tv",
+      "qled", "oled tv"],                                           "tv"),
+    # Consoles
+    (["playstation", "xbox", "nintendo", "game console",
+      "steam deck"],                                                 "console"),
+    # IoT — before camera/printer so order doesn't matter
+    (["raspberry pi"],                                              "iot"),
+    (["iot", "smart home", "internet of things", "thermostat",
+      "smart plug", "smart bulb", "smart light"],                   "iot"),
+    # Printers
+    (["printer", "network printer", "laser printer", "inkjet",
+      "all-in-one printer"],                                        "printer"),
+    # Cameras
+    (["ip camera", "security camera", "network camera", "nvr",
+      "cctv", "hikvision", "dahua", "reolink"],                    "camera"),
+    (["camera"],                                                    "camera"),
+    # VoIP
+    (["voip", "sip phone", "ip phone", "desk phone"],              "voip"),
+    # NAS / Server
+    (["nas", "network attached", "network storage",
+      "synology", "qnap", "truenas", "freenas"],                   "nas"),
+    (["server"],                                                    "server"),
+]
+
+
+def _fingerbank_to_type(device_name: str, parents: list[str]) -> str | None:
+    all_names = [device_name.lower()] + [p.lower() for p in parents]
+    for keywords, dtype in _FB_TYPE_MAP:
+        if any(kw in name for name in all_names for kw in keywords):
+            return dtype
+    return None
+
+
+async def _fingerbank_query(mac: str, dhcp_fingerprint: str | None, dhcp_vendor: str | None,
+                            dhcp_hostname: str | None, api_key: str) -> dict:
+    """
+    Call Fingerbank API. Returns a result dict always — includes an 'error' key on failure
+    so callers can surface the reason without swallowing it.
+    Sends whatever DHCP signals are available; at least one must be present.
+    """
+    body: dict = {}
+    if dhcp_fingerprint:
+        body["dhcp_fingerprint"] = dhcp_fingerprint
+    if dhcp_vendor:
+        body["dhcp_vendor"] = dhcp_vendor
+    if dhcp_hostname:
+        body["hostname"] = dhcp_hostname
+    body["mac"] = mac
+
+    if len(body) == 1:  # only mac — nothing useful to send
+        return {"error": "No DHCP data available to query", "queried_at": datetime.now(timezone.utc).isoformat(), "dhcp_fp_used": None}
+
+    print(f"[fingerbank] querying {mac}  fp={dhcp_fingerprint!r}  vc={dhcp_vendor!r}", flush=True)
+
+    try:
+        async with httpx.AsyncClient(timeout=12.0) as client:
+            resp = await client.post(
+                _FB_URL,
+                params={"key": api_key},
+                headers={"Authorization": f"Token {api_key}"},
+                json=body,
+            )
+        print(f"[fingerbank] {mac} → HTTP {resp.status_code}", flush=True)
+
+        if resp.status_code == 200:
+            data = resp.json()
+            dev = data.get("device") or {}
+
+            # Parents may be a nested tree or a flat list — handle both
+            def _collect_names(node, depth=0) -> list[str]:
+                if not node or depth > 8:
+                    return []
+                names = []
+                if isinstance(node, dict):
+                    n = (node.get("name") or "").strip()
+                    if n:
+                        names.append(n)
+                    for p in (node.get("parents") or []):
+                        names += _collect_names(p, depth + 1)
+                elif isinstance(node, list):
+                    for item in node:
+                        names += _collect_names(item, depth)
+                return names
+
+            parent_names = _collect_names(dev.get("parents"))
+            device_name  = (dev.get("name") or "").strip() or None
+            score        = data.get("score")
+            mapped_type  = _fingerbank_to_type(device_name or "", parent_names)
+
+            print(f"[fingerbank] {mac} → {device_name!r} score={score} type={mapped_type} "
+                  f"parents={parent_names}", flush=True)
+            return {
+                "device_name":  device_name,
+                "score":        score,
+                "parents":      parent_names,
+                "mapped_type":  mapped_type,
+                "queried_at":   datetime.now(timezone.utc).isoformat(),
+                "dhcp_fp_used": dhcp_fingerprint,
+            }
+
+        # Non-200 — log body so we can see the error message from Fingerbank
+        body_text = resp.text[:400]
+        ts = datetime.now(timezone.utc).isoformat()
+        if resp.status_code == 401:
+            msg = f"HTTP 401 Unauthorized — check your API key. Response: {body_text}"
+            print(f"[fingerbank] {mac} error: {msg}", flush=True)
+            # Permanent: bad key won't fix itself — stop retrying automatically
+            return {"error": msg, "status": "auth_error", "queried_at": ts, "dhcp_fp_used": dhcp_fingerprint}
+        elif resp.status_code == 404:
+            msg = "No match found in Fingerbank database"
+            print(f"[fingerbank] {mac}: {msg}", flush=True)
+            # Permanent: Fingerbank has no entry for this device — don't retry
+            return {"error": msg, "status": "no_match", "queried_at": ts, "dhcp_fp_used": dhcp_fingerprint}
+        else:
+            msg = f"HTTP {resp.status_code}. Response: {body_text}"
+            print(f"[fingerbank] {mac} error: {msg}", flush=True)
+            # Transient (429, 5xx, etc.) — loop will retry on next cycle
+            return {"error": msg, "status": "error", "queried_at": ts, "dhcp_fp_used": dhcp_fingerprint}
+
+    except Exception as exc:
+        msg = f"Request failed: {exc}"
+        print(f"[fingerbank] {mac} exception: {msg}", flush=True)
+        # Transient — retry
+        return {"error": msg, "status": "error", "queried_at": datetime.now(timezone.utc).isoformat(), "dhcp_fp_used": dhcp_fingerprint}
+
+
+async def _fingerbank_loop():
+    await asyncio.sleep(30)  # startup grace — let DHCP data arrive first
+    while True:
+        try:
+            db = SessionLocal()
+            try:
+                key_row = db.get(Setting, "fingerbank_api_key")
+                api_key = (key_row.value or "").strip() if key_row else ""
+                if api_key:
+                    # Query devices that have never been looked up, or had a transient error.
+                    # Permanent outcomes (no_match, auth_error) and successes are never re-queried
+                    # automatically — only the manual "Fetch now" button can override those.
+                    rows = db.execute(text("""
+                        SELECT mac_address FROM devices
+                        WHERE (dhcp_fingerprint IS NOT NULL
+                               OR dhcp_vendor_class IS NOT NULL
+                               OR dhcp_hostname    IS NOT NULL)
+                          AND (
+                            fingerbank_result IS NULL
+                            OR fingerbank_result->>'status' = 'error'
+                          )
+                        ORDER BY last_seen DESC
+                    """)).fetchall()
+                    if rows:
+                        print(f"[fingerbank] loop: {len(rows)} device(s) to query", flush=True)
+                    for (mac,) in rows:
+                        device = db.get(Device, mac)
+                        if not device:
+                            continue
+                        result = await _fingerbank_query(
+                            mac, device.dhcp_fingerprint,
+                            device.dhcp_vendor_class, device.dhcp_hostname, api_key
+                        )
+                        device.fingerbank_result = result
+                        from sqlalchemy.orm.attributes import flag_modified
+                        flag_modified(device, "fingerbank_result")
+                        db.commit()
+                        await asyncio.sleep(0.5)
+            finally:
+                db.close()
+        except Exception as exc:
+            print(f"[fingerbank-loop] unhandled error: {exc}", flush=True)
+        await asyncio.sleep(60)  # check for new DHCP arrivals every minute
+
+
 @app.on_event("startup")
 async def on_startup():
     db = SessionLocal()
@@ -1024,6 +1227,7 @@ async def on_startup():
     asyncio.ensure_future(_speedtest_schedule_loop())
     asyncio.ensure_future(_trivy_db_update_loop())
     asyncio.ensure_future(_docker_event_loop())
+    asyncio.ensure_future(_fingerbank_loop())
 
 
 # ---------------------------------------------------------------------------
@@ -1125,6 +1329,7 @@ class SetupCompleteRequest(BaseModel):
     ntfy_url:             str    = "https://ntfy.sh"
     docker_enabled:       bool   = False
     docker_host:          str    = "unix:///var/run/docker.sock"
+    fingerbank_api_key:   str    = ""
 
 
 # ---------------------------------------------------------------------------
@@ -1189,56 +1394,96 @@ def _identity_score(d: Device) -> dict:
         score += 15; reasons.append("os_identified")
     if getattr(d, 'dhcp_vendor_class', None) or getattr(d, 'dhcp_fingerprint', None):
         score += 10; reasons.append("dhcp_fingerprinted")
+    fb = getattr(d, 'fingerbank_result', None)
+    if fb and (fb.get('score') or 0) >= 50:
+        score += 15; reasons.append("fingerbank_identified")
     return {"score": min(score, 100), "reasons": reasons}
 
 
 def _infer_device_type(d: Device) -> str | None:
     if getattr(d, 'device_type_override', None):
         return d.device_type_override
-    hostname = (d.hostname or d.custom_name or "").lower()
-    vendor   = (getattr(d, 'vendor_override', None) or d.vendor or "").lower()
+    # Fingerbank result is the most authoritative signal when confidence >= 50
+    fb = getattr(d, 'fingerbank_result', None)
+    if fb and not fb.get('error') and (fb.get('score') or 0) >= 50 and fb.get('mapped_type'):
+        return fb['mapped_type']
+    # DHCP-inferred type from probe's local classifier
     scan     = d.scan_results or {}
-    ports    = {p.get("port") for p in (scan.get("open_ports") or []) if p.get("port")}
-    os_guess = (scan.get("os_matches") or [{}])[0].get("name", "").lower() if scan.get("os_matches") else ""
-    if any(k in hostname for k in ("cam", "camera", "nvr", "reolink", "dahua", "hikvision", "arlo", "ring", "nest")):
-        return "camera"
-    if any(k in vendor for k in ("reolink", "hikvision", "dahua", "axis", "hanwha")):
-        return "camera"
-    if any(k in hostname for k in ("iphone", "android", "phone", "pixel", "galaxy", "ipad", "tablet", "redmi", "oneplus")):
-        return "phone"
-    if "android" in os_guess or "ios" in os_guess:
-        return "phone"
-    if any(k in hostname for k in ("shelly", "plug", "switch", "tasmota", "sonoff", "gosund", "kasa", "tapo")):
-        return "smart_plug"
-    if any(k in vendor for k in ("espressif", "tuya", "tapo", "shelly", "meross", "gosund")):
-        return "iot"
-    if any(k in hostname for k in ("ap.", "access", "router", "gateway", "ubnt", "unifi", "openwrt", "airos")):
-        return "access_point"
-    if any(k in vendor for k in ("ubiquiti", "tp-link", "netgear", "asus", "linksys", "openwrt")):
-        if {80, 443, 22} & ports:
-            return "router"
-    if any(k in hostname for k in ("nas", "synology", "qnap", "server", "truenas", "plex", "jellyfin")):
-        return "nas"
-    if {445, 139, 2049} & ports:
-        return "nas"
-    if any(k in hostname for k in ("printer", "print", "hp", "epson", "canon", "brother")):
-        return "printer"
-    if {9100, 515, 631} & ports:
-        return "printer"
-    if any(k in hostname for k in ("tv", "roku", "firetv", "appletv", "chromecast", "shield", "androidtv")):
-        return "tv"
-    if any(k in vendor for k in ("sony interactive", "microsoft xbox", "nintendo")):
-        return "console"
-    if any(k in vendor for k in ("tado", "philips", "ikea", "meross", "bouffalo")):
-        return "smart_home"
-    if "windows" in os_guess or {3389, 445} & ports:
-        return "computer"
-    if "linux" in os_guess and {22} & ports and len(ports) > 3:
-        return "server"
-    # Fall back to DHCP-inferred type (written by probe sniffer)
     dhcp_type = scan.get("device_type")
     if dhcp_type and scan.get("device_type_source") == "dhcp":
         return dhcp_type
+    # Local heuristics — combine DNS hostname, DHCP hostname, DHCP vendor class, OUI vendor
+    hostname = (d.hostname or d.custom_name or "").lower()
+    dhcp_hn  = (getattr(d, 'dhcp_hostname',     None) or "").lower()
+    dhcp_vc  = (getattr(d, 'dhcp_vendor_class', None) or "").lower()
+    vendor   = (getattr(d, 'vendor_override',   None) or d.vendor or "").lower()
+    combined = f"{hostname} {dhcp_hn} {dhcp_vc} {vendor}"
+    ports    = {p.get("port") for p in (scan.get("open_ports") or []) if p.get("port")}
+    os_guess = (scan.get("os_matches") or [{}])[0].get("name", "").lower() if scan.get("os_matches") else ""
+    if any(k in combined for k in ("cam", "camera", "nvr", "reolink", "dahua", "hikvision", "arlo", "ring", "nest-cam")):
+        return "camera"
+    if any(k in combined for k in ("iphone", "ipad", "android", "pixel", "galaxy", "oneplus", "xiaomi", "redmi")):
+        return "phone"
+    if "android" in os_guess or "ios" in os_guess:
+        return "phone"
+    if any(k in combined for k in ("shelly", "tasmota", "sonoff", "gosund", "esphome")):
+        return "iot"
+    if any(k in combined for k in ("espressif", "tuya", "meross", "bouffalo")):
+        return "iot"
+    if any(k in combined for k in ("access point", "wireless ap", "unifi", "ubnt", "airos")):
+        return "ap"
+    if any(k in combined for k in ("router", "gateway", "openwrt", "dd-wrt", "pfsense", "opnsense")):
+        return "router"
+    if any(k in vendor for k in ("ubiquiti", "tp-link", "netgear", "asus", "linksys")) and {80, 443, 22} & ports:
+        return "router"
+    if any(k in combined for k in ("nas", "synology", "qnap", "truenas", "openmediavault")):
+        return "nas"
+    if {445, 139, 2049} & ports:
+        return "nas"
+    if any(k in combined for k in ("printer", "jetdirect")):
+        return "printer"
+    if {9100, 515, 631} & ports:
+        return "printer"
+    if any(k in combined for k in ("roku", "firetv", "fire tv", "chromecast", "appletv", "apple tv")):
+        return "streamer"
+    if any(k in combined for k in ("smart tv", "androidtv", "android tv", "google tv")):
+        return "tv"
+    if any(k in combined for k in ("playstation", "xbox", "nintendo")):
+        return "console"
+    if any(k in vendor for k in ("sony interactive", "microsoft xbox")):
+        return "console"
+    if "windows" in os_guess or {3389} & ports:
+        return "desktop"
+    if "linux" in os_guess and {22} & ports and len(ports) > 3:
+        return "server"
+    return None
+
+
+_GENERIC_BRAND = re.compile(
+    r'^(Generic|Unknown|Internet of Things|Phone|Tablet|Mobile|Android|'
+    r'Windows|Linux|IoT|Smart Home|Network|Networking|Wireless)',
+    re.I,
+)
+
+def _infer_vendor(d: Device) -> str | None:
+    """Return vendor name, falling back to Fingerbank hierarchy when OUI lookup is empty."""
+    if getattr(d, 'vendor_override', None):
+        return d.vendor_override
+    if d.vendor and d.vendor.lower() not in ('unknown', ''):
+        return d.vendor
+    fb = getattr(d, 'fingerbank_result', None) or {}
+    if fb.get('error'):
+        return None
+    for p in (fb.get('parents') or []):
+        if p and not _GENERIC_BRAND.match(p):
+            tok = p.split()[0]  # "OnePlus Android" → "OnePlus", "TP-Link TL-SG108E" → "TP-Link"
+            if tok and len(tok) > 2:
+                return tok
+    dn = (fb.get('device_name') or '').strip()
+    if dn:
+        tok = dn.split()[0]
+        if tok and len(tok) > 2:
+            return tok
     return None
 
 
@@ -1255,6 +1500,7 @@ def _to_dict(d: Device) -> dict:
         "hostname":             d.hostname,
         "vendor":               d.vendor,
         "vendor_override":      getattr(d, 'vendor_override', None),
+        "vendor_inferred":      _infer_vendor(d),
         "device_type_override": getattr(d, 'device_type_override', None),
         "custom_name":          d.custom_name,
         "is_online":            d.is_online,
@@ -1287,6 +1533,7 @@ def _to_dict(d: Device) -> dict:
         "dhcp_hostname":         getattr(d, 'dhcp_hostname', None),
         "dhcp_vendor_class":     getattr(d, 'dhcp_vendor_class', None),
         "dhcp_fingerprint":      getattr(d, 'dhcp_fingerprint', None),
+        "fingerbank_result":     getattr(d, 'fingerbank_result', None),
         # Populated by list_devices; single-device endpoints return defaults
         "is_virtual_interface":  False,
         "virtual_of":            None,
@@ -1566,6 +1813,8 @@ def setup_complete(
         to_save["ntfy_url"] = payload.ntfy_url
     if payload.docker_host:
         to_save["docker_host"] = payload.docker_host
+    if payload.fingerbank_api_key:
+        to_save["fingerbank_api_key"] = payload.fingerbank_api_key
     for key, value in to_save.items():
         s = db.get(Setting, key)
         if s:
@@ -1827,6 +2076,30 @@ def reset_baseline(mac: str, db: Session = Depends(get_db)):
     d.baseline_scan_count = 0
     db.commit(); db.refresh(d)
     return _to_dict(d)
+
+
+@app.post("/devices/{mac}/fingerbank/lookup")
+async def fingerbank_lookup(mac: str, db: Session = Depends(get_db)):
+    """Immediately trigger a Fingerbank lookup for a single device. Returns the raw result."""
+    mac = mac.lower()
+    device = db.get(Device, mac)
+    if not device:
+        raise HTTPException(404, "Device not found")
+    if not device.dhcp_fingerprint:
+        raise HTTPException(422, "No DHCP fingerprint captured for this device yet")
+    key_row = db.get(Setting, "fingerbank_api_key")
+    api_key = (key_row.value or "").strip() if key_row else ""
+    if not api_key:
+        raise HTTPException(422, "No Fingerbank API key configured in Settings → Scanner → Device Identification")
+    result = await _fingerbank_query(
+        mac, device.dhcp_fingerprint,
+        device.dhcp_vendor_class, device.dhcp_hostname, api_key
+    )
+    device.fingerbank_result = result
+    from sqlalchemy.orm.attributes import flag_modified
+    flag_modified(device, "fingerbank_result")
+    db.commit()
+    return {"result": result, "device": _to_dict(device)}
 
 
 @app.delete("/devices/{mac}")

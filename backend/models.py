@@ -58,6 +58,9 @@ class Device(Base):
     dhcp_vendor_class       = Column(String, nullable=True)
     dhcp_fingerprint        = Column(String, nullable=True)
 
+    # Fingerbank API identification result
+    fingerbank_result       = Column(JSON, nullable=True)
+
     ip_history   = relationship("IPHistory",    back_populates="device",
                                 order_by="IPHistory.first_seen.desc()")
     events       = relationship("DeviceEvent",  back_populates="device",

@@ -411,6 +411,112 @@ function ScanPipeline({ device, vulnScanning }) {
   )
 }
 
+function DhcpFingerprintPanel({ localDevice, mac, setLocalDevice }) {
+  const [fbLoading, setFbLoading] = useState(false)
+  const [fbError,   setFbError]   = useState(null)
+
+  const hasDhcp   = localDevice.dhcp_hostname || localDevice.dhcp_vendor_class || localDevice.dhcp_fingerprint
+  const dhcpType  = localDevice.scan_results?.device_type_source === 'dhcp' ? localDevice.scan_results.device_type      : null
+  const dhcpConf  = localDevice.scan_results?.device_type_source === 'dhcp' ? localDevice.scan_results.device_type_conf : null
+  const fb        = localDevice.fingerbank_result
+
+  async function handleFbLookup() {
+    setFbLoading(true); setFbError(null)
+    try {
+      const res = await api.fingerbankLookup(mac)
+      setLocalDevice(prev => ({ ...prev, fingerbank_result: res.result }))
+    } catch (e) {
+      setFbError(e.message || 'Lookup failed')
+    } finally {
+      setFbLoading(false)
+    }
+  }
+
+  if (!hasDhcp) return (
+    <p className="text-xs italic leading-relaxed" style={{ color: 'var(--color-text-faint)' }}>
+      No DHCP packet seen yet. Disconnect and reconnect the device, or force a full DHCP cycle:
+      Windows — <code className="font-mono">ipconfig /release</code> then <code className="font-mono">/renew</code>;
+      Linux — <code className="font-mono">sudo dhclient -r && sudo dhclient</code>.
+      Mid-lease background renewals are unicast and bypass the probe.
+    </p>
+  )
+
+  return (
+    <>
+      {localDevice.dhcp_hostname     && <Row label="DHCP hostname" value={localDevice.dhcp_hostname}     mono />}
+      {localDevice.dhcp_vendor_class && <Row label="Vendor class"  value={localDevice.dhcp_vendor_class} mono />}
+      {localDevice.dhcp_fingerprint  && <Row label="Option 55"     value={localDevice.dhcp_fingerprint}  mono />}
+      {dhcpType && !fb && (
+        <Row label="Local match" value={
+          <span>
+            {dhcpType}
+            {dhcpConf && <span className="ml-1 text-[10px]" style={{ color: 'var(--color-text-faint)' }}>({Math.round(dhcpConf * 100)}% conf)</span>}
+          </span>
+        } />
+      )}
+
+      {/* Fingerbank results */}
+      {fb && !fb.error ? (
+        <div className="mt-2 pt-2 space-y-1.5 border-t" style={{ borderColor: 'var(--color-border)' }}>
+          <div className="flex items-center justify-between mb-1">
+            <div className="flex items-center gap-1.5">
+              <span className="text-[10px] font-semibold uppercase tracking-wider" style={{ color: 'var(--color-brand)' }}>Fingerbank</span>
+              {fb.score != null && (
+                <span className="text-[10px] px-1.5 py-0.5 rounded-full font-medium"
+                  style={{
+                    background: fb.score >= 70 ? 'rgba(34,197,94,0.15)' : fb.score >= 40 ? 'rgba(245,158,11,0.15)' : 'rgba(239,68,68,0.1)',
+                    color:      fb.score >= 70 ? '#22c55e'              : fb.score >= 40 ? '#f59e0b'              : '#ef4444',
+                  }}>
+                  {fb.score}% confidence
+                </span>
+              )}
+            </div>
+            <button onClick={handleFbLookup} disabled={fbLoading}
+              className="text-[10px] flex items-center gap-1 opacity-60 hover:opacity-100 transition-opacity"
+              style={{ color: 'var(--color-brand)' }}>
+              {fbLoading ? <Loader2 size={9} className="animate-spin" /> : <RefreshCw size={9} />}
+              {fbLoading ? 'Fetching…' : 'Re-fetch'}
+            </button>
+          </div>
+          {fb.device_name && <Row label="Identified as" value={fb.device_name} />}
+          {fb.parents?.length > 0 && (
+            <Row label="Hierarchy" value={
+              <span className="text-right leading-snug">{fb.parents.filter(Boolean).join(' › ')}</span>
+            } />
+          )}
+          {fb.mapped_type && <Row label="Mapped type" value={fb.mapped_type} />}
+          {fb.queried_at && (
+            <p className="text-[10px] text-right" style={{ color: 'var(--color-text-faint)' }}>
+              Queried {new Date(fb.queried_at).toLocaleDateString()}
+            </p>
+          )}
+        </div>
+      ) : (
+        <div className="mt-2 flex items-center justify-between gap-2">
+          <p className="text-[11px] italic" style={{ color: 'var(--color-text-faint)' }}>
+            {!fb
+              ? 'Fingerbank lookup pending — will run automatically within a minute.'
+              : fb.status === 'no_match'
+                ? 'No match found in Fingerbank database.'
+                : fb.status === 'auth_error'
+                  ? 'API key rejected — check Settings → Scanner → Device Identification.'
+                  : fb.error
+                    ? `Lookup failed: ${fb.error}`
+                    : 'Fingerbank lookup pending.'}
+          </p>
+          <button onClick={handleFbLookup} disabled={fbLoading}
+            className="shrink-0 text-[10px] px-2 py-1 rounded-lg border font-medium flex items-center gap-1 transition-colors"
+            style={{ borderColor: 'color-mix(in srgb, var(--color-brand) 40%, transparent)', color: 'var(--color-brand)', background: 'color-mix(in srgb, var(--color-brand) 10%, transparent)' }}>
+            {fbLoading ? <Loader2 size={9} className="animate-spin" /> : <RefreshCw size={9} />}
+            {fbLoading ? 'Fetching…' : 'Fetch now'}
+          </button>
+        </div>
+      )}
+      {fbError && <p className="text-[10px] text-red-400 mt-1">{fbError}</p>}
+    </>
+  )
+}
+
 // ---------------------------------------------------------------------------
 // Main component
 // ---------------------------------------------------------------------------
@@ -756,7 +862,7 @@ export function DeviceDrawer({ device, onClose, onRename, onResolveName, onRefre
                   }
                 />
                 <Row label="MAC Address" value={mac} mono />
-                <Row label="Vendor"      value={localDevice.vendor_override || localDevice.vendor || 'Unknown'} />
+                <Row label="Vendor"      value={localDevice.vendor_override || localDevice.vendor || localDevice.vendor_inferred || 'Unknown'} />
                 <Row
                   label="Hostname"
                   value={
@@ -782,28 +888,7 @@ export function DeviceDrawer({ device, onClose, onRename, onResolveName, onRefre
 
               {/* DHCP Fingerprinting */}
               <Collapsible title="DHCP Fingerprint" icon={Radio} defaultOpen={false}>
-                {(() => {
-                  const hasDhcp = localDevice.dhcp_hostname || localDevice.dhcp_vendor_class || localDevice.dhcp_fingerprint
-                  const dhcpType  = localDevice.scan_results?.device_type_source === 'dhcp' ? localDevice.scan_results.device_type  : null
-                  const dhcpConf  = localDevice.scan_results?.device_type_source === 'dhcp' ? localDevice.scan_results.device_type_conf : null
-                  if (!hasDhcp) return (
-                    <p className="text-xs italic leading-relaxed" style={{ color: 'var(--color-text-faint)' }}>
-                      No DHCP packet seen yet. Disconnect and reconnect the device, or force a full DHCP cycle: Windows — <code className="font-mono">ipconfig /release</code> then <code className="font-mono">/renew</code>; Linux — <code className="font-mono">sudo dhclient -r && sudo dhclient</code>. Mid-lease background renewals are unicast and bypass the probe.
-                    </p>
-                  )
-                  return (
-                    <>
-                      {localDevice.dhcp_hostname    && <Row label="DHCP hostname"  value={localDevice.dhcp_hostname} mono />}
-                      {localDevice.dhcp_vendor_class && <Row label="Vendor class"   value={localDevice.dhcp_vendor_class} mono />}
-                      {localDevice.dhcp_fingerprint  && <Row label="Option 55"      value={localDevice.dhcp_fingerprint} mono />}
-                      {dhcpType && (
-                        <Row label="Inferred type" value={
-                          <span>{dhcpType}{dhcpConf ? <span className="ml-1 text-[10px]" style={{ color: 'var(--color-text-faint)' }}>({Math.round(dhcpConf * 100)}% conf)</span> : null}</span>
-                        } />
-                      )}
-                    </>
-                  )
-                })()}
+                <DhcpFingerprintPanel localDevice={localDevice} mac={mac} setLocalDevice={setLocalDevice} />
               </Collapsible>
 
               {/* IP History */}

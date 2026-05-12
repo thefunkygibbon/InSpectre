@@ -4,6 +4,7 @@ import ipaddress
 import json
 import os
 import queue
+import re
 import signal
 import socket
 import subprocess
@@ -1648,6 +1649,15 @@ def process_dhcp_packet(packet) -> None:
         pass
 
 
+# Matches hostnames auto-generated from IP addresses, e.g. "192-168-0-15.lan", "10.0.0.5"
+_IP_DERIVED_RE = re.compile(r'^(\d{1,3}[.\-_]){3}\d{1,3}(\.[a-z]{1,12})?$', re.I)
+
+def _is_ip_derived_hostname(h: str | None) -> bool:
+    if not h:
+        return True
+    return bool(_IP_DERIVED_RE.match(h))
+
+
 def _upsert_dhcp_info(mac: str, hostname: str | None, vendor_class: str | None, opt55: list[int] | None) -> None:
     """Write DHCP fingerprint data to the device row and optionally refine device_type."""
     fingerprint_str = ','.join(str(x) for x in opt55) if opt55 else None
@@ -1661,12 +1671,19 @@ def _upsert_dhcp_info(mac: str, hostname: str | None, vendor_class: str | None, 
 
         changed = False
 
-        if hostname and not device.dhcp_hostname:
-            device.dhcp_hostname = hostname
-            # Also fill in DNS hostname if still missing
-            if not device.hostname:
-                device.hostname = hostname
-            changed = True
+        if hostname:
+            if device.dhcp_hostname != hostname:
+                device.dhcp_hostname = hostname
+                changed = True
+            # Replace hostname when it looks auto-generated from the IP address
+            if _is_ip_derived_hostname(device.hostname) and hostname != device.hostname:
+                conflict = session.query(Device).filter(
+                    Device.hostname == hostname,
+                    Device.mac_address != mac,
+                ).first()
+                if not conflict:
+                    device.hostname = hostname
+                    changed = True
 
         if vendor_class and device.dhcp_vendor_class != vendor_class:
             device.dhcp_vendor_class = vendor_class

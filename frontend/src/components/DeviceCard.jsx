@@ -97,7 +97,7 @@ function isNewDevice(device) {
 
 export function DeviceCard({ device, onClick, onStarToggle, isVulnScanning }) {
   const name     = deviceDisplayName(device)
-  const vendor   = cleanVendor(device.vendor_override || device.vendor)
+  const vendor   = cleanVendor(device.vendor_override || device.vendor || device.vendor_inferred)
   const DevIcon  = getDeviceIcon(device)
   const category = getDeviceCategory(device)
   const ports    = openPortCount(device)
@@ -166,7 +166,14 @@ export function DeviceCard({ device, onClick, onStarToggle, isVulnScanning }) {
         <span style={{ color: 'var(--color-text-muted)' }}>MAC</span>
         <span className="font-mono truncate text-[11px]" style={{ color: 'var(--color-text)' }}>{device.mac_address}</span>
         <span style={{ color: 'var(--color-text-muted)' }}>Type</span>
-        <span className="truncate capitalize" style={{ color: 'var(--color-text)' }}>{category.label}</span>
+        <span className="truncate capitalize" style={{ color: 'var(--color-text)' }}>
+          {category.label}
+          {device.fingerbank_result?.device_name && (device.fingerbank_result.score || 0) >= 50 && (
+            <span className="block text-[10px] truncate" style={{ color: 'var(--color-brand)', opacity: 0.85 }}>
+              {device.fingerbank_result.device_name}
+            </span>
+          )}
+        </span>
         {ports !== null && (
           <>
             <span style={{ color: 'var(--color-text-muted)' }}>Ports</span>

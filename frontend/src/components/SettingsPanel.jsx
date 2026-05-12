@@ -29,6 +29,8 @@ const SETTING_META = {
     description: 'DNS server used for hostname resolution. Leave blank to auto-detect from host.' },
   probe_interface:         { label: 'Probe Interface',     unit: '',              type: 'text',              tab: 'scanner',
     description: 'Network interface the probe uses for scanning (e.g. eth0, eno1). Leave blank to auto-detect.' },
+  fingerbank_api_key:      { label: 'Fingerbank API Key',  unit: '',              type: 'text',              tab: 'scanner',
+    description: 'Free API key from fingerbank.org. When set, DHCP fingerprints are sent to Fingerbank for cloud device identification. Results appear in the DHCP Fingerprint section of each device.' },
   vuln_scan_templates:     { label: 'Vuln Scan Templates', unit: '',              type: 'text',              tab: 'scanner',
     description: 'Comma-separated template tags for vulnerability scanning (e.g. cve,exposure,misconfig,default-login,network).' },
   vuln_scan_schedule:      { label: 'Scheduled Vuln Scans', unit: '',             type: 'select', tab: 'scanner',
@@ -464,6 +466,13 @@ export function SettingsPanel({ onClose, onSettingChange }) {
                 <SettingRow key={s.key} s={s} dirty={dirty} onchange={handleChange}
                   placeholder={detectedInterface || 'auto-detect'} />
               ))}
+
+              {/* Device Identification */}
+              <CollapsibleSection label="Device Identification" Icon={Settings2} defaultOpen={false}>
+                {settingsByKeys(['fingerbank_api_key']).map(s => (
+                  <SettingRow key={s.key} s={s} dirty={dirty} onchange={handleChange} />
+                ))}
+              </CollapsibleSection>
 
               {/* Vulnerability Scanning */}
               <CollapsibleSection label="Vulnerability Scanning" Icon={AlertTriangle} defaultOpen={false}>

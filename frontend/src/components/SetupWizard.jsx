@@ -2,19 +2,20 @@ import { useState, useEffect } from 'react'
 import {
   User, Lock, Network, Shield, Bell, ArrowRight,
   CheckCircle, Eye, EyeOff, Upload, RotateCcw, Database,
-  Box, Server, Plus, Loader2, Check,
+  Box, Server, Plus, Loader2, Check, Fingerprint, ExternalLink,
 } from 'lucide-react'
 import { Logo } from './Logo'
 import { api, setToken } from '../api'
 
 // Steps for the "fresh setup" path only (restore path bypasses all of these)
 const FRESH_STEPS = [
-  { id: 'user',       label: 'Create Account',   Icon: User        },
-  { id: 'network',    label: 'Network Settings', Icon: Network     },
-  { id: 'vuln',       label: 'Vuln Scans',       Icon: Shield      },
-  { id: 'notify',     label: 'Notifications',    Icon: Bell        },
-  { id: 'containers', label: 'Container Hosts',  Icon: Box         },
-  { id: 'done',       label: 'All Set!',         Icon: CheckCircle },
+  { id: 'user',        label: 'Create Account',   Icon: User        },
+  { id: 'network',     label: 'Network Settings', Icon: Network     },
+  { id: 'vuln',        label: 'Vuln Scans',       Icon: Shield      },
+  { id: 'notify',      label: 'Notifications',    Icon: Bell        },
+  { id: 'containers',  label: 'Container Hosts',  Icon: Box         },
+  { id: 'fingerbank',  label: 'Device ID',        Icon: Fingerprint },
+  { id: 'done',        label: 'All Set!',          Icon: CheckCircle },
 ]
 
 const WIZARD_HOST_TYPES = [
@@ -688,6 +689,92 @@ function StepContainers({ onNext }) {
   )
 }
 
+function StepFingerbank({ onNext }) {
+  const [apiKey,  setApiKey]  = useState('')
+  const [showKey, setShowKey] = useState(false)
+
+  return (
+    <div className="space-y-5">
+      {/* What / why */}
+      <div className="flex items-start gap-3 px-4 py-3 rounded-xl"
+        style={{ background: 'color-mix(in srgb, var(--color-brand) 8%, transparent)', border: '1px solid color-mix(in srgb, var(--color-brand) 20%, transparent)' }}>
+        <Fingerprint size={18} className="shrink-0 mt-0.5" style={{ color: 'var(--color-brand)' }} />
+        <p className="text-xs leading-relaxed" style={{ color: 'var(--color-text-muted)' }}>
+          <span className="font-semibold" style={{ color: 'var(--color-text)' }}>Fingerbank</span> is a free
+          device-identification service. When a device connects to your network and requests an IP address,
+          InSpectre sends its DHCP fingerprint to Fingerbank, which looks up the make, model, and device type —
+          turning "Unknown" into "Google Pixel 10 Pro" or "Espressif ESP32".
+        </p>
+      </div>
+
+      {/* Sign-up link */}
+      <div className="text-sm" style={{ color: 'var(--color-text-muted)' }}>
+        Don't have an account yet? Registration is{' '}
+        <span className="font-semibold" style={{ color: '#10b981' }}>completely free</span> — no credit card required.
+        <a
+          href="https://api.fingerbank.org/email_registrations/new"
+          target="_blank"
+          rel="noopener noreferrer"
+          className="flex items-center gap-1 mt-2 text-xs font-medium transition-opacity hover:opacity-80"
+          style={{ color: 'var(--color-brand)' }}
+        >
+          <ExternalLink size={11} />
+          Create a free Fingerbank account
+        </a>
+      </div>
+
+      {/* API key input */}
+      <div className="space-y-1">
+        <label className="block text-xs font-medium" style={{ color: 'var(--color-text-muted)' }}>
+          Fingerbank API Key
+        </label>
+        <div className="relative">
+          <input
+            className="input w-full font-mono pr-10"
+            type={showKey ? 'text' : 'password'}
+            placeholder="Paste your API key here…"
+            value={apiKey}
+            onChange={e => setApiKey(e.target.value)}
+            autoComplete="off"
+            spellCheck={false}
+          />
+          <button
+            type="button"
+            onClick={() => setShowKey(v => !v)}
+            className="absolute right-3 top-1/2 -translate-y-1/2 opacity-50 hover:opacity-100 transition-opacity"
+            tabIndex={-1}
+          >
+            {showKey ? <EyeOff size={14} /> : <Eye size={14} />}
+          </button>
+        </div>
+        <p className="text-[11px]" style={{ color: 'var(--color-text-faint)' }}>
+          Found in your Fingerbank account under <span className="font-mono">API key</span>.
+          You can add or change this later in Settings → Scanner → Device Identification.
+        </p>
+      </div>
+
+      <div className="flex flex-col gap-2">
+        <button
+          onClick={() => onNext({ fingerbank_api_key: apiKey.trim() })}
+          className="w-full py-2.5 rounded-xl font-semibold text-sm flex items-center justify-center gap-2"
+          style={{ background: 'var(--color-brand)', color: 'white' }}
+        >
+          {apiKey.trim() ? <><span>Save &amp; Continue</span><ArrowRight size={14} /></> : <>Continue <ArrowRight size={14} /></>}
+        </button>
+        {apiKey.trim() === '' && (
+          <button
+            onClick={() => onNext({ fingerbank_api_key: '' })}
+            className="w-full py-2 text-xs font-medium transition-opacity hover:opacity-100 opacity-60"
+            style={{ color: 'var(--color-text-muted)' }}
+          >
+            Skip for now
+          </button>
+        )}
+      </div>
+    </div>
+  )
+}
+
 function StepDone({ onFinish }) {
   return (
     <div className="space-y-6 text-center">
@@ -735,6 +822,7 @@ export function SetupWizard({ onComplete }) {
         gotify_token:          collected.gotify_token          ?? '',
         pushbullet_api_key:    collected.pushbullet_api_key    ?? '',
         alert_webhook_url:     collected.alert_webhook_url     ?? '',
+        fingerbank_api_key:    collected.fingerbank_api_key    ?? '',
       })
     } catch (_) { /* ignore — dashboard still loads */ }
     onComplete()
@@ -806,12 +894,13 @@ export function SetupWizard({ onComplete }) {
           )}
 
           {/* Fresh setup steps */}
-          {isFresh && step === 0 && <StepUser       onNext={handleNext} />}
-          {isFresh && step === 1 && <StepNetwork    onNext={handleNext} />}
-          {isFresh && step === 2 && <StepVuln       onNext={handleNext} />}
-          {isFresh && step === 3 && <StepNotify     onNext={handleNext} />}
-          {isFresh && step === 4 && <StepContainers onNext={handleNext} />}
-          {isFresh && step === 5 && <StepDone       onFinish={handleFinish} />}
+          {isFresh && step === 0 && <StepUser        onNext={handleNext} />}
+          {isFresh && step === 1 && <StepNetwork     onNext={handleNext} />}
+          {isFresh && step === 2 && <StepVuln        onNext={handleNext} />}
+          {isFresh && step === 3 && <StepNotify      onNext={handleNext} />}
+          {isFresh && step === 4 && <StepContainers  onNext={handleNext} />}
+          {isFresh && step === 5 && <StepFingerbank  onNext={handleNext} />}
+          {isFresh && step === 6 && <StepDone        onFinish={handleFinish} />}
         </div>
       </div>
     </div>
