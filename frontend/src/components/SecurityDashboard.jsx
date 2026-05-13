@@ -2,9 +2,10 @@ import { useState, useEffect } from 'react'
 import {
   ShieldAlert, ShieldCheck, RefreshCw, ScanLine,
   AlertTriangle, Info, Clock, ChevronDown, ChevronRight,
-  Settings2, Save, Loader, X, Box,
+  Settings2, Save, Loader, X, Box, FileDown,
 } from 'lucide-react'
 import { api } from '../api'
+import { exportDashboardVulnPDF } from '../utils/vulnPdfExport'
 
 // ---------------------------------------------------------------------------
 // Vuln scan settings panel
@@ -438,6 +439,7 @@ export function SecurityDashboard({ onDeviceClick, onContainerClick }) {
   const [dockerEnabled,   setDockerEnabled]   = useState(false)
   const [containerVulns,  setContainerVulns]  = useState([])
   const [scanningContainers, setScanningContainers] = useState(false)
+  const [exporting,          setExporting]          = useState(false)
 
   async function load(silent = false) {
     if (!silent) { setLoading(true); setError(null) }
@@ -499,6 +501,22 @@ export function SecurityDashboard({ onDeviceClick, onContainerClick }) {
     }
   }
 
+  async function handleExportPDF() {
+    setExporting(true)
+    try {
+      const deviceFindings = {}
+      await Promise.all(topVuln.map(async (d) => {
+        try {
+          const reports = await api.getVulnReports(d.mac_address, 1)
+          deviceFindings[d.mac_address] = reports?.[0]?.findings || []
+        } catch { deviceFindings[d.mac_address] = [] }
+      }))
+      exportDashboardVulnPDF(data, containerVulns, deviceFindings)
+    } finally {
+      setExporting(false)
+    }
+  }
+
   async function toggleVulnExpand(mac) {
     if (expandedVuln[mac]) {
       setExpandedVuln(prev => { const n = { ...prev }; delete n[mac]; return n })
@@ -551,6 +569,13 @@ export function SecurityDashboard({ onDeviceClick, onContainerClick }) {
               title="Run vulnerability scan on all eligible devices">
               <ScanLine size={13} className={scanning ? 'animate-pulse' : ''} />
               {scanning ? 'Starting…' : 'Scan all devices'}
+            </button>
+            <button onClick={handleExportPDF} disabled={exporting || loading || !data}
+              className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold disabled:opacity-50 transition-opacity"
+              style={{ border: '1px solid var(--color-border)', color: 'var(--color-text-muted)' }}
+              title="Export security report as PDF">
+              <FileDown size={13} className={exporting ? 'animate-pulse' : ''} />
+              {exporting ? 'Preparing…' : 'Export PDF'}
             </button>
             <button onClick={load} disabled={loading} className="btn-ghost p-2" title="Refresh data">
               <RefreshCw size={15} className={loading ? 'animate-spin' : ''} />

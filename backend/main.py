@@ -454,6 +454,27 @@ async def _run_scheduled_vuln_scans():
         await asyncio.sleep(10)
 
 
+async def _run_all_vuln_scans():
+    """Manual 'scan all' — ignores the vuln_scan_targets setting and scans every eligible device."""
+    db = SessionLocal()
+    try:
+        settings_s = db.get(Setting, "vuln_scan_templates")
+        scripts    = (settings_s.value or "").strip() if settings_s else ""
+        devices    = [(d.mac_address, d.ip_address)
+                      for d in db.query(Device)
+                                 .filter(Device.is_online == True,
+                                         Device.ip_address != None,
+                                         Device.is_ignored == False)
+                                 .all()]
+    finally:
+        db.close()
+
+    print(f"[scan-all] Starting manual vuln scan: {len(devices)} device(s)", flush=True)
+    for mac, ip in devices:
+        await _run_single_vuln_scan(mac, ip, scripts)
+        await asyncio.sleep(10)
+
+
 async def _scheduled_vuln_scan_loop():
     global _last_scheduled_vuln_scan
     await asyncio.sleep(30)  # startup grace period
@@ -2224,6 +2245,12 @@ def get_identity_score(mac: str, db: Session = Depends(get_db)):
 # ---------------------------------------------------------------------------
 # Phase 3 — Vulnerability scanning (proxied through the probe container)
 # ---------------------------------------------------------------------------
+# Per-mac broadcast state: multiple browser connections can subscribe to the
+# same running scan (handles drawer close/reopen mid-scan).
+_nuclei_subs:  dict[str, list[asyncio.Queue]] = {}  # mac → subscriber queues
+_nuclei_lines: dict[str, list[str]] = {}            # mac → buffered output lines
+
+
 @app.get("/devices/{mac}/vuln-scan")
 async def stream_vuln_scan(mac: str, db: Session = Depends(get_db)):
     d = db.get(Device, mac.lower())
@@ -2235,48 +2262,63 @@ async def stream_vuln_scan(mac: str, db: Session = Depends(get_db)):
     templates_setting = db.get(Setting, "vuln_scan_templates")
     templates = (templates_setting.value or "").strip() if templates_setting else ""
 
-    # Use primary_ip — it's the stable address. ip_address can be temporarily
-    # updated to a secondary IP by the sniffer, which would break the probe lookup.
     ip        = getattr(d, "primary_ip", None) or d.ip_address
     mac_lower = mac.lower()
-    probe_url = f"{PROBE_URL}/stream/vuln-scan/{ip}"
-    params    = {"templates": templates, "mac": mac_lower}
 
-    # Queue bridges the probe reader (background task) and the browser stream.
-    # The reader runs as an independent asyncio task so the result is always
-    # saved even if the browser navigates away before the scan finishes.
-    line_queue: asyncio.Queue[str | None] = asyncio.Queue()
+    # Create a queue for this connection
+    q: asyncio.Queue[str | None] = asyncio.Queue()
 
-    async def _probe_reader() -> None:
-        try:
-            async with httpx.AsyncClient(timeout=None) as client:
-                async with client.stream("GET", probe_url, params=params) as resp:
-                    if resp.status_code != 200:
-                        body = await resp.aread()
-                        await line_queue.put(f"data: [ERROR] Probe returned HTTP {resp.status_code}: {body.decode()[:200]}\n\n")
-                        return
-                    async for raw_line in resp.aiter_lines():
-                        await line_queue.put(f"{raw_line}\n")
-                        if raw_line.startswith("data: RESULT:"):
-                            payload_str = raw_line[len("data: RESULT:"):]
-                            try:
-                                data = json.loads(payload_str)
-                                _save_vuln_result(mac_lower, ip, data, templates)
-                            except Exception as exc:
-                                await line_queue.put(f"data: [WARN] Could not save report: {exc}\n\n")
-        except httpx.ConnectError:
-            await line_queue.put(f"data: [ERROR] Cannot reach probe at {PROBE_URL} — is it running?\n\n")
-        except Exception as exc:
-            await line_queue.put(f"data: [ERROR] Proxy error: {exc}\n\n")
-        finally:
-            await line_queue.put(None)  # sentinel: stream finished
+    if mac_lower in _nuclei_subs:
+        # Scan already running — replay buffered lines then subscribe for new ones
+        for line in _nuclei_lines.get(mac_lower, []):
+            await q.put(line)
+        _nuclei_subs[mac_lower].append(q)
+    else:
+        # Start a new scan — initialise broadcast state first
+        _nuclei_subs[mac_lower]  = [q]
+        _nuclei_lines[mac_lower] = []
 
-    asyncio.create_task(_probe_reader())
+        probe_url = f"{PROBE_URL}/stream/vuln-scan/{ip}"
+        params    = {"templates": templates, "mac": mac_lower}
+
+        async def _probe_reader() -> None:
+            async def _broadcast(line: str) -> None:
+                _nuclei_lines.setdefault(mac_lower, []).append(line)
+                for sub_q in list(_nuclei_subs.get(mac_lower, [])):
+                    await sub_q.put(line)
+
+            try:
+                async with httpx.AsyncClient(timeout=None) as client:
+                    async with client.stream("GET", probe_url, params=params) as resp:
+                        if resp.status_code != 200:
+                            body = await resp.aread()
+                            await _broadcast(f"data: [ERROR] Probe returned HTTP {resp.status_code}: {body.decode()[:200]}\n\n")
+                            return
+                        async for raw_line in resp.aiter_lines():
+                            await _broadcast(f"{raw_line}\n")
+                            if raw_line.startswith("data: RESULT:"):
+                                payload_str = raw_line[len("data: RESULT:"):]
+                                try:
+                                    data = json.loads(payload_str)
+                                    _save_vuln_result(mac_lower, ip, data, templates)
+                                except Exception as exc:
+                                    await _broadcast(f"data: [WARN] Could not save report: {exc}\n\n")
+            except httpx.ConnectError:
+                await _broadcast(f"data: [ERROR] Cannot reach probe at {PROBE_URL} — is it running?\n\n")
+            except Exception as exc:
+                await _broadcast(f"data: [ERROR] Proxy error: {exc}\n\n")
+            finally:
+                # Signal all current subscribers that the stream is done, then clean up
+                for sub_q in _nuclei_subs.pop(mac_lower, []):
+                    await sub_q.put(None)
+                _nuclei_lines.pop(mac_lower, None)
+
+        asyncio.create_task(_probe_reader())
 
     async def _event_stream():
         while True:
             try:
-                line = await asyncio.wait_for(line_queue.get(), timeout=30)
+                line = await asyncio.wait_for(q.get(), timeout=30)
             except asyncio.TimeoutError:
                 yield ": heartbeat\n\n"
                 continue
@@ -2289,6 +2331,12 @@ async def stream_vuln_scan(mac: str, db: Session = Depends(get_db)):
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
+
+
+@app.get("/devices/{mac}/vuln-scan-status")
+def vuln_scan_status(mac: str):
+    """Returns whether a nuclei scan is currently running for this device."""
+    return {"scanning": mac.lower() in _nuclei_subs}
 
 
 @app.get("/devices/{mac}/vuln-reports")
@@ -2740,7 +2788,7 @@ def delete_suppression(suppression_id: int, db: Session = Depends(get_db)):
 # ---------------------------------------------------------------------------
 @app.post("/vulns/scan-all")
 async def trigger_scan_all():
-    asyncio.ensure_future(_run_scheduled_vuln_scans())
+    asyncio.ensure_future(_run_all_vuln_scans())
     return {"status": "started", "message": "Vulnerability scan initiated for all eligible devices"}
 
 
@@ -6120,8 +6168,13 @@ async def docker_scan_all(db: Session = Depends(get_db)):
     except Exception as e:
         raise HTTPException(503, str(e))
 
-    for name, image in containers:
-        threading.Thread(target=_run_trivy_for_container, args=(name, image), daemon=True).start()
+    # Run scans sequentially in a single thread — parallel Trivy processes compete
+    # for the shared vulnerability DB and fail silently, returning empty results.
+    def _run_all():
+        for name, image in containers:
+            _run_trivy_for_container(name, image)
+
+    threading.Thread(target=_run_all, daemon=True).start()
 
     return {"started": len(containers), "containers": [n for n, _ in containers]}
 

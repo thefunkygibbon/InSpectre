@@ -2,9 +2,10 @@ import { useState, useEffect, useRef } from 'react'
 import {
   X, Box, Play, Square, RotateCcw, ChevronDown, ChevronRight,
   Network, HardDrive, Tag, Terminal, ShieldAlert, ShieldCheck,
-  Settings2, Clock, ExternalLink, Eye, EyeOff, Loader2, FileText, Download,
+  Settings2, Clock, ExternalLink, Eye, EyeOff, Loader2, FileText, Download, FileDown,
 } from 'lucide-react'
 import { api } from '../api'
+import { exportContainerVulnPDF } from '../utils/vulnPdfExport'
 
 const STATUS_CONFIG = {
   running:    { color: '#22c55e', bg: 'rgba(34,197,94,0.12)',   border: 'rgba(34,197,94,0.3)',   label: 'Running'    },
@@ -388,6 +389,15 @@ function VulnTab({ container, trivyScan, updateTrivyScan }) {
           <span className="flex items-center gap-1 text-xs" style={{ color: 'var(--color-text-faint)' }}>
             <Loader2 size={11} className="animate-spin" />Scanning…
           </span>
+        )}
+        {vulns !== null && !scanning && (
+          <button
+            onClick={() => exportContainerVulnPDF(container, vulns, scannedAt)}
+            className="flex items-center gap-1 px-2 py-1.5 rounded-lg text-xs font-medium transition-colors ml-auto"
+            style={{ color: 'var(--color-text-faint)', border: '1px solid var(--color-border)' }}
+            title="Export PDF report">
+            <FileDown size={11} /> Export PDF
+          </button>
         )}
       </div>
 

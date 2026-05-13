@@ -3,10 +3,11 @@ import {
   ShieldAlert, ShieldCheck, ShieldQuestion, AlertTriangle,
   Info, ChevronDown, ChevronRight, Trash2,
   Clock, Square, Wrench, AlertOctagon, BookOpen, Tag, Globe,
-  ExternalLink,
+  ExternalLink, FileDown,
 } from 'lucide-react'
 import { api, streamSSE } from '../api'
 import { StreamOutput }   from './StreamOutput'
+import { exportDeviceVulnPDF } from '../utils/vulnPdfExport'
 
 // ---------------------------------------------------------------------------
 // Severity config
@@ -381,7 +382,8 @@ export function VulnPanel({ device, onScanComplete, lines, setLines, scanning, s
 
   const [reports,  setReports]  = useState(null)
   const [loading,  setLoading]  = useState(false)
-  const abortRef = useRef(null)
+  const abortRef   = useRef(null)
+  const startScanRef = useRef(null)
 
   useEffect(() => {
     if (!mac) return
@@ -392,6 +394,22 @@ export function VulnPanel({ device, onScanComplete, lines, setLines, scanning, s
       .finally(() => setLoading(false))
   }, [mac])
 
+  // On mount, check whether the backend has a scan running for this device.
+  // If it does (scan started before drawer was opened or after drawer was closed),
+  // reconnect the SSE stream so the user sees live progress.
+  useEffect(() => {
+    if (!mac || scanning) return
+    let cancelled = false
+    api.getVulnScanStatus(mac)
+      .then(({ scanning: active }) => {
+        if (!cancelled && active && startScanRef.current) {
+          startScanRef.current({ reconnect: true })
+        }
+      })
+      .catch(() => {})
+    return () => { cancelled = true }
+  }, [mac]) // eslint-disable-line react-hooks/exhaustive-deps
+
   function stopScan() {
     if (abortRef.current) {
       abortRef.current.abort()
@@ -400,10 +418,12 @@ export function VulnPanel({ device, onScanComplete, lines, setLines, scanning, s
     setScanning(false)
   }
 
-  async function startScan() {
+  async function startScan({ reconnect = false } = {}) {
     if (scanning) { stopScan(); return }
     setScanning(true)
-    setLines(['[INFO] Initiating vulnerability scan…'])
+    // On reconnect, keep existing lines — the backend will replay buffered output.
+    // On a fresh start, reset to a clean slate.
+    if (!reconnect) setLines(['[INFO] Initiating vulnerability scan…'])
 
     const ctrl = new AbortController()
     abortRef.current = ctrl
@@ -432,6 +452,10 @@ export function VulnPanel({ device, onScanComplete, lines, setLines, scanning, s
     }
   }
 
+  // Keep a stable ref so the reconnect effect can call startScan without
+  // needing it in the dependency array (avoids re-running on every render).
+  startScanRef.current = startScan
+
   function handleDeleteReport(id) {
     setReports(prev => (prev || []).filter(r => r.id !== id))
   }
@@ -450,12 +474,23 @@ export function VulnPanel({ device, onScanComplete, lines, setLines, scanning, s
           </h3>
           {lastReport && <SevBadge severity={lastReport.severity} />}
         </div>
-        {device.vuln_last_scanned && (
-          <span className="text-[10px] text-text-faint flex items-center gap-1">
-            <Clock size={10} />
-            {fmt(device.vuln_last_scanned)}
-          </span>
-        )}
+        <div className="flex items-center gap-2">
+          {device.vuln_last_scanned && (
+            <span className="text-[10px] text-text-faint flex items-center gap-1">
+              <Clock size={10} />
+              {fmt(device.vuln_last_scanned)}
+            </span>
+          )}
+          {reports && reports.length > 0 && (
+            <button
+              onClick={() => exportDeviceVulnPDF(device, reports)}
+              className="flex items-center gap-1 px-2 py-1 rounded text-[10px] font-medium transition-colors"
+              style={{ color: 'var(--color-text-faint)', border: '1px solid var(--color-border)' }}
+              title="Export PDF report">
+              <FileDown size={11} /> Export PDF
+            </button>
+          )}
+        </div>
       </div>
 
       {/* IP warning */}

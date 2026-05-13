@@ -165,6 +165,7 @@ export const api = {
   // Phase 3 — Vuln scanning
   getVulnReports:       (mac, limit) => request('GET',    `/devices/${mac}/vuln-reports${limit ? `?limit=${limit}` : ''}`),
   getVulnReportDetail:  (mac, id)    => request('GET',    `/devices/${mac}/vuln-reports/${id}`),
+  getVulnScanStatus:    (mac)        => request('GET',    `/devices/${mac}/vuln-scan-status`),
   deleteVulnReport:     (mac, id)    => request('DELETE', `/devices/${mac}/vuln-reports/${id}`),
   getAllVulnReports:     (severity)   => request('GET',    `/vuln-reports${severity ? `?severity=${severity}` : ''}`),
   getVulnSummary:       ()           => request('GET',    '/vulns/summary'),
