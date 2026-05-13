@@ -884,8 +884,9 @@ Access settings via the gear icon in the main navigation bar. Settings are organ
 
 | Setting | Description |
 |---|---|
-| **Backup database** | Export the full database as a JSON file for backup. |
-| **Restore database** | Import a previously exported JSON backup. Replaces current data. |
+| **Backup password** | Optional password used to encrypt the backup file (AES-256-GCM). Leave blank for an unencrypted `.json` backup. When set, the backup saves as `.ienc` and cannot be restored without the same password. |
+| **Download backup** | Export the full database as a JSON (unencrypted) or `.ienc` (encrypted) backup file covering all devices, events, vuln reports, speed test history, settings, users, fingerprints, block schedules, and saved views. |
+| **Restore from backup** | Import a previously exported backup file (`.json` or `.ienc`). If restoring an encrypted backup, enter the password in the backup password field first. |
 | **Export devices CSV** | Download a CSV file of all devices and their current metadata. |
 | **Import fingerprints** | Import a fingerprint database JSON file to augment the local classification database. |
 | **Export fingerprints** | Export the current local fingerprint database as a JSON file. |
@@ -896,19 +897,61 @@ Access settings via the gear icon in the main navigation bar. Settings are organ
 
 ### 11.1 Backup and Restore
 
-InSpectre stores all data in a PostgreSQL database in the `postgres_data/` directory on the host. Two backup approaches are available:
+InSpectre's built-in backup covers the complete database state. A backup taken from a running system can be restored to a fresh install and produce an identical result — all data, settings, users, and history included.
 
-**JSON backup (recommended for portability):**
-- Go to **Settings → Data → Backup database**.
-- A JSON file is downloaded containing all devices, events, vulnerability reports, fingerprints, and settings.
-- To restore: **Settings → Data → Restore database** and upload the JSON file.
+**What is included in a backup:**
 
-> Restoring from a JSON backup replaces all current data. Make sure to take a fresh backup before restoring.
+| Data | Included |
+|---|---|
+| All device records (names, tags, notes, overrides, baselines, groupings) | Yes |
+| Full event timeline (`device_events`) | Yes |
+| Vulnerability scan reports | Yes |
+| IP history | Yes |
+| Speed test history | Yes |
+| All settings | Yes |
+| User accounts and password hashes | Yes |
+| Fingerprint database | Yes |
+| Block schedules | Yes |
+| Saved filter views | Yes |
+| Alert suppressions | Yes |
+| Traffic session data | No (ephemeral) |
 
-**Directory backup (for self-hosters):**
-- Stop InSpectre: `./inspectre.sh down`
-- Copy the `postgres_data/` directory to a safe location.
-- To restore: replace `postgres_data/` with the backup copy and run `./inspectre.sh up`.
+**Taking a backup:**
+
+1. Go to **Settings → Data → Database Backup & Restore**.
+2. Optionally enter a **backup password** to encrypt the file (leave blank for an unencrypted `.json` file).
+3. Click **Download backup** — the file saves as `inspectre_backup.json` (unencrypted) or `inspectre_backup.ienc` (encrypted).
+
+**Encryption:**
+
+When a password is provided, the backup is encrypted with AES-256-GCM. The password is not stored anywhere — you must remember it to restore the backup. Any password can be used; it does not have to match your InSpectre login password.
+
+> If you lose the password to an encrypted backup, the backup cannot be decrypted. Keep the password in a secure password manager alongside the backup file.
+
+**Restoring a backup:**
+
+*From within the settings panel (existing install):*
+1. Go to **Settings → Data → Database Backup & Restore**.
+2. If restoring an encrypted backup, enter the password in the backup password field first.
+3. Click **Restore from backup** and select the `.json` or `.ienc` file.
+4. A success summary shows the number of records restored by type.
+
+> Restoring merges data into the existing database using upsert logic — it does not wipe first. Existing records are overwritten by the backup values. Run a fresh backup of the current state before restoring if you want to preserve it.
+
+*From the setup wizard (fresh install):*
+1. At the start of the setup wizard, choose **Restore from backup** instead of **Fresh setup**.
+2. If the backup is encrypted, enter the password in the field shown before selecting the file.
+3. Select the backup file — setup is marked complete automatically after restore.
+
+**Directory-level backup (advanced):**
+
+As an alternative to the JSON backup, you can copy the `postgres_data/` directory directly:
+```bash
+./inspectre.sh down
+cp -r postgres_data/ postgres_data.backup/
+./inspectre.sh up
+```
+To restore, replace `postgres_data/` with your copy and start the stack. This preserves everything including tables not covered by the JSON backup (such as in-flight traffic sessions), but the file is not portable across major PostgreSQL version changes.
 
 **Rebuilding without losing data:**
 ```bash
