@@ -424,6 +424,46 @@ DHCP packets are only captured when the device actively requests or renews its l
 
 Enter your API key in **Settings → Scanner → Device Identification → Fingerbank API Key**. Register for a free account at [fingerbank.org](https://fingerbank.org/).
 
+### 3.13 Device Grouping
+
+Many devices appear on the network with more than one MAC address — typically a laptop or desktop with both a wired Ethernet port and a Wi-Fi adapter. Without grouping, these show as two separate unknown devices. InSpectre automatically detects this pattern and merges them.
+
+**How auto-grouping works:**
+
+When a newly discovered device has a hostname that matches an existing device's hostname (after stripping domain suffixes like `.lan` or `.local` and ignoring case), the two devices are automatically placed in the same group. The matching logic:
+
+- Strips domain suffixes: `andrewlaptop.lan` and `andrewLAPTOP` both resolve to base label `andrewlaptop`
+- Case-insensitive: `AndrewLaptop` == `andrewlaptop`
+- Generic hostnames are excluded (Android-*, iPhone, localhost, etc.) to avoid false merges
+
+**Backfill on startup:**
+
+When InSpectre starts, a background process scans all existing devices and retroactively groups any that match by hostname. You do not need to delete and rediscover devices — existing records are updated automatically.
+
+**Disabling auto-grouping:**
+
+If you prefer to manage grouping manually, go to **Settings → Scanner → Advanced → Auto-group by Hostname** and disable the toggle. With auto-grouping off, InSpectre flags devices with matching hostnames but does not merge them automatically.
+
+**What changes when devices are grouped:**
+
+| Aspect | Behaviour |
+|---|---|
+| **Dashboard card** | Only one card is shown — the representative interface. If one interface is online, that one is the representative. If multiple are online, the primary member is used. If all are offline, the primary is used. |
+| **Card footer — Interfaces row** | Lists all member interfaces with their online status dots and display names |
+| **Overview tab** | "Grouped Interfaces" panel shows all members |
+| **Timeline** | Shows events from all member MACs in a single unified timeline. Events from a different MAC than the one whose drawer you have open are labelled with the source MAC. |
+| **Event type** | New interfaces added to an existing group write an `interface_joined` event instead of a `joined` event |
+| **Admin tab** | Device Grouping section allows adding, removing, and setting primary interface |
+
+**Manual grouping:**
+
+To manually add a device to an existing group:
+1. Open either device's drawer → **Admin** tab → **Device Grouping**.
+2. Enter the MAC address of the other device in the "Add by MAC" field.
+3. Click **Add**.
+
+To remove a device from a group, click the **Remove** button next to that MAC in the same panel. The removed device becomes a standalone device again and will appear separately on the dashboard.
+
 ---
 
 ## 4. Network Scanning
@@ -636,15 +676,30 @@ To stop monitoring, click **Stop monitoring**.
 
 ### 7.3 Speed Test
 
-The **Speed Test** panel in the Traffic Monitor view runs `speedtest-cli` from the probe container and reports:
+The **Speed Test** panel in the Traffic Monitor view runs the Ookla Speedtest CLI from the probe container and reports:
 - Download speed (Mbps)
 - Upload speed (Mbps)
 - Ping latency (ms)
-- Test server used
+- Test server name and location
 
-Results reflect the speed available to the InSpectre host, not to any specific client device. This is useful as a baseline to confirm whether your ISP is delivering the expected bandwidth.
+Results reflect the speed available to the InSpectre host, not to any specific client device. This is useful as a baseline to confirm your ISP is delivering the expected bandwidth.
 
-**Scheduling:** Use the **Auto-run** dropdown in the speed test panel to schedule automatic tests at a fixed interval (every 30 minutes, hourly, every 6 hours, or daily). Results are stored and displayed in the history list below the panel. The schedule persists across restarts.
+**Running a test:**
+
+1. Navigate to the **Traffic** page (the activity/chart icon in the nav bar).
+2. Scroll to the **Speed Test** section.
+3. Optionally select a specific test server from the **Choose server** dropdown — click the button to load the server list (closest servers are shown first). Leave on auto-select for the nearest server.
+4. Click **Run Speed Test**.
+
+Live download and upload progress is shown in real time as the test runs. When complete, the result is added to the history list below.
+
+**Scheduling:**
+
+Use the gear icon (⚙) in the speed test header to schedule automatic tests. Available intervals: every 30 minutes, hourly, every 6 hours, or daily. Results from scheduled tests appear in the same history list. The schedule persists across restarts.
+
+**History:**
+
+Past speed test results are stored and displayed in the history list with timestamp, server, ping, download, and upload. Individual results can be deleted from the list with the trash icon. Speed test history is included in the full JSON backup.
 
 ---
 
@@ -801,6 +856,7 @@ Access settings via the gear icon in the main navigation bar. Settings are organ
 | **Auto-scan new devices** | When enabled, a vulnerability scan is triggered automatically the first time a new device is discovered. |
 | **Nuclei Template Update Interval** | How often Nuclei templates are refreshed from the upstream template repository, in hours. Default: 24. |
 | **Fingerbank API Key** | Free API key from [fingerbank.org](https://fingerbank.org/). When set, DHCP fingerprint data is sent to Fingerbank for cloud device identification. Leave blank to disable. Results appear in the DHCP Fingerprint section of each device drawer. |
+| **Auto-group by Hostname** | When enabled, devices that share the same base hostname (ignoring domain suffixes and case) are automatically grouped as a single physical device with multiple interfaces. Disable to manage grouping manually. |
 
 ### 10.2 Notification Settings
 
