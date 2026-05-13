@@ -46,6 +46,46 @@
   --toast-offline-border:  #5a2a2a;
 }
 
+/* ── Phantom skin tokens ── */
+[data-skin="phantom"] {
+  --color-bg:            #000000;
+  --color-surface:       #080808;
+  --color-surface-hover: #0f0f0f;
+  --color-surface-active:#161616;
+  --color-surface-offset:#0b0b0b;
+  --color-border:        rgba(0,255,65,0.12);
+  --color-text:          #d0ffd8;
+  --color-text-muted:    #4dba6a;
+  --color-text-faint:    #1f5c30;
+  --color-brand:         #00ff41;
+  --color-brand-light:   #39ff6e;
+  --noise-opacity: 0;
+  --toast-new-bg:        #001a08;
+  --toast-new-border:    rgba(0,255,65,0.3);
+  --toast-offline-bg:    #1a0000;
+  --toast-offline-border: rgba(239,68,68,0.3);
+}
+
+/* ── Phantom light mode ── */
+[data-skin="phantom"][data-theme="light"] {
+  --color-bg:            #f0f7f1;
+  --color-surface:       #ffffff;
+  --color-surface-hover: #e4f2e6;
+  --color-surface-active:#d2ecd5;
+  --color-surface-offset:#f5fbf5;
+  --color-border:        rgba(0,110,35,0.14);
+  --color-text:          #081a0c;
+  --color-text-muted:    #1a6b30;
+  --color-text-faint:    #5aaa70;
+  --color-brand:         #007a20;
+  --color-brand-light:   #009928;
+  --toast-new-bg:        #edf7ee;
+  --toast-new-border:    rgba(0,110,35,0.3);
+  --toast-offline-bg:    #fde8e8;
+  --toast-offline-border: rgba(220,38,38,0.3);
+  color-scheme: light;
+}
+
 /* Default to dark */
 :root { color-scheme: dark; }
 [data-theme="light"] { color-scheme: light; }
@@ -296,6 +336,84 @@
     to   { opacity: 1; }
   }
   .animate-fade-in { animation: fade-in 0.15s ease both; }
+
+  /* ── Phantom skin overrides ── */
+  [data-skin="phantom"] .card,
+  [data-skin="phantom"] .device-card,
+  [data-skin="phantom"] .glass {
+    border-radius: 0 !important;
+    border-color: rgba(0,255,65,0.15) !important;
+  }
+  [data-skin="phantom"] .device-card:hover {
+    border-color: #00ff41 !important;
+    box-shadow: 0 0 14px rgba(0,255,65,0.25), inset 0 0 40px rgba(0,255,65,0.02) !important;
+  }
+  [data-skin="phantom"] .device-card::before {
+    background: linear-gradient(135deg, rgba(0,255,65,0.06), transparent 60%) !important;
+  }
+  [data-skin="phantom"] .btn-primary {
+    border-radius: 0 !important;
+    border: 1px solid var(--color-brand);
+    font-family: 'JetBrains Mono', monospace;
+    letter-spacing: 0.06em;
+    font-size: 0.75rem;
+    text-transform: uppercase;
+  }
+  [data-skin="phantom"] .btn-ghost {
+    border-radius: 0 !important;
+  }
+  [data-skin="phantom"] .input {
+    border-radius: 0 !important;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 0.75rem;
+    border-color: rgba(0,255,65,0.2);
+  }
+  [data-skin="phantom"] .input:focus {
+    border-color: #00ff41;
+    box-shadow: 0 0 0 2px rgba(0,255,65,0.15);
+  }
+  [data-skin="phantom"] .drawer-tab {
+    border-radius: 0 !important;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 0.7rem;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+  }
+  [data-skin="phantom"] .badge-online,
+  [data-skin="phantom"] .badge-offline,
+  [data-skin="phantom"] .badge-scanning {
+    border-radius: 0 !important;
+  }
+  [data-skin="phantom"] .header-glow { display: none; }
+  [data-skin="phantom"] .noise-overlay {
+    background-image: repeating-linear-gradient(
+      0deg,
+      transparent,
+      transparent 3px,
+      rgba(0, 255, 65, 0.025) 3px,
+      rgba(0, 255, 65, 0.025) 4px
+    ) !important;
+    opacity: 1 !important;
+  }
+  [data-skin="phantom"] ::-webkit-scrollbar-thumb {
+    background: rgba(0,255,65,0.2);
+  }
+  [data-skin="phantom"][data-theme="light"] ::-webkit-scrollbar-thumb {
+    background: rgba(0,110,35,0.2);
+  }
+  [data-skin="phantom"][data-theme="light"] .noise-overlay {
+    background-image: repeating-linear-gradient(
+      0deg,
+      transparent,
+      transparent 3px,
+      rgba(0, 110, 35, 0.04) 3px,
+      rgba(0, 110, 35, 0.04) 4px
+    ) !important;
+  }
+  [data-skin="phantom"][data-theme="light"] .device-card:hover {
+    border-color: #007a20 !important;
+    box-shadow: 0 0 14px rgba(0,110,35,0.2), inset 0 0 40px rgba(0,110,35,0.03) !important;
+  }
 
   /* ── Live ping indicator ── */
   @keyframes live-ping {

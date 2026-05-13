@@ -2,10 +2,11 @@ import { useState, useEffect, useRef } from 'react'
 import {
   Save, RotateCcw, Settings2, X, Download, Upload, FileText,
   Database, Bell, ScanLine, Eye, EyeOff, Send, Globe, User, Key, Box,
-  AlertTriangle, ChevronDown, ChevronRight,
+  AlertTriangle, ChevronDown, ChevronRight, Paintbrush,
 } from 'lucide-react'
 import { api } from '../api'
 import { HostsManager } from './HostsManager'
+import { useTheme } from '../hooks/useTheme'
 
 // ── Setting definitions ────────────────────────────────────────────────────────
 const SETTING_META = {
@@ -180,11 +181,12 @@ const DELIVERY_KEYS = new Set(['alert_webhook_url','ntfy_url','ntfy_topic','goti
 const DOCKER_KEYS = new Set(['docker_enabled','docker_host','docker_tls_verify'])
 
 const TABS = [
-  { id: 'scanner',       label: 'Scanner',       Icon: ScanLine },
-  { id: 'notifications', label: 'Notifications', Icon: Bell     },
-  { id: 'docker',        label: 'Docker',        Icon: Box      },
-  { id: 'data',          label: 'Data',          Icon: Database },
-  { id: 'account',       label: 'Account',       Icon: User     },
+  { id: 'scanner',       label: 'Scanner',       Icon: ScanLine   },
+  { id: 'notifications', label: 'Notifications', Icon: Bell       },
+  { id: 'docker',        label: 'Docker',        Icon: Box        },
+  { id: 'data',          label: 'Data',          Icon: Database   },
+  { id: 'appearance',    label: 'Appearance',    Icon: Paintbrush },
+  { id: 'account',       label: 'Account',       Icon: User       },
 ]
 
 async function downloadResponse(res, filename) {
@@ -198,6 +200,7 @@ async function downloadResponse(res, filename) {
 }
 
 export function SettingsPanel({ onClose, onSettingChange }) {
+  const { skin, setSkin, isDark } = useTheme()
   const [activeTab,     setActiveTab]     = useState('scanner')
   const [settings,      setSettings]      = useState([])
   const [dirty,         setDirty]         = useState({})
@@ -380,7 +383,7 @@ export function SettingsPanel({ onClose, onSettingChange }) {
   }
 
   const hasDirty   = Object.keys(dirty).length > 0
-  const showFooter = activeTab !== 'account'
+  const showFooter = activeTab !== 'account' && activeTab !== 'appearance'
 
   // Returns current value for a key (dirty-aware)
   function val(key) {
@@ -431,20 +434,23 @@ export function SettingsPanel({ onClose, onSettingChange }) {
           <button onClick={onClose} className="btn-ghost p-2" aria-label="Close"><X size={18} /></button>
         </div>
 
-        {/* Tab bar */}
-        <div className="flex overflow-x-auto px-6 gap-1"
-          style={{ borderBottom: '1px solid var(--color-border)', paddingTop: '12px' }}>
+        {/* Nav grid */}
+        <div className="px-4 py-3 grid grid-cols-3 gap-1.5"
+          style={{ borderBottom: '1px solid var(--color-border)' }}>
           {TABS.map(({ id, label, Icon }) => {
             const isActive = activeTab === id
             return (
               <button key={id} onClick={() => setActiveTab(id)}
-                className="flex shrink-0 whitespace-nowrap items-center gap-1.5 px-2 pb-3 text-xs sm:px-3 sm:text-sm font-medium transition-colors relative"
+                className="flex flex-col items-center gap-1.5 py-2.5 px-1 rounded-xl text-xs font-medium transition-all"
                 style={{
                   color: isActive ? 'var(--color-brand)' : 'var(--color-text-muted)',
-                  borderBottom: isActive ? '2px solid var(--color-brand)' : '2px solid transparent',
-                  marginBottom: '-1px',
+                  background: isActive
+                    ? 'color-mix(in srgb, var(--color-brand) 10%, var(--color-surface-offset))'
+                    : 'var(--color-surface-offset)',
+                  border: `1px solid ${isActive ? 'color-mix(in srgb, var(--color-brand) 30%, transparent)' : 'var(--color-border)'}`,
                 }}>
-                <Icon size={13} />{label}
+                <Icon size={15} />
+                <span style={{ fontSize: '10px', lineHeight: 1 }}>{label}</span>
               </button>
             )
           })}
@@ -911,6 +917,95 @@ export function SettingsPanel({ onClose, onSettingChange }) {
                   </div>
                 )}
               </div>
+            </>
+          )}
+
+          {/* ── Appearance tab ───────────────────────────────────────────────── */}
+          {activeTab === 'appearance' && (
+            <>
+              <p className="text-xs" style={{ color: 'var(--color-text-faint)' }}>
+                Choose a UI style. Changes take effect immediately — no reload required.
+              </p>
+
+              <SectionHeader label="UI Style" Icon={Paintbrush} />
+
+              <div className="grid grid-cols-2 gap-3">
+                {/* Spectre card */}
+                <button
+                  onClick={() => setSkin('spectre')}
+                  style={{
+                    position: 'relative', padding: '14px', textAlign: 'left', cursor: 'pointer',
+                    background: skin === 'spectre'
+                      ? 'color-mix(in srgb, var(--color-brand) 8%, var(--color-surface))'
+                      : 'var(--color-surface-offset)',
+                    border: `2px solid ${skin === 'spectre' ? 'var(--color-brand)' : 'var(--color-border)'}`,
+                    borderRadius: '0.75rem', transition: 'border-color 0.15s',
+                  }}
+                >
+                  {/* Mini preview */}
+                  <div style={{
+                    width: '100%', height: '52px', marginBottom: '10px', overflow: 'hidden',
+                    background: '#0d0d0f', border: '1px solid rgba(255,255,255,0.08)', borderRadius: '6px',
+                    padding: '8px', display: 'flex', flexDirection: 'column', gap: '4px',
+                  }}>
+                    <div style={{ height: '6px', borderRadius: '9999px', width: '55%', background: '#4fa8b0' }} />
+                    <div style={{ height: '4px', borderRadius: '9999px', width: '75%', background: 'rgba(255,255,255,0.12)' }} />
+                    <div style={{ height: '4px', borderRadius: '9999px', width: '60%', background: 'rgba(255,255,255,0.08)' }} />
+                    <div style={{ height: '4px', borderRadius: '9999px', width: '45%', background: 'rgba(255,255,255,0.06)' }} />
+                  </div>
+                  <div style={{ fontSize: '13px', fontWeight: 600, color: 'var(--color-text)', marginBottom: '2px' }}>Spectre</div>
+                  <div style={{ fontSize: '11px', color: 'var(--color-text-muted)' }}>Clean · Modern · Rounded</div>
+                  {skin === 'spectre' && (
+                    <div style={{
+                      position: 'absolute', top: '8px', right: '8px',
+                      width: '16px', height: '16px', borderRadius: '50%',
+                      background: 'var(--color-brand)', display: 'flex', alignItems: 'center', justifyContent: 'center',
+                      fontSize: '10px', color: 'white', fontWeight: 700,
+                    }}>✓</div>
+                  )}
+                </button>
+
+                {/* Phantom card */}
+                <button
+                  onClick={() => setSkin('phantom')}
+                  style={{
+                    position: 'relative', padding: '14px', textAlign: 'left', cursor: 'pointer',
+                    background: skin === 'phantom'
+                      ? 'color-mix(in srgb, var(--color-brand) 8%, var(--color-surface))'
+                      : 'var(--color-surface-offset)',
+                    border: `2px solid ${skin === 'phantom' ? 'var(--color-brand)' : 'var(--color-border)'}`,
+                    borderRadius: '0.75rem', transition: 'border-color 0.15s',
+                  }}
+                >
+                  {/* Mini preview — adapts to current light/dark mode */}
+                  <div style={{
+                    width: '100%', height: '52px', marginBottom: '10px', overflow: 'hidden',
+                    background: isDark ? '#000' : '#f0f7f1',
+                    border: `1px solid ${isDark ? 'rgba(0,255,65,0.2)' : 'rgba(0,110,35,0.2)'}`,
+                    padding: '8px', display: 'flex', flexDirection: 'column', gap: '4px',
+                  }}>
+                    <div style={{ height: '6px', width: '55%', background: isDark ? '#00ff41' : '#007a20' }} />
+                    <div style={{ height: '4px', width: '75%', background: isDark ? 'rgba(0,255,65,0.25)' : 'rgba(0,110,35,0.2)' }} />
+                    <div style={{ height: '4px', width: '60%', background: isDark ? 'rgba(0,255,65,0.15)' : 'rgba(0,110,35,0.12)' }} />
+                    <div style={{ height: '4px', width: '45%', background: isDark ? 'rgba(0,255,65,0.1)' : 'rgba(0,110,35,0.08)' }} />
+                  </div>
+                  <div style={{ fontSize: '13px', fontWeight: 600, color: 'var(--color-text)', marginBottom: '2px' }}>Phantom</div>
+                  <div style={{ fontSize: '11px', color: 'var(--color-text-muted)' }}>Terminal · SOC · Sidebar</div>
+                  {skin === 'phantom' && (
+                    <div style={{
+                      position: 'absolute', top: '8px', right: '8px',
+                      width: '16px', height: '16px', borderRadius: '50%',
+                      background: 'var(--color-brand)', display: 'flex', alignItems: 'center', justifyContent: 'center',
+                      fontSize: '10px', color: 'white', fontWeight: 700,
+                    }}>✓</div>
+                  )}
+                </button>
+              </div>
+
+              <p className="text-xs mt-2" style={{ color: 'var(--color-text-faint)' }}>
+                <strong style={{ color: 'var(--color-text-muted)' }}>Spectre</strong> — top nav bar, rounded cards, teal accent. Follows dark/light mode.<br />
+                <strong style={{ color: 'var(--color-text-muted)' }}>Phantom</strong> — fixed left sidebar, JetBrains Mono, sharp corners. Green on black (dark) or green on white (light).
+              </p>
             </>
           )}
 

@@ -160,7 +160,7 @@ function Toast({ alert, kind, onDismiss, onDeviceClick }) {
   )
 }
 
-function NotificationToasts({ newAlerts, offlineAlerts, onDismissNew, onDismissOffline, onDeviceClick }) {
+function NotificationToasts({ newAlerts, offlineAlerts, onDismissNew, onDismissOffline, onDeviceClick, topOffset = '5rem' }) {
   const all = [
     ...newAlerts.map(a     => ({ ...a, kind: 'new'     })),
     ...offlineAlerts.map(a => ({ ...a, kind: 'offline' })),
@@ -169,7 +169,7 @@ function NotificationToasts({ newAlerts, offlineAlerts, onDismissNew, onDismissO
   return (
     <div
       className="fixed z-50 flex flex-col gap-2"
-      style={{ top: '5rem', right: '1rem', width: '320px', pointerEvents: 'none' }}
+      style={{ top: topOffset, right: '1rem', width: '320px', pointerEvents: 'none' }}
     >
       {all.map(a => (
         <Toast
@@ -267,7 +267,7 @@ function MainApp({ onLogout }) {
       return { ...prev, [mac]: { ...current, ...patch } }
     })
   }
-  const { theme, toggle: toggleTheme } = useTheme()
+  const { theme, toggle: toggleTheme, skin } = useTheme()
   const clock = useClock()
   const { activeFilters, toggleFilter, clearFilters, applyFilters, savedViews, saveView, loadView, deleteView } = useSmartFilters()
 
@@ -399,6 +399,478 @@ function MainApp({ onLogout }) {
   const hasActiveSmartFilters = Object.keys(activeFilters).length > 0
   const activepageInfo = PAGES.find(p => p.id === activePage)
 
+  // ── Shared page content (used by both Spectre and Phantom layouts) ──────────
+  const innerContent = (
+    <>
+      {error && !activePage && (
+        <div className="flex items-center gap-3 px-4 py-3 rounded-xl text-sm mb-8"
+          style={{ background: 'rgb(239 68 68 / 0.1)', border: '1px solid rgb(239 68 68 / 0.2)', color: '#ef4444' }}>
+          <AlertCircle size={16} className="shrink-0" />
+          {error}
+        </div>
+      )}
+
+      {activePage === 'tools' && <NetworkTools />}
+
+      {activePage === 'security' && (
+        <SecurityDashboard
+          onDeviceClick={(mac, tab) => {
+            setActivePage(null)
+            const dev = devices.find(d => d.mac_address === mac)
+            if (dev) openDevice(dev, tab || 'overview')
+          }}
+          onContainerClick={name => {
+            setContainerToOpen(name)
+            setActivePage('containers')
+          }}
+        />
+      )}
+
+      {activePage === 'blocking' && (
+        <DeviceBlocking devices={devices} onDeviceClick={dev => {
+          setActivePage(null)
+          openDevice(typeof dev === 'object' ? dev : devices.find(d => d.mac_address === dev))
+        }} />
+      )}
+
+      {activePage === 'timeline' && (
+        <NetworkTimeline onDeviceClick={mac => {
+          setActivePage(null)
+          const dev = devices.find(d => d.mac_address === mac)
+          if (dev) openDevice(dev)
+        }} />
+      )}
+
+      {activePage === 'traffic' && <TrafficPage />}
+
+      {activePage === 'containers' && <ContainersPage openContainer={containerToOpen} />}
+
+      {!activePage && (
+        <div className="space-y-8">
+          <section>
+            <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
+              <StatCard label="Total Devices" value={stats?.total_devices} icon={Monitor}   color="brand"
+                onClick={() => handleCardFilter('all')}    active={filter === 'all'} />
+              <StatCard label="Online"        value={stats?.online}        icon={Wifi}       color="emerald"
+                onClick={() => handleCardFilter('online')}  active={filter === 'online'} />
+              <StatCard label="Offline"       value={stats?.offline}       icon={WifiOff}    color="red"
+                onClick={() => handleCardFilter('offline')} active={filter === 'offline'} />
+              <StatCard label="Watched"       value={stats?.important}     icon={Star}       color="amber"
+                onClick={() => handleCardFilter('important')} active={filter === 'important'} />
+            </div>
+          </section>
+
+          <section className="flex flex-wrap gap-2 items-center">
+            <div className="relative" style={{ minWidth: '160px', flex: '1 1 160px', maxWidth: '340px' }}>
+              <Search size={15} className="absolute left-3 top-1/2 -translate-y-1/2 pointer-events-none"
+                style={{ color: 'var(--color-text-muted)' }} />
+              <input className="input pl-9 w-full" placeholder="Search…"
+                value={search} onChange={e => setSearch(e.target.value)} />
+              {search && (
+                <button onClick={() => setSearch('')}
+                  className="absolute right-2 top-1/2 -translate-y-1/2 rounded p-0.5 transition-colors hover:opacity-70"
+                  style={{ color: 'var(--color-text-muted)' }} aria-label="Clear search">
+                  <X size={13} />
+                </button>
+              )}
+            </div>
+
+            <button
+              onClick={() => setShowFilters(v => !v)}
+              className="flex items-center gap-1.5 px-3 py-2 rounded-xl text-xs font-medium border transition-colors relative"
+              style={showFilters || Object.keys(activeFilters).length > 0
+                ? { background: 'var(--color-brand)', color: 'white', borderColor: 'transparent' }
+                : { background: 'var(--color-surface-offset)', color: 'var(--color-text-muted)', borderColor: 'var(--color-border)' }}
+              title="Toggle smart filters" aria-label="Toggle smart filters"
+            >
+              <SlidersHorizontal size={13} />
+              <span>Filters</span>
+              {Object.keys(activeFilters).length > 0 && !showFilters && (
+                <span className="ml-0.5 px-1.5 py-0.5 rounded-full text-[10px] font-bold"
+                  style={{ background: 'rgba(255,255,255,0.25)', color: 'white' }}>
+                  {Object.keys(activeFilters).length}
+                </span>
+              )}
+            </button>
+
+            {!isCategoryMode && (
+              <div className="relative">
+                <select value={sort} onChange={e => setSort(e.target.value)}
+                  className="input pr-8 appearance-none cursor-pointer text-xs" aria-label="Sort devices">
+                  {SORT_OPTIONS.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
+                </select>
+                <ChevronDown size={14} className="absolute right-3 top-1/2 -translate-y-1/2 pointer-events-none"
+                  style={{ color: 'var(--color-text-muted)' }} />
+              </div>
+            )}
+
+            <button
+              onClick={handleExportCsv}
+              className="p-2 rounded-xl glass transition-all duration-150"
+              style={{ color: 'var(--color-text-muted)' }}
+              aria-label="Export devices as CSV" title="Export devices as CSV">
+              <Download size={15} />
+            </button>
+
+            <div className="flex items-center gap-1 glass rounded-xl p-1 ml-auto">
+              <button onClick={() => setLayout('grid')}
+                className="p-2 rounded-lg transition-all duration-150"
+                style={layout === 'grid' ? { background: 'var(--color-brand)', color: 'white' } : { color: 'var(--color-text-muted)' }}
+                aria-label="Grid layout" title="Grid layout">
+                <LayoutGrid size={15} /></button>
+              <button onClick={() => setLayout('list')}
+                className="p-2 rounded-lg transition-all duration-150"
+                style={layout === 'list' ? { background: 'var(--color-brand)', color: 'white' } : { color: 'var(--color-text-muted)' }}
+                aria-label="List layout" title="List layout">
+                <List size={15} /></button>
+              <button onClick={() => setLayout('category')}
+                className="p-2 rounded-lg transition-all duration-150"
+                style={layout === 'category' ? { background: 'var(--color-brand)', color: 'white' } : { color: 'var(--color-text-muted)' }}
+                aria-label="Category view" title="Category view">
+                <Layers size={15} /></button>
+            </div>
+          </section>
+
+          {showFilters && (
+            <section>
+              <SmartFilterBar
+                devices={devices}
+                activeFilters={activeFilters}
+                onToggle={toggleFilter}
+                onClear={clearFilters}
+                savedViews={savedViews}
+                onSaveView={saveView}
+                onLoadView={loadView}
+                onDeleteView={deleteView}
+              />
+            </section>
+          )}
+
+          <section>
+            {loading ? (
+              <SkeletonGrid layout={layout === 'category' ? 'grid' : layout} />
+            ) : filtered.length === 0 ? (
+              <EmptyState search={search} filter={filter} hasSmartFilters={hasActiveSmartFilters} onClearSmartFilters={clearFilters} />
+            ) : isCategoryMode ? (
+              <>
+                <p className="text-xs mb-4" style={{ color: 'var(--color-text-faint)' }}>
+                  Showing {filtered.length} of {devices.length} device{devices.length !== 1 ? 's' : ''} &middot; grouped by device type
+                </p>
+                <CategoryView devices={filtered} layout="grid" onDeviceClick={openDevice} />
+              </>
+            ) : (
+              <>
+                <p className="text-xs mb-4" style={{ color: 'var(--color-text-faint)' }}>
+                  Showing {filtered.length} of {devices.length} device{devices.length !== 1 ? 's' : ''}
+                  {filter !== 'all' && (
+                    <span className="ml-2 px-2 py-0.5 rounded-full text-[10px] font-semibold uppercase"
+                      style={{ background: 'var(--color-brand)', color: 'white' }}>{filter}</span>
+                  )}
+                  {hasActiveSmartFilters && (
+                    <span className="ml-2 px-2 py-0.5 rounded-full text-[10px] font-semibold"
+                      style={{ background: 'var(--color-surface-offset)', color: 'var(--color-text-muted)' }}>
+                      + smart filters
+                    </span>
+                  )}
+                </p>
+                {layout === 'grid' ? (
+                  <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-4">
+                    {filtered.map(d => (
+                      <DeviceCard key={d.mac_address} device={d}
+                        onClick={() => openDevice(d)}
+                        onStarToggle={handleStarToggle}
+                        isVulnScanning={vulnScansByMac[d.mac_address]?.scanning || false}
+                      />
+                    ))}
+                  </div>
+                ) : (
+                  <div className="card overflow-hidden">
+                    <div
+                      className="grid grid-cols-[1.5rem_1fr_5rem_1.5rem] sm:grid-cols-[1.5rem_2fr_1fr_1fr_1fr_6rem_1.5rem] gap-3 sm:gap-4 px-4 py-2.5 border-b
+                                 text-xs font-semibold uppercase tracking-wider"
+                      style={{ borderColor: 'var(--color-border)', color: 'var(--color-text-muted)' }}
+                    >
+                      <span /><span>Name / IP</span>
+                      <span className="hidden sm:block">MAC</span>
+                      <span className="hidden sm:block">Vendor</span>
+                      <span className="hidden sm:block">Last Changed</span>
+                      <span>Status</span><span />
+                    </div>
+                    {filtered.map((d, i) => (
+                      <DeviceRow key={d.mac_address} device={d} onClick={() => openDevice(d)}
+                        striped={i % 2 === 1} onStarToggle={handleStarToggle}
+                        isVulnScanning={vulnScansByMac[d.mac_address]?.scanning || false} />
+                    ))}
+                  </div>
+                )}
+              </>
+            )}
+          </section>
+        </div>
+      )}
+    </>
+  )
+
+  // ── Shared overlay JSX ───────────────────────────────────────────────────────
+  const sharedDrawer = selected && (
+    <DeviceDrawer
+      key={selected.mac_address}
+      device={selected}
+      onClose={() => setSelected(null)}
+      onRename={handleRename}
+      onResolveName={handleResolveName}
+      onRefresh={refresh}
+      onStarToggle={handleStarToggle}
+      onMetadataUpdate={async (mac, patch) => {
+        const updated = await api.updateMetadata(mac, patch)
+        setSelected(prev => prev?.mac_address === mac ? { ...prev, ...updated } : prev)
+        await refresh()
+      }}
+      onZoneChange={(zone) => setSelected(prev => prev?.mac_address === selected.mac_address ? { ...prev, zone } : prev)}
+      vulnScanState={vulnScansByMac[selected.mac_address] || { lines: [], scanning: false }}
+      onVulnScanChange={(patchOrFn) => updateVulnScan(selected.mac_address, patchOrFn)}
+      initialTab={drawerInitialTab}
+    />
+  )
+  const sharedSettings = showSettings && (
+    <SettingsPanel onClose={() => setShowSettings(false)} onSettingChange={handleSettingChange} />
+  )
+
+  // ── Phantom layout (terminal SOC, left sidebar) ──────────────────────────────
+  if (skin === 'phantom') {
+    const phantomAlertDrop = showAlertDrop && (
+      <>
+        <div className="fixed inset-0 z-30" onClick={() => setShowAlertDrop(false)} />
+        <div style={{
+          position: 'fixed', left: '248px', bottom: '48px',
+          width: '320px', zIndex: 40, padding: '16px',
+          background: 'var(--color-surface)', border: '1px solid var(--color-border)',
+          boxShadow: '0 8px 32px rgba(0,0,0,0.7)',
+          fontFamily: 'JetBrains Mono, monospace',
+        }}>
+          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '12px' }}>
+            <span style={{ fontSize: '10px', letterSpacing: '0.12em', color: 'var(--color-text-muted)' }}>// ALERTS</span>
+            {totalAlerts > 0 && (
+              <button onClick={() => { dismissAllNew(); dismissAllOffline(); setShowAlertDrop(false) }}
+                style={{ fontSize: '10px', color: 'var(--color-brand)', background: 'none', border: 'none', cursor: 'pointer', letterSpacing: '0.06em' }}>
+                CLEAR_ALL
+              </button>
+            )}
+          </div>
+          {totalAlerts === 0 ? (
+            <p style={{ fontSize: '11px', textAlign: 'center', padding: '16px 0', color: 'var(--color-text-faint)' }}>// no alerts</p>
+          ) : (
+            <div style={{ maxHeight: '400px', overflowY: 'auto', display: 'flex', flexDirection: 'column', gap: '6px' }}>
+              {newDeviceAlerts.map(a => (
+                <div key={`new-${a.id}`}
+                  style={{ display: 'flex', alignItems: 'flex-start', gap: '8px', padding: '8px', background: 'var(--color-surface-offset)', cursor: 'pointer' }}
+                  onClick={() => { handleToastDeviceClick(a); dismissNewDevice(a.id); setShowAlertDrop(false) }}>
+                  <Bell size={11} style={{ color: 'var(--color-brand)', flexShrink: 0, marginTop: 2 }} />
+                  <div style={{ flex: 1, minWidth: 0 }}>
+                    <p style={{ fontSize: '10px', fontWeight: 600, color: 'var(--color-brand)', letterSpacing: '0.06em' }}>NEW_DEVICE</p>
+                    <p style={{ fontSize: '10px', color: 'var(--color-text)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                      {a.ip}{(a.hostname || a.vendor) ? ` — ${a.hostname || a.vendor}` : ''}
+                    </p>
+                    <p style={{ fontSize: '10px', color: 'var(--color-text-muted)' }}>{a.mac}</p>
+                  </div>
+                  <button onClick={e => { e.stopPropagation(); dismissNewDevice(a.id) }}
+                    style={{ opacity: 0.5, background: 'none', border: 'none', cursor: 'pointer', color: 'var(--color-text)', flexShrink: 0 }}>
+                    <X size={11} />
+                  </button>
+                </div>
+              ))}
+              {offlineAlerts.map(a => (
+                <div key={`off-${a.id}`}
+                  style={{ display: 'flex', alignItems: 'flex-start', gap: '8px', padding: '8px',
+                           background: a.is_important ? 'rgba(239,68,68,0.08)' : 'var(--color-surface-offset)',
+                           border: a.is_important ? '1px solid rgba(239,68,68,0.2)' : 'none', cursor: 'pointer' }}
+                  onClick={() => { handleToastDeviceClick(a); dismissOffline(a.id); setShowAlertDrop(false) }}>
+                  <WifiOff size={11} style={{ color: '#ef4444', flexShrink: 0, marginTop: 2 }} />
+                  <div style={{ flex: 1, minWidth: 0 }}>
+                    <p style={{ fontSize: '10px', fontWeight: 600, color: '#ef4444', display: 'flex', alignItems: 'center', gap: '4px', letterSpacing: '0.06em' }}>
+                      {a.is_important && <Star size={9} fill="currentColor" />}
+                      {a.is_important ? 'WATCHED_OFFLINE' : 'DEVICE_OFFLINE'}
+                    </p>
+                    <p style={{ fontSize: '10px', color: 'var(--color-text)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                      {a.name} <span style={{ color: 'var(--color-text-muted)' }}>{a.ip}</span>
+                    </p>
+                  </div>
+                  <button onClick={e => { e.stopPropagation(); dismissOffline(a.id) }}
+                    style={{ opacity: 0.5, background: 'none', border: 'none', cursor: 'pointer', color: 'var(--color-text)', flexShrink: 0 }}>
+                    <X size={11} />
+                  </button>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      </>
+    )
+
+    return (
+      <div style={{ display: 'flex', height: '100vh', overflow: 'hidden', background: 'var(--color-bg)', color: 'var(--color-text)' }}>
+        <div className="noise-overlay" />
+
+        {/* ── Sidebar ── */}
+        <aside style={{
+          width: '240px', minWidth: '240px', display: 'flex', flexDirection: 'column',
+          borderRight: '1px solid var(--color-border)', background: 'var(--color-surface)',
+          overflowY: 'auto', position: 'relative', zIndex: 10,
+          fontFamily: 'JetBrains Mono, monospace',
+        }}>
+          {/* Logo */}
+          <div style={{ padding: '18px 16px 14px', borderBottom: '1px solid var(--color-border)' }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
+              <Logo size={22} />
+              <div>
+                <div className="terminal-cursor" style={{ fontSize: '12px', fontWeight: 700, letterSpacing: '0.15em', color: 'var(--color-brand)' }}>
+                  INSPECTRE
+                </div>
+                <div style={{ fontSize: '9px', color: 'var(--color-text-faint)', marginTop: '1px' }}>
+                  v{APP_VERSION} // PHANTOM
+                </div>
+              </div>
+            </div>
+          </div>
+
+          {/* Live status */}
+          <div style={{ padding: '8px 16px', borderBottom: '1px solid var(--color-border)', display: 'flex', alignItems: 'center', gap: '8px' }}>
+            <span className="live-ping" aria-hidden><span className="live-ping-dot" /></span>
+            <span style={{ fontSize: '9px', color: 'var(--color-text-faint)', letterSpacing: '0.1em' }}>LIVE // {clock}</span>
+          </div>
+
+          {/* Nav */}
+          <nav style={{ flex: 1, padding: '6px 0' }}>
+            <button
+              onClick={() => setActivePage(null)}
+              style={{
+                width: '100%', display: 'flex', alignItems: 'center', gap: '10px',
+                padding: '9px 16px', fontSize: '10px', letterSpacing: '0.1em', cursor: 'pointer',
+                color: !activePage ? 'var(--color-brand)' : 'var(--color-text-muted)',
+                background: !activePage ? 'rgba(0,255,65,0.04)' : 'transparent',
+                borderLeft: `2px solid ${!activePage ? 'var(--color-brand)' : 'transparent'}`,
+                border: 'none', textAlign: 'left', transition: 'color 0.1s, background 0.1s',
+                fontFamily: 'inherit',
+              }}
+            >
+              <Monitor size={13} style={{ flexShrink: 0 }} />
+              <span>DASHBOARD</span>
+              {!activePage && <span style={{ marginLeft: 'auto', fontSize: '9px' }}>▶</span>}
+            </button>
+            {PAGES.map(p => (
+              <button key={p.id}
+                onClick={() => setActivePage(p.id)}
+                style={{
+                  width: '100%', display: 'flex', alignItems: 'center', gap: '10px',
+                  padding: '9px 16px', fontSize: '10px', letterSpacing: '0.1em', cursor: 'pointer',
+                  color: activePage === p.id ? 'var(--color-brand)' : 'var(--color-text-muted)',
+                  background: activePage === p.id ? 'rgba(0,255,65,0.04)' : 'transparent',
+                  borderLeft: `2px solid ${activePage === p.id ? 'var(--color-brand)' : 'transparent'}`,
+                  border: 'none', textAlign: 'left', transition: 'color 0.1s, background 0.1s',
+                  fontFamily: 'inherit',
+                }}
+              >
+                <p.Icon size={13} style={{ flexShrink: 0 }} />
+                <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                  {p.label.toUpperCase().replace(/ /g, '_')}
+                </span>
+                {activePage === p.id && <span style={{ marginLeft: 'auto', flexShrink: 0, fontSize: '9px' }}>▶</span>}
+              </button>
+            ))}
+          </nav>
+
+          {/* Stats mini-panel */}
+          {stats && (
+            <div style={{ padding: '10px 16px', borderTop: '1px solid var(--color-border)', borderBottom: '1px solid var(--color-border)' }}>
+              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '3px 8px', fontSize: '9px', letterSpacing: '0.06em' }}>
+                <div><span style={{ color: 'var(--color-text-faint)' }}>TOTAL </span><span style={{ color: 'var(--color-brand)' }}>{stats.total_devices ?? '—'}</span></div>
+                <div><span style={{ color: 'var(--color-text-faint)' }}>ONLINE </span><span style={{ color: '#10b981' }}>{stats.online ?? '—'}</span></div>
+                <div><span style={{ color: 'var(--color-text-faint)' }}>OFFLN </span><span style={{ color: '#ef4444' }}>{stats.offline ?? '—'}</span></div>
+                <div><span style={{ color: 'var(--color-text-faint)' }}>WATCH </span><span style={{ color: '#f59e0b' }}>{stats.important ?? '—'}</span></div>
+              </div>
+            </div>
+          )}
+
+          {/* Utility icons */}
+          <div style={{ padding: '6px', borderTop: '1px solid var(--color-border)', display: 'flex', alignItems: 'center', justifyContent: 'space-around' }}>
+            <div style={{ position: 'relative' }}>
+              <button onClick={() => setShowAlertDrop(v => !v)} title="Alerts"
+                style={{ padding: '7px', color: totalAlerts > 0 ? 'var(--color-brand)' : 'var(--color-text-muted)', background: 'none', border: 'none', cursor: 'pointer', position: 'relative', display: 'flex' }}>
+                <Bell size={15} />
+                {totalAlerts > 0 && (
+                  <span style={{
+                    position: 'absolute', top: '2px', right: '2px',
+                    width: '13px', height: '13px', borderRadius: '50%',
+                    background: 'var(--color-brand)', color: '#000',
+                    fontSize: '8px', fontWeight: 700, display: 'flex', alignItems: 'center', justifyContent: 'center',
+                  }}>{totalAlerts > 9 ? '9+' : totalAlerts}</span>
+                )}
+              </button>
+              {phantomAlertDrop}
+            </div>
+            <button onClick={toggleTheme} title={isDark ? 'Light mode' : 'Dark mode'}
+              style={{ padding: '7px', color: 'var(--color-text-muted)', background: 'none', border: 'none', cursor: 'pointer', display: 'flex' }}>
+              {isDark ? <Sun size={15} /> : <Moon size={15} />}
+            </button>
+            <button onClick={() => setShowSettings(true)} title="Settings"
+              style={{ padding: '7px', color: 'var(--color-text-muted)', background: 'none', border: 'none', cursor: 'pointer', display: 'flex' }}>
+              <Settings size={15} />
+            </button>
+            <button onClick={onLogout} title="Sign out"
+              style={{ padding: '7px', color: 'var(--color-text-muted)', background: 'none', border: 'none', cursor: 'pointer', display: 'flex' }}>
+              <LogOut size={15} />
+            </button>
+          </div>
+        </aside>
+
+        {/* ── Content area ── */}
+        <div style={{ flex: 1, display: 'flex', flexDirection: 'column', overflow: 'hidden', position: 'relative', zIndex: 1 }}>
+          {/* Top bar */}
+          <div style={{
+            padding: '7px 24px', flexShrink: 0,
+            borderBottom: '1px solid var(--color-border)',
+            background: 'var(--color-surface)',
+            display: 'flex', alignItems: 'center', gap: '12px',
+            fontSize: '10px', letterSpacing: '0.1em', color: 'var(--color-text-faint)',
+            fontFamily: 'JetBrains Mono, monospace',
+          }}>
+            <span>{activePage ? `// ${(activepageInfo?.title || '').toUpperCase().replace(/ /g, '_')}` : '// DASHBOARD'}</span>
+          </div>
+
+          <main style={{ flex: 1, overflowY: 'auto', padding: '24px' }}>
+            {innerContent}
+          </main>
+
+          <div style={{
+            padding: '7px 24px', flexShrink: 0,
+            borderTop: '1px solid var(--color-border)',
+            background: 'var(--color-surface)',
+            display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+            fontSize: '9px', color: 'var(--color-text-faint)', letterSpacing: '0.08em',
+            fontFamily: 'JetBrains Mono, monospace',
+          }}>
+            <span>// INSPECTRE v{APP_VERSION} &copy; {new Date().getFullYear()} thefunkygibbon</span>
+            <StatusButton />
+          </div>
+        </div>
+
+        {notificationsEnabled && (
+          <NotificationToasts
+            newAlerts={newDeviceAlerts}
+            offlineAlerts={offlineAlerts}
+            onDismissNew={dismissNewDevice}
+            onDismissOffline={dismissOffline}
+            onDeviceClick={handleToastDeviceClick}
+            topOffset="1rem"
+          />
+        )}
+        {sharedDrawer}
+        {sharedSettings}
+      </div>
+    )
+  }
+
+  // ── Spectre layout (default) ─────────────────────────────────────────────────
   return (
     <div className="min-h-screen bg-bg flex flex-col transition-colors duration-200">
       <div className="noise-overlay" />
@@ -410,13 +882,11 @@ function MainApp({ onLogout }) {
         <header className="sticky top-0 z-30 border-b border-border bg-surface/80 backdrop-blur-xl">
           <div className="max-w-[1400px] mx-auto px-4 sm:px-6 h-16 flex items-center gap-2 sm:gap-4">
 
-            {/* Logo + back button */}
             <div className="flex items-center gap-3 shrink-0">
               {activePage ? (
                 <button onClick={() => setActivePage(null)}
                   className="btn-ghost p-2 flex items-center gap-1.5 text-xs font-medium"
-                  aria-label="Back to dashboard"
-                  title="Back to dashboard">
+                  aria-label="Back to dashboard" title="Back to dashboard">
                   <ArrowLeft size={15} />
                   <span className="hidden sm:inline">Dashboard</span>
                 </button>
@@ -431,48 +901,36 @@ function MainApp({ onLogout }) {
               )}
             </div>
 
-            {/* Page nav — icon row on md+, dropdown on small screens */}
             {!activePage && (
               <>
-                {/* Desktop: icon row */}
                 <div className="hidden md:flex items-center gap-0.5 ml-2">
                   {PAGES.map(p => (
-                    <button key={p.id}
-                      onClick={() => setActivePage(p.id)}
-                      className="btn-ghost p-2 relative shrink-0"
-                      aria-label={p.label}
-                      title={p.label}>
+                    <button key={p.id} onClick={() => setActivePage(p.id)}
+                      className="btn-ghost p-2 relative shrink-0" aria-label={p.label} title={p.label}>
                       <p.Icon size={16} />
                     </button>
                   ))}
                 </div>
-                {/* Mobile: dropdown */}
                 <div className="md:hidden ml-2 relative">
                   <MobileNavMenu pages={PAGES} onSelect={setActivePage} />
                 </div>
               </>
             )}
 
-            {/* Page title when on a page */}
             {activePage && (
               <span className="text-sm font-semibold truncate" style={{ color: 'var(--color-text)' }}>
                 {activepageInfo?.title}
               </span>
             )}
 
-            {/* Spacer */}
             <div className="flex-1" />
 
-            {/* Live clock — center-right */}
             <div className="hidden md:flex items-center gap-2">
               <span className="live-ping" aria-hidden><span className="live-ping-dot" /></span>
               <span className="text-xs font-mono" style={{ color: 'var(--color-text-faint)' }}>live &middot; {clock}</span>
             </div>
 
-            {/* Right-side utility icons */}
             <div className="flex items-center gap-0.5">
-
-              {/* Bell / alerts */}
               <div className="relative">
                 <button
                   onClick={() => setShowAlertDrop(v => !v)}
@@ -507,7 +965,6 @@ function MainApp({ onLogout }) {
                           </button>
                         )}
                       </div>
-
                       {totalAlerts === 0 ? (
                         <p className="text-xs text-center py-4" style={{ color: 'var(--color-text-faint)' }}>No new alerts</p>
                       ) : (
@@ -516,8 +973,7 @@ function MainApp({ onLogout }) {
                             <div key={`new-${a.id}`}
                               className="flex items-start gap-2 p-2.5 rounded-lg cursor-pointer hover:opacity-80 transition-opacity"
                               style={{ background: 'var(--color-surface-offset)' }}
-                              onClick={() => { handleToastDeviceClick(a); dismissNewDevice(a.id); setShowAlertDrop(false) }}
-                            >
+                              onClick={() => { handleToastDeviceClick(a); dismissNewDevice(a.id); setShowAlertDrop(false) }}>
                               <Bell size={12} className="mt-0.5 shrink-0" style={{ color: 'var(--color-brand)' }} />
                               <div className="flex-1 min-w-0">
                                 <p className="text-xs font-medium" style={{ color: 'var(--color-text)' }}>
@@ -538,8 +994,7 @@ function MainApp({ onLogout }) {
                               className="flex items-start gap-2 p-2.5 rounded-lg cursor-pointer hover:opacity-80 transition-opacity"
                               style={{ background: a.is_important ? 'rgba(239,68,68,0.08)' : 'var(--color-surface-offset)',
                                        border: a.is_important ? '1px solid rgba(239,68,68,0.2)' : 'none' }}
-                              onClick={() => { handleToastDeviceClick(a); dismissOffline(a.id); setShowAlertDrop(false) }}
-                            >
+                              onClick={() => { handleToastDeviceClick(a); dismissOffline(a.id); setShowAlertDrop(false) }}>
                               <WifiOff size={12} className="mt-0.5 shrink-0" style={{ color: '#ef4444' }} />
                               <div className="flex-1 min-w-0">
                                 <p className="text-xs font-medium flex items-center gap-1" style={{ color: '#ef4444' }}>
@@ -581,232 +1036,8 @@ function MainApp({ onLogout }) {
           </div>
         </header>
 
-        {/* ── Page content ── */}
         <main className="flex-1 max-w-[1400px] mx-auto w-full px-4 sm:px-6 py-8">
-
-          {error && !activePage && (
-            <div className="flex items-center gap-3 px-4 py-3 rounded-xl text-sm mb-8"
-              style={{ background: 'rgb(239 68 68 / 0.1)', border: '1px solid rgb(239 68 68 / 0.2)', color: '#ef4444' }}>
-              <AlertCircle size={16} className="shrink-0" />
-              {error}
-            </div>
-          )}
-
-          {/* ── Full page views ── */}
-          {activePage === 'tools' && (
-            <NetworkTools />
-          )}
-
-          {activePage === 'security' && (
-            <SecurityDashboard
-              onDeviceClick={(mac, tab) => {
-                setActivePage(null)
-                const dev = devices.find(d => d.mac_address === mac)
-                if (dev) openDevice(dev, tab || 'overview')
-              }}
-              onContainerClick={name => {
-                setContainerToOpen(name)
-                setActivePage('containers')
-              }}
-            />
-          )}
-
-          {activePage === 'blocking' && (
-            <DeviceBlocking devices={devices} onDeviceClick={dev => {
-              setActivePage(null)
-              openDevice(typeof dev === 'object' ? dev : devices.find(d => d.mac_address === dev))
-            }} />
-          )}
-
-          {activePage === 'timeline' && (
-            <NetworkTimeline onDeviceClick={mac => {
-              setActivePage(null)
-              const dev = devices.find(d => d.mac_address === mac)
-              if (dev) openDevice(dev)
-            }} />
-          )}
-
-          {activePage === 'traffic' && (
-            <TrafficPage />
-          )}
-
-          {activePage === 'containers' && (
-            <ContainersPage openContainer={containerToOpen} />
-          )}
-
-          {/* ── Main dashboard ── */}
-          {!activePage && (
-            <div className="space-y-8">
-              {/* Stat cards */}
-              <section>
-                <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
-                  <StatCard label="Total Devices" value={stats?.total_devices} icon={Monitor}   color="brand"
-                    onClick={() => handleCardFilter('all')}    active={filter === 'all'} />
-                  <StatCard label="Online"        value={stats?.online}        icon={Wifi}       color="emerald"
-                    onClick={() => handleCardFilter('online')}  active={filter === 'online'} />
-                  <StatCard label="Offline"       value={stats?.offline}       icon={WifiOff}    color="red"
-                    onClick={() => handleCardFilter('offline')} active={filter === 'offline'} />
-                  <StatCard label="Watched"       value={stats?.important}     icon={Star}       color="amber"
-                    onClick={() => handleCardFilter('important')} active={filter === 'important'} />
-                </div>
-              </section>
-
-              {/* Search / filter / sort / layout row */}
-              <section className="flex flex-wrap gap-2 items-center">
-                <div className="relative" style={{ minWidth: '160px', flex: '1 1 160px', maxWidth: '340px' }}>
-                  <Search size={15} className="absolute left-3 top-1/2 -translate-y-1/2 pointer-events-none"
-                    style={{ color: 'var(--color-text-muted)' }} />
-                  <input className="input pl-9 w-full" placeholder="Search…"
-                    value={search} onChange={e => setSearch(e.target.value)} />
-                  {search && (
-                    <button onClick={() => setSearch('')}
-                      className="absolute right-2 top-1/2 -translate-y-1/2 rounded p-0.5 transition-colors hover:opacity-70"
-                      style={{ color: 'var(--color-text-muted)' }} aria-label="Clear search">
-                      <X size={13} />
-                    </button>
-                  )}
-                </div>
-
-                {/* Filters toggle */}
-                <button
-                  onClick={() => setShowFilters(v => !v)}
-                  className="flex items-center gap-1.5 px-3 py-2 rounded-xl text-xs font-medium border transition-colors relative"
-                  style={showFilters || Object.keys(activeFilters).length > 0
-                    ? { background: 'var(--color-brand)', color: 'white', borderColor: 'transparent' }
-                    : { background: 'var(--color-surface-offset)', color: 'var(--color-text-muted)', borderColor: 'var(--color-border)' }}
-                  title="Toggle smart filters"
-                  aria-label="Toggle smart filters"
-                >
-                  <SlidersHorizontal size={13} />
-                  <span>Filters</span>
-                  {Object.keys(activeFilters).length > 0 && !showFilters && (
-                    <span className="ml-0.5 px-1.5 py-0.5 rounded-full text-[10px] font-bold"
-                      style={{ background: 'rgba(255,255,255,0.25)', color: 'white' }}>
-                      {Object.keys(activeFilters).length}
-                    </span>
-                  )}
-                </button>
-
-                {/* Sort — only in non-category mode */}
-                {!isCategoryMode && (
-                  <div className="relative">
-                    <select value={sort} onChange={e => setSort(e.target.value)}
-                      className="input pr-8 appearance-none cursor-pointer text-xs" aria-label="Sort devices">
-                      {SORT_OPTIONS.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
-                    </select>
-                    <ChevronDown size={14} className="absolute right-3 top-1/2 -translate-y-1/2 pointer-events-none"
-                      style={{ color: 'var(--color-text-muted)' }} />
-                  </div>
-                )}
-
-                <button
-                  onClick={handleExportCsv}
-                  className="p-2 rounded-xl glass transition-all duration-150"
-                  style={{ color: 'var(--color-text-muted)' }}
-                  aria-label="Export devices as CSV" title="Export devices as CSV">
-                  <Download size={15} />
-                </button>
-
-                <div className="flex items-center gap-1 glass rounded-xl p-1 ml-auto">
-                  <button onClick={() => setLayout('grid')}
-                    className="p-2 rounded-lg transition-all duration-150"
-                    style={layout === 'grid' ? { background: 'var(--color-brand)', color: 'white' } : { color: 'var(--color-text-muted)' }}
-                    aria-label="Grid layout" title="Grid layout">
-                    <LayoutGrid size={15} /></button>
-                  <button onClick={() => setLayout('list')}
-                    className="p-2 rounded-lg transition-all duration-150"
-                    style={layout === 'list' ? { background: 'var(--color-brand)', color: 'white' } : { color: 'var(--color-text-muted)' }}
-                    aria-label="List layout" title="List layout">
-                    <List size={15} /></button>
-                  <button onClick={() => setLayout('category')}
-                    className="p-2 rounded-lg transition-all duration-150"
-                    style={layout === 'category' ? { background: 'var(--color-brand)', color: 'white' } : { color: 'var(--color-text-muted)' }}
-                    aria-label="Category view" title="Category view">
-                    <Layers size={15} /></button>
-                </div>
-              </section>
-
-              {/* Smart filter bar — collapsible */}
-              {showFilters && (
-                <section>
-                  <SmartFilterBar
-                    devices={devices}
-                    activeFilters={activeFilters}
-                    onToggle={toggleFilter}
-                    onClear={clearFilters}
-                    savedViews={savedViews}
-                    onSaveView={saveView}
-                    onLoadView={loadView}
-                    onDeleteView={deleteView}
-                  />
-                </section>
-              )}
-
-              {/* Device list */}
-              <section>
-                {loading ? (
-                  <SkeletonGrid layout={layout === 'category' ? 'grid' : layout} />
-                ) : filtered.length === 0 ? (
-                  <EmptyState search={search} filter={filter} hasSmartFilters={hasActiveSmartFilters} onClearSmartFilters={clearFilters} />
-                ) : isCategoryMode ? (
-                  <>
-                    <p className="text-xs mb-4" style={{ color: 'var(--color-text-faint)' }}>
-                      Showing {filtered.length} of {devices.length} device{devices.length !== 1 ? 's' : ''} &middot; grouped by device type
-                    </p>
-                    <CategoryView devices={filtered} layout="grid" onDeviceClick={openDevice} />
-                  </>
-                ) : (
-                  <>
-                    <p className="text-xs mb-4" style={{ color: 'var(--color-text-faint)' }}>
-                      Showing {filtered.length} of {devices.length} device{devices.length !== 1 ? 's' : ''}
-                      {filter !== 'all' && (
-                        <span className="ml-2 px-2 py-0.5 rounded-full text-[10px] font-semibold uppercase"
-                          style={{ background: 'var(--color-brand)', color: 'white' }}>{filter}</span>
-                      )}
-                      {hasActiveSmartFilters && (
-                        <span className="ml-2 px-2 py-0.5 rounded-full text-[10px] font-semibold"
-                          style={{ background: 'var(--color-surface-offset)', color: 'var(--color-text-muted)' }}>
-                          + smart filters
-                        </span>
-                      )}
-                    </p>
-                    {layout === 'grid' ? (
-                      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-4">
-                        {filtered.map(d => (
-                          <DeviceCard key={d.mac_address} device={d}
-                            onClick={() => openDevice(d)}
-                            onStarToggle={handleStarToggle}
-                            isVulnScanning={vulnScansByMac[d.mac_address]?.scanning || false}
-                          />
-                        ))}
-                      </div>
-                    ) : (
-                      <div className="card overflow-hidden">
-                        <div
-                          className="grid grid-cols-[1.5rem_1fr_5rem_1.5rem] sm:grid-cols-[1.5rem_2fr_1fr_1fr_1fr_6rem_1.5rem] gap-3 sm:gap-4 px-4 py-2.5 border-b
-                                     text-xs font-semibold uppercase tracking-wider"
-                          style={{ borderColor: 'var(--color-border)', color: 'var(--color-text-muted)' }}
-                        >
-                          <span />
-                          <span>Name / IP</span>
-                          <span className="hidden sm:block">MAC</span>
-                          <span className="hidden sm:block">Vendor</span>
-                          <span className="hidden sm:block">Last Changed</span>
-                          <span>Status</span>
-                          <span />
-                        </div>
-                        {filtered.map((d, i) => (
-                          <DeviceRow key={d.mac_address} device={d} onClick={() => openDevice(d)}
-                            striped={i % 2 === 1} onStarToggle={handleStarToggle}
-                            isVulnScanning={vulnScansByMac[d.mac_address]?.scanning || false} />
-                        ))}
-                      </div>
-                    )}
-                  </>
-                )}
-              </section>
-            </div>
-          )}
+          {innerContent}
         </main>
 
         <footer className="border-t py-4" style={{ borderColor: 'var(--color-border)' }}>
@@ -835,30 +1066,8 @@ function MainApp({ onLogout }) {
           onDeviceClick={handleToastDeviceClick}
         />
       )}
-
-      {selected && (
-        <DeviceDrawer
-          key={selected.mac_address}
-          device={selected}
-          onClose={() => setSelected(null)}
-          onRename={handleRename}
-          onResolveName={handleResolveName}
-          onRefresh={refresh}
-          onStarToggle={handleStarToggle}
-          onMetadataUpdate={async (mac, patch) => {
-            const updated = await api.updateMetadata(mac, patch)
-            setSelected(prev => prev?.mac_address === mac ? { ...prev, ...updated } : prev)
-            await refresh()
-          }}
-          onZoneChange={(zone) => setSelected(prev => prev?.mac_address === selected.mac_address ? { ...prev, zone } : prev)}
-          vulnScanState={vulnScansByMac[selected.mac_address] || { lines: [], scanning: false }}
-          onVulnScanChange={(patchOrFn) => updateVulnScan(selected.mac_address, patchOrFn)}
-          initialTab={drawerInitialTab}
-        />
-      )}
-      {showSettings && (
-        <SettingsPanel onClose={() => setShowSettings(false)} onSettingChange={handleSettingChange} />
-      )}
+      {sharedDrawer}
+      {sharedSettings}
     </div>
   )
 }
