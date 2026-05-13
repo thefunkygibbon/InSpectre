@@ -1,7 +1,7 @@
 import {
   Wifi, Laptop, Smartphone, Server, Printer, Tv,
   HelpCircle, Camera, Gamepad2, Cpu, Router,
-  MonitorSpeaker, Tablet, Radio, Network, Shield, Monitor
+  MonitorSpeaker, Tablet, Radio, Network, Shield, Monitor, GitMerge
 } from 'lucide-react'
 import { OnlineDot } from './OnlineDot'
 import { StarButton } from './StarButton'
@@ -184,6 +184,21 @@ export function DeviceCard({ device, onClick, onStarToggle, isVulnScanning }) {
           <>
             <span style={{ color: 'var(--color-text-muted)' }}>Location</span>
             <span className="truncate" style={{ color: 'var(--color-text)' }}>{device.location}</span>
+          </>
+        )}
+        {device.group_members?.length > 1 && (
+          <>
+            <span className="flex items-center gap-1" style={{ color: 'var(--color-text-muted)' }}>
+              <GitMerge size={10} />Interfaces
+            </span>
+            <span className="flex flex-col gap-0.5">
+              {device.group_members.map(m => (
+                <span key={m.mac_address} className="flex items-center gap-1 text-[11px]">
+                  <span className={`w-1.5 h-1.5 rounded-full shrink-0 ${m.is_online ? 'bg-green-400' : 'bg-gray-500'}`} />
+                  <span className="truncate" style={{ color: 'var(--color-text)' }}>{m.display_name}</span>
+                </span>
+              ))}
+            </span>
           </>
         )}
       </div>

@@ -2,12 +2,13 @@ import { useState, useEffect, useMemo } from 'react'
 import {
   Wifi, WifiOff, Plus, ArrowLeftRight, ScanLine,
   Star, Tag, Edit3, AlertCircle, Clock, ShieldAlert, Ban, CheckCircle, Radio,
-  TrendingUp, TrendingDown,
+  TrendingUp, TrendingDown, GitMerge,
 } from 'lucide-react'
 import { api } from '../api'
 
 const EVENT_CONFIG = {
   joined:             { icon: Plus,           color: '#10b981', label: 'First seen' },
+  interface_joined:   { icon: GitMerge,       color: '#06b6d4', label: 'Joined on new interface' },
   online:             { icon: Wifi,           color: '#10b981', label: 'Came online' },
   offline:            { icon: WifiOff,        color: '#ef4444', label: 'Went offline' },
   ip_change:          { icon: ArrowLeftRight, color: '#f59e0b', label: 'IP changed' },
@@ -57,6 +58,7 @@ function eventDetail(event) {
     }
     case 'port_opened':      return d.port != null ? `Port ${d.port}${d.severity ? ` [${d.severity}]` : ''}` : null
     case 'port_closed':      return d.port != null ? `Port ${d.port} closed` : null
+    case 'interface_joined': return d?.ip ? `${d.ip} · ${d.vendor || ''}`.replace(/ · $/, '') : null
     default:                 return null
   }
 }
@@ -170,6 +172,7 @@ export function DeviceTimeline({ mac }) {
           const cfg    = EVENT_CONFIG[event.type] || { icon: Clock, color: 'var(--color-text-faint)', label: event.type }
           const Icon   = cfg.icon
           const detail = eventDetail(event)
+          const isCrossDevice = event.mac_address && event.mac_address !== mac
           return (
             <div key={event.id} className="flex gap-3 items-start relative">
               {/* Icon bubble */}
@@ -189,6 +192,11 @@ export function DeviceTimeline({ mac }) {
                     {relativeTime(event.created_at)}
                   </span>
                 </div>
+                {isCrossDevice && (
+                  <p className="text-[10px] mt-0.5 font-mono" style={{ color: 'var(--color-text-faint)' }}>
+                    via {event.mac_address}
+                  </p>
+                )}
                 {detail && (
                   <p className="text-[11px] mt-0.5 font-mono" style={{ color: 'var(--color-text-muted)' }}>
                     {detail}

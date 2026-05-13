@@ -136,6 +136,10 @@ const SETTING_META = {
     ],
     description: 'Automatically ARP-block a device when a vulnerability scan finds issues at or above the selected severity.' },
 
+  // Phase 9 — device grouping
+  auto_group_by_hostname: { label: 'Auto-group by Hostname', type: 'toggle', tab: 'scanner',
+    description: 'Automatically group devices with the same hostname as the same physical device on a different interface (e.g. laptop on WiFi vs Ethernet). When disabled, a suggestion event is written instead and grouping can be done manually in the device admin panel.' },
+
   // Here Be Dragons — advanced probe pipeline controls
   enable_arp_sweep: { label: 'Enable Active ARP Sweep', type: 'toggle', tab: 'scanner',
     description: 'Send active ARP broadcast packets to discover devices on the configured subnet. Disable to rely on the passive sniffer only — note that without the sweep, device online/offline state will no longer be tracked.' },
@@ -203,8 +207,10 @@ export function SettingsPanel({ onClose, onSettingChange }) {
   const [exportingDevs, setExportingDevs] = useState(false)
   const [exportingFp,   setExportingFp]   = useState(false)
   const [importStatus,  setImportStatus]  = useState(null)
-  const [backingUp,     setBackingUp]     = useState(false)
-  const [restoreStatus, setRestoreStatus] = useState(null)
+  const [backingUp,      setBackingUp]      = useState(false)
+  const [restoreStatus,  setRestoreStatus]  = useState(null)
+  const [backupPassword, setBackupPassword] = useState('')
+  const [showBackupPwd,  setShowBackupPwd]  = useState(false)
   const restoreInputRef = useRef(null)
   const [dragonsOpen,   setDragonsOpen]   = useState(false)
   const [restarting,    setRestarting]    = useState({})  // { probe: bool, backend: bool }
@@ -311,7 +317,10 @@ export function SettingsPanel({ onClose, onSettingChange }) {
 
   async function handleBackup() {
     setBackingUp(true)
-    try { await downloadResponse(await api.exportBackup(), 'inspectre-backup.json') }
+    try {
+      const fname = backupPassword ? 'inspectre_backup.ienc' : 'inspectre_backup.json'
+      await downloadResponse(await api.exportBackup(backupPassword), fname)
+    }
     catch (e) { alert('Backup failed: ' + e.message) }
     finally { setBackingUp(false) }
   }
@@ -321,9 +330,12 @@ export function SettingsPanel({ onClose, onSettingChange }) {
     if (!file) return
     setRestoreStatus('loading')
     try {
-      const result = await api.importRestore(file)
+      const result = await api.importRestore(file, backupPassword)
       setRestoreStatus(result)
-    } catch { setRestoreStatus('error') }
+    } catch (err) {
+      const msg = err.message || ''
+      setRestoreStatus(msg.toLowerCase().includes('encrypt') ? 'needs_password' : 'error')
+    }
     finally { if (restoreInputRef.current) restoreInputRef.current.value = '' }
   }
 
@@ -550,6 +562,11 @@ export function SettingsPanel({ onClose, onSettingChange }) {
                     <SettingRow key={s.key} s={s} dirty={dirty} onchange={handleChange} />
                   ))}
 
+                  <p className="text-xs font-semibold" style={{ color: 'var(--color-text-muted)', paddingTop: '4px' }}>Device Grouping</p>
+                  {settingsByKeys(['auto_group_by_hostname']).map(s => (
+                    <SettingRow key={s.key} s={s} dirty={dirty} onchange={handleChange} />
+                  ))}
+
                   <p className="text-xs font-semibold" style={{ color: 'var(--color-text-muted)', paddingTop: '4px' }}>Container Restart</p>
                   <div className="card p-4 space-y-3">
                     <p className="text-xs" style={{ color: 'var(--color-text-faint)' }}>
@@ -762,31 +779,63 @@ export function SettingsPanel({ onClose, onSettingChange }) {
               <SectionHeader label="Database Backup & Restore" Icon={Database} />
               <div className="card p-4 space-y-3">
                 <p className="text-xs" style={{ color: 'var(--color-text-faint)' }}>
-                  Export a full backup of your settings and fingerprint data. Devices can be re-discovered
-                  automatically, but custom names, tags, and identity overrides are included.
+                  Full backup of all devices, events, vuln reports, speed test history, settings, users, and fingerprints. Restoring on a fresh install brings everything back exactly as it was.
                 </p>
+
+                {/* Optional encryption password */}
+                <div>
+                  <label className="text-xs block mb-1.5" style={{ color: 'var(--color-text-muted)' }}>
+                    Backup password
+                    <span className="ml-1" style={{ color: 'var(--color-text-faint)' }}>(optional — leave blank for unencrypted)</span>
+                  </label>
+                  <div className="flex gap-2 items-center">
+                    <input
+                      type={showBackupPwd ? 'text' : 'password'}
+                      className="input text-sm"
+                      style={{ maxWidth: '260px' }}
+                      placeholder="Leave blank for no encryption"
+                      value={backupPassword}
+                      onChange={e => setBackupPassword(e.target.value)}
+                    />
+                    <button
+                      onClick={() => setShowBackupPwd(v => !v)}
+                      className="p-1.5 rounded transition-colors"
+                      style={{ color: 'var(--color-text-faint)' }}
+                      title={showBackupPwd ? 'Hide password' : 'Show password'}
+                    >
+                      {showBackupPwd ? <EyeOff size={14} /> : <Eye size={14} />}
+                    </button>
+                  </div>
+                </div>
+
                 <div className="flex gap-2 flex-wrap">
                   <button onClick={handleBackup} disabled={backingUp}
                     className="btn-secondary flex items-center gap-2 text-sm">
                     <Download size={13} />
-                    {backingUp ? 'Exporting…' : 'Download backup.json'}
+                    {backingUp ? 'Exporting…' : backupPassword ? 'Download encrypted backup' : 'Download backup.json'}
                   </button>
                   <button onClick={() => restoreInputRef.current?.click()}
                     className="btn-secondary flex items-center gap-2 text-sm">
                     <Upload size={13} /> Restore from backup
                   </button>
-                  <input ref={restoreInputRef} type="file" accept=".json,application/json"
+                  <input ref={restoreInputRef} type="file" accept=".json,.ienc,application/json,application/octet-stream"
                     className="sr-only" onChange={handleRestoreBackup} />
                 </div>
+
                 {restoreStatus === 'loading' && (
                   <p className="text-xs" style={{ color: 'var(--color-text-muted)' }}>Restoring…</p>
                 )}
-                {restoreStatus === 'error' && (
-                  <p className="text-xs" style={{ color: '#ef4444' }}>
-                    Restore failed — check the file is a valid InSpectre backup.json.
+                {restoreStatus === 'needs_password' && (
+                  <p className="text-xs" style={{ color: '#f59e0b' }}>
+                    This backup is encrypted — enter the password above, then try restoring again.
                   </p>
                 )}
-                {restoreStatus && restoreStatus !== 'loading' && restoreStatus !== 'error' && (
+                {restoreStatus === 'error' && (
+                  <p className="text-xs" style={{ color: '#ef4444' }}>
+                    Restore failed — check the file is a valid InSpectre backup, or the password is wrong.
+                  </p>
+                )}
+                {restoreStatus && !['loading', 'error', 'needs_password'].includes(restoreStatus) && (
                   <div className="rounded-lg p-3 text-xs space-y-1"
                     style={{
                       background: 'color-mix(in srgb, var(--color-success) 10%, var(--color-surface-offset))',
@@ -794,8 +843,8 @@ export function SettingsPanel({ onClose, onSettingChange }) {
                     }}>
                     <p className="font-medium">Restore complete ✓</p>
                     <p>
-                      {restoreStatus.settings_restored != null
-                        ? `${restoreStatus.settings_restored} settings · ${restoreStatus.fingerprints_restored} fingerprints restored`
+                      {restoreStatus.devices != null
+                        ? `${restoreStatus.devices} devices · ${restoreStatus.settings} settings · ${restoreStatus.device_events} events · ${restoreStatus.speedtest_results ?? 0} speed tests`
                         : JSON.stringify(restoreStatus)}
                     </p>
                   </div>

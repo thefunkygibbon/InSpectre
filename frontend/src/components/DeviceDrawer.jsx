@@ -883,13 +883,53 @@ export function DeviceDrawer({ device, onClose, onRename, onResolveName, onRefre
                   if (onZoneChange) onZoneChange(zone)
                 }} />
                 {localDevice.miss_count  !== undefined && <Row label="Miss count" value={localDevice.miss_count} />}
-                <MdnsRow mac={mac} scan={scan} onRefreshed={updated => setLocalDevice(prev => ({ ...prev, scan_results: { ...(prev.scan_results || {}), mdns_services: updated } }))} />
               </Collapsible>
+
+              {/* Grouped interfaces */}
+              {localDevice.group_members?.length > 1 && (
+                <Collapsible title={`Grouped Interfaces (${localDevice.group_members.length})`} icon={GitMerge} defaultOpen={true}>
+                  <div className="space-y-1.5">
+                    {localDevice.group_members.map(m => (
+                      <div key={m.mac_address}
+                        className="flex items-center gap-2 px-2 py-1.5 rounded-lg text-xs"
+                        style={{ background: 'var(--color-surface-offset)' }}>
+                        <span className={`w-2 h-2 rounded-full shrink-0 ${m.is_online ? 'bg-green-400' : 'bg-gray-500'}`} />
+                        <span className="flex-1 font-medium truncate" style={{ color: 'var(--color-text)' }}>
+                          {m.display_name}
+                        </span>
+                        <span className="font-mono text-[10px]" style={{ color: 'var(--color-text-faint)' }}>
+                          {m.ip_address || '—'}
+                        </span>
+                        <span className="font-mono text-[10px]" style={{ color: 'var(--color-text-faint)' }}>
+                          {m.mac_address}
+                        </span>
+                        {m.group_primary && (
+                          <span className="text-[10px] px-1 rounded"
+                            style={{ background: 'var(--color-brand-alpha)', color: 'var(--color-brand)' }}>
+                            primary
+                          </span>
+                        )}
+                      </div>
+                    ))}
+                    <p className="text-[10px] pt-0.5" style={{ color: 'var(--color-text-faint)' }}>
+                      This device shares a hostname with the above interfaces — they are treated as the same physical device.
+                      Manage grouping in the Admin tab.
+                    </p>
+                  </div>
+                </Collapsible>
+              )}
 
               {/* DHCP Fingerprinting */}
               <Collapsible title="DHCP Fingerprint" icon={Radio} defaultOpen={false}>
                 <DhcpFingerprintPanel localDevice={localDevice} mac={mac} setLocalDevice={setLocalDevice} />
               </Collapsible>
+
+              {/* Advertised Services */}
+              <AdvertisedServicesSection
+                mac={mac}
+                scan={scan}
+                onUpdate={updated => setLocalDevice(prev => ({ ...prev, scan_results: { ...(prev.scan_results || {}), ...updated } }))}
+              />
 
               {/* IP History */}
               <Collapsible title="IP History" icon={History} defaultOpen={false}>
@@ -1056,6 +1096,10 @@ export function DeviceDrawer({ device, onClose, onRename, onResolveName, onRefre
                 <SuppressionManager mac={mac} />
               </Collapsible>
 
+              <Collapsible title="Device Grouping" icon={GitMerge} defaultOpen={!!localDevice.group_id}>
+                <GroupManager mac={mac} device={localDevice} onChanged={() => { if (onRefresh) onRefresh() }} />
+              </Collapsible>
+
               {/* Danger zone */}
               <div className="rounded-xl border border-red-500/30 overflow-hidden">
                 <div className="px-4 py-2.5 border-b border-red-500/20"
@@ -1098,6 +1142,140 @@ export function DeviceDrawer({ device, onClose, onRename, onResolveName, onRefre
     </>
   )
 }
+
+function GroupManager({ mac, device, onChanged }) {
+  const [group,      setGroup]      = useState(null)
+  const [loading,    setLoading]    = useState(false)
+  const [addMac,     setAddMac]     = useState('')
+  const [addErr,     setAddErr]     = useState(null)
+  const [busy,       setBusy]       = useState(false)
+
+  useEffect(() => {
+    api.getDeviceGroup(mac).then(setGroup).catch(() => {})
+  }, [mac])
+
+  const reload = () => api.getDeviceGroup(mac).then(setGroup).catch(() => {})
+
+  const handleAdd = async () => {
+    const target = addMac.trim().toLowerCase()
+    if (!target) return
+    setAddErr(null)
+    setBusy(true)
+    try {
+      await api.addToGroup(mac, target)
+      setAddMac('')
+      await reload()
+      onChanged()
+    } catch (e) {
+      setAddErr(e.message)
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const handleRemove = async (targetMac) => {
+    setBusy(true)
+    try {
+      await api.removeFromGroup(targetMac)
+      await reload()
+      onChanged()
+    } catch (e) {
+      alert('Error: ' + e.message)
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const handleSetPrimary = async (targetMac) => {
+    setBusy(true)
+    try {
+      await api.setGroupPrimary(targetMac)
+      await reload()
+      onChanged()
+    } catch (e) {
+      alert('Error: ' + e.message)
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const members = group?.members || []
+  const inGroup = members.length > 0
+
+  return (
+    <div className="space-y-3">
+      <p className="text-xs" style={{ color: 'var(--color-text-muted)' }}>
+        Group this device with others that are the same physical device on different network interfaces
+        (e.g. a laptop switching between WiFi and Ethernet). The group representative is shown in the
+        device list; events from all interfaces appear in the unified timeline.
+      </p>
+
+      {inGroup && (
+        <div className="space-y-1">
+          <p className="text-[11px] font-semibold uppercase tracking-wider mb-1" style={{ color: 'var(--color-text-faint)' }}>
+            Group members
+          </p>
+          {members.map(m => (
+            <div key={m.mac_address}
+              className="flex items-center gap-2 px-2 py-1.5 rounded-lg text-xs"
+              style={{ background: 'var(--color-surface-offset)' }}>
+              <span className={`w-1.5 h-1.5 rounded-full shrink-0 ${m.is_online ? 'bg-green-400' : 'bg-gray-500'}`} />
+              <span className="flex-1 font-mono truncate" style={{ color: 'var(--color-text)' }}>
+                {m.display_name}
+              </span>
+              <span className="font-mono text-[10px]" style={{ color: 'var(--color-text-faint)' }}>
+                {m.mac_address}
+              </span>
+              {m.group_primary && (
+                <span className="text-[10px] px-1 rounded" style={{ background: 'var(--color-brand-alpha)', color: 'var(--color-brand)' }}>
+                  primary
+                </span>
+              )}
+              {!m.group_primary && (
+                <button
+                  disabled={busy}
+                  onClick={() => handleSetPrimary(m.mac_address)}
+                  className="text-[10px] px-1.5 py-0.5 rounded border transition-colors"
+                  style={{ borderColor: 'var(--color-border)', color: 'var(--color-text-faint)' }}
+                  title="Set as group primary">
+                  set primary
+                </button>
+              )}
+              <button
+                disabled={busy}
+                onClick={() => handleRemove(m.mac_address)}
+                className="ml-1 p-0.5 rounded hover:bg-red-500/20 text-red-400 transition-colors"
+                title="Remove from group">
+                <Trash2 size={11} />
+              </button>
+            </div>
+          ))}
+        </div>
+      )}
+
+      <div className="flex gap-2">
+        <input
+          value={addMac}
+          onChange={e => setAddMac(e.target.value)}
+          onKeyDown={e => e.key === 'Enter' && handleAdd()}
+          placeholder="MAC address to group with…"
+          className="flex-1 px-2 py-1.5 rounded-lg border text-xs font-mono"
+          style={{ background: 'var(--color-surface-offset)', borderColor: 'var(--color-border)', color: 'var(--color-text)' }}
+        />
+        <button
+          disabled={busy || !addMac.trim()}
+          onClick={handleAdd}
+          className="flex items-center gap-1 px-3 py-1.5 rounded-lg border text-xs font-medium transition-colors disabled:opacity-50"
+          style={{ borderColor: 'var(--color-brand)', color: 'var(--color-brand)', background: 'var(--color-brand-alpha)' }}>
+          <Plus size={12} />
+          Group
+        </button>
+      </div>
+      {addErr && <p className="text-xs text-red-400">{addErr}</p>}
+    </div>
+  )
+}
+
 
 function ActionBtn({ icon: Icon, label, onClick, active, loading }) {
   return (
@@ -1247,43 +1425,116 @@ function ZoneEditor({ mac, currentZone, onChanged }) {
   )
 }
 
-function MdnsRow({ mac, scan, onRefreshed }) {
-  const [refreshing, setRefreshing] = useState(false)
-  const services = scan?.mdns_services || []
+// ---------------------------------------------------------------------------
+// Advertised Services section — mDNS/Bonjour + SSDP/UPnP
+// ---------------------------------------------------------------------------
+function ServicePill({ label }) {
+  return (
+    <span className="text-[10px] px-1.5 py-0.5 rounded font-mono"
+      style={{ background: 'var(--color-surface-offset)', color: 'var(--color-text-muted)', border: '1px solid var(--color-border)' }}>
+      {label}
+    </span>
+  )
+}
 
-  async function handleRefresh() {
-    setRefreshing(true)
+function SsdpServiceCard({ svc }) {
+  const label = svc.st
+    ? svc.st.replace('urn:schemas-upnp-org:', '').replace('urn:dial-multiscreen-org:', 'dial:')
+    : svc.usn || 'Unknown'
+  return (
+    <div className="rounded-lg px-3 py-2 mb-1.5 text-[11px]"
+      style={{ background: 'var(--color-surface-offset)', border: '1px solid var(--color-border)' }}>
+      <p className="font-medium text-text truncate" title={svc.st}>{label}</p>
+      {svc.server && <p className="text-[10px] text-text-faint truncate mt-0.5" title={svc.server}>{svc.server}</p>}
+      {svc.location && (
+        <p className="text-[10px] font-mono text-brand truncate mt-0.5" title={svc.location}>{svc.location}</p>
+      )}
+    </div>
+  )
+}
+
+function AdvertisedServicesSection({ mac, scan, onUpdate }) {
+  const [mdnsScanning,  setMdnsScanning]  = useState(false)
+  const [ssdpScanning,  setSsdpScanning]  = useState(false)
+
+  const mdnsServices = scan?.mdns_services || []
+  const ssdpServices = scan?.ssdp_services || []
+  const totalCount   = mdnsServices.length + ssdpServices.length
+
+  async function handleMdnsScan() {
+    setMdnsScanning(true)
     try {
       const result = await api.refreshMdns(mac)
-      onRefreshed(result.mdns_services || [])
+      onUpdate({ mdns_services: result.mdns_services || [] })
     } catch {}
-    finally { setRefreshing(false) }
+    finally { setMdnsScanning(false) }
+  }
+
+  async function handleSsdpScan() {
+    setSsdpScanning(true)
+    try {
+      await api.networkSsdpScan()
+      // SSDP stores by IP — re-fetch device data via polling; just give a short delay
+      await new Promise(r => setTimeout(r, 1500))
+      // Trigger a page refresh via onUpdate with current values so parent re-polls
+    } catch {}
+    finally { setSsdpScanning(false) }
   }
 
   return (
-    <div className="flex items-start justify-between py-1.5 gap-4 border-b border-border last:border-0">
-      <span className="text-xs text-text-muted shrink-0 mt-0.5">mDNS services</span>
-      <div className="flex flex-col items-end gap-1">
-        {services.length > 0 ? (
-          <div className="flex flex-wrap gap-1 justify-end">
-            {services.map(s => (
-              <span key={s} className="text-[10px] px-1.5 py-0.5 rounded font-mono"
-                style={{ background: 'var(--color-surface-offset)', color: 'var(--color-text-muted)', border: '1px solid var(--color-border)' }}>
-                {s}
-              </span>
-            ))}
+    <Collapsible
+      title={`Advertised Services${totalCount > 0 ? ` (${totalCount})` : ''}`}
+      icon={Radio}
+      defaultOpen={totalCount > 0}>
+
+      {/* mDNS / Bonjour */}
+      <div className="mb-4">
+        <div className="flex items-center justify-between mb-2">
+          <span className="text-[10px] font-semibold uppercase tracking-wider" style={{ color: 'var(--color-text-faint)' }}>
+            mDNS / Bonjour
+          </span>
+          <button onClick={handleMdnsScan} disabled={mdnsScanning}
+            className="flex items-center gap-1 text-[10px] transition-opacity opacity-60 hover:opacity-100"
+            style={{ color: 'var(--color-brand)' }}>
+            <Radio size={9} className={mdnsScanning ? 'animate-pulse' : ''} />
+            {mdnsScanning ? 'Scanning…' : 'Scan now'}
+          </button>
+        </div>
+        {mdnsServices.length > 0 ? (
+          <div className="flex flex-wrap gap-1">
+            {mdnsServices.map(s => <ServicePill key={s} label={s} />)}
           </div>
         ) : (
-          <span className="text-xs text-text-faint italic">None discovered</span>
+          <p className="text-[11px] italic" style={{ color: 'var(--color-text-faint)' }}>
+            No mDNS services discovered — passive listener running in background
+          </p>
         )}
-        <button onClick={handleRefresh} disabled={refreshing}
-          className="flex items-center gap-1 text-[10px] opacity-60 hover:opacity-100 transition-opacity"
-          style={{ color: 'var(--color-brand)' }}>
-          <Radio size={9} className={refreshing ? 'animate-pulse' : ''} />
-          {refreshing ? 'Scanning…' : 'Refresh mDNS'}
-        </button>
       </div>
-    </div>
+
+      {/* SSDP / UPnP */}
+      <div>
+        <div className="flex items-center justify-between mb-2">
+          <span className="text-[10px] font-semibold uppercase tracking-wider" style={{ color: 'var(--color-text-faint)' }}>
+            SSDP / UPnP
+          </span>
+          <button onClick={handleSsdpScan} disabled={ssdpScanning}
+            className="flex items-center gap-1 text-[10px] transition-opacity opacity-60 hover:opacity-100"
+            style={{ color: 'var(--color-brand)' }}>
+            <Layers size={9} className={ssdpScanning ? 'animate-pulse' : ''} />
+            {ssdpScanning ? 'Scanning…' : 'Scan now'}
+          </button>
+        </div>
+        {ssdpServices.length > 0 ? (
+          <div>
+            {ssdpServices.map((svc, i) => <SsdpServiceCard key={svc.usn || i} svc={svc} />)}
+          </div>
+        ) : (
+          <p className="text-[11px] italic" style={{ color: 'var(--color-text-faint)' }}>
+            No UPnP services discovered — passive listener running in background
+          </p>
+        )}
+      </div>
+    </Collapsible>
   )
 }
 

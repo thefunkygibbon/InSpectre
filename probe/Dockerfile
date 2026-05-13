@@ -1,6 +1,6 @@
 FROM python:3.12-slim
 
-# Network tools + wget/unzip for Nuclei
+# Network tools + wget/curl/gnupg/unzip (gnupg needed for Ookla packagecloud key)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libpcap-dev gcc \
     avahi-utils \
@@ -11,6 +11,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     iproute2 \
     iptables \
     wget \
+    curl \
+    gnupg \
     unzip \
     && rm -rf /var/lib/apt/lists/*
 
@@ -36,6 +38,17 @@ RUN wget -q "https://github.com/praetorian-inc/nerva/releases/download/v${NERVA_
 
 # Pre-fetch Nuclei community templates (baked into image; rebuild to refresh)
 RUN nuclei -update-templates -no-color 2>&1 | tail -5 || true
+
+# Install Ookla speedtest CLI via official packagecloud repo
+# Graceful failure: if Ookla's repo is unreachable the probe still starts;
+# the speedtest endpoint will return an error message to the UI.
+RUN if curl -s https://packagecloud.io/install/repositories/ookla/speedtest-cli/script.deb.sh | bash \
+       && apt-get install -y speedtest; then \
+      speedtest --accept-license --accept-gdpr > /dev/null 2>&1 || true; \
+      rm -rf /var/lib/apt/lists/*; \
+    else \
+      echo "[WARN] Ookla speedtest CLI install failed — speed tests will be unavailable"; \
+    fi
 
 WORKDIR /app
 COPY requirements.txt .

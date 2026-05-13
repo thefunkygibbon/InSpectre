@@ -256,7 +256,14 @@ export function ContainersPage({ openContainer }) {
       if (mode === 'exclude' &&  fn()) return false
     }
     if (search.trim()) {
-      const q = search.toLowerCase()
+      const q = search.toLowerCase().trim()
+      const portMatch = q.match(/^port:(\d+)$/)
+      if (portMatch) {
+        const portNum = portMatch[1]
+        return (c.ports || []).some(p =>
+          String(p.host_port) === portNum || String(p.container_port?.split('/')[0]) === portNum
+        )
+      }
       return c.name.toLowerCase().includes(q)
           || c.image.toLowerCase().includes(q)
           || c.short_id.toLowerCase().includes(q)

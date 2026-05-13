@@ -89,8 +89,10 @@ function ChoiceScreen({ onFresh, onRestore }) {
 
 // ── Restore path ───────────────────────────────────────────────────────────
 function RestorePath({ onComplete, onBack }) {
-  const [status,  setStatus]  = useState(null)   // null | {ok, msg, stats}
-  const [loading, setLoading] = useState(false)
+  const [status,       setStatus]       = useState(null)
+  const [loading,      setLoading]      = useState(false)
+  const [password,     setPassword]     = useState('')
+  const [showPassword, setShowPassword] = useState(false)
 
   async function handleFile(e) {
     const file = e.target.files?.[0]
@@ -98,7 +100,7 @@ function RestorePath({ onComplete, onBack }) {
     setLoading(true)
     setStatus(null)
     try {
-      const result = await api.setupRestoreFromBackup(file)
+      const result = await api.setupRestoreFromBackup(file, password)
       const r = result.restored ?? {}
       setStatus({
         ok: true,
@@ -106,7 +108,10 @@ function RestorePath({ onComplete, onBack }) {
            + `${r.device_events ?? 0} events, ${r.vuln_reports ?? 0} vuln reports.`,
       })
     } catch (err) {
-      setStatus({ ok: false, msg: 'Restore failed — invalid or incompatible backup file.' })
+      const msg = err.message || ''
+      setStatus({ ok: false, msg: msg.toLowerCase().includes('encrypt')
+        ? 'This backup is encrypted — enter the password above before selecting the file.'
+        : 'Restore failed — invalid backup file or wrong password.' })
     } finally {
       setLoading(false)
     }
@@ -115,9 +120,29 @@ function RestorePath({ onComplete, onBack }) {
   return (
     <div className="space-y-4">
       <p className="text-sm" style={{ color: 'var(--color-text-muted)' }}>
-        Select your <code className="text-xs px-1 py-0.5 rounded" style={{ background: 'var(--color-surface-offset)' }}>inspectre_backup.json</code> file.
+        Select your <code className="text-xs px-1 py-0.5 rounded" style={{ background: 'var(--color-surface-offset)' }}>inspectre_backup.json</code> (or <code className="text-xs px-1 py-0.5 rounded" style={{ background: 'var(--color-surface-offset)' }}>.ienc</code> if encrypted).
         All devices, settings, timelines, vuln history, and your login credentials will be restored.
       </p>
+
+      {/* Password field for encrypted backups */}
+      <div>
+        <label className="text-xs block mb-1.5" style={{ color: 'var(--color-text-muted)' }}>
+          Backup password <span style={{ color: 'var(--color-text-faint)' }}>(leave blank if unencrypted)</span>
+        </label>
+        <div className="flex gap-2 items-center">
+          <input
+            type={showPassword ? 'text' : 'password'}
+            className="input text-sm"
+            style={{ maxWidth: '260px' }}
+            placeholder="Only needed for encrypted backups"
+            value={password}
+            onChange={e => setPassword(e.target.value)}
+          />
+          <button onClick={() => setShowPassword(v => !v)} className="p-1.5 rounded" style={{ color: 'var(--color-text-faint)' }}>
+            {showPassword ? <EyeOff size={14} /> : <Eye size={14} />}
+          </button>
+        </div>
+      </div>
 
       {!status?.ok && (
         <label
@@ -128,7 +153,7 @@ function RestorePath({ onComplete, onBack }) {
           <span className="text-sm font-medium text-center" style={{ color: 'var(--color-text-muted)' }}>
             {loading ? 'Restoring…' : 'Click to select backup file'}
           </span>
-          <input type="file" accept=".json" className="hidden" onChange={handleFile} disabled={loading} />
+          <input type="file" accept=".json,.ienc" className="hidden" onChange={handleFile} disabled={loading} />
         </label>
       )}
 

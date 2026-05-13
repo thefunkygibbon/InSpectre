@@ -344,18 +344,26 @@ function MainApp({ onLogout }) {
     if (filter === 'scanned')   list = list.filter(d => d.deep_scanned)
     if (filter === 'important') list = list.filter(d => d.is_important)
     if (search.trim()) {
-      const q = search.toLowerCase()
-      list = list.filter(d =>
-        (d.ip_address   || '').toLowerCase().includes(q) ||
-        (d.mac_address  || '').toLowerCase().includes(q) ||
-        (d.hostname     || '').toLowerCase().includes(q) ||
-        (d.custom_name  || '').toLowerCase().includes(q) ||
-        (d.vendor       || '').toLowerCase().includes(q) ||
-        (d.display_name || '').toLowerCase().includes(q) ||
-        (d.tags         || '').toLowerCase().includes(q) ||
-        (d.location     || '').toLowerCase().includes(q) ||
-        (d.zone         || '').toLowerCase().includes(q)
-      )
+      const q = search.toLowerCase().trim()
+      const portMatch = q.match(/^port:(\d+)$/)
+      if (portMatch) {
+        const portNum = parseInt(portMatch[1], 10)
+        list = list.filter(d =>
+          (d.scan_results?.open_ports || []).some(p => p.port === portNum)
+        )
+      } else {
+        list = list.filter(d =>
+          (d.ip_address   || '').toLowerCase().includes(q) ||
+          (d.mac_address  || '').toLowerCase().includes(q) ||
+          (d.hostname     || '').toLowerCase().includes(q) ||
+          (d.custom_name  || '').toLowerCase().includes(q) ||
+          (d.vendor       || '').toLowerCase().includes(q) ||
+          (d.display_name || '').toLowerCase().includes(q) ||
+          (d.tags         || '').toLowerCase().includes(q) ||
+          (d.location     || '').toLowerCase().includes(q) ||
+          (d.zone         || '').toLowerCase().includes(q)
+        )
+      }
     }
     list = applyFilters(list)
     return sortDevices(list, sort)

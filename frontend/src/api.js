@@ -101,8 +101,14 @@ export const api = {
     if (type)  p.set('type', type)
     return request('GET', `/devices/${mac}/events${p.toString() ? '?' + p : ''}`)
   },
-  getDeviceServices: (mac)      => request('GET',  `/devices/${mac}/services`),
+  getDeviceServices:  (mac)           => request('GET',  `/devices/${mac}/services`),
+  getDeviceGroup:     (mac)           => request('GET',  `/devices/${mac}/group`),
+  addToGroup:         (mac, targetMac)=> request('POST', `/devices/${mac}/group/add`, { target_mac: targetMac }),
+  removeFromGroup:    (mac)           => request('POST', `/devices/${mac}/group/remove`),
+  setGroupPrimary:    (mac)           => request('PUT',  `/devices/${mac}/group/primary`),
   refreshMdns:       (mac)      => request('POST', `/devices/${mac}/mdns-refresh`),
+  networkMdnsScan:   ()         => request('POST', '/network/mdns-scan'),
+  networkSsdpScan:   ()         => request('POST', '/network/ssdp-scan'),
   getDeviceZones:    ()         => request('GET',  '/devices/meta/zones'),
   getStats:          ()         => request('GET',  '/stats'),
 
@@ -204,21 +210,29 @@ export const api = {
   deleteDevice:       (mac)             => request('DELETE', `/devices/${mac}`),
 
   // Backup / restore
-  exportBackup: () => {
+  exportBackup: (password = '') => {
+    const form = new FormData()
+    form.append('password', password)
     const token = getToken()
-    return fetch(`${BASE}/export/backup`, { headers: token ? { Authorization: `Bearer ${token}` } : {} })
+    const headers = token ? { Authorization: `Bearer ${token}` } : {}
+    return fetch(`${BASE}/export/backup`, { method: 'POST', body: form, headers })
   },
-  importRestore: (file) => {
+  importRestore: (file, password = '') => {
     const form = new FormData()
     form.append('file', file)
+    form.append('password', password)
     const token = getToken()
     const headers = token ? { Authorization: `Bearer ${token}` } : {}
     return fetch(`${BASE}/import/restore`, { method: 'POST', body: form, headers })
-      .then(r => { if (!r.ok) throw new Error(`Restore failed: ${r.status}`); return r.json() })
+      .then(async r => {
+        if (!r.ok) { const e = await r.json().catch(() => ({})); throw new Error(e.detail || `Restore failed: ${r.status}`) }
+        return r.json()
+      })
   },
-  setupRestoreFromBackup: (file) => {
+  setupRestoreFromBackup: (file, password = '') => {
     const form = new FormData()
     form.append('file', file)
+    form.append('password', password)
     return fetch(`${BASE}/setup/restore-from-backup`, { method: 'POST', body: form })
       .then(r => { if (!r.ok) throw new Error(`Restore failed: ${r.status}`); return r.json() })
   },

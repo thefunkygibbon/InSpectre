@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException, Depends, UploadFile, File, Query, Security, Request
+from fastapi import FastAPI, HTTPException, Depends, UploadFile, File, Query, Security, Request, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, Response, JSONResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
@@ -247,6 +247,10 @@ def _migrate(db: Session):
         "ALTER TABLE devices ADD COLUMN IF NOT EXISTS dhcp_fingerprint  VARCHAR",
         # Fingerbank API identification result
         "ALTER TABLE devices ADD COLUMN IF NOT EXISTS fingerbank_result JSONB",
+        # Phase 9 — device grouping (same physical device, different interface)
+        "ALTER TABLE devices ADD COLUMN IF NOT EXISTS group_id      UUID",
+        "ALTER TABLE devices ADD COLUMN IF NOT EXISTS group_primary BOOLEAN NOT NULL DEFAULT FALSE",
+        "CREATE INDEX IF NOT EXISTS ix_devices_group_id ON devices(group_id)",
     ]
     for sql in migrations:
         try:
@@ -304,6 +308,8 @@ DEFAULT_SETTINGS = {
     # Phase 8 — auto-block
     "auto_block_new_devices":    ("false", "Automatically ARP-block newly discovered devices until manually approved."),
     "auto_block_vuln_severity":  ("none",  "Minimum vuln severity to trigger auto-block. Options: none, medium, high, critical."),
+    # Phase 9 — device grouping
+    "auto_group_by_hostname":    ("true",  "Automatically group devices with the same hostname as the same physical device on a different interface (e.g. laptop switching between WiFi and Ethernet). When disabled, a suggestion event is written instead."),
     # Network / probe identity
     "dns_server":                ("",      "LAN DNS server IP (auto-detected if blank). Set this to your router's IP for best hostname resolution."),
     "probe_interface":           ("",      "Network interface the probe uses for scanning (e.g. eth0, eno1). Auto-detected on startup if blank; changes apply immediately via Settings → Apply."),
@@ -631,7 +637,7 @@ async def _alert_dispatch_loop():
                         LIMIT 50
                     """), {
                         "last_id": _last_alert_event_id,
-                        "types":   ["joined", "offline", "vuln_scan_complete", "port_change", "port_opened", "port_closed"],
+                        "types":   ["joined", "interface_joined", "offline", "vuln_scan_complete", "port_change", "port_opened", "port_closed"],
                     }).fetchall()
                 else:
                     rows = []
@@ -653,6 +659,13 @@ async def _alert_dispatch_loop():
                             pending_alerts.append((f"New device detected: {name} ({ip})", "new_device"))
                         if auto_block_new:
                             devices_to_block.append(mac)
+                        if vuln_on_new_device and ip:
+                            scripts_s = db.get(Setting, "vuln_scan_templates")
+                            scripts   = (scripts_s.value or "").strip() if scripts_s else ""
+                            vuln_scans_to_run.append((mac, ip, scripts))
+                    elif etype == "interface_joined":
+                        if alert_new:
+                            pending_alerts.append((f"Grouped device rejoined on new interface: {name} ({ip})", "new_device"))
                         if vuln_on_new_device and ip:
                             scripts_s = db.get(Setting, "vuln_scan_templates")
                             scripts   = (scripts_s.value or "").strip() if scripts_s else ""
@@ -858,7 +871,7 @@ async def _run_speedtest_and_save():
                         result = json.loads(line[len("data: RESULT:"):])
                     elif line.startswith("data: "):
                         raw_lines.append(line[6:])
-        if result:
+        if result.get("download_mbps") is not None or result.get("upload_mbps") is not None:
             db = SessionLocal()
             try:
                 db.execute(text(
@@ -1559,6 +1572,11 @@ def _to_dict(d: Device) -> dict:
         "is_virtual_interface":  False,
         "virtual_of":            None,
         "secondary_ips":         [],
+        "group_id":                str(getattr(d, "group_id", None)) if getattr(d, "group_id", None) else None,
+        "group_primary":           bool(getattr(d, "group_primary", False)),
+        "group_members":           [],
+        "group_size":              1,
+        "is_group_representative": False,
     }
 
 
@@ -1977,8 +1995,38 @@ def list_devices(
             if v_mac in macs:
                 virtual_ips_for.setdefault(real_mac, set()).add(ip)
 
+    # Build group representative info from already-loaded devices
+    group_map: dict[str, list] = {}  # group_id_str -> list[Device]
+    for d in devices:
+        gid = getattr(d, "group_id", None)
+        if gid:
+            group_map.setdefault(str(gid), []).append(d)
+
+    group_representative: dict[str, str] = {}  # group_id_str -> mac
+    for gid_str, members in group_map.items():
+        online_members  = [m for m in members if m.is_online]
+        primary_members = [m for m in members if getattr(m, "group_primary", False)]
+        if len(online_members) == 1:
+            rep = online_members[0].mac_address
+        elif len(online_members) > 1:
+            rep = primary_members[0].mac_address if primary_members else online_members[0].mac_address
+        elif primary_members:
+            rep = primary_members[0].mac_address
+        else:
+            rep = members[0].mac_address
+        group_representative[gid_str] = rep
+
+    hidden_macs: set = {
+        m.mac_address
+        for gid_str, members in group_map.items()
+        for m in members
+        if m.mac_address != group_representative.get(gid_str)
+    }
+
     result = []
     for d in devices:
+        if d.mac_address in hidden_macs:
+            continue
         dct = _to_dict(d)
         dct['is_virtual_interface'] = d.mac_address in virtual_of
         dct['virtual_of']           = virtual_of.get(d.mac_address)
@@ -1988,6 +2036,22 @@ def list_devices(
             ip for ip in secondary_ip_map.get(d.mac_address, [])
             if ip != primary and ip not in excl_virt
         ]
+        gid = getattr(d, "group_id", None)
+        if gid:
+            gid_str = str(gid)
+            members = group_map.get(gid_str, [])
+            dct["group_members"] = [
+                {
+                    "mac_address":   m.mac_address,
+                    "group_primary": bool(getattr(m, "group_primary", False)),
+                    "is_online":     m.is_online,
+                    "display_name":  m.custom_name or m.hostname or m.ip_address,
+                    "ip_address":    m.ip_address,
+                }
+                for m in members
+            ]
+            dct["group_size"]              = len(members)
+            dct["is_group_representative"] = True
         result.append(dct)
     return result
 
@@ -1998,6 +2062,29 @@ def get_device(mac: str, db: Session = Depends(get_db)):
     if not d:
         raise HTTPException(404, "Device not found")
     result = _to_dict(d)
+    if d.group_id:
+        try:
+            rows = db.execute(
+                text("""
+                    SELECT mac_address, hostname, custom_name, ip_address, is_online, group_primary
+                    FROM devices WHERE group_id = :gid
+                """),
+                {"gid": d.group_id},
+            ).fetchall()
+            result["group_members"] = [
+                {
+                    "mac_address":   r[0],
+                    "group_primary": bool(r[5]),
+                    "is_online":     bool(r[4]),
+                    "display_name":  r[2] or r[1] or r[3] or r[0],
+                    "ip_address":    r[3],
+                }
+                for r in rows
+            ]
+            result["group_size"]              = len(rows)
+            result["is_group_representative"] = True
+        except Exception:
+            pass
     latest = (
         db.query(VulnReport)
         .filter(VulnReport.mac_address == mac.lower())
@@ -2217,19 +2304,40 @@ def get_device_events(
     d = db.get(Device, mac.lower())
     if not d:
         raise HTTPException(404, "Device not found")
+    # If the device is in a group, include events from all group members
+    group_id = getattr(d, "group_id", None)
+    if group_id:
+        try:
+            macs = [r[0] for r in db.execute(
+                text("SELECT mac_address FROM devices WHERE group_id = :gid"),
+                {"gid": group_id},
+            ).fetchall()]
+        except Exception:
+            macs = [mac.lower()]
+    else:
+        macs = [mac.lower()]
     try:
         rows = db.execute(
             text("""
-                SELECT id, type, detail, created_at
+                SELECT id, mac_address, type, detail, created_at
                 FROM device_events
-                WHERE mac_address = :mac
+                WHERE mac_address = ANY(:macs)
                   AND (:type IS NULL OR type = :type)
                 ORDER BY created_at DESC
                 LIMIT :limit OFFSET :offset
             """),
-            {"mac": mac.lower(), "type": type, "limit": limit, "offset": offset}
+            {"macs": macs, "type": type, "limit": limit, "offset": offset}
         ).fetchall()
-        return [{"id": r[0], "type": r[1], "detail": r[2], "created_at": r[3].isoformat() if r[3] else None} for r in rows]
+        return [
+            {
+                "id":          r[0],
+                "mac_address": r[1],
+                "type":        r[2],
+                "detail":      r[3],
+                "created_at":  r[4].isoformat() if r[4] else None,
+            }
+            for r in rows
+        ]
     except Exception:
         return []
 
@@ -2240,6 +2348,135 @@ def get_identity_score(mac: str, db: Session = Depends(get_db)):
     if not d:
         raise HTTPException(404, "Device not found")
     return {"mac": mac, "score": _identity_score(d), "device_type": _infer_device_type(d)}
+
+
+# ---------------------------------------------------------------------------
+# Phase 9 — Device grouping
+# ---------------------------------------------------------------------------
+
+class GroupAddRequest(BaseModel):
+    target_mac: str
+
+
+@app.get("/devices/{mac}/group")
+def get_device_group(mac: str, db: Session = Depends(get_db)):
+    d = db.get(Device, mac.lower())
+    if not d:
+        raise HTTPException(404, "Device not found")
+    group_id = getattr(d, "group_id", None)
+    if not group_id:
+        return {"group_id": None, "members": []}
+    rows = db.execute(
+        text("""
+            SELECT mac_address, hostname, custom_name, ip_address, is_online, group_primary
+            FROM devices WHERE group_id = :gid
+        """),
+        {"gid": group_id},
+    ).fetchall()
+    return {
+        "group_id": str(group_id),
+        "members": [
+            {
+                "mac_address":   r[0],
+                "hostname":      r[1],
+                "custom_name":   r[2],
+                "ip_address":    r[3],
+                "is_online":     r[4],
+                "group_primary": bool(r[5]),
+                "display_name":  r[2] or r[1] or r[3] or r[0],
+            }
+            for r in rows
+        ],
+    }
+
+
+@app.post("/devices/{mac}/group/add")
+def add_to_group(mac: str, body: GroupAddRequest, db: Session = Depends(get_db)):
+    import uuid as _uuid
+    mac1 = mac.lower()
+    mac2 = body.target_mac.lower()
+    if mac1 == mac2:
+        raise HTTPException(400, "Cannot group a device with itself")
+    d1 = db.get(Device, mac1)
+    d2 = db.get(Device, mac2)
+    if not d1 or not d2:
+        raise HTTPException(404, "Device not found")
+    g1 = getattr(d1, "group_id", None)
+    g2 = getattr(d2, "group_id", None)
+    if g1 and g2 and str(g1) == str(g2):
+        return {"ok": True, "group_id": str(g1)}
+    # Prefer an existing group_id; if both have different groups, merge into g1
+    new_gid = str(g1 or g2 or _uuid.uuid4())
+    db.execute(
+        text("UPDATE devices SET group_id = :gid WHERE mac_address = ANY(:macs)"),
+        {"gid": new_gid, "macs": [mac1, mac2]},
+    )
+    # If g2 had a group, pull all its members into the new group
+    if g2 and str(g2) != new_gid:
+        db.execute(
+            text("UPDATE devices SET group_id = :gid WHERE group_id = :old"),
+            {"gid": new_gid, "old": str(g2)},
+        )
+    # Ensure exactly one primary exists: prefer the existing primary, else set mac1
+    primaries = db.execute(
+        text("SELECT mac_address FROM devices WHERE group_id = :gid AND group_primary = true"),
+        {"gid": new_gid},
+    ).fetchall()
+    if not primaries:
+        db.execute(
+            text("UPDATE devices SET group_primary = true WHERE mac_address = :mac"),
+            {"mac": mac1},
+        )
+    db.commit()
+    return {"ok": True, "group_id": new_gid}
+
+
+@app.post("/devices/{mac}/group/remove")
+def remove_from_group(mac: str, db: Session = Depends(get_db)):
+    mac_lower = mac.lower()
+    d = db.get(Device, mac_lower)
+    if not d:
+        raise HTTPException(404, "Device not found")
+    group_id = getattr(d, "group_id", None)
+    if not group_id:
+        return {"ok": True}
+    db.execute(
+        text("UPDATE devices SET group_id = NULL, group_primary = FALSE WHERE mac_address = :mac"),
+        {"mac": mac_lower},
+    )
+    # If only one member remains, dissolve the group
+    remaining = db.execute(
+        text("SELECT COUNT(*) FROM devices WHERE group_id = :gid"),
+        {"gid": group_id},
+    ).scalar() or 0
+    if remaining <= 1:
+        db.execute(
+            text("UPDATE devices SET group_id = NULL, group_primary = FALSE WHERE group_id = :gid"),
+            {"gid": group_id},
+        )
+    db.commit()
+    return {"ok": True}
+
+
+@app.put("/devices/{mac}/group/primary")
+def set_group_primary(mac: str, db: Session = Depends(get_db)):
+    mac_lower = mac.lower()
+    d = db.get(Device, mac_lower)
+    if not d:
+        raise HTTPException(404, "Device not found")
+    group_id = getattr(d, "group_id", None)
+    if not group_id:
+        raise HTTPException(400, "Device is not in a group")
+    db.execute(
+        text("UPDATE devices SET group_primary = FALSE WHERE group_id = :gid"),
+        {"gid": group_id},
+    )
+    db.execute(
+        text("UPDATE devices SET group_primary = TRUE WHERE mac_address = :mac"),
+        {"mac": mac_lower},
+    )
+    db.commit()
+    return {"ok": True}
 
 
 # ---------------------------------------------------------------------------
@@ -2544,6 +2781,34 @@ async def refresh_device_mdns(mac: str, db: Session = Depends(get_db)):
     db.refresh(d)
     mdns_services = (d.scan_results or {}).get("mdns_services", []) if d.scan_results else []
     return {"mdns_services": mdns_services}
+
+
+@app.post("/network/mdns-scan")
+async def network_mdns_scan():
+    """Trigger a network-wide active mDNS browse."""
+    try:
+        async with httpx.AsyncClient(timeout=25.0) as client:
+            resp = await client.post(f"{PROBE_URL}/mdns/refresh")
+            resp.raise_for_status()
+            return resp.json()
+    except httpx.ConnectError:
+        raise HTTPException(502, f"Cannot reach probe at {PROBE_URL}")
+    except Exception as e:
+        raise HTTPException(502, f"mDNS scan failed: {e}")
+
+
+@app.post("/network/ssdp-scan")
+async def network_ssdp_scan():
+    """Trigger a network-wide active SSDP M-SEARCH."""
+    try:
+        async with httpx.AsyncClient(timeout=20.0) as client:
+            resp = await client.post(f"{PROBE_URL}/ssdp/refresh")
+            resp.raise_for_status()
+            return resp.json()
+    except httpx.ConnectError:
+        raise HTTPException(502, f"Cannot reach probe at {PROBE_URL}")
+    except Exception as e:
+        raise HTTPException(502, f"SSDP scan failed: {e}")
 
 
 # ---------------------------------------------------------------------------
@@ -3020,6 +3285,7 @@ async def apply_settings(db: Session = Depends(get_db)):
         "enable_service_fingerprinting", "enable_mdns",
         "enable_nightly_scan", "enable_unscanned_retry",
         "probe_interface", "dns_server",
+        "auto_group_by_hostname",
     ):
         if key in settings:
             payload[key] = settings[key]
@@ -3293,8 +3559,31 @@ async def import_fingerprints_json(file: UploadFile = File(...), db: Session = D
 # ---------------------------------------------------------------------------
 # Database backup / restore
 # ---------------------------------------------------------------------------
-@app.get("/export/backup")
-def export_backup(db: Session = Depends(get_db)):
+def _encrypt_backup(plaintext: bytes, password: str) -> bytes:
+    from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+    from cryptography.hazmat.primitives import hashes
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+    salt  = os.urandom(16)
+    key   = PBKDF2HMAC(algorithm=hashes.SHA256(), length=32, salt=salt, iterations=600000).derive(password.encode())
+    nonce = os.urandom(12)
+    ct    = AESGCM(key).encrypt(nonce, plaintext, None)  # 16-byte GCM tag appended by library
+    return b"IENC1" + salt + nonce + ct
+
+def _decrypt_backup(data: bytes, password: str) -> bytes:
+    from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+    from cryptography.hazmat.primitives import hashes
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+    if not data.startswith(b"IENC1"):
+        raise ValueError("Not an encrypted backup")
+    salt  = data[5:21]
+    nonce = data[21:33]
+    ct    = data[33:]
+    key   = PBKDF2HMAC(algorithm=hashes.SHA256(), length=32, salt=salt, iterations=600000).derive(password.encode())
+    return AESGCM(key).decrypt(nonce, ct, None)  # raises InvalidTag on wrong password
+
+
+@app.post("/export/backup")
+def export_backup(password: str = Form(""), db: Session = Depends(get_db)):
     """Export all user data as a portable JSON backup (version 2)."""
 
     def _rows(sql, *params):
@@ -3403,6 +3692,21 @@ def export_backup(db: Session = Depends(get_db)):
     except Exception:
         pass
 
+    # Speedtest history
+    speedtest_results = []
+    try:
+        speedtest_results = [
+            {"id": r[0], "tested_at": r[1].isoformat() if r[1] else None,
+             "server": r[2], "ping_ms": r[3], "download_mbps": r[4],
+             "upload_mbps": r[5], "raw_output": r[6]}
+            for r in _rows(
+                "SELECT id, tested_at, server, ping_ms, download_mbps, upload_mbps, raw_output "
+                "FROM speedtest_results ORDER BY tested_at"
+            )
+        ]
+    except Exception:
+        pass
+
     payload = {
         "version": 2,
         "exported_at": datetime.now(timezone.utc).isoformat(),
@@ -3416,12 +3720,21 @@ def export_backup(db: Session = Depends(get_db)):
         "alert_suppressions": suppressions,
         "saved_views": saved_views,
         "block_schedules": block_schedules,
+        "speedtest_results": speedtest_results,
     }
-    content = json.dumps(payload, indent=2, default=str)
+    raw = json.dumps(payload, indent=2, default=str).encode()
+    if password:
+        content  = _encrypt_backup(raw, password)
+        fname    = "inspectre_backup.ienc"
+        mimetype = "application/octet-stream"
+    else:
+        content  = raw
+        fname    = "inspectre_backup.json"
+        mimetype = "application/json"
     return Response(
-        content=content.encode(),
-        media_type="application/json",
-        headers={"Content-Disposition": "attachment; filename=inspectre_backup.json"},
+        content=content,
+        media_type=mimetype,
+        headers={"Content-Disposition": f"attachment; filename={fname}"},
     )
 
 
@@ -3447,7 +3760,7 @@ def _do_restore(payload: dict, db: Session) -> dict:
         "settings": 0, "fingerprints": 0, "devices": 0,
         "device_events": 0, "vuln_reports": 0, "ip_history": 0,
         "users": 0, "alert_suppressions": 0, "saved_views": 0,
-        "block_schedules": 0,
+        "block_schedules": 0, "speedtest_results": 0,
     }
 
     # Settings — restore ALL keys without skipping
@@ -3517,6 +3830,8 @@ def _do_restore(payload: dict, db: Session) -> dict:
             deep_scan_last_run=_dt(d.get("deep_scan_last_run")),
             baseline_ports=d.get("baseline_ports"),
             baseline_scan_count=int(d.get("baseline_scan_count") or 0),
+            group_id=d.get("group_id"),
+            group_primary=bool(d.get("group_primary", False)),
         )
         existing = db.get(Device, mac)
         if existing:
@@ -3697,12 +4012,33 @@ def _do_restore(payload: dict, db: Session) -> dict:
         except Exception:
             sp.rollback()
 
+    # Speedtest results
+    for sr in payload.get("speedtest_results", []):
+        sr_id = sr.get("id")
+        if sr_id is None:
+            continue
+        sp = db.begin_nested()
+        try:
+            db.execute(text(
+                "INSERT INTO speedtest_results "
+                "(id, tested_at, server, ping_ms, download_mbps, upload_mbps, raw_output) "
+                "VALUES (:id, :tested_at, :server, :ping_ms, :download_mbps, :upload_mbps, :raw_output) "
+                "ON CONFLICT (id) DO NOTHING"
+            ), {"id": sr_id, "tested_at": sr.get("tested_at"), "server": sr.get("server"),
+                "ping_ms": sr.get("ping_ms"), "download_mbps": sr.get("download_mbps"),
+                "upload_mbps": sr.get("upload_mbps"), "raw_output": sr.get("raw_output")})
+            sp.commit()
+            stats["speedtest_results"] += 1
+        except Exception:
+            sp.rollback()
+
     db.commit()
 
     # Reset SERIAL sequences so new inserts don't collide with restored IDs
     for tbl, col in [
         ("device_events", "id"), ("vuln_reports", "id"), ("ip_history", "id"),
         ("alert_suppressions", "id"), ("saved_views", "id"), ("block_schedules", "id"),
+        ("speedtest_results", "id"),
     ]:
         try:
             db.execute(text(
@@ -3717,9 +4053,16 @@ def _do_restore(payload: dict, db: Session) -> dict:
 
 
 @app.post("/import/restore")
-async def import_restore(file: UploadFile = File(...), db: Session = Depends(get_db)):
-    """Full restore from a v1 or v2 backup JSON."""
+async def import_restore(file: UploadFile = File(...), password: str = Form(""), db: Session = Depends(get_db)):
+    """Full restore from a v1 or v2 backup JSON (plain or encrypted)."""
     content = await file.read()
+    if content[:5] == b"IENC1":
+        if not password:
+            raise HTTPException(400, "This backup is encrypted — enter the password before restoring")
+        try:
+            content = _decrypt_backup(content, password)
+        except Exception:
+            raise HTTPException(400, "Decryption failed — wrong password")
     try:
         payload = json.loads(content)
     except Exception as exc:
@@ -3730,10 +4073,17 @@ async def import_restore(file: UploadFile = File(...), db: Session = Depends(get
 
 
 @app.post("/setup/restore-from-backup")
-async def setup_restore_from_backup(file: UploadFile = File(...), db: Session = Depends(get_db)):
+async def setup_restore_from_backup(file: UploadFile = File(...), password: str = Form(""), db: Session = Depends(get_db)):
     """Public endpoint: restore from backup during initial setup wizard.
     Restores all data including credentials and marks setup_complete = true."""
     content = await file.read()
+    if content[:5] == b"IENC1":
+        if not password:
+            raise HTTPException(400, "This backup is encrypted — enter the password before restoring")
+        try:
+            content = _decrypt_backup(content, password)
+        except Exception:
+            raise HTTPException(400, "Decryption failed — wrong password")
     try:
         payload = json.loads(content)
     except Exception as exc:
@@ -4531,7 +4881,7 @@ async def tools_dnsbl(ip: str = Query(...)):
 @app.get("/tools/speedtest")
 async def stream_speedtest_proxy(server_id: str = ""):
     probe_url = f"{PROBE_URL}/stream/tools/speedtest"
-    params    = {}
+    params: dict = {}
     if server_id:
         params["server_id"] = server_id
     raw_lines: list[str] = []
@@ -4551,21 +4901,22 @@ async def stream_speedtest_proxy(server_id: str = ""):
                                 payload_str = line[len("data: RESULT:"):]
                                 try:
                                     data = json.loads(payload_str)
-                                    db2 = SessionLocal()
-                                    try:
-                                        db2.execute(text(
-                                            "INSERT INTO speedtest_results (server, ping_ms, download_mbps, upload_mbps, raw_output) "
-                                            "VALUES (:server, :ping, :dl, :ul, :raw)"
-                                        ), {
-                                            "server": data.get("server"),
-                                            "ping":   data.get("ping_ms"),
-                                            "dl":     data.get("download_mbps"),
-                                            "ul":     data.get("upload_mbps"),
-                                            "raw":    "\n".join(l[6:] for l in raw_lines if l.startswith("data: ")),
-                                        })
-                                        db2.commit()
-                                    finally:
-                                        db2.close()
+                                    if data.get("download_mbps") is not None or data.get("upload_mbps") is not None:
+                                        db2 = SessionLocal()
+                                        try:
+                                            db2.execute(text(
+                                                "INSERT INTO speedtest_results (server, ping_ms, download_mbps, upload_mbps, raw_output) "
+                                                "VALUES (:server, :ping, :dl, :ul, :raw)"
+                                            ), {
+                                                "server": data.get("server"),
+                                                "ping":   data.get("ping_ms"),
+                                                "dl":     data.get("download_mbps"),
+                                                "ul":     data.get("upload_mbps"),
+                                                "raw":    "\n".join(l[6:] for l in raw_lines if l.startswith("data: ")),
+                                            })
+                                            db2.commit()
+                                        finally:
+                                            db2.close()
                                 except Exception:
                                     pass
         except httpx.ConnectError:
@@ -4583,7 +4934,7 @@ async def stream_speedtest_proxy(server_id: str = ""):
 @app.get("/tools/speedtest-servers")
 async def get_speedtest_servers():
     try:
-        async with httpx.AsyncClient(timeout=30) as client:
+        async with httpx.AsyncClient(timeout=60) as client:
             resp = await client.get(f"{PROBE_URL}/tools/speedtest-servers")
             return resp.json()
     except Exception as exc:

@@ -115,6 +115,7 @@ ENABLE_SERVICE_FINGERPRINTING = _env_bool("ENABLE_SERVICE_FINGERPRINTING")
 ENABLE_MDNS                   = _env_bool("ENABLE_MDNS")
 ENABLE_NIGHTLY_SCAN           = _env_bool("ENABLE_NIGHTLY_SCAN")
 ENABLE_UNSCANNED_RETRY        = _env_bool("ENABLE_UNSCANNED_RETRY")
+AUTO_GROUP_BY_HOSTNAME        = _env_bool("AUTO_GROUP_BY_HOSTNAME")
 
 # In-memory absent-port counters for baseline drift detection (resets on restart — acceptable)
 # { mac: { port: consecutive_absent_count } }
@@ -138,6 +139,7 @@ def _load_settings_from_db() -> None:
     global NIGHTLY_SCAN_START, NIGHTLY_SCAN_END, OFFLINE_RESCAN_HOURS, BASELINE_SCAN_COUNT_THRESHOLD, HOSTNAME_COOLDOWN_HOURS
     global ENABLE_ARP_SWEEP, ENABLE_PASSIVE_SNIFFER, ENABLE_HOSTNAME_RESOLUTION, ENABLE_PORT_SCANNING
     global ENABLE_SERVICE_FINGERPRINTING, ENABLE_MDNS, ENABLE_NIGHTLY_SCAN, ENABLE_UNSCANNED_RETRY
+    global AUTO_GROUP_BY_HOSTNAME
     global _DNS_SERVER
     try:
         session = Session()
@@ -175,6 +177,7 @@ def _load_settings_from_db() -> None:
         ENABLE_MDNS                   = _pb("enable_mdns")
         ENABLE_NIGHTLY_SCAN           = _pb("enable_nightly_scan")
         ENABLE_UNSCANNED_RETRY        = _pb("enable_unscanned_retry")
+        AUTO_GROUP_BY_HOSTNAME        = _pb("auto_group_by_hostname")
         # dns_server from DB overrides ENV-based detection
         ds = db.get("dns_server", "").strip()
         if ds:
@@ -218,6 +221,7 @@ def apply_runtime_config(payload: dict) -> dict:
     global SCAN_INTERVAL, IP_RANGE, INTERFACE, PORT_SCAN_WORKERS, GATEWAY_SCAN_WORKERS, PORT_SCAN_METHOD, OS_CONFIDENCE_THRESHOLD, OFFLINE_MISS_THRESHOLD, SNIFFER_WORKERS, ARP_SCAN_RETRY, PRIMARY_IP_MODE, SNIFFER_SUBNET_FILTER, NUCLEI_TEMPLATE_UPDATE_INTERVAL
     global HOSTNAME_COOLDOWN_HOURS, ENABLE_ARP_SWEEP, ENABLE_PASSIVE_SNIFFER, ENABLE_HOSTNAME_RESOLUTION, ENABLE_PORT_SCANNING
     global ENABLE_SERVICE_FINGERPRINTING, ENABLE_MDNS, ENABLE_NIGHTLY_SCAN, ENABLE_UNSCANNED_RETRY
+    global AUTO_GROUP_BY_HOSTNAME
     global _DNS_SERVER
 
     changes = {}
@@ -281,6 +285,7 @@ def apply_runtime_config(payload: dict) -> dict:
     if "enable_mdns"                   in payload: ENABLE_MDNS                   = _abool(payload["enable_mdns"]);                   changes["enable_mdns"]                   = ENABLE_MDNS
     if "enable_nightly_scan"           in payload: ENABLE_NIGHTLY_SCAN           = _abool(payload["enable_nightly_scan"]);           changes["enable_nightly_scan"]           = ENABLE_NIGHTLY_SCAN
     if "enable_unscanned_retry"        in payload: ENABLE_UNSCANNED_RETRY        = _abool(payload["enable_unscanned_retry"]);        changes["enable_unscanned_retry"]        = ENABLE_UNSCANNED_RETRY
+    if "auto_group_by_hostname"        in payload: AUTO_GROUP_BY_HOSTNAME        = _abool(payload["auto_group_by_hostname"]);        changes["auto_group_by_hostname"]        = AUTO_GROUP_BY_HOSTNAME
     if "nuclei_template_update_interval" in payload:
         NUCLEI_TEMPLATE_UPDATE_INTERVAL = str(payload["nuclei_template_update_interval"]).strip()
         changes["nuclei_template_update_interval"] = NUCLEI_TEMPLATE_UPDATE_INTERVAL
@@ -981,6 +986,301 @@ def _mdns_loop() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Passive mDNS listener (continuous background thread)
+# ---------------------------------------------------------------------------
+def _mdns_passive_listener() -> None:
+    """Continuously listen on the mDNS multicast group for spontaneous service announcements."""
+    import socket as _sock, struct as _struct
+
+    MDNS_ADDR = "224.0.0.251"
+    MDNS_PORT = 5353
+    print("[mdns-passive] Starting passive listener", flush=True)
+
+    while True:
+        ptr_records: dict = {}
+        srv_records: dict = {}
+        a_records:   dict = {}
+
+        def _dec(data, offset, depth=0):
+            if depth > 10: return "", offset
+            labels, jumped, jump_ret = [], False, offset
+            while offset < len(data):
+                length = data[offset]
+                if length == 0: offset += 1; break
+                elif (length & 0xC0) == 0xC0:
+                    if offset + 1 >= len(data): break
+                    ptr = ((length & 0x3F) << 8) | data[offset + 1]
+                    if not jumped: jump_ret = offset + 2
+                    jumped = True
+                    s, _ = _dec(data, ptr, depth + 1)
+                    if s: labels.append(s)
+                    break
+                else:
+                    end = offset + 1 + length
+                    if end > len(data): break
+                    labels.append(data[offset + 1:end].decode("utf-8", errors="replace"))
+                    offset = end
+            return ".".join(labels), (jump_ret if jumped else offset)
+
+        def _parse(data):
+            try:
+                if len(data) < 12: return
+                flags = _struct.unpack_from(">H", data, 2)[0]
+                if not (flags & 0x8000): return  # skip queries
+                qdcount, ancount, nscount, arcount = _struct.unpack_from(">HHHH", data, 4)
+                offset = 12
+                for _ in range(qdcount):
+                    _, offset = _dec(data, offset); offset += 4
+                for _ in range(ancount + nscount + arcount):
+                    if offset + 10 > len(data): break
+                    name, offset = _dec(data, offset)
+                    if offset + 10 > len(data): break
+                    rtype, _, _, rdlen = _struct.unpack_from(">HHIH", data, offset)
+                    offset += 10
+                    rs = offset; offset += rdlen
+                    if rdlen == 0 or rs + rdlen > len(data): continue
+                    n = name.lower().rstrip(".")
+                    if rtype == 12:
+                        tgt, _ = _dec(data, rs)
+                        t = tgt.lower().rstrip(".")
+                        if t:
+                            lst = ptr_records.setdefault(n, [])
+                            if t not in lst: lst.append(t)
+                    elif rtype == 33 and rdlen >= 7:
+                        tgt, _ = _dec(data, rs + 6)
+                        srv_records[n] = tgt.lower().rstrip(".")
+                    elif rtype == 1 and rdlen == 4:
+                        a_records[n] = ".".join(str(b) for b in data[rs:rs + 4])
+            except Exception:
+                pass
+
+        def _flush():
+            result = {}
+            for hn, ip in a_records.items():
+                if _is_valid_ip(ip):
+                    entry = result.setdefault(ip, {"mdns_name": None, "services": []})
+                    if not entry["mdns_name"]:
+                        entry["mdns_name"] = hn.removesuffix(".local")
+            for svc_type, instances in ptr_records.items():
+                if "._dns-sd." in svc_type: continue
+                parts = svc_type.removesuffix(".local").split(".")
+                label = ".".join(parts[-2:]) if len(parts) >= 2 else svc_type.removesuffix(".local")
+                for inst in instances:
+                    hn = srv_records.get(inst)
+                    ip = None
+                    if hn: ip = a_records.get(hn) or a_records.get(hn + ".local")
+                    if ip and _is_valid_ip(ip):
+                        entry = result.setdefault(ip, {"mdns_name": None, "services": []})
+                        if label not in entry["services"]: entry["services"].append(label)
+            if result:
+                _apply_mdns_enrichment(result)
+            ptr_records.clear(); srv_records.clear(); a_records.clear()
+
+        s = None
+        try:
+            s = _sock.socket(_sock.AF_INET, _sock.SOCK_DGRAM, _sock.IPPROTO_UDP)
+            s.setsockopt(_sock.SOL_SOCKET, _sock.SO_REUSEADDR, 1)
+            try: s.setsockopt(_sock.SOL_SOCKET, _sock.SO_REUSEPORT, 1)
+            except (AttributeError, OSError): pass
+            s.bind(("", MDNS_PORT))
+            mreq = _struct.pack("4sL", _sock.inet_aton(MDNS_ADDR), _sock.INADDR_ANY)
+            s.setsockopt(_sock.IPPROTO_IP, _sock.IP_ADD_MEMBERSHIP, mreq)
+            s.settimeout(30.0)
+            pkt_count = 0
+            while True:
+                try:
+                    data, _ = s.recvfrom(8192)
+                    _parse(data)
+                    pkt_count += 1
+                    if pkt_count >= 100: _flush(); pkt_count = 0
+                except _sock.timeout:
+                    if ptr_records or a_records: _flush()
+                except Exception: break
+        except PermissionError as e:
+            print(f"[mdns-passive] permission denied: {e}", flush=True)
+            time.sleep(60)
+        except Exception as e:
+            print(f"[mdns-passive] error, restarting: {e}", flush=True)
+            time.sleep(10)
+        finally:
+            if s:
+                try:
+                    mreq = _struct.pack("4sL", _sock.inet_aton(MDNS_ADDR), _sock.INADDR_ANY)
+                    s.setsockopt(_sock.IPPROTO_IP, _sock.IP_DROP_MEMBERSHIP, mreq)
+                except Exception: pass
+                try: s.close()
+                except Exception: pass
+
+
+# ---------------------------------------------------------------------------
+# SSDP/UPnP discovery helpers
+# ---------------------------------------------------------------------------
+def _parse_ssdp_message(text: str) -> dict | None:
+    """Parse SSDP NOTIFY or HTTP 200 response headers into a service dict."""
+    lines = text.splitlines()
+    headers: dict[str, str] = {}
+    for line in lines[1:]:
+        if ":" in line:
+            k, _, v = line.partition(":")
+            headers[k.strip().lower()] = v.strip()
+    st  = headers.get("st",  headers.get("nt",  ""))
+    usn = headers.get("usn", "")
+    if not (st or usn): return None
+    return {
+        "st":       st,
+        "usn":      usn,
+        "server":   headers.get("server",   ""),
+        "location": headers.get("location", ""),
+    }
+
+
+def _apply_ssdp_enrichment(ssdp_data: dict[str, list[dict]]) -> None:
+    """Store SSDP service discoveries in device.scan_results["ssdp_services"]."""
+    if not ssdp_data:
+        return
+    session = Session()
+    try:
+        updated = 0
+        now_iso = datetime.now(timezone.utc).isoformat()
+        for ip, services in ssdp_data.items():
+            dev = session.query(Device).filter(Device.ip_address == ip).first()
+            if not dev:
+                continue
+            scan = dict(dev.scan_results) if dev.scan_results else {}
+            existing = {s["usn"]: s for s in scan.get("ssdp_services", []) if s.get("usn")}
+            changed = False
+            for svc in services:
+                usn = svc.get("usn", "")
+                if not usn:
+                    continue
+                svc["last_seen"] = now_iso
+                if usn not in existing or existing[usn] != svc:
+                    existing[usn] = svc
+                    changed = True
+            if changed:
+                scan["ssdp_services"] = list(existing.values())
+                dev.scan_results = scan
+                flag_modified(dev, "scan_results")
+                updated += 1
+        if updated:
+            session.commit()
+            print(f"[ssdp] Enriched {updated} device(s)", flush=True)
+    except Exception as e:
+        session.rollback()
+        print(f"[ssdp] Enrichment error: {e}", flush=True)
+    finally:
+        session.close()
+
+
+def _ssdp_browse(timeout: int = 6) -> dict[str, list[dict]]:
+    """Send SSDP M-SEARCH and collect UPnP responses. Returns {ip: [service_dict]}."""
+    import socket as _sock
+
+    SSDP_ADDR = "239.255.255.255"
+    SSDP_PORT = 1900
+    request = (
+        "M-SEARCH * HTTP/1.1\r\n"
+        f"HOST: {SSDP_ADDR}:{SSDP_PORT}\r\n"
+        'MAN: "ssdp:discover"\r\n'
+        f"MX: {max(1, timeout - 2)}\r\n"
+        "ST: ssdp:all\r\n"
+        "\r\n"
+    ).encode()
+
+    result: dict[str, list[dict]] = {}
+    s = None
+    try:
+        s = _sock.socket(_sock.AF_INET, _sock.SOCK_DGRAM, _sock.IPPROTO_UDP)
+        s.setsockopt(_sock.SOL_SOCKET, _sock.SO_REUSEADDR, 1)
+        s.setsockopt(_sock.IPPROTO_IP, _sock.IP_MULTICAST_TTL, 4)
+        s.settimeout(0.5)
+        # Bind to ephemeral port so unicast responses come back here
+        s.bind(("", 0))
+        s.sendto(request, (SSDP_ADDR, SSDP_PORT))
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            try:
+                data, addr = s.recvfrom(8192)
+                ip = addr[0]
+                info = _parse_ssdp_message(data.decode("utf-8", errors="replace"))
+                if info and info.get("usn"):
+                    existing_usns = {sv["usn"] for sv in result.get(ip, [])}
+                    if info["usn"] not in existing_usns:
+                        result.setdefault(ip, []).append(info)
+            except _sock.timeout:
+                continue
+            except Exception:
+                break
+    except Exception as e:
+        print(f"[ssdp] browse error: {e}", flush=True)
+    finally:
+        if s:
+            try: s.close()
+            except Exception: pass
+
+    total = sum(len(v) for v in result.values())
+    if result:
+        print(f"[ssdp] Discovered {total} service(s) on {len(result)} device(s)", flush=True)
+    return result
+
+
+def _ssdp_passive_listener() -> None:
+    """Continuously listen for UPnP NOTIFY announcements on the SSDP multicast group."""
+    import socket as _sock, struct as _struct
+
+    SSDP_ADDR = "239.255.255.255"
+    SSDP_PORT = 1900
+    print("[ssdp-passive] Starting passive SSDP listener", flush=True)
+
+    while True:
+        pending: dict[str, list[dict]] = {}
+        last_flush = time.monotonic()
+        s = None
+        try:
+            s = _sock.socket(_sock.AF_INET, _sock.SOCK_DGRAM, _sock.IPPROTO_UDP)
+            s.setsockopt(_sock.SOL_SOCKET, _sock.SO_REUSEADDR, 1)
+            try: s.setsockopt(_sock.SOL_SOCKET, _sock.SO_REUSEPORT, 1)
+            except (AttributeError, OSError): pass
+            s.bind(("", SSDP_PORT))
+            mreq = _struct.pack("4sL", _sock.inet_aton(SSDP_ADDR), _sock.INADDR_ANY)
+            s.setsockopt(_sock.IPPROTO_IP, _sock.IP_ADD_MEMBERSHIP, mreq)
+            s.settimeout(1.0)
+            while True:
+                try:
+                    data, addr = s.recvfrom(8192)
+                    text = data.decode("utf-8", errors="replace")
+                    if "ssdp:byebye" in text.lower(): continue
+                    info = _parse_ssdp_message(text)
+                    if info and info.get("usn"):
+                        ip = addr[0]
+                        existing_usns = {sv["usn"] for sv in pending.get(ip, [])}
+                        if info["usn"] not in existing_usns:
+                            pending.setdefault(ip, []).append(info)
+                except _sock.timeout:
+                    pass
+                except Exception:
+                    break
+                if pending and time.monotonic() - last_flush > 30:
+                    _apply_ssdp_enrichment(pending)
+                    pending.clear()
+                    last_flush = time.monotonic()
+        except PermissionError as e:
+            print(f"[ssdp-passive] permission denied: {e}", flush=True)
+            time.sleep(60)
+        except Exception as e:
+            print(f"[ssdp-passive] error, restarting: {e}", flush=True)
+            time.sleep(10)
+        finally:
+            if s:
+                try:
+                    mreq = _struct.pack("4sL", _sock.inet_aton(SSDP_ADDR), _sock.INADDR_ANY)
+                    s.setsockopt(_sock.IPPROTO_IP, _sock.IP_DROP_MEMBERSHIP, mreq)
+                except Exception: pass
+                try: s.close()
+                except Exception: pass
+
+
+# ---------------------------------------------------------------------------
 # ARP sweep
 # ---------------------------------------------------------------------------
 def arp_scan(interface: str, ip_range: str) -> list[dict]:
@@ -1230,6 +1530,95 @@ def trigger_deep_scan(ip: str, mac: str) -> None:
     threading.Thread(target=_run_deep_scan_thread, args=(ip, mac), daemon=True).start()
 
 # ---------------------------------------------------------------------------
+# Device grouping helpers
+# ---------------------------------------------------------------------------
+_GENERIC_HOSTNAME_RE = re.compile(
+    r'^(?:android[\-_]|iphone|ipad|localhost|dhcp|unknown|desktop[\-_]?|'
+    r'workgroup|raspberrypi|my[\-_]pc|workpc|user[\-_]pc|my[\-_]laptop|'
+    r'pc$|host$|node$|client$|device$)',
+    re.IGNORECASE,
+)
+
+
+def _hostname_base(hostname: str) -> str:
+    """Return the first DNS label in lowercase (strips .lan / .local / .home suffixes)."""
+    if not hostname:
+        return ""
+    return hostname.split('.')[0].lower()
+
+
+def _is_generic_hostname(hostname: str) -> bool:
+    """Return True for hostnames that are too generic to reliably identify a device."""
+    base = _hostname_base(hostname)
+    if not base or len(base) < 3:
+        return True
+    return bool(_GENERIC_HOSTNAME_RE.match(base))
+
+
+def _try_auto_group_by_hostname(mac: str, hostname: str) -> bool:
+    """
+    Look for an offline device with the same base hostname (first DNS label).
+    Handles andrewlaptop == andrewlaptop.lan == andrewlaptop.local etc.
+    If AUTO_GROUP_BY_HOSTNAME is enabled, assign both to a shared group_id
+    and return True (caller emits 'interface_joined' instead of 'joined').
+    If AUTO_GROUP_BY_HOSTNAME is False a 'group_suggestion' event is written
+    and False is returned.
+    """
+    base = _hostname_base(hostname)
+    if not base or _is_generic_hostname(hostname):
+        return False
+    import uuid as _uuid
+    sess = Session()
+    try:
+        row = sess.execute(
+            text("""
+                SELECT mac_address, group_id FROM devices
+                WHERE (
+                    LOWER(SPLIT_PART(COALESCE(hostname, ''), '.', 1))      = :base
+                    OR LOWER(SPLIT_PART(COALESCE(dhcp_hostname, ''), '.', 1)) = :base
+                )
+                  AND mac_address != :mac
+                  AND is_online = false
+                LIMIT 1
+            """),
+            {"base": base, "mac": mac},
+        ).fetchone()
+        if not row:
+            return False
+        peer_mac, peer_gid = row[0], row[1]
+
+        if not AUTO_GROUP_BY_HOSTNAME:
+            _write_event(mac, "group_suggestion", {
+                "peer_mac": peer_mac,
+                "reason": f"Same base hostname '{base}' as offline device",
+            })
+            return False
+
+        new_gid = str(peer_gid) if peer_gid else str(_uuid.uuid4())
+
+        if not peer_gid:
+            # Peer has no group yet — create one with peer as primary
+            sess.execute(
+                text("UPDATE devices SET group_id = :gid, group_primary = true WHERE mac_address = :m"),
+                {"gid": new_gid, "m": peer_mac},
+            )
+        # Add new device to the group (non-primary)
+        sess.execute(
+            text("UPDATE devices SET group_id = :gid, group_primary = false WHERE mac_address = :m"),
+            {"gid": new_gid, "m": mac},
+        )
+        sess.commit()
+        print(f"[+] Auto-grouped {mac} with {peer_mac} (base hostname='{base}')", flush=True)
+        return True
+    except Exception as exc:
+        sess.rollback()
+        print(f"[grouping] Error auto-grouping {mac}: {exc}", flush=True)
+        return False
+    finally:
+        sess.close()
+
+
+# ---------------------------------------------------------------------------
 # Device upsert
 # ---------------------------------------------------------------------------
 def upsert_seen_device(mac: str, ip: str, source: str) -> None:
@@ -1402,7 +1791,8 @@ def upsert_seen_device(mac: str, ip: str, source: str) -> None:
 
             if is_new:
                 print(f"[+] New device via {source}: {ip} ({mac}) hostname={hostname} vendor={vendor}", flush=True)
-                _write_event(mac, "joined", {"ip": ip, "vendor": vendor or "Unknown"})
+                grouped = _try_auto_group_by_hostname(mac, hostname_val)
+                _write_event(mac, "interface_joined" if grouped else "joined", {"ip": ip, "vendor": vendor or "Unknown"})
                 trigger_deep_scan(ip, mac)
             else:
                 if not was_online:
@@ -2324,45 +2714,73 @@ def stream_tools_portscan(host: str = Query(...), ports: str = Query("1-1024")):
 
 
 @probe_api.get("/stream/tools/speedtest")
-async def stream_speedtest(server_id: str = ""):
+async def stream_speedtest(server_id: str = "", single: bool = False):
     async def _gen():
-        cmd = ["speedtest-cli", "--no-pre-allocate"]
+        result: dict = {}
+        # Ookla speedtest CLI — multi-stream by default (Ookla has no single-stream flag)
+        cmd = ["speedtest", "--format=jsonl", "--accept-license", "--accept-gdpr"]
         if server_id:
-            cmd += ["--server", server_id]
-        lines_seen: list[str] = []
+            cmd += [f"--server-id={server_id}"]
         try:
             proc = await asyncio.create_subprocess_exec(
                 *cmd,
                 stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.STDOUT,
+                stderr=asyncio.subprocess.PIPE,
             )
             assert proc.stdout
+            yield 'data: {"type":"testStart"}\n\n'
             async for raw in proc.stdout:
                 line = raw.decode(errors="replace").rstrip()
-                if line:
-                    lines_seen.append(line)
-                    yield f"data: {line}\n\n"
+                if not line:
+                    continue
+                try:
+                    evt   = json.loads(line)
+                    etype = evt.get("type", "")
+                    if etype == "testStart":
+                        srv = evt.get("server", {})
+                        result["server"] = f"{srv.get('name', '')}, {srv.get('location', '')}"
+                    elif etype == "ping":
+                        ping_ms = round(evt.get("ping", {}).get("latency", 0), 2)
+                        result["ping_ms"] = ping_ms
+                        srv = evt.get("server", {})
+                        if srv:
+                            result["server"] = f"{srv.get('name', '')}, {srv.get('location', '')}"
+                        yield f'data: {json.dumps({"type":"ping","ping":{"latency":ping_ms}})}\n\n'
+                    elif etype == "download":
+                        bw       = evt.get("download", {}).get("bandwidth", 0)
+                        progress = evt.get("download", {}).get("progress", 0)
+                        yield f'data: {json.dumps({"type":"download","download":{"bandwidth":bw,"progress":progress}})}\n\n'
+                    elif etype == "upload":
+                        bw       = evt.get("upload", {}).get("bandwidth", 0)
+                        progress = evt.get("upload", {}).get("progress", 0)
+                        yield f'data: {json.dumps({"type":"upload","upload":{"bandwidth":bw,"progress":progress}})}\n\n'
+                    elif etype == "result":
+                        dl_bw = evt.get("download", {}).get("bandwidth", 0)
+                        ul_bw = evt.get("upload", {}).get("bandwidth", 0)
+                        result["download_mbps"] = round(dl_bw * 8 / 1_000_000, 2)
+                        result["upload_mbps"]   = round(ul_bw * 8 / 1_000_000, 2)
+                        result["ping_ms"]       = round(evt.get("ping", {}).get("latency", result.get("ping_ms", 0)), 2)
+                        srv = evt.get("server", {})
+                        if srv:
+                            result["server"] = f"{srv.get('name', '')}, {srv.get('location', '')}"
+                        if evt.get("result", {}).get("url"):
+                            result["result_url"] = evt["result"]["url"]
+                        # Emit final bandwidth values so UI shows correct peak
+                        yield f'data: {json.dumps({"type":"download","download":{"bandwidth":dl_bw,"progress":1.0}})}\n\n'
+                        yield f'data: {json.dumps({"type":"upload","upload":{"bandwidth":ul_bw,"progress":1.0}})}\n\n'
+                except (json.JSONDecodeError, KeyError, TypeError):
+                    pass
             await proc.wait()
-            # Parse and emit structured result
-            result: dict = {}
-            for ln in lines_seen:
-                if ln.startswith("Download:"):
-                    try: result["download_mbps"] = float(ln.split()[1])
-                    except (IndexError, ValueError): pass
-                elif ln.startswith("Upload:"):
-                    try: result["upload_mbps"] = float(ln.split()[1])
-                    except (IndexError, ValueError): pass
-                elif "Hosted by" in ln:
-                    try:
-                        # "Hosted by Name (City) [Xkm]: Y ms"
-                        parts = ln.split(": ", 1)
-                        if len(parts) == 2:
-                            result["ping_ms"] = float(parts[1].split()[0])
-                        result["server"] = ln.replace("Hosted by ", "").split(" [")[0].strip()
-                    except (IndexError, ValueError): pass
-            yield f"data: RESULT:{json.dumps(result)}\n\n"
+            if result.get("download_mbps") is not None:
+                yield f"data: RESULT:{json.dumps(result)}\n\n"
+            else:
+                stderr_out = b""
+                if proc.stderr:
+                    stderr_out = await proc.stderr.read()
+                err_msg = stderr_out.decode(errors="replace").strip()
+                yield f"data: ERROR: Speed test produced no measurements — {err_msg or 'check probe network connectivity'}\n\n"
         except FileNotFoundError:
-            yield "data: ERROR: speedtest-cli not found — rebuild probe container\n\n"
+            yield "data: ERROR: Ookla speedtest CLI not found — rebuild probe container\n\n"
         except Exception as exc:
             yield f"data: ERROR: {exc}\n\n"
     return StreamingResponse(
@@ -2376,27 +2794,31 @@ async def stream_speedtest(server_id: str = ""):
 async def get_speedtest_servers():
     try:
         proc = await asyncio.create_subprocess_exec(
-            "speedtest-cli", "--list",
+            "speedtest", "--servers", "--format=json", "--accept-license", "--accept-gdpr",
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
         )
-        out, _ = await proc.communicate()
-        text = out.decode(errors="replace")
-        servers = []
-        for line in text.splitlines()[1:]:  # skip header
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                parts = line.split(")")
-                sid = parts[0].strip()
-                rest = parts[1].strip() if len(parts) > 1 else line
-                servers.append({"id": sid, "label": rest[:80]})
-            except Exception:
-                pass
-        return {"servers": servers[:50]}
+        try:
+            out, _ = await asyncio.wait_for(proc.communicate(), timeout=30.0)
+        except asyncio.TimeoutError:
+            proc.kill()
+            return {"servers": [], "error": "Server list request timed out"}
+
+        text_out = out.decode(errors="replace").strip()
+        print(f"[speedtest-servers] exit={proc.returncode} output={repr(text_out[:400])}", flush=True)
+
+        try:
+            data = json.loads(text_out)
+            raw = data.get("servers", [])
+            servers = [
+                {"id": str(s["id"]), "label": f"{s['name']} ({s.get('location','')}, {s.get('country','')})"[:90]}
+                for s in raw if "id" in s and "name" in s
+            ]
+            return {"servers": servers[:50]}
+        except (json.JSONDecodeError, KeyError, TypeError) as e:
+            return {"servers": [], "error": f"Failed to parse server list: {e}"}
     except FileNotFoundError:
-        return {"servers": [], "error": "speedtest-cli not found"}
+        return {"servers": [], "error": "Ookla speedtest CLI not found — rebuild probe container"}
     except Exception as exc:
         return {"servers": [], "error": str(exc)}
 
@@ -2535,6 +2957,16 @@ def probe_mdns_refresh():
     if mdns_data:
         _apply_mdns_enrichment(mdns_data)
     return {"discovered": len(mdns_data), "ips": list(mdns_data.keys())}
+
+
+@probe_api.post("/ssdp/refresh")
+def probe_ssdp_refresh():
+    """Trigger an active SSDP M-SEARCH and store results."""
+    ssdp_data = _ssdp_browse()
+    if ssdp_data:
+        _apply_ssdp_enrichment(ssdp_data)
+    total = sum(len(v) for v in ssdp_data.values())
+    return {"discovered": len(ssdp_data), "services": total, "ips": list(ssdp_data.keys())}
 
 
 @probe_api.post("/block/{mac}")
@@ -2830,6 +3262,84 @@ def _startup_nerva_backfill() -> None:
     print(f"[nerva] Backfill: {count} device(s) queued for re-fingerprint", flush=True)
 
 # ---------------------------------------------------------------------------
+# Hostname group backfill (runs once at startup)
+# ---------------------------------------------------------------------------
+def _backfill_hostname_groups() -> None:
+    """
+    Group already-stored devices that share a base hostname but have no group yet.
+    Runs once at startup so existing devices are covered without needing rediscovery.
+    Skips generic hostnames and devices that are already correctly grouped.
+    """
+    if not AUTO_GROUP_BY_HOSTNAME:
+        return
+    import uuid as _uuid
+    sess = Session()
+    try:
+        rows = sess.execute(text("""
+            SELECT mac_address, hostname, dhcp_hostname, group_id, group_primary, is_online, last_seen
+            FROM devices
+            WHERE (hostname      IS NOT NULL AND hostname      != '')
+               OR (dhcp_hostname IS NOT NULL AND dhcp_hostname != '')
+        """)).fetchall()
+
+        # base_hostname -> list of device dicts
+        base_map: dict[str, list] = {}
+        for row in rows:
+            mac, hn, dhcp_hn, gid, gprimary, online, last_seen = row
+            base = _hostname_base(hn or dhcp_hn or '')
+            if not base or _is_generic_hostname(base):
+                continue
+            base_map.setdefault(base, []).append({
+                "mac": mac, "group_id": gid, "group_primary": bool(gprimary),
+                "is_online": bool(online), "last_seen": last_seen,
+            })
+
+        assigned = 0
+        for base, devs in base_map.items():
+            if len(devs) < 2:
+                continue
+            # Already fully grouped in the same group — nothing to do
+            gids = [str(d["group_id"]) for d in devs if d["group_id"]]
+            if len(gids) == len(devs) and len(set(gids)) == 1:
+                continue
+
+            # Pick (or reuse) a group UUID
+            new_gid = gids[0] if gids else str(_uuid.uuid4())
+
+            # Choose primary: single online device wins; else most recently seen
+            online_devs = [d for d in devs if d["is_online"]]
+            if len(online_devs) == 1:
+                primary_mac = online_devs[0]["mac"]
+            else:
+                primary_mac = max(
+                    devs,
+                    key=lambda d: d["last_seen"] or datetime.min.replace(tzinfo=timezone.utc),
+                )["mac"]
+
+            for d in devs:
+                want_primary = (d["mac"] == primary_mac)
+                if (d["group_id"] and str(d["group_id"]) == new_gid
+                        and d["group_primary"] == want_primary):
+                    continue
+                sess.execute(
+                    text("UPDATE devices SET group_id = :gid, group_primary = :pri WHERE mac_address = :mac"),
+                    {"gid": new_gid, "pri": want_primary, "mac": d["mac"]},
+                )
+                assigned += 1
+
+        if assigned:
+            sess.commit()
+            print(f"[grouping] Backfill: grouped {assigned} device(s) by base hostname", flush=True)
+        else:
+            print("[grouping] Backfill: no ungrouped hostname matches found", flush=True)
+    except Exception as exc:
+        sess.rollback()
+        print(f"[grouping] Backfill error: {exc}", flush=True)
+    finally:
+        sess.close()
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 def _graceful_shutdown(signum, frame) -> None:
@@ -2854,8 +3364,9 @@ def main() -> None:
     wait_for_db()
     init_db()
     _load_settings_from_db()
-    threading.Thread(target=refresh_missing_vendors, daemon=True, name="vendor-refresh").start()
-    threading.Thread(target=_startup_nerva_backfill, daemon=True, name="nerva-backfill").start()
+    threading.Thread(target=refresh_missing_vendors,   daemon=True, name="vendor-refresh").start()
+    threading.Thread(target=_startup_nerva_backfill,   daemon=True, name="nerva-backfill").start()
+    threading.Thread(target=_backfill_hostname_groups, daemon=True, name="group-backfill").start()
     print(
         f"[*] Scanning {IP_RANGE} on {INTERFACE} every {SCAN_INTERVAL}s\n"
         f"[*] Offline threshold: {OFFLINE_MISS_THRESHOLD} missed sweeps | OS confidence: {OS_CONFIDENCE_THRESHOLD}%",
@@ -2897,6 +3408,8 @@ def main() -> None:
                 threading.Thread(target=start_arp_sniffer, daemon=True, name="arp-sniffer").start()
             if ENABLE_MDNS:
                 threading.Thread(target=_mdns_loop, daemon=True, name="mdns-loop").start()
+                threading.Thread(target=_mdns_passive_listener, daemon=True, name="mdns-passive").start()
+                threading.Thread(target=_ssdp_passive_listener, daemon=True, name="ssdp-passive").start()
             _background_started = True
 
         with _sniffer_seen_lock:
