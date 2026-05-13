@@ -95,16 +95,10 @@ InSpectre is a self-hosted home network monitor and security scanner that automa
 ```bash
 git clone https://github.com/thefunkygibbon/InSpectre.git
 cd InSpectre
-
-# Edit docker-compose.yml and set:
-#   IP_RANGE       e.g. 192.168.1.0/24
-#   INTERFACE      e.g. eth0
-#   LAN_DNS_SERVER e.g. 192.168.1.1
-
 ./inspectre.sh up
 ```
 
-Open **http://localhost:3000** in your browser and complete the first-run setup wizard to create your admin account.
+Open **http://localhost:3000** in your browser and complete the first-run setup wizard. The wizard configures your network settings, scan range, and notifications — no file editing required.
 
 ### Available helper commands
 
@@ -126,16 +120,17 @@ docker compose up -d
 
 ## Configuration
 
-Key environment variables are set in `docker-compose.yml`:
+All configuration is done through the **Settings** panel in the UI — no file editing needed after `./inspectre.sh up`. The setup wizard on first run covers scan range, DNS, notifications, and container hosts.
 
-| Variable | Description | Example |
-|---|---|---|
-| `IP_RANGE` | CIDR range to scan | `192.168.1.0/24` |
-| `INTERFACE` | Network interface for the probe | `eth0` |
-| `LAN_DNS_SERVER` | DNS server for hostname resolution | `192.168.1.1` |
-| `DATABASE_URL` | PostgreSQL connection string (pre-set) | `postgresql://...` |
+The probe auto-detects the correct network interface and IP range from the host's routing table. If auto-detection picks the wrong interface (e.g. on a machine with multiple NICs), you can override it by uncommenting the relevant lines in `docker-compose.yml`:
 
-All other settings (scan interval, nmap arguments, alert channels, nightly scan window, container hosts, etc.) are managed from the **Settings** panel inside the UI after first run — no restart required for most of them.
+```yaml
+# IP_RANGE: "192.168.1.0/24"
+# INTERFACE: "eth0"
+# LAN_DNS_SERVER: "192.168.1.1"
+```
+
+Everything else — scan interval, nmap arguments, alert channels, nightly scan window, container hosts, etc. — is managed from the Settings panel at runtime with no restart required.
 
 ---
 

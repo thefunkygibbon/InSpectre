@@ -94,28 +94,27 @@
 
 ### 1.2 Installation
 
-Clone the repository and configure the required environment variables before starting:
+Clone the repository and start the stack — no file editing required before first run:
 
 ```bash
 git clone https://github.com/thefunkygibbon/InSpectre.git
 cd InSpectre
-```
-
-Open `docker-compose.yml` and set these three variables to match your network:
-
-| Variable | What to put here |
-|---|---|
-| `IP_RANGE` | The CIDR range of your LAN, e.g. `192.168.1.0/24` |
-| `INTERFACE` | The network interface the host uses to reach the LAN, e.g. `eth0` or `enp3s0`. Run `ip link` or `ifconfig` to find it. |
-| `LAN_DNS_SERVER` | Your local DNS server or router IP, e.g. `192.168.1.1`. Used for hostname resolution. |
-
-### 1.3 First Run & Setup Wizard
-
-Use the `inspectre.sh` helper script to start the stack:
-
-```bash
 ./inspectre.sh up
 ```
+
+The probe automatically detects the correct network interface and IP range from the host's routing table. All other configuration (scan range, DNS server, notifications, container hosts) is done through the setup wizard and Settings panel in the UI.
+
+**If auto-detection picks the wrong interface** (e.g. on a machine with multiple NICs), you can override it by uncommenting the relevant lines near the bottom of the `probe:` environment block in `docker-compose.yml`:
+
+```yaml
+# IP_RANGE: "192.168.1.0/24"
+# INTERFACE: "eth0"
+# LAN_DNS_SERVER: "192.168.1.1"
+```
+
+Rebuild after changing docker-compose.yml: `./inspectre.sh rebuild keep-data`.
+
+### 1.3 First Run & Setup Wizard
 
 This builds all three containers and starts them in the background. On first run, the database schema is created automatically — you do not need to run any migrations manually.
 
@@ -1205,12 +1204,12 @@ The **Container Vulnerabilities** section at the bottom of the dashboard shows:
 
 - Check that the probe container is running: `docker compose ps`
 - Check probe logs: `./inspectre.sh logs` and look for errors from the `probe` service
-- Verify the `INTERFACE` variable in `docker-compose.yml` matches an interface that actually exists on the host. Run `ip link` to list available interfaces.
+- The probe auto-detects the network interface on startup. If it picked the wrong one, set **Settings → Scanner → Interface** to the correct interface name, or uncomment and set `INTERFACE` in the `probe:` environment block of `docker-compose.yml` and rebuild.
 - The probe runs on host network mode and binds to port 8666. Make sure nothing else on the host is using that port.
 
 **Devices are not appearing on the dashboard**
 
-- Confirm `IP_RANGE` in `docker-compose.yml` covers the subnet your devices are on. A common mistake is using the wrong subnet (e.g., `10.0.0.0/24` when devices are on `192.168.1.0/24`).
+- Check **Settings → Scanner → IP Range** covers the subnet your devices are on. A common mistake is the wrong subnet (e.g., `10.0.0.0/24` when devices are on `192.168.1.0/24`). The probe auto-detects this on first start — if it got it wrong, update the setting and click **Apply**.
 - Check that the host machine is on the same Layer 2 network segment as the devices you expect to see. ARP does not cross routers.
 - Wait at least 60 seconds (one full scan cycle) after starting for the first results to appear.
 - Check probe logs for ARP sweep errors: `./inspectre.sh logs`
@@ -1238,7 +1237,7 @@ The **Container Vulnerabilities** section at the bottom of the dashboard shows:
 
 - ARP MITM requires the probe to be on the same Layer 2 segment as the target device and the gateway. It will not work across VLANs or through managed switches with Dynamic ARP Inspection enabled.
 - Check that the probe has `NET_ADMIN` and `NET_RAW` capabilities (set via `privileged: true` in `docker-compose.yml`).
-- Verify the `INTERFACE` setting is correct. ARP spoofing must go out on the same interface as the target device.
+- Verify the interface in **Settings → Scanner → Interface** is the correct LAN-facing interface. ARP spoofing must go out on the same interface as the target device.
 
 **Notifications are not being received**
 
@@ -1322,9 +1321,9 @@ Yes, with caveats. The Docker images are currently built for `linux/amd64`. For 
 
 Currently, `IP_RANGE` accepts a single CIDR block. To monitor multiple subnets, you can set a supernet that encompasses all of them (e.g., `192.168.0.0/16` instead of `192.168.1.0/24`), though this increases scan time. Support for multiple IP ranges is a planned enhancement.
 
-**Q: What happens if I change `IP_RANGE` after devices are already in the database?**
+**Q: What happens if I change the IP Range after devices are already in the database?**
 
-Existing device records are not deleted. The probe will simply stop seeing devices outside the new range (they will go offline) and will discover any new devices within the new range. Device history is preserved.
+Existing device records are not deleted. The probe will simply stop seeing devices outside the new range (they will go offline) and will discover any new devices within the new range. Device history is preserved. Change the range in **Settings → Scanner → IP Range** and click **Apply**.
 
 **Q: Can InSpectre block IoT devices from talking to each other (east-west blocking), not just from the internet?**
 
