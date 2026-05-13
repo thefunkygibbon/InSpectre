@@ -25,6 +25,7 @@
    - 3.10 [Ignoring Devices](#310-ignoring-devices)
    - 3.11 [Zones](#311-zones)
    - 3.12 [DHCP Fingerprinting & Fingerbank](#312-dhcp-fingerprinting--fingerbank)
+   - 3.13 [Device Grouping](#313-device-grouping)
 4. [Network Scanning](#4-network-scanning)
    - 4.1 [Port Scanning](#41-port-scanning)
    - 4.2 [OS Detection](#42-os-detection)
@@ -271,6 +272,7 @@ It shows:
 - **Open ports** — list of open TCP ports with service names and version info where known
 - **Last seen / First seen** timestamps
 - **DHCP Fingerprint** — a collapsible section (shown when DHCP data has been collected) displaying the device's self-reported hostname, vendor class ID, DHCP option list, and any Fingerbank cloud identification result; see [Section 3.12](#312-dhcp-fingerprinting--fingerbank)
+- **Grouped interfaces** — if this device has been grouped with other interfaces of the same physical device, a collapsible "Grouped Interfaces" panel shows each member MAC with its display name, current IP, and online status dot
 
 ### 3.4 Device Drawer — Actions Tab
 
@@ -330,6 +332,7 @@ The **Timeline** tab provides two views of a device's history:
 | `tagged` | Tags were added or modified |
 | `marked_important` | Device was starred/watched |
 | `vuln_scan_complete` | Vulnerability scan finished |
+| `interface_joined` | A new MAC was discovered sharing the same hostname — automatically grouped with this device as a new interface |
 
 ### 3.8 Device Drawer — Admin Tab
 
@@ -349,6 +352,12 @@ The **Admin** tab provides metadata management for the device:
 **Flags:**
 - **Watched** — marks the device as important; enables elevated offline alerts and Watched sort priority
 - **Ignored** — hides the device from the default view (it still appears when the Ignored filter is active)
+
+**Device Grouping:**
+A **Device Grouping** collapsible at the bottom of the Admin tab allows manual group management. It shows all MACs currently in the group with their display names and online status. From here you can:
+- **Remove** a member from the group (it becomes a standalone device again)
+- **Set as primary** — the primary member is used as the group representative when multiple interfaces are online simultaneously
+- **Add by MAC** — manually add another device (by MAC address) to this group
 
 ### 3.9 Watched Devices
 

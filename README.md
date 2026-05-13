@@ -27,6 +27,7 @@ InSpectre is a self-hosted home network monitor and security scanner that automa
 - **Watched flag** — star important devices for elevated offline alerts and priority sorting
 - **Ignore flag** — hide known-benign devices from the main view
 - **Notes** — free-text notes attached to any device
+- **Device grouping** — devices sharing the same hostname (e.g. `laptop` and `laptop.lan`) are automatically grouped as a single physical device with multiple interfaces. Grouped devices share a unified event timeline and appear as one card on the dashboard. Manual grouping and ungrouping is available from the device drawer.
 
 ### Scanning & Security
 - **Port scanning** — nmap-based TCP port sweep with OS detection and service fingerprinting
@@ -51,7 +52,7 @@ InSpectre is a self-hosted home network monitor and security scanner that automa
 
 ### Traffic Monitoring
 - **Per-device traffic analysis** — bytes, packets, domains contacted, countries, and unusual port activity
-- **Live speed test** — run a speedtest-cli speed test directly from the UI with optional scheduled auto-runs (every 30m / 1h / 6h / daily)
+- **Live speed test** — run an Ookla-powered speed test from the probe container and report download/upload speeds and ping. Optional server selector and scheduled auto-runs (every 30m / 1h / 6h / daily). Results are stored and shown in the history list.
 
 ### Network Tools
 - **IP Tools** — Ping, Traceroute, Port Scan, Reverse DNS, ARP Lookup, Wake-on-LAN
@@ -78,7 +79,7 @@ InSpectre is a self-hosted home network monitor and security scanner that automa
 ### Authentication & Setup
 - **Built-in authentication** — username and password login with JWT session tokens
 - **First-run setup wizard** — guided 7-step configuration of network settings, vulnerability scanning, notifications, container hosts, and Fingerbank device identification on first launch
-- **Backup/restore** — full JSON backup of all data, restorable from within the setup wizard or settings
+- **Backup/restore** — full JSON backup covering all devices, events, vuln reports, speed test history, settings, users, fingerprints, block schedules, and saved views. Optional AES-256-GCM encryption with a user-supplied password. Restorable from the setup wizard or settings panel; encrypted backups are supported in both locations.
 
 ---
 
