@@ -692,26 +692,37 @@ export function SecurityDashboard({ onDeviceClick, onContainerClick }) {
                       const isOpen = !!exp
                       return (
                         <div key={d.mac_address} className="card overflow-hidden">
-                          <button
-                            onClick={() => toggleVulnExpand(d.mac_address)}
-                            className="w-full p-3 text-left flex items-center gap-3 hover:bg-surface-offset/40 transition-colors"
-                          >
-                            {isOpen
-                              ? <ChevronDown size={12} style={{ color: 'var(--color-text-faint)', flexShrink: 0 }} />
-                              : <ChevronRight size={12} style={{ color: 'var(--color-text-faint)', flexShrink: 0 }} />}
+                          <div className="p-3 flex items-center gap-3">
+                            <button
+                              onClick={() => toggleVulnExpand(d.mac_address)}
+                              className="p-0.5 hover:opacity-70 transition-opacity shrink-0"
+                              aria-label={isOpen ? 'Collapse' : 'Expand findings'}
+                            >
+                              {isOpen
+                                ? <ChevronDown size={12} style={{ color: 'var(--color-text-faint)' }} />
+                                : <ChevronRight size={12} style={{ color: 'var(--color-text-faint)' }} />}
+                            </button>
                             <SevBadge severity={d.severity} />
                             <div className="flex-1 min-w-0">
-                              <p className="text-sm font-medium truncate" style={{ color: 'var(--color-text)' }}>
+                              <button
+                                onClick={() => onDeviceClick && onDeviceClick(d.mac_address, 'vulns')}
+                                className="text-sm font-medium truncate block text-left hover:underline"
+                                style={{ color: 'var(--color-brand)' }}
+                              >
                                 {d.display_name}
-                              </p>
+                              </button>
                               <p className="text-xs font-mono" style={{ color: 'var(--color-text-faint)' }}>
                                 {d.ip_address || d.mac_address}
                               </p>
                             </div>
-                            <span className="text-xs shrink-0" style={{ color: 'var(--color-text-faint)' }}>
+                            <button
+                              onClick={() => toggleVulnExpand(d.mac_address)}
+                              className="text-xs shrink-0 hover:opacity-70 transition-opacity"
+                              style={{ color: 'var(--color-text-faint)' }}
+                            >
                               {d.vuln_count} finding{d.vuln_count !== 1 ? 's' : ''}
-                            </span>
-                          </button>
+                            </button>
+                          </div>
                           {isOpen && (
                             <div className="px-3 pb-3 pt-1 border-t" style={{ borderColor: 'var(--color-border)' }}>
                               {exp.loading ? (
@@ -759,25 +770,70 @@ export function SecurityDashboard({ onDeviceClick, onContainerClick }) {
                   <div className="card divide-y" style={{ '--tw-divide-opacity': 1 }}>
                     {recentScan.slice(0, 10).map((r, i) => {
                       const cfg = SEV_CFG[r.severity] || SEV_CFG.info
+                      const exp = expandedVuln[r.mac_address]
+                      const isOpen = !!exp
                       return (
-                        <button
-                          key={i}
-                          onClick={() => onDeviceClick && onDeviceClick(r.mac_address, 'vulns')}
-                          className="w-full px-3 py-2.5 flex items-center gap-3 text-left hover:bg-surface-offset transition-colors first:rounded-t-lg last:rounded-b-lg"
-                        >
-                          <span className="w-2 h-2 rounded-full shrink-0 mt-0.5" style={{ background: cfg.color }} />
-                          <div className="flex-1 min-w-0">
-                            <p className="text-xs font-medium truncate" style={{ color: 'var(--color-text)' }}>
-                              {r.display_name}
-                            </p>
+                        <div key={i}>
+                          <div className="px-3 py-2.5 flex items-center gap-3 hover:bg-surface-offset transition-colors first:rounded-t-lg last:rounded-b-lg">
+                            <span className="w-2 h-2 rounded-full shrink-0 mt-0.5" style={{ background: cfg.color }} />
+                            <div className="flex-1 min-w-0">
+                              <button
+                                onClick={() => onDeviceClick && onDeviceClick(r.mac_address, 'vulns')}
+                                className="text-xs font-medium truncate block text-left hover:underline"
+                                style={{ color: 'var(--color-brand)' }}
+                              >
+                                {r.display_name}
+                              </button>
+                            </div>
+                            <SevBadge severity={r.severity} />
+                            <span className="text-[10px] shrink-0 flex items-center gap-1"
+                              style={{ color: 'var(--color-text-faint)' }}>
+                              <Clock size={9} />
+                              {fmtRelative(r.scanned_at)}
+                            </span>
+                            <button
+                              onClick={() => toggleVulnExpand(r.mac_address)}
+                              className="p-0.5 hover:opacity-70 transition-opacity shrink-0"
+                              aria-label={isOpen ? 'Collapse findings' : 'Expand findings'}
+                            >
+                              {isOpen
+                                ? <ChevronDown size={12} style={{ color: 'var(--color-text-faint)' }} />
+                                : <ChevronRight size={12} style={{ color: 'var(--color-text-faint)' }} />}
+                            </button>
                           </div>
-                          <SevBadge severity={r.severity} />
-                          <span className="text-[10px] shrink-0 flex items-center gap-1"
-                            style={{ color: 'var(--color-text-faint)' }}>
-                            <Clock size={9} />
-                            {fmtRelative(r.scanned_at)}
-                          </span>
-                        </button>
+                          {isOpen && (
+                            <div className="px-3 pb-3 pt-1 border-t" style={{ borderColor: 'var(--color-border)' }}>
+                              {exp.loading ? (
+                                <p className="text-[11px] animate-pulse" style={{ color: 'var(--color-text-faint)' }}>Loading findings…</p>
+                              ) : exp.findings?.length === 0 ? (
+                                <p className="text-[11px]" style={{ color: '#22c55e' }}>No findings in latest report</p>
+                              ) : (
+                                <div className="space-y-1 mt-1">
+                                  {(exp.findings || []).map((f, fi) => {
+                                    const fcfg = SEV_CFG[f.severity] || SEV_CFG.info
+                                    return (
+                                      <div key={fi} className="flex items-center gap-2">
+                                        <span className="px-1.5 py-0.5 rounded text-[9px] font-bold uppercase shrink-0"
+                                          style={{ background: fcfg.bg, color: fcfg.color, border: `1px solid ${fcfg.border}` }}>
+                                          {f.severity.slice(0, 4)}
+                                        </span>
+                                        <span className="text-[11px] truncate" style={{ color: 'var(--color-text-muted)' }}>
+                                          {f.name}
+                                        </span>
+                                        {f.matched_at && (
+                                          <span className="text-[10px] font-mono shrink-0 truncate max-w-[100px]"
+                                            style={{ color: 'var(--color-text-faint)' }}>
+                                            {f.matched_at}
+                                          </span>
+                                        )}
+                                      </div>
+                                    )
+                                  })}
+                                </div>
+                              )}
+                            </div>
+                          )}
+                        </div>
                       )
                     })}
                   </div>

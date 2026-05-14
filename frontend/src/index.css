@@ -263,7 +263,7 @@
     50%       { opacity: 0; }
   }
   .terminal-cursor::after {
-    content: '\u258c';
+    content: '\258c';
     display: inline-block;
     margin-left: 2px;
     animation: blink-cursor 1s step-end infinite;

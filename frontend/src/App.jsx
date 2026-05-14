@@ -282,6 +282,13 @@ function MainApp({ onLogout }) {
   const [showAlertDrop,    setShowAlertDrop]    = useState(false)
   const [showFilters,      setShowFilters]      = useState(false)
   const [containerToOpen,  setContainerToOpen]  = useState(null)
+  const [isNarrow,         setIsNarrow]         = useState(() => window.innerWidth < 768)
+
+  useEffect(() => {
+    function onResize() { setIsNarrow(window.innerWidth < 768) }
+    window.addEventListener('resize', onResize)
+    return () => window.removeEventListener('resize', onResize)
+  }, [])
 
   useEffect(() => {
     if (activePage !== 'containers') setContainerToOpen(null)
@@ -574,7 +581,7 @@ function MainApp({ onLogout }) {
                   )}
                 </p>
                 {layout === 'grid' ? (
-                  <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-4">
+                  <div className={`grid gap-4 grid-cols-1 sm:grid-cols-2 ${skin === 'phantom' ? 'xl:grid-cols-3' : 'lg:grid-cols-3 xl:grid-cols-4'}`}>
                     {filtered.map(d => (
                       <DeviceCard key={d.mac_address} device={d}
                         onClick={() => openDevice(d)}
@@ -707,6 +714,172 @@ function MainApp({ onLogout }) {
       </>
     )
 
+    // ── Phantom mobile layout (narrow screens: top-nav instead of sidebar) ────
+    if (isNarrow) {
+      const phantomNavStyle = (active) => ({
+        display: 'flex', alignItems: 'center', justifyContent: 'center',
+        padding: '8px', background: 'none', border: 'none', cursor: 'pointer',
+        color: active ? 'var(--color-brand)' : 'var(--color-text-muted)',
+        fontFamily: 'JetBrains Mono, monospace',
+        position: 'relative',
+      })
+      return (
+        <div style={{ display: 'flex', flexDirection: 'column', minHeight: '100vh', background: 'var(--color-bg)', color: 'var(--color-text)' }}>
+          <div className="noise-overlay" />
+          {/* Top nav */}
+          <header style={{
+            position: 'sticky', top: 0, zIndex: 30, flexShrink: 0,
+            borderBottom: '1px solid var(--color-border)',
+            background: 'var(--color-surface)',
+            display: 'flex', alignItems: 'center', gap: '4px', padding: '0 12px', height: '52px',
+            fontFamily: 'JetBrains Mono, monospace',
+          }}>
+            {/* Logo / back */}
+            <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexShrink: 0, marginRight: '4px' }}>
+              {activePage ? (
+                <button onClick={() => setActivePage(null)}
+                  style={{ ...phantomNavStyle(false), gap: '6px', padding: '6px 8px', fontSize: '11px', letterSpacing: '0.06em' }}>
+                  <ArrowLeft size={14} />
+                  <span>BACK</span>
+                </button>
+              ) : (
+                <>
+                  <Logo size={22} />
+                  <span style={{ fontSize: '11px', fontWeight: 700, letterSpacing: '0.15em', color: 'var(--color-brand)' }}>INSPECTRE</span>
+                </>
+              )}
+            </div>
+
+            {/* Page title or page nav */}
+            {activePage ? (
+              <span style={{ fontSize: '10px', letterSpacing: '0.1em', color: 'var(--color-text-faint)', flex: 1 }}>
+                // {(activepageInfo?.title || '').toUpperCase().replace(/ /g, '_')}
+              </span>
+            ) : (
+              <div style={{ flex: 1, display: 'flex', alignItems: 'center' }}>
+                <MobileNavMenu pages={PAGES} onSelect={setActivePage} />
+              </div>
+            )}
+
+            {/* Utility */}
+            <div style={{ display: 'flex', alignItems: 'center', gap: '0px', flexShrink: 0 }}>
+              <div style={{ position: 'relative' }}>
+                <button onClick={() => setShowAlertDrop(v => !v)} style={phantomNavStyle(totalAlerts > 0)}>
+                  <Bell size={15} />
+                  {totalAlerts > 0 && (
+                    <span style={{
+                      position: 'absolute', top: '4px', right: '4px',
+                      width: '13px', height: '13px', borderRadius: '50%',
+                      background: 'var(--color-brand)', color: '#000',
+                      fontSize: '8px', fontWeight: 700, display: 'flex', alignItems: 'center', justifyContent: 'center',
+                    }}>{totalAlerts > 9 ? '9+' : totalAlerts}</span>
+                  )}
+                </button>
+                {showAlertDrop && (
+                  <>
+                    <div className="fixed inset-0 z-30" onClick={() => setShowAlertDrop(false)} />
+                    <div style={{
+                      position: 'fixed', right: '8px', top: '56px',
+                      width: '300px', maxWidth: 'calc(100vw - 16px)', zIndex: 40, padding: '14px',
+                      background: 'var(--color-surface)', border: '1px solid var(--color-border)',
+                      boxShadow: '0 8px 32px rgba(0,0,0,0.7)', fontFamily: 'JetBrains Mono, monospace',
+                    }}>
+                      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '10px' }}>
+                        <span style={{ fontSize: '10px', letterSpacing: '0.12em', color: 'var(--color-text-muted)' }}>// ALERTS</span>
+                        {totalAlerts > 0 && (
+                          <button onClick={() => { dismissAllNew(); dismissAllOffline(); setShowAlertDrop(false) }}
+                            style={{ fontSize: '10px', color: 'var(--color-brand)', background: 'none', border: 'none', cursor: 'pointer' }}>
+                            CLEAR_ALL
+                          </button>
+                        )}
+                      </div>
+                      {totalAlerts === 0 ? (
+                        <p style={{ fontSize: '11px', textAlign: 'center', padding: '12px 0', color: 'var(--color-text-faint)' }}>// no alerts</p>
+                      ) : (
+                        <div style={{ maxHeight: '300px', overflowY: 'auto', display: 'flex', flexDirection: 'column', gap: '6px' }}>
+                          {newDeviceAlerts.map(a => (
+                            <div key={`new-${a.id}`}
+                              style={{ display: 'flex', alignItems: 'flex-start', gap: '8px', padding: '8px', background: 'var(--color-surface-offset)', cursor: 'pointer' }}
+                              onClick={() => { handleToastDeviceClick(a); dismissNewDevice(a.id); setShowAlertDrop(false) }}>
+                              <Bell size={11} style={{ color: 'var(--color-brand)', flexShrink: 0, marginTop: 2 }} />
+                              <div style={{ flex: 1, minWidth: 0 }}>
+                                <p style={{ fontSize: '10px', fontWeight: 600, color: 'var(--color-brand)' }}>NEW_DEVICE</p>
+                                <p style={{ fontSize: '10px', color: 'var(--color-text)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                                  {a.ip}{(a.hostname || a.vendor) ? ` — ${a.hostname || a.vendor}` : ''}
+                                </p>
+                              </div>
+                              <button onClick={e => { e.stopPropagation(); dismissNewDevice(a.id) }}
+                                style={{ opacity: 0.5, background: 'none', border: 'none', cursor: 'pointer', color: 'var(--color-text)', flexShrink: 0 }}>
+                                <X size={11} />
+                              </button>
+                            </div>
+                          ))}
+                          {offlineAlerts.map(a => (
+                            <div key={`off-${a.id}`}
+                              style={{ display: 'flex', alignItems: 'flex-start', gap: '8px', padding: '8px',
+                                       background: a.is_important ? 'rgba(239,68,68,0.08)' : 'var(--color-surface-offset)',
+                                       border: a.is_important ? '1px solid rgba(239,68,68,0.2)' : 'none', cursor: 'pointer' }}
+                              onClick={() => { handleToastDeviceClick(a); dismissOffline(a.id); setShowAlertDrop(false) }}>
+                              <WifiOff size={11} style={{ color: '#ef4444', flexShrink: 0, marginTop: 2 }} />
+                              <div style={{ flex: 1, minWidth: 0 }}>
+                                <p style={{ fontSize: '10px', fontWeight: 600, color: '#ef4444' }}>
+                                  {a.is_important ? 'WATCHED_OFFLINE' : 'DEVICE_OFFLINE'}
+                                </p>
+                                <p style={{ fontSize: '10px', color: 'var(--color-text)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                                  {a.name} <span style={{ color: 'var(--color-text-muted)' }}>{a.ip}</span>
+                                </p>
+                              </div>
+                              <button onClick={e => { e.stopPropagation(); dismissOffline(a.id) }}
+                                style={{ opacity: 0.5, background: 'none', border: 'none', cursor: 'pointer', color: 'var(--color-text)', flexShrink: 0 }}>
+                                <X size={11} />
+                              </button>
+                            </div>
+                          ))}
+                        </div>
+                      )}
+                    </div>
+                  </>
+                )}
+              </div>
+              <button onClick={toggleTheme} style={phantomNavStyle(false)} title={isDark ? 'Light' : 'Dark'}>
+                {isDark ? <Sun size={15} /> : <Moon size={15} />}
+              </button>
+              <button onClick={() => setShowSettings(true)} style={phantomNavStyle(false)} title="Settings">
+                <Settings size={15} />
+              </button>
+              <button onClick={onLogout} style={phantomNavStyle(false)} title="Sign out">
+                <LogOut size={15} />
+              </button>
+            </div>
+          </header>
+
+          <main style={{ flex: 1, overflowY: 'auto', padding: '16px' }}>
+            {innerContent}
+          </main>
+
+          <div style={{
+            padding: '6px 16px', flexShrink: 0,
+            borderTop: '1px solid var(--color-border)', background: 'var(--color-surface)',
+            fontSize: '9px', color: 'var(--color-text-faint)', letterSpacing: '0.06em',
+            fontFamily: 'JetBrains Mono, monospace', display: 'flex', justifyContent: 'space-between', alignItems: 'center',
+          }}>
+            <span>// INSPECTRE v{APP_VERSION}</span>
+            <StatusButton />
+          </div>
+
+          {notificationsEnabled && (
+            <NotificationToasts
+              newAlerts={newDeviceAlerts} offlineAlerts={offlineAlerts}
+              onDismissNew={dismissNewDevice} onDismissOffline={dismissOffline}
+              onDeviceClick={handleToastDeviceClick} topOffset="56px"
+            />
+          )}
+          {sharedDrawer}
+          {sharedSettings}
+        </div>
+      )
+    }
+
     return (
       <div style={{ display: 'flex', height: '100vh', overflow: 'hidden', background: 'var(--color-bg)', color: 'var(--color-text)' }}>
         <div className="noise-overlay" />
@@ -723,7 +896,7 @@ function MainApp({ onLogout }) {
             <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
               <Logo size={22} />
               <div>
-                <div className="terminal-cursor" style={{ fontSize: '12px', fontWeight: 700, letterSpacing: '0.15em', color: 'var(--color-brand)' }}>
+                <div style={{ fontSize: '12px', fontWeight: 700, letterSpacing: '0.15em', color: 'var(--color-brand)' }}>
                   INSPECTRE
                 </div>
                 <div style={{ fontSize: '9px', color: 'var(--color-text-faint)', marginTop: '1px' }}>

@@ -412,7 +412,7 @@ def _save_vuln_result(mac: str, ip: str, data: dict, scripts: str):
 # ---------------------------------------------------------------------------
 # Scheduled vuln scanner
 # ---------------------------------------------------------------------------
-_last_scheduled_vuln_scan: datetime | None = None
+_last_scheduled_vuln_scan: datetime | None = datetime.now(timezone.utc)
 
 
 async def _run_single_vuln_scan(mac: str, ip: str, scripts: str):
