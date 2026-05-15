@@ -67,6 +67,11 @@ InSpectre is a self-hosted home network monitor and security scanner that automa
 - **ntfy** — self-hosted push notification support
 - **Gotify** — self-hosted Gotify server support
 - **Webhooks** — generic outbound webhook for any alerting system
+- **Channels & Profiles system** — reusable Notification Channels (each with a service type and credentials) are grouped into Profiles that map specific event types to one or more channels; multiple channels can fire for the same event and one channel can serve multiple profiles
+- **Supported channel services** — ntfy, Gotify, Pushbullet, Webhook, Home Assistant (direct REST), Matrix, SMTP (email), Slack, Telegram, Discord, and Apprise generic URL
+- **Per-channel testing** — each channel can be tested individually from the Settings panel
+- **Home Assistant direct notifications** — a `home_assistant` channel type POSTs alerts directly to the HA REST API (`persistent_notification/create` or any custom `domain/service`); configure host, port, long-lived access token, optional notifier path, and TLS toggle
+- **Home Assistant MQTT Auto-Discovery** — dedicated Settings tab publishes InSpectre entities to Home Assistant via MQTT using the standard Auto-Discovery protocol; creates a system device (total devices online, total vulnerabilities, scan state, last scan time) and per-client sensors: presence, new device binary sensor, IP address, open port count, and vulnerability level
 
 ### Fingerprinting & Identity
 - **OUI lookup** — MAC vendor resolution from the IEEE OUI database
@@ -75,6 +80,7 @@ InSpectre is a self-hosted home network monitor and security scanner that automa
 - **Fingerbank cloud lookup** — optionally send DHCP fingerprint data to [Fingerbank](https://fingerbank.org/) (free tier, 600 lookups/hour) for deeper device identification; results include device name, hierarchy, and a confidence score
 - **Port pattern matching** — classify device type from open port signature
 - **Manual + community + auto fingerprints** — all stored locally, importable/exportable
+- **New device acknowledgement** — newly discovered devices float to the top of the device list and are marked as new until acknowledged; clicking Acknowledge on the device card or in the drawer marks the device as known, removing the badge and the float; the acknowledged state is stored server-side and also drives the MQTT `new` binary sensor
 
 ### Authentication & Setup
 - **Built-in authentication** — username and password login with JWT session tokens

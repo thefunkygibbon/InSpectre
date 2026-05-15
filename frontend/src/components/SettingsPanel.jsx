@@ -2,11 +2,12 @@ import { useState, useEffect, useRef } from 'react'
 import {
   Save, RotateCcw, Settings2, X, Download, Upload, FileText,
   Database, Bell, ScanLine, Eye, EyeOff, Send, Globe, User, Key, Box,
-  AlertTriangle, ChevronDown, ChevronRight, Paintbrush,
+  AlertTriangle, ChevronDown, ChevronRight, Paintbrush, Home, Wifi,
 } from 'lucide-react'
 import { api } from '../api'
 import { HostsManager } from './HostsManager'
 import { useTheme } from '../hooks/useTheme'
+import { NotificationsTab } from './NotificationsTab'
 
 // ── Setting definitions ────────────────────────────────────────────────────────
 const SETTING_META = {
@@ -70,30 +71,6 @@ const SETTING_META = {
       { value: 'weekly',   label: 'Weekly' },
     ],
     description: 'How often the probe automatically updates vulnerability scan templates.' },
-
-  // Notifications tab — in-app
-  notifications_enabled:         { label: 'Toast Notifications',    type: 'toggle', tab: 'notifications',
-    description: 'Show in-app popup toasts when new devices appear or go offline.' },
-  browser_notifications_enabled: { label: 'Browser Notifications',  type: 'toggle', tab: 'notifications',
-    description: 'Show OS-level notifications even when the tab is in the background. Requires browser permission.' },
-
-  // Notifications tab — alert triggers (control the backend dispatch loop)
-  alert_on_new_device:  { label: 'Alert on New Device',      type: 'toggle', tab: 'notifications',
-    description: 'Send an external alert when a new device is discovered.' },
-  alert_on_offline:     { label: 'Alert on Device Offline',  type: 'toggle', tab: 'notifications',
-    description: 'Send an external alert when a watched device goes offline.' },
-  alert_on_port_change: { label: 'Alert on Port Change',     type: 'toggle', tab: 'notifications',
-    description: 'Send an external alert when a device\'s open ports change.' },
-  alert_on_vuln:        { label: 'Alert on Vulnerability',   type: 'toggle', tab: 'notifications',
-    description: 'Send an external alert when a vulnerability scan finds issues.' },
-
-  // Delivery channels — handled as special sections in the UI, referenced here for tab routing
-  alert_webhook_url: { tab: 'notifications' },
-  ntfy_url:          { tab: 'notifications' },
-  ntfy_topic:        { tab: 'notifications' },
-  gotify_url:        { tab: 'notifications' },
-  gotify_token:      { tab: 'notifications' },
-  pushbullet_api_key:{ tab: 'notifications' },
 
   // Docker monitoring — handled as custom cards, referenced here for tab routing
   docker_enabled:        { tab: 'docker' },
@@ -174,19 +151,16 @@ const SETTING_META = {
     description: 'On each sweep cycle, trigger a port scan for any device that has never been scanned. Disable if new devices are causing too many simultaneous scans.' },
 }
 
-// Keys rendered as custom delivery-channel cards, not through SettingRow
-const DELIVERY_KEYS = new Set(['alert_webhook_url','ntfy_url','ntfy_topic','gotify_url','gotify_token','pushbullet_api_key'])
-
 // Docker keys handled as custom cards
 const DOCKER_KEYS = new Set(['docker_enabled','docker_host','docker_tls_verify'])
 
 const TABS = [
-  { id: 'scanner',       label: 'Scanner',       Icon: ScanLine   },
-  { id: 'notifications', label: 'Notifications', Icon: Bell       },
-  { id: 'docker',        label: 'Docker',        Icon: Box        },
-  { id: 'data',          label: 'Data',          Icon: Database   },
-  { id: 'appearance',    label: 'Appearance',    Icon: Paintbrush },
-  { id: 'account',       label: 'Account',       Icon: User       },
+  { id: 'scanner',       label: 'Scanner',        Icon: ScanLine   },
+  { id: 'notifications', label: 'Notifications',  Icon: Bell       },
+  { id: 'ha',            label: 'Home Assistant', Icon: Home       },
+  { id: 'docker',        label: 'Docker',         Icon: Box        },
+  { id: 'data',          label: 'Data',           Icon: Database   },
+  { id: 'admin',         label: 'Admin',          Icon: Settings2  },
 ]
 
 async function downloadResponse(res, filename) {
@@ -217,13 +191,8 @@ export function SettingsPanel({ onClose, onSettingChange }) {
   const restoreInputRef = useRef(null)
   const [dragonsOpen,   setDragonsOpen]   = useState(false)
   const [restarting,    setRestarting]    = useState({})  // { probe: bool, backend: bool }
-  const [showPbKey,     setShowPbKey]     = useState(false)
-  const [showGotifyToken, setShowGotifyToken] = useState(false)
-  const [pbTestStatus,  setPbTestStatus]  = useState(null)
-  const [pbTestMsg,     setPbTestMsg]     = useState('')
-  const [browserPerm,   setBrowserPerm]   = useState(
-    typeof Notification !== 'undefined' ? Notification.permission : 'unsupported'
-  )
+  const [haMqttStatus,  setHaMqttStatus]  = useState(null)   // null | { connected: bool }
+  const [haConnecting,  setHaConnecting]  = useState(false)
   const fileInputRef = useRef(null)
   const [detectedInterface, setDetectedInterface] = useState('')
 
@@ -233,6 +202,7 @@ export function SettingsPanel({ onClose, onSettingChange }) {
     api.setupNetworkInfo().then(info => {
       if (info?.interface) setDetectedInterface(info.interface)
     }).catch(() => {})
+    api.haMqttStatus().then(setHaMqttStatus).catch(() => {})
   }, [])
 
   function handleChange(key, value) {
@@ -274,34 +244,6 @@ export function SettingsPanel({ onClose, onSettingChange }) {
       setDirty({})
       s.forEach(x => onSettingChange?.(x.key, x.value))
     })
-  }
-
-  async function handleRequestBrowserPermission() {
-    if (typeof Notification === 'undefined') return
-    const result = await Notification.requestPermission()
-    setBrowserPerm(result)
-  }
-
-  async function handleTestPushbullet() {
-    const currentKey = (
-      dirty['pushbullet_api_key'] ??
-      settings.find(s => s.key === 'pushbullet_api_key')?.value ??
-      ''
-    ).trim()
-    if (!currentKey) {
-      setPbTestStatus('error'); setPbTestMsg('Enter an API key first.')
-      setTimeout(() => setPbTestStatus(null), 4000)
-      return
-    }
-    setPbTestStatus('testing')
-    try {
-      await api.testPushbullet(currentKey)
-      setPbTestStatus('ok'); setPbTestMsg('Test notification sent!')
-    } catch (e) {
-      setPbTestStatus('error')
-      setPbTestMsg((e.message || '').includes('401') ? 'Invalid API key.' : 'Failed — check key and connection.')
-    }
-    setTimeout(() => setPbTestStatus(null), 6000)
   }
 
   async function handleExportDevices() {
@@ -383,27 +325,16 @@ export function SettingsPanel({ onClose, onSettingChange }) {
   }
 
   const hasDirty   = Object.keys(dirty).length > 0
-  const showFooter = activeTab !== 'account' && activeTab !== 'appearance'
+  const showFooter = activeTab !== 'admin'
 
   // Returns current value for a key (dirty-aware)
   function val(key) {
     return dirty[key] ?? settings.find(s => s.key === key)?.value ?? ''
   }
 
-  // Standard setting rows for a tab (excludes delivery-channel keys)
-  function tabRows(tab) {
-    return settings.filter(s => SETTING_META[s.key]?.tab === tab && !DELIVERY_KEYS.has(s.key))
-  }
-
-  const bnEnabled = val('browser_notifications_enabled') === 'true'
-
   // ── Scanner tab grouping ────────────────────────────────────────────────────
   const networkScanKeys   = ['scan_interval','offline_miss_threshold']
   const networkConfigKeys = ['ip_range','dns_server','probe_interface']
-
-  // ── Notifications tab grouping ──────────────────────────────────────────────
-  const inAppKeys   = ['notifications_enabled','browser_notifications_enabled']
-  const triggerKeys = ['alert_on_new_device','alert_on_offline','alert_on_port_change','alert_on_vuln']
 
   function settingsByKeys(keys) {
     return keys.map(k => settings.find(s => s.key === k)).filter(Boolean)
@@ -602,150 +533,110 @@ export function SettingsPanel({ onClose, onSettingChange }) {
 
           {/* ── Notifications tab ───────────────────────────────────────────── */}
           {activeTab === 'notifications' && (
-            <>
+            <NotificationsTab settings={settings} dirty={dirty} onchange={handleChange} />
+          )}
+
+          {/* ── Home Assistant tab ──────────────────────────────────────────── */}
+          {activeTab === 'ha' && (
+            <div className="space-y-4">
               <p className="text-xs" style={{ color: 'var(--color-text-faint)' }}>
-                Configure how and where you receive alerts about network events.
+                Publishes InSpectre device state to Home Assistant via MQTT Auto-Discovery.
+                Each network device gets presence, IP, open-ports and vulnerability sensors.
+                A system device tracks total devices online, vulnerabilities, and scan state.
               </p>
 
-              {settings.length === 0 && <SkeletonRows count={5} />}
-
-              {/* In-app */}
-              <SectionHeader label="In-App" Icon={Bell} />
-              {settingsByKeys(inAppKeys).map(s => (
-                <SettingRow key={s.key} s={s} dirty={dirty} onchange={handleChange} />
-              ))}
-
-              {/* Browser permission helper */}
-              {bnEnabled && browserPerm !== 'unsupported' && (
-                <div className="rounded-lg p-3 text-xs space-y-2"
-                  style={{ background: 'var(--color-surface-offset)', border: '1px solid var(--color-border)' }}>
-                  <div className="flex items-center justify-between">
-                    <span className="font-medium" style={{ color: 'var(--color-text)' }}>Browser permission</span>
-                    <PermBadge perm={browserPerm} />
-                  </div>
-                  {browserPerm === 'default' && (
-                    <>
-                      <p style={{ color: 'var(--color-text-muted)' }}>Permission required to show OS-level notifications.</p>
-                      <button onClick={handleRequestBrowserPermission}
-                        className="btn-secondary text-xs flex items-center gap-1.5">
-                        <Bell size={11} /> Request Permission
-                      </button>
-                    </>
-                  )}
-                  {browserPerm === 'denied' && (
-                    <p style={{ color: '#ef4444' }}>Permission denied. Reset in your browser's site settings, then reload.</p>
-                  )}
-                  {browserPerm === 'granted' && (
-                    <p style={{ color: 'var(--color-text-muted)' }}>OS notifications are active.</p>
-                  )}
-                </div>
-              )}
-
-              {/* Alert triggers */}
-              <SectionHeader label="Alert Triggers" Icon={Bell} />
-              <p className="text-xs -mt-2" style={{ color: 'var(--color-text-faint)' }}>
-                Which events fire alerts to the delivery channels below.
-              </p>
-              {settingsByKeys(triggerKeys).map(s => (
-                <SettingRow key={s.key} s={s} dirty={dirty} onchange={handleChange} />
-              ))}
-
-              {/* Delivery: Webhook */}
-              <SectionHeader label="Webhook" Icon={Globe} />
-              <div className="card p-4 space-y-2">
-                <p className="text-xs" style={{ color: 'var(--color-text-faint)' }}>
-                  POST JSON to a URL when an alert fires. Leave blank to disable.
-                </p>
-                <input
-                  type="url"
-                  className="input text-sm"
-                  placeholder="https://example.com/webhook"
-                  value={val('alert_webhook_url')}
-                  onChange={e => handleChange('alert_webhook_url', e.target.value)}
-                  style={dirty['alert_webhook_url'] !== undefined ? { borderColor: 'color-mix(in srgb, var(--color-brand) 50%, transparent)' } : {}}
-                />
-              </div>
-
-              {/* Delivery: ntfy */}
-              <SectionHeader label="ntfy" Icon={Globe} />
-              <div className="card p-4 space-y-3">
-                <p className="text-xs" style={{ color: 'var(--color-text-faint)' }}>
-                  Self-hosted or ntfy.sh push notifications. Leave topic blank to disable.
-                </p>
-                <div className="space-y-1.5">
-                  <label className="text-xs font-medium" style={{ color: 'var(--color-text-muted)' }}>Server URL</label>
-                  <input type="url" className="input text-sm" placeholder="https://ntfy.sh"
-                    value={val('ntfy_url')} onChange={e => handleChange('ntfy_url', e.target.value)}
-                    style={dirty['ntfy_url'] !== undefined ? { borderColor: 'color-mix(in srgb, var(--color-brand) 50%, transparent)' } : {}} />
-                </div>
-                <div className="space-y-1.5">
-                  <label className="text-xs font-medium" style={{ color: 'var(--color-text-muted)' }}>Topic</label>
-                  <input type="text" className="input text-sm" placeholder="my-inspectre-alerts"
-                    value={val('ntfy_topic')} onChange={e => handleChange('ntfy_topic', e.target.value)}
-                    style={dirty['ntfy_topic'] !== undefined ? { borderColor: 'color-mix(in srgb, var(--color-brand) 50%, transparent)' } : {}} />
-                </div>
-              </div>
-
-              {/* Delivery: Gotify */}
-              <SectionHeader label="Gotify" Icon={Globe} />
-              <div className="card p-4 space-y-3">
-                <p className="text-xs" style={{ color: 'var(--color-text-faint)' }}>
-                  Self-hosted Gotify push notifications. Leave URL blank to disable.
-                </p>
-                <div className="space-y-1.5">
-                  <label className="text-xs font-medium" style={{ color: 'var(--color-text-muted)' }}>Server URL</label>
-                  <input type="url" className="input text-sm" placeholder="https://gotify.example.com"
-                    value={val('gotify_url')} onChange={e => handleChange('gotify_url', e.target.value)}
-                    style={dirty['gotify_url'] !== undefined ? { borderColor: 'color-mix(in srgb, var(--color-brand) 50%, transparent)' } : {}} />
-                </div>
-                <div className="space-y-1.5">
-                  <label className="text-xs font-medium" style={{ color: 'var(--color-text-muted)' }}>App Token</label>
-                  <div className="relative">
-                    <input type={showGotifyToken ? 'text' : 'password'} className="input text-sm pr-10 font-mono"
-                      placeholder="A1b2C3d4…"
-                      value={val('gotify_token')} onChange={e => handleChange('gotify_token', e.target.value)}
-                      style={dirty['gotify_token'] !== undefined ? { borderColor: 'color-mix(in srgb, var(--color-brand) 50%, transparent)' } : {}} />
-                    <button type="button" onClick={() => setShowGotifyToken(v => !v)}
-                      className="absolute right-3 top-1/2 -translate-y-1/2 opacity-50 hover:opacity-100 transition-opacity"
-                      aria-label={showGotifyToken ? 'Hide token' : 'Show token'}>
-                      {showGotifyToken ? <EyeOff size={14} /> : <Eye size={14} />}
+              <SectionHeader label="MQTT Broker" Icon={Wifi} />
+              {[
+                { key: 'ha_mqtt_enabled',          label: 'Enable HA Integration',  type: 'toggle'   },
+                { key: 'ha_mqtt_host',             label: 'Broker Host',            type: 'text',     placeholder: '192.168.0.1' },
+                { key: 'ha_mqtt_port',             label: 'Broker Port',            type: 'number',   placeholder: '1883' },
+                { key: 'ha_mqtt_user',             label: 'Username',               type: 'text',     placeholder: 'optional' },
+                { key: 'ha_mqtt_password',         label: 'Password',               type: 'password', placeholder: 'optional' },
+              ].map(f => {
+                const val = settings.find(s => s.key === f.key)?.value ?? ''
+                const dv  = dirty[f.key] ?? val
+                if (f.type === 'toggle') return (
+                  <div key={f.key} className="flex items-center justify-between py-1">
+                    <span className="text-sm">{f.label}</span>
+                    <button type="button" onClick={() => handleChange(f.key, dv === 'true' ? 'false' : 'true')}
+                      className={`relative inline-flex h-5 w-9 rounded-full transition-colors ${dv === 'true' ? 'bg-blue-500' : 'bg-gray-400'}`}
+                      style={{ minWidth: '36px' }}>
+                      <span className={`inline-block h-4 w-4 mt-0.5 rounded-full bg-white shadow transition-transform ${dv === 'true' ? 'translate-x-4' : 'translate-x-0.5'}`} />
                     </button>
                   </div>
+                )
+                return (
+                  <div key={f.key} className="space-y-1">
+                    <label className="text-xs font-medium" style={{ color: 'var(--color-text-muted)' }}>{f.label}</label>
+                    {f.type === 'password'
+                      ? <input type="password" className="input text-sm w-full" value={dirty[f.key] ?? val}
+                               onChange={e => handleChange(f.key, e.target.value)} placeholder={f.placeholder} />
+                      : <input type={f.type} className="input text-sm w-full" value={dirty[f.key] ?? val}
+                               onChange={e => handleChange(f.key, e.target.value)} placeholder={f.placeholder} />
+                    }
+                  </div>
+                )
+              })}
+
+              <SectionHeader label="Topic Prefixes" Icon={Home} />
+              {[
+                { key: 'ha_mqtt_discovery_prefix', label: 'Discovery Prefix', type: 'text', placeholder: 'homeassistant' },
+                { key: 'ha_mqtt_state_prefix',     label: 'State Prefix',     type: 'text', placeholder: 'inspectre' },
+              ].map(f => {
+                const val = settings.find(s => s.key === f.key)?.value ?? ''
+                return (
+                  <div key={f.key} className="space-y-1">
+                    <label className="text-xs font-medium" style={{ color: 'var(--color-text-muted)' }}>{f.label}</label>
+                    <input type="text" className="input text-sm w-full" value={dirty[f.key] ?? val}
+                           onChange={e => handleChange(f.key, e.target.value)} placeholder={f.placeholder} />
+                  </div>
+                )
+              })}
+
+              <SectionHeader label="Connection" Icon={Wifi} />
+              <div className="flex items-center gap-3">
+                <div className={`flex items-center gap-2 text-xs px-2 py-1 rounded ${
+                  haMqttStatus?.connected ? 'bg-green-500/20 text-green-400' : 'bg-gray-500/20 text-gray-400'
+                }`}>
+                  <span className={`w-2 h-2 rounded-full ${haMqttStatus?.connected ? 'bg-green-400' : 'bg-gray-400'}`} />
+                  {haMqttStatus?.connected ? 'Connected' : haMqttStatus === null ? 'Unknown' : 'Disconnected'}
                 </div>
+                <button className="btn-secondary text-xs" disabled={haConnecting}
+                  onClick={async () => {
+                    setHaConnecting(true)
+                    try {
+                      // Save pending settings first
+                      const pendingKeys = ['ha_mqtt_enabled','ha_mqtt_host','ha_mqtt_port',
+                                           'ha_mqtt_user','ha_mqtt_password',
+                                           'ha_mqtt_discovery_prefix','ha_mqtt_state_prefix']
+                      for (const k of pendingKeys) {
+                        if (dirty[k] !== undefined) await api.saveSetting(k, dirty[k])
+                      }
+                      const status = await api.haMqttReconnect()
+                      setHaMqttStatus(status)
+                    } catch { setHaMqttStatus({ connected: false }) }
+                    finally { setHaConnecting(false) }
+                  }}>
+                  {haConnecting ? 'Connecting…' : 'Save & Connect'}
+                </button>
+                {haMqttStatus?.connected && (
+                  <button className="btn-secondary text-xs" onClick={async () => {
+                    await api.haMqttDisconnect().catch(() => {})
+                    setHaMqttStatus({ connected: false })
+                  }}>Disconnect</button>
+                )}
               </div>
 
-              {/* Delivery: Pushbullet */}
-              <SectionHeader label="Pushbullet" Icon={Send} />
-              <div className="card p-4 space-y-3">
-                <p className="text-xs" style={{ color: 'var(--color-text-faint)' }}>
-                  Push to your phone and desktop via the Pushbullet app.
-                  Get your token at <span style={{ color: 'var(--color-brand)' }}>pushbullet.com/account</span>.
-                </p>
-                <div className="space-y-1.5">
-                  <label className="text-xs font-medium" style={{ color: 'var(--color-text-muted)' }}>API Key</label>
-                  <div className="relative">
-                    <input type={showPbKey ? 'text' : 'password'} className="input text-sm pr-10 font-mono"
-                      placeholder="o.XXXXXXXXXXXXXXXXXXXXXXXX"
-                      value={val('pushbullet_api_key')} onChange={e => handleChange('pushbullet_api_key', e.target.value)}
-                      style={dirty['pushbullet_api_key'] !== undefined ? { borderColor: 'color-mix(in srgb, var(--color-brand) 50%, transparent)' } : {}} />
-                    <button type="button" onClick={() => setShowPbKey(v => !v)}
-                      className="absolute right-3 top-1/2 -translate-y-1/2 opacity-50 hover:opacity-100 transition-opacity"
-                      aria-label={showPbKey ? 'Hide key' : 'Show key'}>
-                      {showPbKey ? <EyeOff size={14} /> : <Eye size={14} />}
-                    </button>
-                  </div>
-                </div>
-                <div className="flex items-center gap-3 flex-wrap">
-                  <button onClick={handleTestPushbullet} disabled={pbTestStatus === 'testing'}
-                    className="btn-secondary flex items-center gap-2 text-sm">
-                    <Send size={12} />
-                    {pbTestStatus === 'testing' ? 'Sending…' : 'Send test push'}
-                  </button>
-                  {pbTestStatus === 'ok'    && <span className="text-xs" style={{ color: 'var(--color-success)' }}>✓ {pbTestMsg}</span>}
-                  {pbTestStatus === 'error' && <span className="text-xs" style={{ color: '#ef4444' }}>{pbTestMsg}</span>}
-                </div>
+              <div className="text-xs space-y-1 pt-2" style={{ color: 'var(--color-text-faint)' }}>
+                <p><strong>Topic structure:</strong></p>
+                <p className="font-mono">inspectre/system/status  (LWT: online/offline)</p>
+                <p className="font-mono">inspectre/system/total_devices</p>
+                <p className="font-mono">inspectre/clients/&lt;mac&gt;/presence  (ON/OFF)</p>
+                <p className="font-mono">inspectre/clients/&lt;mac&gt;/ip</p>
+                <p className="font-mono">inspectre/clients/&lt;mac&gt;/open_ports</p>
+                <p className="font-mono">inspectre/clients/&lt;mac&gt;/vulnerabilities</p>
               </div>
-            </>
+            </div>
           )}
 
           {/* ── Docker tab ──────────────────────────────────────────────────── */}
@@ -920,14 +811,13 @@ export function SettingsPanel({ onClose, onSettingChange }) {
             </>
           )}
 
-          {/* ── Appearance tab ───────────────────────────────────────────────── */}
-          {activeTab === 'appearance' && (
+          {/* ── Admin tab (Appearance + Account) ────────────────────────────── */}
+          {activeTab === 'admin' && (
             <>
+              <SectionHeader label="UI Style" Icon={Paintbrush} />
               <p className="text-xs" style={{ color: 'var(--color-text-faint)' }}>
                 Choose a UI style. Changes take effect immediately — no reload required.
               </p>
-
-              <SectionHeader label="UI Style" Icon={Paintbrush} />
 
               <div className="grid grid-cols-2 gap-3">
                 {/* Spectre card */}
@@ -942,7 +832,6 @@ export function SettingsPanel({ onClose, onSettingChange }) {
                     borderRadius: '0.75rem', transition: 'border-color 0.15s',
                   }}
                 >
-                  {/* Mini preview */}
                   <div style={{
                     width: '100%', height: '52px', marginBottom: '10px', overflow: 'hidden',
                     background: '#0d0d0f', border: '1px solid rgba(255,255,255,0.08)', borderRadius: '6px',
@@ -977,7 +866,6 @@ export function SettingsPanel({ onClose, onSettingChange }) {
                     borderRadius: '0.75rem', transition: 'border-color 0.15s',
                   }}
                 >
-                  {/* Mini preview — adapts to current light/dark mode */}
                   <div style={{
                     width: '100%', height: '52px', marginBottom: '10px', overflow: 'hidden',
                     background: isDark ? '#000' : '#f0f7f1',
@@ -1005,15 +893,6 @@ export function SettingsPanel({ onClose, onSettingChange }) {
               <p className="text-xs mt-2" style={{ color: 'var(--color-text-faint)' }}>
                 <strong style={{ color: 'var(--color-text-muted)' }}>Spectre</strong> — top nav bar, rounded cards, teal accent. Follows dark/light mode.<br />
                 <strong style={{ color: 'var(--color-text-muted)' }}>Phantom</strong> — fixed left sidebar, JetBrains Mono, sharp corners. Green on black (dark) or green on white (light).
-              </p>
-            </>
-          )}
-
-          {/* ── Account tab ─────────────────────────────────────────────────── */}
-          {activeTab === 'account' && (
-            <>
-              <p className="text-xs" style={{ color: 'var(--color-text-faint)' }}>
-                Manage your account credentials.
               </p>
 
               <SectionHeader label="Change Password" Icon={Key} />

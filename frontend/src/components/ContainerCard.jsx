@@ -1,4 +1,4 @@
-import { Box } from 'lucide-react'
+import { Box, X } from 'lucide-react'
 
 const STATUS_CONFIG = {
   running:    { color: '#22c55e', bg: 'rgba(34,197,94,0.12)',   border: 'rgba(34,197,94,0.3)',   dot: '#22c55e', label: 'Running'    },
@@ -7,6 +7,13 @@ const STATUS_CONFIG = {
   restarting: { color: '#3b82f6', bg: 'rgba(59,130,246,0.12)',  border: 'rgba(59,130,246,0.3)',  dot: '#3b82f6', label: 'Restarting' },
   dead:       { color: '#ef4444', bg: 'rgba(239,68,68,0.12)',   border: 'rgba(239,68,68,0.3)',   dot: '#ef4444', label: 'Dead'       },
   created:    { color: '#8b5cf6', bg: 'rgba(139,92,246,0.12)',  border: 'rgba(139,92,246,0.3)',  dot: '#8b5cf6', label: 'Created'    },
+}
+
+const NEW_CONTAINER_DAYS = 7
+
+function isNewContainer(container) {
+  if (!container.created) return false
+  return Date.now() - new Date(container.created).getTime() < NEW_CONTAINER_DAYS * 24 * 60 * 60 * 1000
 }
 
 function relativeTime(iso) {
@@ -27,10 +34,11 @@ function shortImage(image) {
   return noReg || image
 }
 
-export function ContainerCard({ container, onClick }) {
+export function ContainerCard({ container, onClick, isAcknowledged, isTrivyScanning, onAcknowledge }) {
   const cfg       = STATUS_CONFIG[container.status] || STATUS_CONFIG.exited
   const isRunning = container.status === 'running'
   const exposedPorts = (container.ports || []).filter(p => p.host_port).slice(0, 3)
+  const showNew   = isNewContainer(container) && !isAcknowledged
 
   const footerTime = isRunning
     ? (container.state?.started_at ? `started · ${relativeTime(container.state.started_at)}` : 'running')
@@ -39,10 +47,10 @@ export function ContainerCard({ container, onClick }) {
   return (
     <button
       onClick={onClick}
-      className="device-card p-5 text-left w-full flex flex-col gap-3 group relative"
+      className={`device-card${isTrivyScanning ? ' device-card-vuln-scanning' : ''} p-5 text-left w-full min-w-0 flex flex-col gap-3 group relative`}
     >
       {/* Header */}
-      <div className="flex items-start justify-between gap-2">
+      <div className="flex items-start justify-between gap-2 min-w-0">
         <div className="flex items-center gap-2.5 min-w-0">
           <span className="w-8 h-8 rounded-lg flex items-center justify-center shrink-0"
             style={{ background: cfg.bg }}>
@@ -61,10 +69,34 @@ export function ContainerCard({ container, onClick }) {
             </span>
           </div>
         </div>
-        <span className="text-[10px] font-medium px-2 py-0.5 rounded-full shrink-0 whitespace-nowrap"
-          style={{ background: cfg.bg, color: cfg.color, border: `1px solid ${cfg.border}` }}>
-          {cfg.label}
-        </span>
+        <div className="flex flex-col gap-1 items-end shrink-0">
+          {showNew && (
+            <span className="flex items-center gap-0.5 text-[10px] font-bold rounded-full px-2 py-0.5"
+              style={{ color: '#10b981', background: 'rgba(16,185,129,0.12)', border: '1px solid rgba(16,185,129,0.35)' }}>
+              NEW
+              {onAcknowledge && (
+                <button
+                  onClick={e => { e.stopPropagation(); onAcknowledge(container.id) }}
+                  className="opacity-60 hover:opacity-100 transition-opacity ml-0.5"
+                  title="Acknowledge — stop surfacing to top"
+                  aria-label="Acknowledge new container"
+                >
+                  <X size={8} />
+                </button>
+              )}
+            </span>
+          )}
+          <span className="text-[10px] font-medium px-2 py-0.5 rounded-full whitespace-nowrap"
+            style={{ background: cfg.bg, color: cfg.color, border: `1px solid ${cfg.border}` }}>
+            {cfg.label}
+          </span>
+          {isTrivyScanning && (
+            <span className="text-[10px] font-medium rounded-full px-2 py-0.5 whitespace-nowrap"
+              style={{ color: 'var(--color-brand)', background: 'color-mix(in srgb, var(--color-brand) 12%, transparent)', border: '1px solid color-mix(in srgb, var(--color-brand) 25%, transparent)' }}>
+              Vuln Scan
+            </span>
+          )}
+        </div>
       </div>
 
       {/* Details grid */}

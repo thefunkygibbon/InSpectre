@@ -61,6 +61,7 @@ export const api = {
       database: { ok: false, message: 'Unknown' },
       probe:    { ok: false, message: 'Unknown' },
       all_ok: false,
+      active_scans: { port: [], vuln: [] },
     }))
   },
 
@@ -156,10 +157,6 @@ export const api = {
       .then(r => { if (!r.ok) throw new Error(`Import failed: ${r.status}`); return r.json() })
   },
 
-  // Notifications
-  sendPushbullet: (title, body) => request('POST', '/notify/pushbullet', { title, body }),
-  testPushbullet: (apiKey)      => request('POST', '/notify/test', { api_key: apiKey || '' }),
-
   // Streaming
   streamPing:       (mac, signal) => streamSSE(`/devices/${mac}/ping`,       (l) => l, signal),
   streamTraceroute: (mac, signal) => streamSSE(`/devices/${mac}/traceroute`, (l) => l, signal),
@@ -172,6 +169,7 @@ export const api = {
   getVulnReports:       (mac, limit) => request('GET',    `/devices/${mac}/vuln-reports${limit ? `?limit=${limit}` : ''}`),
   getVulnReportDetail:  (mac, id)    => request('GET',    `/devices/${mac}/vuln-reports/${id}`),
   getVulnScanStatus:    (mac)        => request('GET',    `/devices/${mac}/vuln-scan-status`),
+  acknowledgeDevice:    (mac)        => request('POST',   `/devices/${mac}/acknowledge`),
   deleteVulnReport:     (mac, id)    => request('DELETE', `/devices/${mac}/vuln-reports/${id}`),
   getAllVulnReports:     (severity)   => request('GET',    `/vuln-reports${severity ? `?severity=${severity}` : ''}`),
   getVulnSummary:       ()           => request('GET',    '/vulns/summary'),
@@ -289,6 +287,9 @@ export const api = {
   deleteContainerHost:    (id)        => request('DELETE', `/container-hosts/${id}`),
   testContainerHost:      (id)        => request('POST',   `/container-hosts/${id}/test`),
 
+  // Device acknowledgement
+  acknowledgeDevice:  (mac)        => request('POST',   `/devices/${mac}/acknowledge`),
+
   // Traffic monitoring
   trafficStart:       (mac)        => request('POST',   `/traffic/start/${mac}`),
   trafficStop:        (mac)        => request('DELETE', `/traffic/stop/${mac}`),
@@ -298,6 +299,27 @@ export const api = {
   trafficTopDomains:  (mac, days)  => request('GET',    `/traffic/top-domains/${mac}${days ? `?days=${days}` : ''}`),
   trafficSummary:     ()           => request('GET',    '/traffic/summary'),
   trafficStream:      (mac, onLine, signal) => streamSSE(`/traffic/stream/${mac}`, onLine, signal),
+
+  // Notification channels
+  notifChannels:        ()          => request('GET',    '/notifications/channels'),
+  createNotifChannel:   (body)      => request('POST',   '/notifications/channels', body),
+  updateNotifChannel:   (id, body)  => request('PUT',    `/notifications/channels/${id}`, body),
+  deleteNotifChannel:   (id)        => request('DELETE', `/notifications/channels/${id}`),
+  testNotifChannel:     (id)        => request('POST',   `/notifications/channels/${id}/test`),
+
+  // Notification profiles
+  notifProfiles:        ()          => request('GET',    '/notifications/profiles'),
+  createNotifProfile:   (body)      => request('POST',   '/notifications/profiles', body),
+  updateNotifProfile:   (id, body)  => request('PUT',    `/notifications/profiles/${id}`, body),
+  deleteNotifProfile:   (id)        => request('DELETE', `/notifications/profiles/${id}`),
+
+  // Notification event definitions and pending browser queue
+  notifEvents:          ()          => request('GET',    '/notifications/events'),
+  notifPending:         ()          => request('GET',    '/notifications/pending'),
+  // Home Assistant MQTT integration
+  haMqttStatus:         ()          => request('GET',    '/ha-mqtt/status'),
+  haMqttReconnect:      ()          => request('POST',   '/ha-mqtt/reconnect'),
+  haMqttDisconnect:     ()          => request('POST',   '/ha-mqtt/disconnect'),
 }
 
 export { streamSSE }

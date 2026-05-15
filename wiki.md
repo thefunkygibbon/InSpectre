@@ -26,6 +26,7 @@
    - 3.11 [Zones](#311-zones)
    - 3.12 [DHCP Fingerprinting & Fingerbank](#312-dhcp-fingerprinting--fingerbank)
    - 3.13 [Device Grouping](#313-device-grouping)
+   - 3.14 [Acknowledging New Devices](#314-acknowledging-new-devices)
 4. [Network Scanning](#4-network-scanning)
    - 4.1 [Port Scanning](#41-port-scanning)
    - 4.2 [OS Detection](#42-os-detection)
@@ -53,17 +54,21 @@
    - 8.4 [Infrastructure Tools](#84-infrastructure-tools)
    - 8.5 [Email Tools](#85-email-tools)
 9. [Notifications](#9-notifications)
-   - 9.1 [Toast Notifications](#91-toast-notifications)
-   - 9.2 [Browser Notifications](#92-browser-notifications)
-   - 9.3 [Pushbullet](#93-pushbullet)
-   - 9.4 [ntfy](#94-ntfy)
-   - 9.5 [Gotify](#95-gotify)
-   - 9.6 [Webhooks](#96-webhooks)
-   - 9.7 [Alert Triggers](#97-alert-triggers)
+   - 9.1 [Notification Channels](#91-notification-channels)
+   - 9.2 [Notification Profiles](#92-notification-profiles)
+   - 9.3 [Setting up ntfy](#93-setting-up-ntfy)
+   - 9.4 [Setting up Gotify](#94-setting-up-gotify)
+   - 9.5 [Setting up Pushbullet](#95-setting-up-pushbullet)
+   - 9.6 [Setting up Webhooks](#96-setting-up-webhooks)
+   - 9.7 [Setting up Home Assistant (direct notifications)](#97-setting-up-home-assistant-direct-notifications)
+   - 9.8 [Home Assistant MQTT Auto-Discovery](#98-home-assistant-mqtt-auto-discovery)
+   - 9.9 [MQTT Auto-Discovery (Home Assistant)](#99-mqtt-auto-discovery-home-assistant)
 10. [Settings Reference](#10-settings-reference)
     - 10.1 [Scanner Settings](#101-scanner-settings)
     - 10.2 [Notification Settings](#102-notification-settings)
     - 10.3 [Data Settings](#103-data-settings)
+    - 10.4 [Home Assistant Settings](#104-home-assistant-settings)
+    - 10.5 [Admin Settings](#105-admin-settings)
 11. [Data Management](#11-data-management)
     - 11.1 [Backup and Restore](#111-backup-and-restore)
     - 11.2 [CSV Export](#112-csv-export)
@@ -78,8 +83,15 @@
     - 12.7 [Container Drawer](#127-container-drawer)
     - 12.8 [Container Vulnerability Scanning (Trivy)](#128-container-vulnerability-scanning-trivy)
     - 12.9 [Container Vulns in the Security Dashboard](#129-container-vulns-in-the-security-dashboard)
-13. [Troubleshooting](#13-troubleshooting)
-14. [FAQ](#14-faq)
+13. [Home Assistant MQTT Integration](#13-home-assistant-mqtt-integration)
+    - 13.1 [Overview](#131-overview)
+    - 13.2 [Requirements](#132-requirements)
+    - 13.3 [Configuration](#133-configuration)
+    - 13.4 [Topic Structure](#134-topic-structure)
+    - 13.5 [The "New Device" Sensor](#135-the-new-device-sensor)
+    - 13.6 [LWT (Last Will and Testament)](#136-lwt-last-will-and-testament)
+14. [Troubleshooting](#14-troubleshooting)
+15. [FAQ](#15-faq)
 
 ---
 
@@ -168,7 +180,7 @@ After setup, every visit requires logging in with the credentials you created. S
 
 **Changing your password:**
 
-Go to **Settings → Account → Change Password** to update your credentials at any time.
+Go to **Settings → Admin → Change Password** to update your credentials at any time.
 
 ---
 
@@ -462,6 +474,17 @@ To manually add a device to an existing group:
 3. Click **Add**.
 
 To remove a device from a group, click the **Remove** button next to that MAC in the same panel. The removed device becomes a standalone device again and will appear separately on the dashboard.
+
+### 3.14 Acknowledging New Devices
+
+When InSpectre sees a device for the first time, it is marked as **new**. By default, new devices float to the top of the device list and are highlighted to draw your attention.
+
+Once you have reviewed a new device and are happy it belongs on your network, click **Acknowledge** on the device card or in the device drawer. This:
+- Removes the "new" highlight and stops it floating to the top
+- Flips the MQTT `new` binary sensor to OFF (if Home Assistant MQTT is configured)
+- Persists server-side — acknowledged status survives browser sessions and won't reset if you clear localStorage or open a different browser
+
+To control whether new devices float to the top, see **Settings → Scanner → Float New Devices to Top**.
 
 ---
 
@@ -759,86 +782,85 @@ The **Network Tools** page is accessible from the main navigation bar. It provid
 
 ## 9. Notifications
 
-InSpectre supports multiple notification channels. All channels are configured in **Settings → Notifications**. Channels can be enabled/disabled independently; multiple channels can be active at the same time.
+InSpectre uses a **Channels and Profiles** system for notifications. Channels are reusable connection configurations (each has a service type and credentials). Profiles link event types to one or more channels. An event fires all channels attached to matching profiles. One channel can be used by multiple profiles.
 
-### 9.1 Toast Notifications
+Available services: ntfy, Gotify, Pushbullet, Webhook, Home Assistant, Matrix, SMTP, Slack, Telegram, Discord, Apprise generic URL.
 
-In-app popup notifications shown in the bottom-right corner of the UI. Always active — no configuration required.
+### 9.1 Notification Channels
 
-Toasts are shown for:
-- New devices joining the network
-- Watched devices going offline
-- Completed scan results
-- Blocking/unblocking actions
+Channels are configured in **Settings → Notifications → Channels**. Each channel has:
+- A display name
+- A service type (ntfy, Gotify, Pushbullet, Webhook, Home Assistant, Matrix, SMTP, Slack, Telegram, Discord, or Apprise)
+- Service-specific credentials (URL, token, host, etc.)
+- An enabled/disabled toggle
+- A **Test** button that sends a test notification immediately
 
-Toasts automatically dismiss after a few seconds.
+### 9.2 Notification Profiles
 
-### 9.2 Browser Notifications
+Profiles are configured in **Settings → Notifications → Profiles**. Each profile:
+- Has a display name
+- Is associated with one or more channels
+- Has per-event-type toggles (new device, device offline, watched offline, vulnerability found, port change, device blocked/unblocked)
+- Can be enabled/disabled as a whole
 
-Operating system-level push notifications sent via the Web Notifications API. Requires the browser to grant notification permission when prompted.
+When an event fires, InSpectre finds all enabled profiles that have that event type enabled and dispatches to all their channels.
 
-Enable in **Settings → Notifications → Browser Notifications**. You will be prompted to grant permission if you haven't already.
+### 9.3 Setting up ntfy
 
-Browser notifications appear even if the InSpectre browser tab is in the background or minimised.
+1. Choose a topic name (e.g. `inspectre-alerts`)
+2. Subscribe to the topic in the ntfy app on your phone
+3. Settings → Notifications → Channels → Add Channel → service: ntfy
+4. Fill in Server URL (e.g. `https://ntfy.sh` or your self-hosted URL) and Topic
+5. Optionally set Username/Password for authenticated servers
+6. Click Test to verify, then Save
+7. Create a Profile and attach this channel to it with the events you want
 
-### 9.3 Pushbullet
+### 9.4 Setting up Gotify
 
-[Pushbullet](https://www.pushbullet.com/) delivers notifications to your phone, tablet, or other browsers.
+1. Create an application in your Gotify server to get an app token
+2. Settings → Notifications → Channels → Add Channel → service: Gotify
+3. Fill in Server URL and App Token
+4. Click Test to verify, then Save
+5. Attach to a Profile with the desired events
 
-**Setup:**
-1. Create a Pushbullet account and install the app on your phone.
-2. Generate an API key at https://www.pushbullet.com/#settings/account.
-3. In InSpectre: **Settings → Notifications → Pushbullet API Key** — paste your key.
-4. Enable **Pushbullet Notifications**.
+### 9.5 Setting up Pushbullet
 
-### 9.4 ntfy
+1. Generate an API key at pushbullet.com (Settings → Account)
+2. Settings → Notifications → Channels → Add Channel → service: Pushbullet
+3. Enter your API Key
+4. Click Test, then Save
+5. Attach to a Profile
 
-[ntfy](https://ntfy.sh/) is an open-source push notification service that can be self-hosted.
+### 9.6 Setting up Webhooks
 
-**Setup:**
-1. Choose a topic name (any string, e.g., `inspectre-alerts`).
-2. Subscribe to the topic in the ntfy app on your phone.
-3. In InSpectre: **Settings → Notifications → ntfy Server URL** (e.g., `https://ntfy.sh` or your self-hosted URL) and **ntfy Topic**.
-4. Enable **ntfy Notifications**.
+1. Settings → Notifications → Channels → Add Channel → service: Webhook
+2. Enter the full endpoint URL
+3. Optionally set custom headers or a secret for HMAC signing
+4. The payload is a JSON object with event type, device details (name, IP, MAC), and timestamp
 
-### 9.5 Gotify
+### 9.7 Setting up Home Assistant (direct notifications)
 
-[Gotify](https://gotify.net/) is a self-hosted push notification server.
+1. In Home Assistant, create a long-lived access token: Profile → Long-lived access tokens → Create token
+2. Settings → Notifications → Channels → Add Channel → service: Home Assistant
+3. Fill in: Host (HA hostname or IP), Port (default 8123), Access Token
+4. Optionally enable Secure (HTTPS) for remote HA instances
+5. Optionally set Notifier — defaults to `persistent_notification/create` (always available). Set to `notify/mobile_app_YOURPHONE` to send to a mobile app, or any other `domain/service` path.
+6. Click Test — a test notification appears in HA's persistent notifications
+7. Attach to a Profile
 
-**Setup:**
-1. Set up a Gotify server and create an application to get an app token.
-2. In InSpectre: **Settings → Notifications → Gotify URL** and **Gotify App Token**.
-3. Enable **Gotify Notifications**.
+### 9.8 Home Assistant MQTT Auto-Discovery
 
-### 9.6 Webhooks
+InSpectre can publish device state to Home Assistant via MQTT using the standard Auto-Discovery protocol. This allows HA to automatically create entities for each network device and the InSpectre system. See [Section 13 — Home Assistant MQTT Integration](#13-home-assistant-mqtt-integration) for full configuration details.
 
-InSpectre can POST a JSON payload to any HTTP endpoint when an alert fires. This allows integration with any system that accepts webhooks (Slack, Discord, Home Assistant, n8n, Zapier, etc.).
+### 9.9 MQTT Auto-Discovery (Home Assistant)
 
-**Setup:**
-1. In InSpectre: **Settings → Notifications → Webhook URL** — enter the full endpoint URL.
-2. Enable **Webhook Notifications**.
-
-The webhook payload is a JSON object containing the alert type, device details (name, IP, MAC), and timestamp.
-
-### 9.7 Alert Triggers
-
-The following events can trigger notifications. Each trigger can be independently enabled or disabled in Settings → Notifications:
-
-| Trigger | Description |
-|---|---|
-| **New device joined** | A MAC address is seen on the network for the first time |
-| **Device offline** | A previously online device stops responding |
-| **Watched device offline** | An offline alert specifically for watched/starred devices (can be configured separately for higher priority) |
-| **Vulnerability found** | A nuclei scan returns one or more findings |
-| **Port change / drift** | A device's open ports differ from its last confirmed baseline |
-| **Device blocked** | A device block is applied (manually or by schedule) |
-| **Device unblocked** | A device block is removed |
+Configure the MQTT integration in **Settings → Home Assistant**. Once connected, Home Assistant will automatically discover InSpectre entities including presence sensors, new-device binary sensors, IP address, open ports, and vulnerability level for each device. See [Section 13 — Home Assistant MQTT Integration](#13-home-assistant-mqtt-integration) for full details.
 
 ---
 
 ## 10. Settings Reference
 
-Access settings via the gear icon in the main navigation bar. Settings are organised into three tabs.
+Access settings via the gear icon in the main navigation bar. Settings are organised into six tabs: Scanner, Notifications, Home Assistant, Docker, Data, and Admin.
 
 ### 10.1 Scanner Settings
 
@@ -889,6 +911,31 @@ Access settings via the gear icon in the main navigation bar. Settings are organ
 | **Export devices CSV** | Download a CSV file of all devices and their current metadata. |
 | **Import fingerprints** | Import a fingerprint database JSON file to augment the local classification database. |
 | **Export fingerprints** | Export the current local fingerprint database as a JSON file. |
+
+### 10.4 Home Assistant Settings
+
+Configure the MQTT-based Home Assistant integration in **Settings → Home Assistant**.
+
+| Setting | Description |
+|---|---|
+| **Enable HA Integration** | Master toggle to enable or disable the Home Assistant MQTT integration. |
+| **Broker Host** | IP or hostname of your MQTT broker (e.g. `192.168.1.10` or `mosquitto`). |
+| **Broker Port** | TCP port of the MQTT broker. Default: 1883 (or 8883 for TLS). |
+| **Username** | MQTT broker username. Leave blank if the broker allows anonymous connections. |
+| **Password** | MQTT broker password. Leave blank if anonymous. |
+| **Discovery Prefix** | MQTT topic prefix Home Assistant listens on for auto-discovery messages. Default: `homeassistant`. Must match your HA MQTT integration configuration. |
+| **State Prefix** | Topic prefix InSpectre uses for state messages. Default: `inspectre`. |
+
+Click **Save & Connect** to apply changes and connect immediately. The status indicator on the page shows Connected / Disconnected.
+
+### 10.5 Admin Settings
+
+Administrative settings are in **Settings → Admin**.
+
+| Setting | Description |
+|---|---|
+| **UI Style** | Choose between **Spectre** (modern, rounded, teal accent) and **Phantom** (terminal-style, JetBrains Mono, green-on-black). |
+| **Change Password** | Update your admin account password. Enter your current password and a new password (minimum 8 characters). |
 
 ---
 
@@ -1198,7 +1245,65 @@ The **Container Vulnerabilities** section at the bottom of the dashboard shows:
 
 ---
 
-## 13. Troubleshooting
+## 13. Home Assistant MQTT Integration
+
+### 13.1 Overview
+
+InSpectre can publish device state to Home Assistant via MQTT using the standard Auto-Discovery protocol. HA automatically creates entities for:
+- A **system device** (InSpectre System) with sensors: Devices Online, Total Vulnerabilities, Scan State, Last Scan Time
+- A **per-client device** for every non-ignored network device, with sensors: Presence (binary, ON=online), New Device (binary, ON=new/unacknowledged), IP Address, Open Ports, Vulnerability Level
+
+All entities appear under their respective devices in Home Assistant's device registry. You can use them in automations, dashboards, and alerts.
+
+### 13.2 Requirements
+
+- An MQTT broker reachable from both InSpectre and Home Assistant (e.g. Mosquitto add-on)
+- Home Assistant with MQTT integration configured (Settings → Devices & Services → Add Integration → MQTT)
+
+### 13.3 Configuration
+
+Go to **Settings → Home Assistant** in InSpectre:
+
+| Field | Description |
+|---|---|
+| Enable HA Integration | Master toggle |
+| Broker Host | IP or hostname of your MQTT broker |
+| Broker Port | Default 1883 (or 8883 for TLS) |
+| Username / Password | MQTT broker credentials (leave blank if anonymous) |
+| Discovery Prefix | MQTT topic prefix HA uses for auto-discovery (default: `homeassistant`) |
+| State Prefix | Topic prefix for state messages (default: `inspectre`) |
+
+Click **Save & Connect** to apply changes and connect immediately. The status indicator shows Connected / Disconnected.
+
+### 13.4 Topic Structure
+
+```
+inspectre/system/status          LWT — "online" or "offline"
+inspectre/system/total_devices   Number of online devices
+inspectre/system/total_vulns     Total vulnerability count
+inspectre/system/scan_state      "idle" or "scanning"
+inspectre/system/last_scan       ISO timestamp of last scan
+
+inspectre/clients/<mac>/presence        "ON" or "OFF"
+inspectre/clients/<mac>/new             "ON" (new/unacknowledged) or "OFF"
+inspectre/clients/<mac>/ip              Current IP address
+inspectre/clients/<mac>/open_ports      Number of open TCP ports
+inspectre/clients/<mac>/vulnerabilities Numeric severity (0=clean, 1=low, 2=medium, 3=high/critical)
+```
+
+MAC addresses use underscores: `aa_bb_cc_dd_ee_ff`.
+
+### 13.5 The "New Device" Sensor
+
+The `new` binary sensor is ON when a device is newly discovered and not yet acknowledged. Use it in HA automations to alert when a genuinely new device appears. When you acknowledge the device in InSpectre (card button or drawer), the sensor flips to OFF immediately via MQTT.
+
+### 13.6 LWT (Last Will and Testament)
+
+InSpectre publishes `online` to `inspectre/system/status` on connect and configures `offline` as the MQTT LWT. If InSpectre disconnects unexpectedly, HA receives `offline` automatically, allowing you to create an availability-based alert.
+
+---
+
+## 14. Troubleshooting
 
 **The probe container is not connecting / backend shows probe as unreachable**
 
@@ -1294,9 +1399,28 @@ The **Container Vulnerabilities** section at the bottom of the dashboard shows:
 
 - These tabs are only available for Docker containers. Proxmox LXC containers show only the Overview and Admin tabs.
 
+**Home Assistant MQTT shows "Disconnected"**
+
+- Verify the broker host and port are reachable from the InSpectre backend container. Use `docker compose exec backend ping <broker-host>` to test connectivity.
+- Check broker credentials. Most Mosquitto installs require username/password even on LAN — check your broker's ACL/password file.
+- Check that the HA MQTT integration is configured (Settings → Devices & Services → MQTT in Home Assistant).
+- After fixing settings, click **Save & Connect** again or use `POST /ha-mqtt/reconnect` from the API.
+
+**Home Assistant entities are not appearing after connecting**
+
+- Wait 30–60 seconds after connecting — discovery messages are retained so HA should pick them up shortly after the MQTT integration sees them.
+- Check that the Discovery Prefix matches what your HA MQTT integration is listening on (default: `homeassistant`).
+- MQTT discovery messages are published with `retain=true`. Use an MQTT explorer tool to verify the topics are present on your broker.
+
+**Home Assistant notification channel test returns 502**
+
+- Verify the HA host URL is reachable from the backend container: `docker compose exec backend curl -k https://<ha-host>:<port>/api/`
+- Confirm the long-lived access token is valid (it should return `{"message":"API running."}` from the above curl).
+- The default notifier `persistent_notification/create` is always available. If you set a custom notifier (e.g. `notify/mobile_app_xxx`), ensure that integration is set up in HA.
+
 ---
 
-## 14. FAQ
+## 15. FAQ
 
 **Q: Does InSpectre send any data to the cloud?**
 

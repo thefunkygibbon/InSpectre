@@ -13,11 +13,14 @@ import json
 import csv
 import io
 import re
+import hashlib
+import re as _re
 import shutil
 import socket
 import subprocess
 import threading
 from datetime import datetime, timezone, timedelta
+from urllib.parse import urlparse, quote as _urlencode
 
 import httpx
 import bcrypt as _bcrypt
@@ -44,6 +47,196 @@ bearer_scheme = HTTPBearer(auto_error=False)
 engine       = create_engine(DATABASE_URL, pool_pre_ping=True)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base.metadata.create_all(bind=engine)
+
+# psycopg2 does not decode JSONB columns automatically unless explicitly registered.
+from sqlalchemy import event as _sa_event
+import psycopg2.extras as _pg_extras
+@_sa_event.listens_for(engine, "connect")
+def _register_jsonb(dbapi_conn, _rec):
+    _pg_extras.register_default_jsonb(dbapi_conn, globally=False, loads=json.loads)
+
+# ---------------------------------------------------------------------------
+# Home Assistant MQTT Auto-Discovery manager
+# ---------------------------------------------------------------------------
+class HAMQTTManager:
+    """Persistent MQTT client for Home Assistant entity publishing."""
+
+    def __init__(self):
+        self._client    = None
+        self._connected = False
+        self._dp        = "homeassistant"
+        self._sp        = "inspectre"
+        self._lock      = threading.Lock()
+
+    @property
+    def connected(self) -> bool:
+        return self._connected
+
+    def connect(self, host: str, port: int = 1883, user: str = "",
+                password: str = "", discovery_prefix: str = "homeassistant",
+                state_prefix: str = "inspectre"):
+        self.disconnect()
+        import paho.mqtt.client as _mqtt
+        self._dp = (discovery_prefix or "homeassistant").strip("/")
+        self._sp = (state_prefix     or "inspectre").strip("/")
+        lwt     = f"{self._sp}/system/status"
+        client  = _mqtt.Client(client_id="inspectre_ha", clean_session=True)
+        client.will_set(lwt, "offline", retain=True, qos=1)
+        if user:
+            client.username_pw_set(user, password or "")
+
+        def _on_connect(c, _u, _f, rc):
+            if rc == 0:
+                self._connected = True
+                c.publish(lwt, "online", retain=True, qos=1)
+                print(f"[ha-mqtt] Connected to {host}:{port}", flush=True)
+            else:
+                self._connected = False
+                print(f"[ha-mqtt] Connect failed rc={rc}", flush=True)
+
+        def _on_disconnect(c, _u, rc):
+            self._connected = False
+            if rc != 0:
+                print(f"[ha-mqtt] Disconnected rc={rc}", flush=True)
+
+        client.on_connect    = _on_connect
+        client.on_disconnect = _on_disconnect
+        client.reconnect_delay_set(min_delay=5, max_delay=60)
+        client.connect(host, int(port), keepalive=60)
+        client.loop_start()
+        self._client = client
+
+    def disconnect(self):
+        with self._lock:
+            if self._client:
+                try:
+                    self._client.publish(f"{self._sp}/system/status", "offline", retain=True)
+                    self._client.loop_stop()
+                    self._client.disconnect()
+                except Exception:
+                    pass
+                self._client    = None
+                self._connected = False
+
+    def publish(self, topic: str, payload, retain: bool = False, qos: int = 0):
+        if not self._client or not self._connected:
+            return
+        self._client.publish(topic, json.dumps(payload) if isinstance(payload, dict) else str(payload),
+                             retain=retain, qos=qos)
+
+    @staticmethod
+    def _mid(mac: str) -> str:
+        return mac.replace(":", "_").lower()
+
+    def pub_system_discovery(self):
+        dp, sp = self._dp, self._sp
+        dev = {"identifiers": ["inspectre_system_service"], "name": "InSpectre",
+               "manufacturer": "InSpectre", "model": "Network Scanner"}
+        for comp, uid, extra in [
+            ("sensor", "total_devices",        {"name": "Total Devices Online",    "icon": "mdi:devices",
+                                                 "state_topic": f"{sp}/system/total_devices"}),
+            ("sensor", "total_vulnerabilities",{"name": "Total Vulnerabilities",   "icon": "mdi:shield-alert",
+                                                 "state_topic": f"{sp}/system/total_vulnerabilities"}),
+            ("sensor", "scan_state",           {"name": "Scan Status",             "icon": "mdi:radar",
+                                                 "state_topic": f"{sp}/system/scan_state"}),
+            ("sensor", "last_scan",            {"name": "Last Scan",               "icon": "mdi:clock-check",
+                                                 "device_class": "timestamp",
+                                                 "state_topic": f"{sp}/system/last_scan"}),
+        ]:
+            self.publish(f"{dp}/{comp}/inspectre_system_{uid}/config",
+                         {"unique_id": f"inspectre_system_{uid}", "device": dev, **extra}, retain=True)
+
+    def pub_device_discovery(self, mac: str, name: str | None, ip: str | None):
+        dp, sp, mid = self._dp, self._sp, self._mid(mac)
+        dev = {"identifiers": [f"inspectre_{mid}"], "name": name or ip or mac,
+               "manufacturer": "InSpectre", "connections": [["mac", mac]]}
+        for comp, uid, extra in [
+            ("binary_sensor", f"{mid}_presence", {"name": "Presence", "device_class": "connectivity",
+                                                   "payload_on": "ON", "payload_off": "OFF",
+                                                   "state_topic": f"{sp}/clients/{mid}/presence"}),
+            ("binary_sensor", f"{mid}_new",      {"name": "New Device", "device_class": "problem",
+                                                   "payload_on": "ON", "payload_off": "OFF",
+                                                   "state_topic": f"{sp}/clients/{mid}/new"}),
+            ("sensor", f"{mid}_ip",    {"name": "IP Address",   "icon": "mdi:ip-network",
+                                         "state_topic": f"{sp}/clients/{mid}/ip"}),
+            ("sensor", f"{mid}_ports", {"name": "Open Ports",   "icon": "mdi:lan",
+                                         "state_topic": f"{sp}/clients/{mid}/open_ports"}),
+            ("sensor", f"{mid}_vulns", {"name": "Vulnerabilities", "icon": "mdi:shield-alert",
+                                         "state_topic": f"{sp}/clients/{mid}/vulnerabilities"}),
+        ]:
+            self.publish(f"{dp}/{comp}/inspectre_{uid}/config",
+                         {"unique_id": f"inspectre_{uid}", "device": dev, **extra}, retain=True)
+
+    def pub_device_state(self, mac: str, is_online: bool, ip: str | None = None,
+                          open_ports: int | None = None, vulns: int | None = None,
+                          is_new: bool | None = None):
+        mid, sp = self._mid(mac), self._sp
+        self.publish(f"{sp}/clients/{mid}/presence", "ON" if is_online else "OFF")
+        if ip         is not None: self.publish(f"{sp}/clients/{mid}/ip",              ip)
+        if open_ports is not None: self.publish(f"{sp}/clients/{mid}/open_ports",  str(open_ports))
+        if vulns      is not None: self.publish(f"{sp}/clients/{mid}/vulnerabilities", str(vulns))
+        if is_new     is not None: self.publish(f"{sp}/clients/{mid}/new",  "ON" if is_new else "OFF")
+
+    def pub_system_state(self, total_devices: int | None = None, total_vulns: int | None = None,
+                          scan_state: str | None = None, last_scan: str | None = None):
+        sp = self._sp
+        if total_devices is not None: self.publish(f"{sp}/system/total_devices",         str(total_devices))
+        if total_vulns   is not None: self.publish(f"{sp}/system/total_vulnerabilities",  str(total_vulns))
+        if scan_state    is not None: self.publish(f"{sp}/system/scan_state",             scan_state)
+        if last_scan     is not None: self.publish(f"{sp}/system/last_scan",              last_scan)
+
+
+_ha_mqtt = HAMQTTManager()
+
+
+def _ha_startup_connect(db: "Session"):
+    """Connect HA MQTT on startup and publish initial discovery + state for all devices."""
+    try:
+        s = {r.key: r.value for r in db.query(Setting).filter(
+            Setting.key.in_(["ha_mqtt_enabled", "ha_mqtt_host", "ha_mqtt_port",
+                              "ha_mqtt_user", "ha_mqtt_password",
+                              "ha_mqtt_discovery_prefix", "ha_mqtt_state_prefix"])
+        ).all()}
+        if s.get("ha_mqtt_enabled") != "true" or not s.get("ha_mqtt_host", "").strip():
+            return
+        _ha_mqtt.connect(
+            host             = s["ha_mqtt_host"].strip(),
+            port             = int(s.get("ha_mqtt_port", "1883") or 1883),
+            user             = s.get("ha_mqtt_user", ""),
+            password         = s.get("ha_mqtt_password", ""),
+            discovery_prefix = s.get("ha_mqtt_discovery_prefix", "homeassistant"),
+            state_prefix     = s.get("ha_mqtt_state_prefix",     "inspectre"),
+        )
+        import time; time.sleep(1)  # brief wait for connect callback
+        if not _ha_mqtt.connected:
+            return
+        _ha_mqtt.pub_system_discovery()
+        NEW_SECS = 7 * 24 * 3600
+        devices = db.execute(text("""
+            SELECT mac_address, COALESCE(custom_name, hostname) AS name, ip_address,
+                   is_online, scan_results, vuln_severity, is_acknowledged,
+                   EXTRACT(EPOCH FROM (NOW() - first_seen)) AS age_secs
+            FROM devices WHERE is_ignored = false
+        """)).fetchall()
+        for d in devices:
+            mac, name, ip, online, scan_res, vsev, acked, age_secs = d
+            ports   = len((scan_res or {}).get("open_ports", [])) if scan_res else 0
+            sev_map = {"low": 1, "info": 1, "medium": 2, "high": 3, "critical": 3}
+            vulns   = sev_map.get(vsev or "", 0)
+            is_new  = not bool(acked) and (age_secs is not None and float(age_secs) < NEW_SECS)
+            _ha_mqtt.pub_device_discovery(mac, name, ip)
+            _ha_mqtt.pub_device_state(mac, bool(online), ip, ports, vulns, is_new)
+        total_online = sum(1 for d in devices if d.is_online)
+        total_vulns  = sum(1 for d in devices if (d.vuln_severity or "") not in ("", "none", "clean"))
+        last_scan_r  = db.execute(text(
+            "SELECT created_at FROM device_events WHERE type='scan_complete' ORDER BY id DESC LIMIT 1"
+        )).fetchone()
+        last_scan = last_scan_r[0].isoformat() if last_scan_r else None
+        _ha_mqtt.pub_system_state(total_online, total_vulns, "idle", last_scan)
+        print(f"[ha-mqtt] Published discovery for {len(devices)} device(s)", flush=True)
+    except Exception as exc:
+        print(f"[ha-mqtt] Startup error: {exc}", flush=True)
+
 
 def get_db():
     db = SessionLocal()
@@ -251,6 +444,31 @@ def _migrate(db: Session):
         "ALTER TABLE devices ADD COLUMN IF NOT EXISTS group_id      UUID",
         "ALTER TABLE devices ADD COLUMN IF NOT EXISTS group_primary BOOLEAN NOT NULL DEFAULT FALSE",
         "CREATE INDEX IF NOT EXISTS ix_devices_group_id ON devices(group_id)",
+        # Phase 10 — device acknowledgement
+        "ALTER TABLE devices ADD COLUMN IF NOT EXISTS is_acknowledged BOOLEAN NOT NULL DEFAULT FALSE",
+        # Notification channels and profiles
+        """CREATE TABLE IF NOT EXISTS notification_channels (
+            id         SERIAL PRIMARY KEY,
+            name       TEXT NOT NULL,
+            service    TEXT NOT NULL,
+            config     JSONB NOT NULL DEFAULT '{}',
+            enabled    BOOLEAN NOT NULL DEFAULT TRUE,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )""",
+        """CREATE TABLE IF NOT EXISTS notification_profiles (
+            id              SERIAL PRIMARY KEY,
+            name            TEXT NOT NULL,
+            events          JSONB NOT NULL DEFAULT '{}',
+            browser_enabled BOOLEAN NOT NULL DEFAULT FALSE,
+            created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )""",
+        """CREATE TABLE IF NOT EXISTS notification_profile_channels (
+            profile_id INTEGER NOT NULL REFERENCES notification_profiles(id) ON DELETE CASCADE,
+            channel_id INTEGER NOT NULL REFERENCES notification_channels(id) ON DELETE CASCADE,
+            PRIMARY KEY (profile_id, channel_id)
+        )""",
+        "CREATE INDEX IF NOT EXISTS ix_npc_profile ON notification_profile_channels(profile_id)",
+        "CREATE INDEX IF NOT EXISTS ix_npc_channel ON notification_profile_channels(channel_id)",
     ]
     for sql in migrations:
         try:
@@ -295,7 +513,7 @@ DEFAULT_SETTINGS = {
     # Phase 7 — scan performance & port baseline
     "nightly_scan_start":            ("2",     "Hour (0-23) when the nightly deep-scan window opens."),
     "nightly_scan_end":              ("4",     "Hour (0-23) when the nightly deep-scan window closes."),
-    "offline_rescan_hours":          ("4",     "Hours a device must be offline before triggering a rescan on return."),
+    "offline_rescan_hours":          ("24",     "Hours a device must be offline before triggering a rescan on return."),
     "baseline_scan_count_threshold": ("3",     "Consecutive matching scans required to confirm a port baseline."),
     "vuln_scan_on_port_change":      ("false", "Auto-trigger a vulnerability scan when a new port is detected above baseline."),
     # Phase 6 — traffic monitoring
@@ -315,6 +533,8 @@ DEFAULT_SETTINGS = {
     "probe_interface":           ("",      "Network interface the probe uses for scanning (e.g. eth0, eno1). Auto-detected on startup if blank; changes apply immediately via Settings → Apply."),
     # Fingerbank device identification
     "fingerbank_api_key":        ("",      "Fingerbank API key for cloud-based DHCP device identification. Get a free key at fingerbank.org. Leave blank to disable."),
+    # New device surfacing
+    "float_new_to_top":          ("true",  "Surface unacknowledged new devices and containers to the top of the list."),
     # Setup wizard
     "setup_complete":            ("false", "Whether the initial setup wizard has been completed."),
     # Docker monitoring
@@ -324,6 +544,14 @@ DEFAULT_SETTINGS = {
     "trivy_db_update_hours":     ("24",   "How often (hours) to refresh the Trivy vulnerability database. Set to 0 to disable automatic updates."),
     "docker_scan_on_new":        ("false", "Automatically run a Trivy vuln scan when a new container is created."),
     "docker_scan_on_update":     ("false", "Automatically run a Trivy vuln scan when a container is recreated with an updated image."),
+    # Notification — speed test alert thresholds
+    "speedtest_expected_download":   ("0",   "Expected/contracted download speed in Mbps. Set to 0 to disable speed test alerts."),
+    "speedtest_expected_upload":     ("0",   "Expected/contracted upload speed in Mbps. Set to 0 to disable upload speed alerts."),
+    "speedtest_alert_threshold":     ("80",  "Speed must drop below this percentage of expected before a speedtest.degraded_download alert fires."),
+    # Notification — device returned
+    "device_returned_days":          ("7",   "Days a device must be absent before a device.returned notification fires when it rejoins."),
+    # Notification — traffic
+    "traffic_suspicious_countries":  ("",    "Comma-separated ISO-3166 country codes to flag (e.g. CN,RU,KP). Leave blank to disable."),
     # Here Be Dragons — advanced probe pipeline controls
     "enable_arp_sweep":              ("true",  "Run active ARP broadcast sweeps to discover devices on the configured subnet."),
     "enable_passive_sniffer":        ("true",  "Run the passive ARP sniffer that listens for ARP traffic. Disable to stop all passive packet capture. Takes effect immediately."),
@@ -338,6 +566,14 @@ DEFAULT_SETTINGS = {
     "enable_mdns":                   ("true",  "Run mDNS discovery to find device names and services advertised over the local mDNS/Bonjour multicast group."),
     "enable_nightly_scan":           ("true",  "Rescan all online devices during the configured nightly scan window."),
     "enable_unscanned_retry":        ("true",  "On each sweep cycle, retry port-scanning any device that has never been successfully scanned. Disable if new devices are causing too many concurrent scans."),
+    # Home Assistant MQTT Auto-Discovery integration
+    "ha_mqtt_enabled":          ("false",          "Enable Home Assistant MQTT Auto-Discovery integration."),
+    "ha_mqtt_host":             ("",               "MQTT broker hostname or IP for HA integration."),
+    "ha_mqtt_port":             ("1883",           "MQTT broker port for HA integration."),
+    "ha_mqtt_user":             ("",               "MQTT username for HA integration (optional)."),
+    "ha_mqtt_password":         ("",               "MQTT password for HA integration (optional)."),
+    "ha_mqtt_discovery_prefix": ("homeassistant",  "HA MQTT discovery prefix (default: homeassistant)."),
+    "ha_mqtt_state_prefix":     ("inspectre",      "InSpectre MQTT state topic prefix (default: inspectre)."),
 }
 
 
@@ -413,6 +649,7 @@ def _save_vuln_result(mac: str, ip: str, data: dict, scripts: str):
 # Scheduled vuln scanner
 # ---------------------------------------------------------------------------
 _last_scheduled_vuln_scan: datetime | None = datetime.now(timezone.utc)
+_last_vuln_scan_day: int | None = None  # weekday (0=Mon) last processed for weekly spreading
 
 
 async def _run_single_vuln_scan(mac: str, ip: str, scripts: str):
@@ -460,6 +697,31 @@ async def _run_scheduled_vuln_scans():
         await asyncio.sleep(10)
 
 
+async def _run_scheduled_vuln_scans_for_day(day_of_week: int):
+    """Weekly mode: scan only the devices assigned to this day bucket (hash(mac) % 7 == day)."""
+    db = SessionLocal()
+    try:
+        settings_s = db.get(Setting, "vuln_scan_templates")
+        scripts    = (settings_s.value or "").strip() if settings_s else ""
+        targets_s  = db.get(Setting, "vuln_scan_targets")
+        targets    = targets_s.value if targets_s else "important"
+        q = db.query(Device).filter(Device.is_online == True, Device.ip_address != None, Device.is_ignored == False)
+        if targets == "important":
+            q = q.filter(Device.is_important == True)
+        all_devices = [(d.mac_address, d.ip_address) for d in q.all()]
+    finally:
+        db.close()
+
+    devices = [
+        (mac, ip) for mac, ip in all_devices
+        if int(hashlib.md5(mac.encode()).hexdigest(), 16) % 7 == day_of_week
+    ]
+    print(f"[scheduler] Weekly scan day {day_of_week}: {len(devices)}/{len(all_devices)} device(s)", flush=True)
+    for mac, ip in devices:
+        await _run_single_vuln_scan(mac, ip, scripts)
+        await asyncio.sleep(10)
+
+
 async def _run_all_vuln_scans():
     """Manual 'scan all' — ignores the vuln_scan_targets setting and scans every eligible device."""
     db = SessionLocal()
@@ -482,19 +744,27 @@ async def _run_all_vuln_scans():
 
 
 async def _scheduled_vuln_scan_loop():
-    global _last_scheduled_vuln_scan
+    global _last_scheduled_vuln_scan, _last_vuln_scan_day
     await asyncio.sleep(30)  # startup grace period
     while True:
         try:
             db = SessionLocal()
             try:
-                sched_s   = db.get(Setting, "vuln_scan_schedule")
-                schedule  = sched_s.value if sched_s else "disabled"
+                sched_s  = db.get(Setting, "vuln_scan_schedule")
+                schedule = sched_s.value if sched_s else "disabled"
             finally:
                 db.close()
 
-            if schedule != "disabled":
-                intervals = {"6h": 21600, "12h": 43200, "24h": 86400, "weekly": 604800}
+            if schedule == "weekly":
+                today = datetime.now(timezone.utc).weekday()
+                if _last_vuln_scan_day is None:
+                    # Record startup day without scanning — spreading begins the next calendar day
+                    _last_vuln_scan_day = today
+                elif _last_vuln_scan_day != today:
+                    await _run_scheduled_vuln_scans_for_day(today)
+                    _last_vuln_scan_day = today
+            elif schedule != "disabled":
+                intervals = {"6h": 21600, "12h": 43200, "24h": 86400}
                 interval  = intervals.get(schedule, 86400)
                 now       = datetime.now(timezone.utc)
                 if _last_scheduled_vuln_scan is None or (now - _last_scheduled_vuln_scan).total_seconds() >= interval:
@@ -506,71 +776,294 @@ async def _scheduled_vuln_scan_loop():
 
 
 # ---------------------------------------------------------------------------
-# Alert dispatch
+# Notification infrastructure
 # ---------------------------------------------------------------------------
+
+HIGH_RISK_PORTS = {21, 23, 137, 138, 139, 445, 512, 513, 514, 3389, 5900}
+
+# (event_type, label, category, description) — served to the frontend for profile editors
+NOTIFICATION_EVENT_DEFS = [
+    ("device.new",                  "New Device",               "Devices",         "A new device appeared on the network"),
+    ("device.online.watched",       "Watched Device Online",    "Devices",         "A watched device came back online"),
+    ("device.offline.watched",      "Watched Device Offline",   "Devices",         "A watched device went offline"),
+    ("device.online.all",           "Any Device Online",        "Devices",         "Any device came online (includes watched)"),
+    ("device.offline.all",          "Any Device Offline",       "Devices",         "Any device went offline (includes watched)"),
+    ("device.returned",             "Device Returned",          "Devices",         "A device reappeared after a long absence"),
+    ("device.auto_blocked",         "Device Auto-Blocked",      "Devices",         "A device was automatically blocked"),
+    ("vuln.critical",               "Critical Vulnerability",   "Vulnerabilities", "Critical-severity vulnerability found on a network device"),
+    ("vuln.high",                   "High Vulnerability",       "Vulnerabilities", "High-severity vulnerability found on a network device"),
+    ("container.vuln_critical",     "Container Critical Vuln",  "Vulnerabilities", "Critical vulnerability found in a container image"),
+    ("container.vuln_high",         "Container High Vuln",      "Vulnerabilities", "High vulnerability found in a container image"),
+    ("port.high_risk",              "High-Risk Port",           "Network",         "Telnet, FTP, SMB, RDP, VNC or similar high-risk port opened"),
+    ("port.opened",                 "New Port Opened",          "Network",         "A new port opened above a device's confirmed baseline"),
+    ("speedtest.degraded_download", "Download Speed Degraded",  "Speed Test",      "Download speed fell below the configured threshold"),
+    ("block.network_pause",         "Network Paused",           "Blocking",        "Internet access was blocked for the whole network"),
+    ("block.schedule_start",        "Block Schedule Started",   "Blocking",        "A block schedule became active"),
+    ("block.schedule_end",          "Block Schedule Ended",     "Blocking",        "A block schedule deactivated"),
+    ("container.crashed",           "Container Crashed",        "Containers",      "A container exited with a non-zero exit code"),
+    ("traffic.unusual_port",        "Unusual Port Traffic",     "Traffic",         "A device communicated on an unusual port"),
+    ("traffic.suspicious_country",  "Suspicious Country Traffic","Traffic",        "A device communicated with a flagged country"),
+]
+
 _last_alert_event_id: int = 0
+_last_network_paused: str = ""
+_pending_browser_notifications: list = []
+_traffic_notif_cooldowns: dict = {}   # (mac, event_type) → datetime of last notification
+_main_loop: asyncio.AbstractEventLoop | None = None
 
 
-async def _send_webhook(url: str, message: str, alert_type: str):
+def _build_apprise_url(service: str, config: dict) -> str | None:
+    """Construct an Apprise notification URL from a service name and config dict."""
     try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            await client.post(url, json={"message": message, "type": alert_type, "source": "InSpectre"})
-    except Exception as exc:
-        print(f"[alerts] Webhook error: {exc}", flush=True)
+        if service == "ntfy":
+            server = (config.get("server") or "https://ntfy.sh").rstrip("/")
+            topic  = config.get("topic", "").strip()
+            if not topic:
+                return None
+            p      = urlparse(server)
+            scheme = "ntfys" if p.scheme == "https" else "ntfy"
+            host   = p.netloc or p.path
+            user   = config.get("user", "").strip()
+            pw     = config.get("password", "").strip()
+            auth   = f"{_urlencode(user, safe='')}:{_urlencode(pw, safe='')}@" if user else ""
+            return f"{scheme}://{auth}{host}/{topic}"
+
+        if service == "gotify":
+            server = (config.get("server") or "").rstrip("/")
+            token  = config.get("token", "").strip()
+            if not server or not token:
+                return None
+            p      = urlparse(server)
+            scheme = "gotifys" if p.scheme == "https" else "gotify"
+            host   = p.netloc or p.path
+            return f"{scheme}://{host}/{token}"
+
+        if service == "pushbullet":
+            key = config.get("api_key", "").strip()
+            return f"pbul://{key}" if key else None
+
+        if service == "telegram":
+            bot   = config.get("bot_token", "").strip()
+            chat  = config.get("chat_id", "").strip()
+            return f"tgram://{bot}/{chat}/" if bot and chat else None
+
+        if service == "discord":
+            wid  = config.get("webhook_id",    "").strip()
+            wtok = config.get("webhook_token",  "").strip()
+            return f"discord://{wid}/{wtok}" if wid and wtok else None
+
+        if service == "pushover":
+            ukey  = config.get("user_key", "").strip()
+            token = config.get("api_token", "").strip()
+            return f"pover://{ukey}@{token}" if ukey and token else None
+
+        if service == "slack":
+            ta = config.get("token_a", "").strip()
+            tb = config.get("token_b", "").strip()
+            tc = config.get("token_c", "").strip()
+            return f"slack://{ta}/{tb}/{tc}" if ta and tb and tc else None
+
+        if service == "email":
+            smtp_host = config.get("smtp_host", "").strip()
+            smtp_user = config.get("smtp_user", "").strip()
+            smtp_pass = config.get("smtp_password", "").strip()
+            to_email  = config.get("to_email", "").strip()
+            port      = config.get("smtp_port", "587")
+            secure    = config.get("secure", True)
+            if not all([smtp_host, smtp_user, smtp_pass, to_email]):
+                return None
+            scheme = "mailtos" if secure else "mailto"
+            return (f"{scheme}://{_urlencode(smtp_user, safe='')}:"
+                    f"{_urlencode(smtp_pass, safe='')}@{smtp_host}:{port}/"
+                    f"{_urlencode(to_email, safe='')}")
+
+        if service == "webhook":
+            url = config.get("url", "").strip()
+            if not url:
+                return None
+            p    = urlparse(url)
+            scheme = "jsons" if p.scheme == "https" else "json"
+            rest = p.netloc + p.path
+            if p.query:
+                rest += f"?{p.query}"
+            return f"{scheme}://{rest}"
+
+        if service == "matrix":
+            user     = config.get("user",     "").strip()
+            password = config.get("password", "").strip()
+            raw_host = config.get("host",     "").strip()
+            room     = config.get("room",     "").strip()
+            port     = config.get("port",     "").strip()
+            secure   = bool(config.get("secure", True))
+            if not user or not password or not raw_host:
+                return None
+            if raw_host.lower().startswith("https://"):
+                secure   = True
+                raw_host = raw_host[8:].rstrip("/")
+            elif raw_host.lower().startswith("http://"):
+                secure   = False
+                raw_host = raw_host[7:].rstrip("/")
+            scheme   = "matrixs" if secure else "matrix"
+            port_str = f":{port}" if port else ""
+            room_str = f"/{_urlencode(room, safe='#:')}" if room else ""
+            return (f"{scheme}://{_urlencode(user, safe='')}:"
+                    f"{_urlencode(password, safe='')}@{raw_host}{port_str}{room_str}")
+
+        if service == "msteams":
+            wh = config.get("webhook_url", "").strip()
+            m  = _re.search(
+                r"webhookb2/([^@]+)@([^/]+)/IncomingWebhook/([^/]+)/([^/?]+)", wh)
+            return f"msteams://{m.group(1)}/{m.group(2)}/{m.group(3)}/{m.group(4)}" if m else None
+
+        if service == "signal":
+            from_phone = config.get("from_phone", "").strip()
+            to_phone   = config.get("to_phone",   "").strip()
+            host       = (config.get("host", "") or "localhost").strip()
+            port       = (config.get("port", "") or "8080").strip()
+            if not from_phone or not to_phone:
+                return None
+            return (f"signal://{_urlencode(from_phone, safe='+')}"
+                    f"@{host}:{port}/{_urlencode(to_phone, safe='+')}")
+
+        if service == "whatsapp":
+            token    = config.get("token",    "").strip()
+            phone_id = config.get("phone_id", "").strip()
+            to_phone = config.get("to_phone", "").strip()
+            if not all([token, phone_id, to_phone]):
+                return None
+            return f"whatsapp://{_urlencode(token, safe='')}@{phone_id}/{_urlencode(to_phone, safe='+')}"
+
+        if service == "mqtt":
+            raw_host = config.get("host",     "").strip()
+            topic    = config.get("topic",    "").strip()
+            user     = config.get("user",     "").strip()
+            password = config.get("password", "").strip()
+            port     = config.get("port",     "").strip()
+            secure   = bool(config.get("secure", False))
+            if not raw_host or not topic:
+                return None
+            if raw_host.lower().startswith("mqtts://"):
+                secure   = True
+                raw_host = raw_host[8:].rstrip("/")
+            elif raw_host.lower().startswith("mqtt://"):
+                raw_host = raw_host[7:].rstrip("/")
+            if port == "8883":
+                secure = True
+            scheme   = "mqtts" if secure else "mqtt"
+            auth     = ""
+            if user:
+                auth = (f"{_urlencode(user, safe='')}:{_urlencode(password, safe='')}@"
+                        if password else f"{_urlencode(user, safe='')}@")
+            port_str = f":{port}" if port else ""
+            return f"{scheme}://{auth}{raw_host}{port_str}/{_urlencode(topic, safe='/')}"
+
+        if service == "ifttt":
+            key   = config.get("webhook_key", "").strip()
+            event = config.get("event_id",    "").strip()
+            return f"ifttt://{key}@{event}" if key and event else None
+
+    except Exception:
+        return None
+    return None
 
 
-async def _send_ntfy(url: str, message: str):
+def _ha_build_url(config: dict) -> tuple[str, str]:
+    """Return (url, token) for the HA service REST endpoint, or raise ValueError."""
+    raw_host = config.get("host", "").strip()
+    token    = config.get("token", "").strip()
+    if not raw_host or not token:
+        raise ValueError("Home Assistant requires 'host' and 'token'")
+    port   = str(config.get("port", "") or "").strip()
+    secure = bool(config.get("secure", False))
+    # notifier may be "domain/service" or just a short name (assumed notify domain)
+    notifier = (config.get("notifier", "") or "persistent_notification/create").strip()
+    if "/" not in notifier:
+        notifier = f"notify/{notifier}"
+    if raw_host.lower().startswith("https://"):
+        secure, raw_host = True, raw_host[8:].rstrip("/")
+    elif raw_host.lower().startswith("http://"):
+        secure, raw_host = False, raw_host[7:].rstrip("/")
+    if port == "443":
+        secure = True
+    scheme   = "https" if secure else "http"
+    port_str = f":{port}" if port else ""
+    return f"{scheme}://{raw_host}{port_str}/api/services/{notifier}", token
+
+
+async def _notify_home_assistant(config: dict, title: str, body: str) -> None:
+    url, token = _ha_build_url(config)
+    async with httpx.AsyncClient(verify=False, timeout=10.0) as client:
+        resp = await client.post(
+            url,
+            json={"message": body, "title": title},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        resp.raise_for_status()
+
+
+async def _notification_dispatch(event_type: str, title: str, body: str,
+                                  device_mac: str | None = None):
+    """Dispatch a notification event through all matching profiles and their channels."""
+    import apprise as _apprise
+    db = SessionLocal()
     try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            await client.post(url, content=message.encode(),
-                              headers={"Title": "InSpectre Alert", "Priority": "default"})
-    except Exception as exc:
-        print(f"[alerts] ntfy error: {exc}", flush=True)
+        profiles = db.execute(text("""
+            SELECT id FROM notification_profiles
+            WHERE (events->>:ev)::boolean = true
+        """), {"ev": event_type}).fetchall()
 
+        if not profiles:
+            return
 
-async def _send_gotify(base_url: str, token: str, message: str):
-    try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            await client.post(
-                f"{base_url.rstrip('/')}/message",
-                params={"token": token},
-                json={"title": "InSpectre Alert", "message": message, "priority": 5},
-            )
-    except Exception as exc:
-        print(f"[alerts] Gotify error: {exc}", flush=True)
+        channels_to_send: dict = {}   # ch_id → (service, config_dict)
+        for (profile_id,) in profiles:
+            rows = db.execute(text("""
+                SELECT nc.id, nc.service, nc.config
+                FROM notification_channels nc
+                JOIN notification_profile_channels npc ON npc.channel_id = nc.id
+                WHERE npc.profile_id = :pid AND nc.enabled = TRUE
+            """), {"pid": profile_id}).fetchall()
+            for ch_id, svc, cfg in rows:
+                if ch_id not in channels_to_send:
+                    channels_to_send[ch_id] = (svc, cfg if isinstance(cfg, dict) else {})
+    finally:
+        db.close()
 
+    # Virtual channels: toast and browser queue to the pending poll endpoint
+    toast_notify   = any(svc == "toast"   for svc, _ in channels_to_send.values())
+    browser_notify = any(svc == "browser" for svc, _ in channels_to_send.values())
 
-async def _send_pushbullet(api_key: str, title: str, body: str):
-    try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            await client.post(
-                "https://api.pushbullet.com/v2/pushes",
-                json={"type": "note", "title": title, "body": body},
-                headers={"Access-Token": api_key, "Content-Type": "application/json"},
-            )
-    except Exception as exc:
-        print(f"[alerts] Pushbullet error: {exc}", flush=True)
+    if toast_notify or browser_notify:
+        _pending_browser_notifications.append({
+            "event_type": event_type, "title": title, "body": body,
+            "toast": toast_notify, "browser": browser_notify,
+            "ts": datetime.now(timezone.utc).isoformat(),
+        })
+        if len(_pending_browser_notifications) > 200:
+            _pending_browser_notifications.pop(0)
 
+    urls = []
+    for ch_id, (svc, cfg) in channels_to_send.items():
+        if svc in ("toast", "browser"):
+            continue
+        if svc == "home_assistant":
+            try:
+                await _notify_home_assistant(cfg, title, body)
+            except Exception as exc:
+                print(f"[notify] Home Assistant error: {exc}", flush=True)
+            continue
+        url = _build_apprise_url(svc, cfg)
+        if url:
+            urls.append(url)
 
-async def _dispatch_alerts(settings: dict, message: str, alert_type: str):
-    tasks = []
-    if settings.get("alert_webhook_url", "").strip():
-        tasks.append(_send_webhook(settings["alert_webhook_url"].strip(), message, alert_type))
-    ntfy_topic = settings.get("ntfy_topic", "").strip()
-    if ntfy_topic:
-        ntfy_base = settings.get("ntfy_url", "https://ntfy.sh").rstrip("/")
-        tasks.append(_send_ntfy(f"{ntfy_base}/{ntfy_topic}", message))
-    gotify_url   = settings.get("gotify_url", "").strip()
-    gotify_token = settings.get("gotify_token", "").strip()
-    if gotify_url and gotify_token:
-        tasks.append(_send_gotify(gotify_url, gotify_token, message))
-    pb_key = settings.get("pushbullet_api_key", "").strip()
-    if pb_key:
-        title = {"new_device": "New device on network", "device_offline": "Device went offline",
-                 "vuln_found": "Vulnerability found"}.get(alert_type, "InSpectre Alert")
-        tasks.append(_send_pushbullet(pb_key, title, message))
-    if tasks:
-        await asyncio.gather(*tasks, return_exceptions=True)
+    if urls:
+        try:
+            a = _apprise.Apprise()
+            for url in urls:
+                a.add(url)
+            await asyncio.to_thread(a.notify, title=title, body=body)
+        except Exception as exc:
+            print(f"[notify] Apprise error: {exc}", flush=True)
 
 
 def _is_suppressed(mac: str, event_type: str, cache: dict) -> bool:
@@ -594,15 +1087,16 @@ def _is_suppressed(mac: str, event_type: str, cache: dict) -> bool:
         db.close()
 
 
-async def _alert_dispatch_loop():
-    global _last_alert_event_id
+async def _notification_loop():
+    global _last_alert_event_id, _last_network_paused
     await asyncio.sleep(20)  # startup grace
 
-    # Initialise _last_alert_event_id to current max so we don't replay history
     db = SessionLocal()
     try:
         row = db.execute(text("SELECT COALESCE(MAX(id), 0) FROM device_events")).scalar()
         _last_alert_event_id = int(row or 0)
+        s = db.get(Setting, "network_paused")
+        _last_network_paused = s.value if s else "false"
     except Exception:
         pass
     finally:
@@ -613,118 +1107,183 @@ async def _alert_dispatch_loop():
             db = SessionLocal()
             try:
                 settings = {s.key: s.value for s in db.query(Setting).all()}
-                alert_new              = settings.get("alert_on_new_device",      "false") == "true"
-                alert_offline          = settings.get("alert_on_offline",         "false") == "true"
-                alert_vuln             = settings.get("alert_on_vuln",            "false") == "true"
-                alert_port_change      = settings.get("alert_on_port_change",     "true")  == "true"
-                vuln_on_new_device     = settings.get("vuln_scan_on_new_device",  "false") == "true"
-                vuln_on_port_change    = settings.get("vuln_scan_on_port_change", "false") == "true"
-                auto_block_new         = settings.get("auto_block_new_devices",   "false") == "true"
-                auto_block_sev         = settings.get("auto_block_vuln_severity", "none")
-                SEV_ORDER = ["none", "info", "clean", "low", "medium", "high", "critical"]
 
-                if alert_new or alert_offline or alert_vuln or alert_port_change or vuln_on_new_device or vuln_on_port_change or auto_block_new or auto_block_sev != "none":
-                    rows = db.execute(text("""
-                        SELECT de.id, de.mac_address, de.type, de.detail, de.created_at,
-                               COALESCE(d.custom_name, d.hostname, d.ip_address, de.mac_address) AS name,
-                               d.ip_address, d.is_important,
-                               COALESCE(d.is_ignored, false) AS is_ignored
-                        FROM device_events de
-                        JOIN devices d ON d.mac_address = de.mac_address
-                        WHERE de.id > :last_id
-                          AND de.type = ANY(:types)
-                        ORDER BY de.id ASC
-                        LIMIT 50
-                    """), {
-                        "last_id": _last_alert_event_id,
-                        "types":   ["joined", "interface_joined", "offline", "vuln_scan_complete", "port_change", "port_opened", "port_closed"],
-                    }).fetchall()
-                else:
-                    rows = []
+                # Network pause detection
+                network_paused = settings.get("network_paused", "false")
+                if network_paused == "true" and _last_network_paused != "true":
+                    asyncio.ensure_future(_notification_dispatch(
+                        "block.network_pause", "Network Paused",
+                        "Internet access has been blocked for the whole network",
+                    ))
+                _last_network_paused = network_paused
 
-                pending_alerts = []
-                vuln_scans_to_run = []
-                devices_to_block: list[str] = []
+                vuln_on_new    = settings.get("vuln_scan_on_new_device",  "false") == "true"
+                vuln_on_port   = settings.get("vuln_scan_on_port_change", "false") == "true"
+                auto_block_new = settings.get("auto_block_new_devices",   "false") == "true"
+                auto_block_sev = settings.get("auto_block_vuln_severity", "none")
+                returned_days  = int(settings.get("device_returned_days", "7") or "7")
+                SEV_ORDER      = ["none", "info", "clean", "low", "medium", "high", "critical"]
+
+                rows = db.execute(text("""
+                    SELECT de.id, de.mac_address, de.type, de.detail, de.created_at,
+                           COALESCE(d.custom_name, d.hostname, d.ip_address, de.mac_address) AS name,
+                           d.ip_address, d.is_important,
+                           COALESCE(d.is_ignored, false) AS is_ignored,
+                           d.scan_results, d.vuln_severity
+                    FROM device_events de
+                    JOIN devices d ON d.mac_address = de.mac_address
+                    WHERE de.id > :last_id
+                      AND de.type = ANY(:types)
+                    ORDER BY de.id ASC
+                    LIMIT 100
+                """), {
+                    "last_id": _last_alert_event_id,
+                    "types":   ["joined", "interface_joined", "online", "offline",
+                                "vuln_scan_complete", "port_opened", "blocked", "unblocked"],
+                }).fetchall()
+
+                dispatches:      list = []  # (event_type, title, body, mac)
+                vuln_scans:      list = []
+                devices_to_block: list = []
                 suppression_cache: dict = {}
+
                 for row in rows:
-                    eid, mac, etype, detail, created_at, name, ip, is_important, is_ignored = row
-                    if is_ignored:
-                        _last_alert_event_id = max(_last_alert_event_id, eid)
-                        continue
+                    eid, mac, etype, detail, created_at, name, ip, is_important, is_ignored, scan_results, vuln_severity = row
                     _last_alert_event_id = max(_last_alert_event_id, eid)
-                    if _is_suppressed(mac, etype, suppression_cache):
+                    if is_ignored:
                         continue
-                    if etype == "joined":
-                        if alert_new:
-                            pending_alerts.append((f"New device detected: {name} ({ip})", "new_device"))
+                    d = detail or {}
+
+                    if etype in ("joined", "interface_joined"):
+                        dispatches.append(("device.new", "New Device",
+                                           f"{name} ({ip}) appeared on the network", mac))
                         if auto_block_new:
                             devices_to_block.append(mac)
-                        if vuln_on_new_device and ip:
+                        if vuln_on_new and ip:
                             scripts_s = db.get(Setting, "vuln_scan_templates")
-                            scripts   = (scripts_s.value or "").strip() if scripts_s else ""
-                            vuln_scans_to_run.append((mac, ip, scripts))
-                    elif etype == "interface_joined":
-                        if alert_new:
-                            pending_alerts.append((f"Grouped device rejoined on new interface: {name} ({ip})", "new_device"))
-                        if vuln_on_new_device and ip:
-                            scripts_s = db.get(Setting, "vuln_scan_templates")
-                            scripts   = (scripts_s.value or "").strip() if scripts_s else ""
-                            vuln_scans_to_run.append((mac, ip, scripts))
-                    elif etype == "offline" and alert_offline and is_important:
-                        pending_alerts.append((f"Watched device offline: {name} ({ip})", "device_offline"))
+                            vuln_scans.append((mac, ip, (scripts_s.value or "").strip() if scripts_s else ""))
+
+                    elif etype == "online":
+                        dispatches.append(("device.online.all", "Device Online",
+                                           f"{name} ({ip}) is back online", mac))
+                        if is_important:
+                            dispatches.append(("device.online.watched", "Watched Device Online",
+                                               f"{name} ({ip}) is back online", mac))
+                        # device.returned: look up when it last went offline
+                        off_row = db.execute(text("""
+                            SELECT created_at FROM device_events
+                            WHERE mac_address = :mac AND type = 'offline'
+                            ORDER BY id DESC LIMIT 1
+                        """), {"mac": mac}).fetchone()
+                        if off_row:
+                            off_at = off_row[0]
+                            if off_at.tzinfo is None:
+                                off_at = off_at.replace(tzinfo=timezone.utc)
+                            days_absent = (datetime.now(timezone.utc) - off_at).days
+                            if days_absent >= returned_days:
+                                dispatches.append(("device.returned", "Device Returned",
+                                                   f"{name} ({ip}) reappeared after {days_absent} days", mac))
+
+                    elif etype == "offline":
+                        dispatches.append(("device.offline.all", "Device Offline",
+                                           f"{name} ({ip}) went offline", mac))
+                        if is_important:
+                            dispatches.append(("device.offline.watched", "Watched Device Offline",
+                                               f"{name} ({ip}) went offline", mac))
+
                     elif etype == "vuln_scan_complete":
-                        severity = (detail or {}).get("severity", "unknown")
-                        if alert_vuln and severity not in ("clean", "info"):
-                            count = (detail or {}).get("vuln_count", 0)
-                            pending_alerts.append((
-                                f"Vulnerabilities found on {name} ({ip}): {severity} severity, {count} finding(s)",
-                                "vuln_found",
-                            ))
-                        if auto_block_sev != "none" and SEV_ORDER.index(severity) >= SEV_ORDER.index(auto_block_sev):
-                            devices_to_block.append(mac)
-                    elif etype == "port_change" and alert_port_change:
-                        d = detail or {}
-                        added   = d.get("added", [])
-                        removed = d.get("removed", [])
-                        parts = []
-                        if added:
-                            parts.append(f"Opened: {', '.join(str(p['port']) for p in added)}")
-                        if removed:
-                            parts.append(f"Closed: {', '.join(str(p['port']) for p in removed)}")
-                        if parts:
-                            pending_alerts.append((
-                                f"Port change on {name} — " + "; ".join(parts),
-                                "port_change",
-                            ))
+                        severity = d.get("severity", "clean")
+                        count    = d.get("vuln_count", 0)
+                        if severity == "critical":
+                            dispatches.append(("vuln.critical", "Critical Vulnerability",
+                                               f"{name} ({ip}): {count} critical finding(s)", mac))
+                        elif severity == "high":
+                            dispatches.append(("vuln.high", "High Vulnerability",
+                                               f"{name} ({ip}): {count} high-severity finding(s)", mac))
+                        if auto_block_sev != "none":
+                            try:
+                                if SEV_ORDER.index(severity) >= SEV_ORDER.index(auto_block_sev):
+                                    devices_to_block.append(mac)
+                            except ValueError:
+                                pass
+
                     elif etype == "port_opened":
-                        d = detail or {}
-                        port     = d.get("port", "?")
-                        severity = d.get("severity", "info")
-                        if alert_port_change:
-                            pending_alerts.append((
-                                f"New port detected on {name} ({ip}) — port {port} [{severity}]",
-                                "port_change",
-                            ))
-                        if vuln_on_port_change and ip:
+                        port = d.get("port")
+                        sev  = d.get("severity", "info")
+                        if port and int(port) in HIGH_RISK_PORTS:
+                            dispatches.append(("port.high_risk", "High-Risk Port",
+                                               f"{name} ({ip}): port {port} is high-risk", mac))
+                        dispatches.append(("port.opened", "New Port Detected",
+                                           f"{name} ({ip}): port {port} [{sev}] opened above baseline", mac))
+                        if vuln_on_port and ip:
                             scripts_s = db.get(Setting, "vuln_scan_templates")
-                            scripts   = (scripts_s.value or "").strip() if scripts_s else ""
-                            vuln_scans_to_run.append((mac, ip, scripts))
-                    elif etype == "port_closed" and alert_port_change:
-                        d    = detail or {}
-                        port = d.get("port", "?")
-                        pending_alerts.append((
-                            f"Port closed on {name} ({ip}) — port {port} [baseline drift]",
-                            "port_change",
-                        ))
+                            vuln_scans.append((mac, ip, (scripts_s.value or "").strip() if scripts_s else ""))
+
+                    elif etype == "blocked":
+                        reason = d.get("reason", "")
+                        if reason == "schedule":
+                            dispatches.append(("block.schedule_start", "Block Schedule Started",
+                                               f"Block schedule activated for {name}", mac))
+                        elif reason in ("auto", "auto_block"):
+                            dispatches.append(("device.auto_blocked", "Device Auto-Blocked",
+                                               f"{name} ({ip}) was automatically blocked", mac))
+
+                    elif etype == "unblocked":
+                        if d.get("reason") == "schedule_end":
+                            dispatches.append(("block.schedule_end", "Block Schedule Ended",
+                                               f"Block schedule deactivated for {name}", mac))
+
+                    # ── HA MQTT state push ───────────────────────────────────
+                    if _ha_mqtt.connected:
+                        try:
+                            ports_count = len((scan_results or {}).get("open_ports", []))
+                            sev_map     = {"low": 1, "info": 1, "medium": 2, "high": 3, "critical": 3}
+                            vuln_count  = sev_map.get(vuln_severity or "", 0)
+                            if etype in ("joined", "interface_joined"):
+                                _ha_mqtt.pub_device_discovery(mac, name, ip)
+                                _ha_mqtt.pub_device_state(mac, True, ip, ports_count, vuln_count, is_new=True)
+                            elif etype == "online":
+                                _ha_mqtt.pub_device_state(mac, True, ip, ports_count, vuln_count)
+                            elif etype == "offline":
+                                _ha_mqtt.pub_device_state(mac, False, ip)
+                            elif etype == "port_opened":
+                                _ha_mqtt.pub_device_state(mac, True, open_ports=ports_count)
+                            elif etype == "vuln_scan_complete":
+                                _ha_mqtt.pub_device_state(mac, True, vulns=d.get("vuln_count", vuln_count))
+                            elif etype == "renamed":
+                                _ha_mqtt.pub_device_discovery(mac, name, ip)
+                        except Exception as _ha_exc:
+                            print(f"[ha-mqtt] Dispatch error: {_ha_exc}", flush=True)
 
             finally:
                 db.close()
 
-            for message, alert_type in pending_alerts:
-                await _dispatch_alerts(settings, message, alert_type)
-            for mac, ip, scripts in vuln_scans_to_run:
-                print(f"[alerts] Auto vuln scan triggered for new device {ip} ({mac})", flush=True)
+            # ── HA MQTT system stats after processing batch ──────────────────
+            if _ha_mqtt.connected:
+                try:
+                    _ha_db = SessionLocal()
+                    try:
+                        _tot_on   = _ha_db.execute(text("SELECT COUNT(*) FROM devices WHERE is_online=true")).scalar() or 0
+                        _tot_vuln = _ha_db.execute(text(
+                            "SELECT COUNT(*) FROM devices WHERE vuln_severity IS NOT NULL AND vuln_severity NOT IN ('none','clean')"
+                        )).scalar() or 0
+                        _ls_row   = _ha_db.execute(text(
+                            "SELECT created_at FROM device_events WHERE type='scan_complete' ORDER BY id DESC LIMIT 1"
+                        )).fetchone()
+                        _ha_mqtt.pub_system_state(_tot_on, _tot_vuln, "idle",
+                                                   _ls_row[0].isoformat() if _ls_row else None)
+                    finally:
+                        _ha_db.close()
+                except Exception as _ha_exc:
+                    print(f"[ha-mqtt] System stats error: {_ha_exc}", flush=True)
+
+            for event_type, title, body, mac in dispatches:
+                if not _is_suppressed(mac, event_type, suppression_cache):
+                    asyncio.ensure_future(_notification_dispatch(event_type, title, body, mac))
+
+            for mac, ip, scripts in vuln_scans:
                 asyncio.ensure_future(_run_single_vuln_scan(mac, ip, scripts))
+
             for mac in devices_to_block:
                 try:
                     async with httpx.AsyncClient(timeout=10) as c:
@@ -732,15 +1291,16 @@ async def _alert_dispatch_loop():
                     db2 = SessionLocal()
                     try:
                         db2.execute(text("UPDATE devices SET is_blocked=true WHERE mac_address=:mac"), {"mac": mac})
+                        _add_event(db2, mac, "blocked", {"reason": "auto"})
                         db2.commit()
                     finally:
                         db2.close()
-                    print(f"[alerts] Auto-blocked {mac}", flush=True)
+                    print(f"[notify] Auto-blocked {mac}", flush=True)
                 except Exception as exc:
-                    print(f"[alerts] Auto-block failed for {mac}: {exc}", flush=True)
+                    print(f"[notify] Auto-block {mac}: {exc}", flush=True)
 
         except Exception as exc:
-            print(f"[alerts] Dispatch loop error: {exc}", flush=True)
+            print(f"[notify] Loop error: {exc}", flush=True)
 
         await asyncio.sleep(30)
 
@@ -798,6 +1358,56 @@ async def _auth_middleware(request: Request, call_next):
 # ---------------------------------------------------------------------------
 # Traffic stats flush loop — polls probe every 5 min and writes to DB
 # ---------------------------------------------------------------------------
+async def _check_traffic_notifications(sessions: list):
+    """Fire traffic-based notifications with a 24-hour per-device cooldown."""
+    db = SessionLocal()
+    try:
+        susp_s = db.get(Setting, "traffic_suspicious_countries")
+        susp_countries = {c.strip().upper() for c in (susp_s.value or "").split(",") if c.strip()} if susp_s else set()
+    finally:
+        db.close()
+
+    now = datetime.now(timezone.utc)
+    COOLDOWN = 86400  # seconds
+
+    for session in sessions:
+        mac = session.get("mac", "").lower()
+        if not mac:
+            continue
+        for bucket in session.get("history", []):
+            unusual_ports = bucket.get("unusual_ports") or []
+            if unusual_ports:
+                key = (mac, "traffic.unusual_port")
+                last = _traffic_notif_cooldowns.get(key)
+                if last is None or (now - last).total_seconds() > COOLDOWN:
+                    _traffic_notif_cooldowns[key] = now
+                    ports_str = ", ".join(str(p) for p in unusual_ports[:5])
+                    asyncio.ensure_future(_notification_dispatch(
+                        "traffic.unusual_port", "Unusual Traffic Pattern",
+                        f"Device {mac}: traffic on unusual ports ({ports_str})",
+                    ))
+                break  # one check per mac per cycle
+
+            if susp_countries:
+                top_countries = bucket.get("top_countries") or {}
+                if isinstance(top_countries, str):
+                    try:
+                        top_countries = json.loads(top_countries)
+                    except Exception:
+                        top_countries = {}
+                flagged = [c for c in top_countries if c.upper() in susp_countries]
+                if flagged:
+                    key = (mac, "traffic.suspicious_country")
+                    last = _traffic_notif_cooldowns.get(key)
+                    if last is None or (now - last).total_seconds() > COOLDOWN:
+                        _traffic_notif_cooldowns[key] = now
+                        asyncio.ensure_future(_notification_dispatch(
+                            "traffic.suspicious_country", "Suspicious Country Traffic",
+                            f"Device {mac}: traffic detected to {', '.join(flagged)}",
+                        ))
+                    break
+
+
 async def _traffic_flush_loop():
     await asyncio.sleep(60)  # startup grace
     while True:
@@ -813,6 +1423,7 @@ async def _traffic_flush_loop():
                             _flush_traffic_sessions(db, sessions)
                         finally:
                             db.close()
+                        await _check_traffic_notifications(sessions)
         except httpx.ConnectError:
             pass
         except Exception as exc:
@@ -835,10 +1446,16 @@ async def _traffic_flush_loop():
         await asyncio.sleep(300)  # 5-minute poll
 
 
-_last_speedtest_run: datetime | None = None
+_last_speedtest_slot: datetime | None = None
+
+_SPEEDTEST_EPOCH = datetime(2020, 1, 1, tzinfo=timezone.utc)
+
+def _speedtest_current_slot(interval_s: int) -> datetime:
+    elapsed = (datetime.now(timezone.utc) - _SPEEDTEST_EPOCH).total_seconds()
+    return _SPEEDTEST_EPOCH + timedelta(seconds=int(elapsed // interval_s) * interval_s)
 
 async def _speedtest_schedule_loop():
-    global _last_speedtest_run
+    global _last_speedtest_slot
     await asyncio.sleep(120)
     INTERVALS = {"30m": 1800, "1h": 3600, "6h": 21600, "24h": 86400}
     while True:
@@ -851,10 +1468,13 @@ async def _speedtest_schedule_loop():
                 db.close()
             interval = INTERVALS.get(sched)
             if interval:
-                now = datetime.now(timezone.utc)
-                if _last_speedtest_run is None or (now - _last_speedtest_run).total_seconds() >= interval:
+                slot = _speedtest_current_slot(interval)
+                if _last_speedtest_slot is None:
+                    # On startup, record the current slot without running — next slot fires the test
+                    _last_speedtest_slot = slot
+                elif slot > _last_speedtest_slot:
                     await _run_speedtest_and_save()
-                    _last_speedtest_run = now
+                    _last_speedtest_slot = slot
         except Exception as exc:
             print(f"[speedtest] schedule loop error: {exc}", flush=True)
         await asyncio.sleep(300)
@@ -888,6 +1508,22 @@ async def _run_speedtest_and_save():
             finally:
                 db.close()
             print(f"[speedtest] completed — DL: {result.get('download_mbps')} Mbps, UL: {result.get('upload_mbps')} Mbps", flush=True)
+            dl = result.get("download_mbps")
+            if dl is not None:
+                db2 = SessionLocal()
+                try:
+                    exp_s = db2.get(Setting, "speedtest_expected_download")
+                    thr_s = db2.get(Setting, "speedtest_alert_threshold")
+                    exp_dl    = float(exp_s.value) if exp_s and exp_s.value else 0.0
+                    threshold = float(thr_s.value) if thr_s and thr_s.value else 80.0
+                finally:
+                    db2.close()
+                if exp_dl > 0 and dl < exp_dl * threshold / 100:
+                    pct = int(dl / exp_dl * 100)
+                    asyncio.ensure_future(_notification_dispatch(
+                        "speedtest.degraded_download", "Download Speed Degraded",
+                        f"Download {dl:.1f} Mbps is {pct}% of expected {exp_dl:.0f} Mbps",
+                    ))
     except Exception as exc:
         print(f"[speedtest] scheduled run error: {exc}", flush=True)
 
@@ -1244,18 +1880,85 @@ async def _fingerbank_loop():
         await asyncio.sleep(60)  # check for new DHCP arrivals every minute
 
 
+def _migrate_legacy_notifications(db: Session):
+    """One-time: create notification channels from old settings if the table is empty."""
+    count = db.execute(text("SELECT COUNT(*) FROM notification_channels")).scalar()
+    if count:
+        return
+
+    channels = []
+    ntfy_topic = db.get(Setting, "ntfy_topic")
+    if ntfy_topic and ntfy_topic.value.strip():
+        ntfy_url_s = db.get(Setting, "ntfy_url")
+        server = ntfy_url_s.value.strip() if ntfy_url_s else "https://ntfy.sh"
+        channels.append(("ntfy (migrated)", "ntfy", {"server": server, "topic": ntfy_topic.value.strip()}))
+
+    gotify_url_s  = db.get(Setting, "gotify_url")
+    gotify_tok_s  = db.get(Setting, "gotify_token")
+    if gotify_url_s and gotify_url_s.value.strip() and gotify_tok_s and gotify_tok_s.value.strip():
+        channels.append(("Gotify (migrated)", "gotify",
+                         {"server": gotify_url_s.value.strip(), "token": gotify_tok_s.value.strip()}))
+
+    pb_s = db.get(Setting, "pushbullet_api_key")
+    if pb_s and pb_s.value.strip():
+        channels.append(("Pushbullet (migrated)", "pushbullet", {"api_key": pb_s.value.strip()}))
+
+    wh_s = db.get(Setting, "alert_webhook_url")
+    if wh_s and wh_s.value.strip():
+        channels.append(("Webhook (migrated)", "webhook", {"url": wh_s.value.strip()}))
+
+    if not channels:
+        return
+
+    for name, svc, cfg in channels:
+        db.execute(text(
+            "INSERT INTO notification_channels (name, service, config) VALUES (:n, :s, :c)"
+        ), {"n": name, "s": svc, "c": json.dumps(cfg)})
+    db.commit()
+
+    events: dict = {}
+    def _flag(key):
+        s = db.get(Setting, key)
+        return s and s.value == "true"
+    if _flag("alert_on_new_device"):
+        events["device.new"] = True
+    if _flag("alert_on_offline"):
+        events["device.offline.watched"] = True
+    if _flag("alert_on_vuln"):
+        events.update({"vuln.critical": True, "vuln.high": True})
+    if _flag("alert_on_port_change"):
+        events["port.opened"] = True
+
+    result = db.execute(text("""
+        INSERT INTO notification_profiles (name, events)
+        VALUES ('Migrated Alerts', :ev) RETURNING id
+    """), {"ev": json.dumps(events)})
+    profile_id = result.scalar()
+    ch_ids = db.execute(text("SELECT id FROM notification_channels")).scalars().all()
+    for cid in ch_ids:
+        db.execute(text(
+            "INSERT INTO notification_profile_channels (profile_id, channel_id) VALUES (:p, :c)"
+        ), {"p": profile_id, "c": cid})
+    db.commit()
+    print(f"[notify] Migrated {len(channels)} legacy notification channel(s)", flush=True)
+
+
 @app.on_event("startup")
 async def on_startup():
+    global _main_loop
+    _main_loop = asyncio.get_event_loop()
     db = SessionLocal()
     try:
         _migrate(db)
         _seed_settings(db)
         _seed_default_user(db)
         _migrate_legacy_docker_host(db)
+        _migrate_legacy_notifications(db)
+        _ha_startup_connect(db)
     finally:
         db.close()
     asyncio.ensure_future(_scheduled_vuln_scan_loop())
-    asyncio.ensure_future(_alert_dispatch_loop())
+    asyncio.ensure_future(_notification_loop())
     asyncio.ensure_future(_block_schedule_loop())
     asyncio.ensure_future(_traffic_flush_loop())
     asyncio.ensure_future(_speedtest_schedule_loop())
@@ -1310,13 +2013,6 @@ class MetadataUpdate(BaseModel):
 
 class PrimaryIPUpdate(BaseModel):
     ip_address: str
-
-class NotifyPayload(BaseModel):
-    title: str
-    body: str
-
-class TestNotifyPayload(BaseModel):
-    api_key: Optional[str] = None
 
 class BlockScheduleCreate(BaseModel):
     mac_address:   Optional[str]      = None
@@ -1577,6 +2273,7 @@ def _to_dict(d: Device) -> dict:
         "group_members":           [],
         "group_size":              1,
         "is_group_representative": False,
+        "is_acknowledged":         bool(getattr(d, "is_acknowledged", False)),
     }
 
 
@@ -1670,7 +2367,20 @@ async def health_check(db: Session = Depends(get_db)):
         "database": {"ok": False, "message": ""},
         "probe":    {"ok": False, "message": ""},
         "setup_complete": False,
+        "active_scans": {"port": [], "vuln": []},
     }
+
+    def _resolve_device_name(mac: str) -> str:
+        try:
+            row = db.execute(
+                text("SELECT custom_name, hostname, ip_address FROM devices WHERE LOWER(mac_address) = :m"),
+                {"m": mac.lower()}
+            ).fetchone()
+            if row:
+                return row[0] or row[1] or row[2] or mac
+        except Exception:
+            pass
+        return mac
 
     # Check database
     try:
@@ -1686,12 +2396,18 @@ async def health_check(db: Session = Depends(get_db)):
             if resp.status_code == 200:
                 probe_data = resp.json()
                 result["probe"] = {"ok": True, "message": probe_data.get("message", "Running")}
+                for mac in probe_data.get("active_port_scans", []):
+                    result["active_scans"]["port"].append({"mac": mac, "name": _resolve_device_name(mac)})
             else:
                 result["probe"] = {"ok": False, "message": f"HTTP {resp.status_code}"}
     except httpx.ConnectError:
         result["probe"] = {"ok": False, "message": f"Cannot reach probe at {PROBE_URL}"}
     except Exception as e:
         result["probe"] = {"ok": False, "message": str(e)[:120]}
+
+    # Active vuln scans (tracked by backend)
+    for mac in list(_nuclei_subs.keys()):
+        result["active_scans"]["vuln"].append({"mac": mac, "name": _resolve_device_name(mac)})
 
     # Check setup complete
     try:
@@ -2145,6 +2861,22 @@ def update_metadata(mac: str, payload: MetadataUpdate, db: Session = Depends(get
         d.is_ignored = payload.is_ignored
     db.commit(); db.refresh(d)
     return _to_dict(d)
+
+
+@app.post("/devices/{mac}/acknowledge")
+def acknowledge_device(mac: str, db: Session = Depends(get_db)):
+    """Mark a new device as acknowledged, removing it from the 'new' surfacing list."""
+    d = db.get(Device, mac.lower())
+    if not d:
+        raise HTTPException(404, "Device not found")
+    d.is_acknowledged = True
+    db.commit()
+    if _ha_mqtt.connected:
+        sev_map = {"low": 1, "info": 1, "medium": 2, "high": 3, "critical": 3}
+        ports = len((d.scan_results or {}).get("open_ports", [])) if d.scan_results else 0
+        vulns = sev_map.get(d.vuln_severity or "", 0)
+        _ha_mqtt.pub_device_state(d.mac_address, bool(d.is_online), d.ip_address, ports, vulns, is_new=False)
+    return {"ok": True}
 
 
 @app.post("/devices/{mac}/resolve-name")
@@ -3329,52 +4061,253 @@ async def restart_backend(username: str = Depends(get_current_user)):
 
 
 # ---------------------------------------------------------------------------
-# Notifications
+# Notification channels & profiles CRUD
 # ---------------------------------------------------------------------------
-@app.post("/notify/pushbullet")
-async def send_pushbullet_notify(payload: NotifyPayload, db: Session = Depends(get_db)):
-    s   = db.get(Setting, "pushbullet_api_key")
-    key = (s.value or "").strip() if s else ""
-    if not key:
-        raise HTTPException(400, "Pushbullet API key not configured")
+
+class ChannelCreate(BaseModel):
+    name: str
+    service: str
+    config: dict
+    enabled: bool = True
+
+class ProfileCreate(BaseModel):
+    name: str
+    events: dict
+    channel_ids: List[int] = []
+
+
+def _channel_row(row) -> dict:
+    return {
+        "id": row.id, "name": row.name, "service": row.service,
+        "config": row.config if isinstance(row.config, dict) else {},
+        "enabled": row.enabled,
+        "created_at": row.created_at.isoformat() if row.created_at else None,
+    }
+
+
+@app.get("/notifications/events")
+def list_notification_events():
+    categories: dict = {}
+    for event_type, label, category, desc in NOTIFICATION_EVENT_DEFS:
+        categories.setdefault(category, []).append(
+            {"type": event_type, "label": label, "description": desc}
+        )
+    return [{"category": cat, "events": evts} for cat, evts in categories.items()]
+
+
+@app.get("/ha-mqtt/status")
+def ha_mqtt_status():
+    return {"connected": _ha_mqtt.connected}
+
+
+@app.post("/ha-mqtt/reconnect")
+def ha_mqtt_reconnect(db: Session = Depends(get_db)):
     try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            resp = await client.post(
-                "https://api.pushbullet.com/v2/pushes",
-                json={"type": "note", "title": payload.title, "body": payload.body},
-                headers={"Access-Token": key, "Content-Type": "application/json"},
-            )
-    except httpx.ConnectError:
-        raise HTTPException(502, "Cannot reach Pushbullet API")
-    if resp.status_code == 401:
-        raise HTTPException(401, "Invalid Pushbullet API key")
-    if resp.status_code >= 400:
-        raise HTTPException(502, f"Pushbullet error {resp.status_code}")
+        _ha_startup_connect(db)
+        return {"connected": _ha_mqtt.connected}
+    except Exception as exc:
+        raise HTTPException(500, f"HA MQTT reconnect failed: {exc}")
+
+
+@app.post("/ha-mqtt/disconnect")
+def ha_mqtt_disconnect():
+    _ha_mqtt.disconnect()
+    return {"connected": False}
+
+
+@app.get("/notifications/channels")
+def list_channels(db: Session = Depends(get_db)):
+    rows = db.execute(text("SELECT * FROM notification_channels ORDER BY created_at")).fetchall()
+    result = []
+    for r in rows:
+        result.append({
+            "id": r.id, "name": r.name, "service": r.service,
+            "config": r.config if isinstance(r.config, dict) else {},
+            "enabled": r.enabled,
+            "created_at": r.created_at.isoformat() if r.created_at else None,
+        })
+    return result
+
+
+@app.post("/notifications/channels", status_code=201)
+def create_channel(payload: ChannelCreate, db: Session = Depends(get_db)):
+    if payload.service == "home_assistant":
+        try:
+            _ha_build_url(payload.config)
+        except ValueError as e:
+            raise HTTPException(400, str(e))
+    elif payload.service not in ("toast", "browser"):
+        if not _build_apprise_url(payload.service, payload.config):
+            raise HTTPException(400, "Invalid channel configuration — could not build a notification URL")
+    result = db.execute(text("""
+        INSERT INTO notification_channels (name, service, config, enabled)
+        VALUES (:n, :s, :c, :e) RETURNING id, name, service, config, enabled, created_at
+    """), {"n": payload.name, "s": payload.service,
+           "c": json.dumps(payload.config), "e": payload.enabled})
+    db.commit()
+    row = db.execute(text("SELECT * FROM notification_channels WHERE id = :id"),
+                     {"id": result.fetchone()[0]}).fetchone()
+    return {
+        "id": row.id, "name": row.name, "service": row.service,
+        "config": row.config if isinstance(row.config, dict) else {},
+        "enabled": row.enabled,
+        "created_at": row.created_at.isoformat() if row.created_at else None,
+    }
+
+
+@app.put("/notifications/channels/{channel_id}")
+def update_channel(channel_id: int, payload: ChannelCreate, db: Session = Depends(get_db)):
+    row = db.execute(text("SELECT id FROM notification_channels WHERE id = :id"),
+                     {"id": channel_id}).fetchone()
+    if not row:
+        raise HTTPException(404, "Channel not found")
+    if payload.service == "home_assistant":
+        try:
+            _ha_build_url(payload.config)
+        except ValueError as e:
+            raise HTTPException(400, str(e))
+    elif payload.service not in ("toast", "browser"):
+        if not _build_apprise_url(payload.service, payload.config):
+            raise HTTPException(400, "Invalid channel configuration")
+    db.execute(text("""
+        UPDATE notification_channels SET name=:n, service=:s, config=:c, enabled=:e
+        WHERE id=:id
+    """), {"n": payload.name, "s": payload.service,
+           "c": json.dumps(payload.config), "e": payload.enabled, "id": channel_id})
+    db.commit()
+    row = db.execute(text("SELECT * FROM notification_channels WHERE id = :id"),
+                     {"id": channel_id}).fetchone()
+    return {
+        "id": row.id, "name": row.name, "service": row.service,
+        "config": row.config if isinstance(row.config, dict) else {},
+        "enabled": row.enabled,
+        "created_at": row.created_at.isoformat() if row.created_at else None,
+    }
+
+
+@app.delete("/notifications/channels/{channel_id}")
+def delete_channel(channel_id: int, db: Session = Depends(get_db)):
+    db.execute(text("DELETE FROM notification_channels WHERE id = :id"), {"id": channel_id})
+    db.commit()
+    return {"deleted": True}
+
+
+@app.post("/notifications/channels/{channel_id}/test")
+async def test_channel(channel_id: int, db: Session = Depends(get_db)):
+    row = db.execute(text("SELECT service, config FROM notification_channels WHERE id = :id"),
+                     {"id": channel_id}).fetchone()
+    if not row:
+        raise HTTPException(404, "Channel not found")
+    svc, cfg = row
+    if svc in ("toast", "browser"):
+        return {"sent": True}
+    config = cfg if isinstance(cfg, dict) else (json.loads(cfg) if isinstance(cfg, str) else {})
+    if svc == "home_assistant":
+        try:
+            await _notify_home_assistant(config, "InSpectre Test", "This is a test notification from InSpectre.")
+            return {"sent": True}
+        except Exception as exc:
+            print(f"[notify-test] home_assistant error: {type(exc).__name__}: {exc}", flush=True)
+            raise HTTPException(502, f"Home Assistant notification failed: {exc}")
+    url = _build_apprise_url(svc, config)
+    if not url:
+        present = list(config.keys())
+        raise HTTPException(400, f"Cannot build notification URL for '{svc}' — config keys: {present}. Re-save the channel.")
+    try:
+        import apprise as _apprise
+        import logging as _logging
+        _al = _logging.getLogger("apprise")
+        _al.setLevel(_logging.DEBUG)
+        _buf: list = []
+        _h = _logging.StreamHandler(type("_S", (), {"write": lambda s, m: _buf.append(m), "flush": lambda s: None})())
+        _h.setLevel(_logging.WARNING)
+        _al.addHandler(_h)
+        a = _apprise.Apprise()
+        added = a.add(url)
+        if not added:
+            raise HTTPException(400, f"Apprise did not recognise the '{svc}' URL — check credentials or missing dependency")
+        ok = await asyncio.to_thread(a.notify,
+                                     title="InSpectre Test",
+                                     body="This is a test notification from InSpectre.")
+        _al.removeHandler(_h)
+        if not ok:
+            detail = " | ".join(_buf[-3:]) if _buf else "check credentials and connectivity"
+            raise HTTPException(502, f"Apprise could not send to {svc}: {detail}")
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(502, f"Notification error ({svc}): {exc}")
     return {"sent": True}
 
 
-@app.post("/notify/test")
-async def test_pushbullet_notify(payload: TestNotifyPayload, db: Session = Depends(get_db)):
-    key = (payload.api_key or "").strip()
-    if not key:
-        s   = db.get(Setting, "pushbullet_api_key")
-        key = (s.value or "").strip() if s else ""
-    if not key:
-        raise HTTPException(400, "No Pushbullet API key configured")
-    try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            resp = await client.post(
-                "https://api.pushbullet.com/v2/pushes",
-                json={"type": "note", "title": "InSpectre Test", "body": "Push notifications are working!"},
-                headers={"Access-Token": key, "Content-Type": "application/json"},
-            )
-    except httpx.ConnectError:
-        raise HTTPException(502, "Cannot reach Pushbullet API")
-    if resp.status_code == 401:
-        raise HTTPException(401, "Invalid API key — check your Pushbullet access token")
-    if resp.status_code >= 400:
-        raise HTTPException(502, f"Pushbullet error {resp.status_code}: {resp.text[:200]}")
-    return {"sent": True}
+@app.get("/notifications/profiles")
+def list_profiles(db: Session = Depends(get_db)):
+    profiles = db.execute(text("SELECT * FROM notification_profiles ORDER BY created_at")).fetchall()
+    result = []
+    for p in profiles:
+        ch_ids = db.execute(text(
+            "SELECT channel_id FROM notification_profile_channels WHERE profile_id = :pid"
+        ), {"pid": p.id}).scalars().all()
+        result.append({
+            "id": p.id, "name": p.name,
+            "events": p.events if isinstance(p.events, dict) else {},
+            "channel_ids": list(ch_ids),
+            "created_at": p.created_at.isoformat() if p.created_at else None,
+        })
+    return result
+
+
+@app.post("/notifications/profiles", status_code=201)
+def create_profile(payload: ProfileCreate, db: Session = Depends(get_db)):
+    result = db.execute(text("""
+        INSERT INTO notification_profiles (name, events)
+        VALUES (:n, :e) RETURNING id
+    """), {"n": payload.name, "e": json.dumps(payload.events)})
+    profile_id = result.scalar()
+    for cid in payload.channel_ids:
+        db.execute(text("""
+            INSERT INTO notification_profile_channels (profile_id, channel_id)
+            VALUES (:p, :c) ON CONFLICT DO NOTHING
+        """), {"p": profile_id, "c": cid})
+    db.commit()
+    return {"id": profile_id, "name": payload.name, "events": payload.events,
+            "channel_ids": payload.channel_ids}
+
+
+@app.put("/notifications/profiles/{profile_id}")
+def update_profile(profile_id: int, payload: ProfileCreate, db: Session = Depends(get_db)):
+    row = db.execute(text("SELECT id FROM notification_profiles WHERE id = :id"),
+                     {"id": profile_id}).fetchone()
+    if not row:
+        raise HTTPException(404, "Profile not found")
+    db.execute(text("""
+        UPDATE notification_profiles SET name=:n, events=:e WHERE id=:id
+    """), {"n": payload.name, "e": json.dumps(payload.events), "id": profile_id})
+    db.execute(text("DELETE FROM notification_profile_channels WHERE profile_id=:pid"),
+               {"pid": profile_id})
+    for cid in payload.channel_ids:
+        db.execute(text("""
+            INSERT INTO notification_profile_channels (profile_id, channel_id)
+            VALUES (:p, :c) ON CONFLICT DO NOTHING
+        """), {"p": profile_id, "c": cid})
+    db.commit()
+    return {"id": profile_id, "name": payload.name, "events": payload.events,
+            "channel_ids": payload.channel_ids}
+
+
+@app.delete("/notifications/profiles/{profile_id}")
+def delete_profile(profile_id: int, db: Session = Depends(get_db)):
+    db.execute(text("DELETE FROM notification_profiles WHERE id = :id"), {"id": profile_id})
+    db.commit()
+    return {"deleted": True}
+
+
+@app.get("/notifications/pending")
+def get_pending_notifications():
+    """Return and clear the queue of pending browser notifications."""
+    items = list(_pending_browser_notifications)
+    _pending_browser_notifications.clear()
+    return {"notifications": items}
 
 
 # ---------------------------------------------------------------------------
@@ -6339,6 +7272,22 @@ def _run_trivy_for_container(name: str, image: str):
         else:
             vulns = []
         _save_trivy_result(name, image, vulns, scanned_at)
+        if vulns and _main_loop and not _main_loop.is_closed():
+            severities = {v.get("severity", "").upper() for v in vulns}
+            if "CRITICAL" in severities:
+                crit = sum(1 for v in vulns if v.get("severity", "").upper() == "CRITICAL")
+                asyncio.run_coroutine_threadsafe(
+                    _notification_dispatch("container.vuln_critical", "Container Critical Vulnerability",
+                                           f"{name}: {crit} critical vulnerability/ies found"),
+                    _main_loop,
+                )
+            elif "HIGH" in severities:
+                high = sum(1 for v in vulns if v.get("severity", "").upper() == "HIGH")
+                asyncio.run_coroutine_threadsafe(
+                    _notification_dispatch("container.vuln_high", "Container High Vulnerability",
+                                           f"{name}: {high} high-severity vulnerability/ies found"),
+                    _main_loop,
+                )
     except Exception as exc:
         print(f"[trivy] {name}: {exc}", flush=True)
     finally:
@@ -6414,6 +7363,16 @@ async def _docker_event_loop():
                             status = "paused" if action == "pause" else "stopped"
                             threading.Thread(target=_record_container_event,
                                              args=(cname, status), daemon=True).start()
+                            if action == "die":
+                                exit_code = attrs.get("exitCode", "0")
+                                if exit_code != "0" and _main_loop and not _main_loop.is_closed():
+                                    asyncio.run_coroutine_threadsafe(
+                                        _notification_dispatch(
+                                            "container.crashed", "Container Crashed",
+                                            f"Container {cname!r} exited with code {exit_code}",
+                                        ),
+                                        _main_loop,
+                                    )
 
                         # Auto-scan logic
                         if action == "create" and do_new:

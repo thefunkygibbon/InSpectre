@@ -65,6 +65,9 @@ class Device(Base):
     group_id      = Column(String, nullable=True)
     group_primary = Column(Boolean, server_default='false', nullable=False)
 
+    # Phase 10 — device acknowledgement
+    is_acknowledged = Column(Boolean, server_default='false', nullable=False)
+
     ip_history   = relationship("IPHistory",    back_populates="device",
                                 order_by="IPHistory.first_seen.desc()")
     events       = relationship("DeviceEvent",  back_populates="device",

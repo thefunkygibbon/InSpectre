@@ -1,7 +1,7 @@
 import {
   Wifi, Laptop, Smartphone, Server, Printer, Tv,
   HelpCircle, Camera, Gamepad2, Cpu, Router,
-  MonitorSpeaker, Tablet, Radio, Network, Shield, Monitor, GitMerge
+  MonitorSpeaker, Tablet, Radio, Network, Shield, Monitor, GitMerge, X
 } from 'lucide-react'
 import { OnlineDot } from './OnlineDot'
 import { StarButton } from './StarButton'
@@ -95,15 +95,16 @@ function isNewDevice(device) {
   return Date.now() - new Date(device.first_seen).getTime() < NEW_DEVICE_DAYS * 24 * 60 * 60 * 1000
 }
 
-export function DeviceCard({ device, onClick, onStarToggle, isVulnScanning }) {
+export function DeviceCard({ device, onClick, onStarToggle, isVulnScanning, isAcknowledged, onAcknowledge }) {
   const name     = deviceDisplayName(device)
   const vendor   = cleanVendor(device.vendor_override || device.vendor || device.vendor_inferred)
   const DevIcon  = getDeviceIcon(device)
   const category = getDeviceCategory(device)
   const ports    = openPortCount(device)
-  const scanning = !device.deep_scanned
-  const drift    = baselineDrift(device)
-  const isNew    = isNewDevice(device)
+  const scanning     = !device.deep_scanned
+  const drift        = baselineDrift(device)
+  const isNew        = isNewDevice(device)
+  const showNew      = isNew && !isAcknowledged
 
 // Show vendor only when it adds info the title doesn't already give
   const showVendorSubtitle = vendor && vendor !== name && !device.ip_address?.startsWith(name)
@@ -111,7 +112,7 @@ export function DeviceCard({ device, onClick, onStarToggle, isVulnScanning }) {
   return (
     <button
       onClick={onClick}
-      className={`device-card${scanning ? ' device-card-scanning' : ''}${device.is_important ? ' ring-1 ring-amber-400/30' : ''} p-5 text-left w-full flex flex-col gap-3 group relative`}
+      className={`device-card${scanning ? ' device-card-scanning' : ''}${isVulnScanning && !scanning ? ' device-card-vuln-scanning' : ''}${device.is_important ? ' ring-1 ring-amber-400/30' : ''} p-5 text-left w-full flex flex-col gap-3 group relative`}
     >
       {/* Star button — top right corner */}
       {onStarToggle && (
@@ -138,10 +139,20 @@ export function DeviceCard({ device, onClick, onStarToggle, isVulnScanning }) {
           </div>
         </div>
         <div className="flex flex-col gap-1 items-end shrink-0">
-          {isNew && (
-            <span className="text-[10px] font-bold rounded-full px-2 py-0.5"
+          {showNew && (
+            <span className="flex items-center gap-0.5 text-[10px] font-bold rounded-full px-2 py-0.5"
               style={{ color: '#10b981', background: 'rgba(16,185,129,0.12)', border: '1px solid rgba(16,185,129,0.35)' }}>
               NEW
+              {onAcknowledge && (
+                <button
+                  onClick={e => { e.stopPropagation(); onAcknowledge(device.mac_address) }}
+                  className="opacity-60 hover:opacity-100 transition-opacity ml-0.5"
+                  title="Acknowledge — stop surfacing to top"
+                  aria-label="Acknowledge new device"
+                >
+                  <X size={8} />
+                </button>
+              )}
             </span>
           )}
           {scanning && (

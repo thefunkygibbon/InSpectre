@@ -2532,13 +2532,14 @@ def _stream_subprocess(cmd: list[str]):
 
 @probe_api.get("/health")
 def probe_health():
-    scanning_count = 0
     with _scan_lock:
-        scanning_count = len(_scanning)
+        active_port_scans = list(_scanning)
+        scanning_count = len(active_port_scans)
     return {
         "ok": True,
         "status": "ok",
-        "message": f"Probe running — scanning {IP_RANGE}, {scanning_count} active scan(s)",
+        "message": f"Probe running — scanning {IP_RANGE}, {scanning_count} active port scan(s)",
+        "active_port_scans": active_port_scans,
         "version": VERSION,
         "dns_server": _DNS_SERVER,
         "config": {

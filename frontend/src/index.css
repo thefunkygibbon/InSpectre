@@ -46,49 +46,133 @@
   --toast-offline-border:  #5a2a2a;
 }
 
-/* ── Phantom skin tokens ── */
-[data-skin="phantom"] {
-  --color-bg:            #000000;
-  --color-surface:       #080808;
-  --color-surface-hover: #0f0f0f;
-  --color-surface-active:#161616;
-  --color-surface-offset:#0b0b0b;
-  --color-border:        rgba(0,255,65,0.12);
-  --color-text:          #d0ffd8;
-  --color-text-muted:    #4dba6a;
-  --color-text-faint:    #1f5c30;
-  --color-brand:         #00ff41;
-  --color-brand-light:   #39ff6e;
-  --noise-opacity: 0;
-  --toast-new-bg:        #001a08;
-  --toast-new-border:    rgba(0,255,65,0.3);
-  --toast-offline-bg:    #1a0000;
-  --toast-offline-border: rgba(239,68,68,0.3);
-}
-
-/* ── Phantom light mode ── */
-[data-skin="phantom"][data-theme="light"] {
-  --color-bg:            #f0f7f1;
-  --color-surface:       #ffffff;
-  --color-surface-hover: #e4f2e6;
-  --color-surface-active:#d2ecd5;
-  --color-surface-offset:#f5fbf5;
-  --color-border:        rgba(0,110,35,0.14);
-  --color-text:          #081a0c;
-  --color-text-muted:    #1a6b30;
-  --color-text-faint:    #5aaa70;
-  --color-brand:         #007a20;
-  --color-brand-light:   #009928;
-  --toast-new-bg:        #edf7ee;
-  --toast-new-border:    rgba(0,110,35,0.3);
-  --toast-offline-bg:    #fde8e8;
-  --toast-offline-border: rgba(220,38,38,0.3);
-  color-scheme: light;
-}
-
 /* Default to dark */
 :root { color-scheme: dark; }
 [data-theme="light"] { color-scheme: light; }
+
+/* ── Phantom skin — green terminal ────────────────────────────────────────── */
+[data-skin="phantom"][data-theme="dark"],
+[data-skin="phantom"]:not([data-theme="light"]) {
+  --color-bg:            #000000;
+  --color-surface:       #050a05;
+  --color-surface-hover: #0a160a;
+  --color-surface-active:#0f200f;
+  --color-surface-offset:#070e07;
+  --color-border:        rgba(0,255,65,0.13);
+  --color-text:          #b8ffca;
+  --color-text-muted:    #58a06a;
+  --color-text-faint:    #2e5e38;
+  --color-brand:         #00ff41;
+  --color-brand-light:   #33ff66;
+  --noise-opacity: 0.008;
+  color-scheme: dark;
+
+  --toast-new-bg:         #021408;
+  --toast-new-border:     #0a4020;
+  --toast-offline-bg:     #150202;
+  --toast-offline-border: #400a0a;
+}
+
+[data-skin="phantom"][data-theme="light"] {
+  --color-bg:            #f0f7f1;
+  --color-surface:       #ffffff;
+  --color-surface-hover: #e6f4e8;
+  --color-surface-active:#d8eedd;
+  --color-surface-offset:#eef6f0;
+  --color-border:        rgba(0,110,35,0.18);
+  --color-text:          #071a0b;
+  --color-text-muted:    #2a6635;
+  --color-text-faint:    #6a9a74;
+  --color-brand:         #007a20;
+  --color-brand-light:   #009928;
+  --noise-opacity: 0.018;
+  color-scheme: light;
+
+  --toast-new-bg:         #ddf5e2;
+  --toast-new-border:     #78c888;
+  --toast-offline-bg:     #fde8e8;
+  --toast-offline-border: #f5a0a0;
+}
+
+/* Phantom skin — sharp corners, monospace body */
+[data-skin="phantom"] body {
+  font-family: 'JetBrains Mono', monospace;
+}
+[data-skin="phantom"] .card,
+[data-skin="phantom"] .device-card,
+[data-skin="phantom"] .input,
+[data-skin="phantom"] .btn-primary,
+[data-skin="phantom"] .btn-ghost,
+[data-skin="phantom"] .btn-secondary {
+  border-radius: 0 !important;
+}
+
+/* Phosphor glow on text */
+[data-skin="phantom"][data-theme="dark"] body,
+[data-skin="phantom"]:not([data-theme="light"]) body {
+  text-shadow: 0 0 8px rgba(0,255,65,0.18);
+}
+
+/* Scanlines — replaces the default noise overlay */
+[data-skin="phantom"] .noise-overlay {
+  background-image: repeating-linear-gradient(
+    0deg,
+    rgba(0,0,0,0.22) 0px,
+    rgba(0,0,0,0.22) 1px,
+    transparent 1px,
+    transparent 4px
+  );
+  opacity: 1 !important;
+}
+
+/* Card glow */
+[data-skin="phantom"][data-theme="dark"] .card,
+[data-skin="phantom"]:not([data-theme="light"]) .card {
+  box-shadow: 0 0 0 1px rgba(0,255,65,0.06), 0 2px 12px rgba(0,255,65,0.04);
+}
+
+/* Device card — stronger phosphor glow on hover */
+[data-skin="phantom"] .device-card::before {
+  background: linear-gradient(135deg, color-mix(in srgb, var(--color-brand) 10%, transparent), transparent 60%);
+}
+[data-skin="phantom"] .device-card:hover {
+  border-color: rgba(0,255,65,0.6);
+  box-shadow:
+    0 0 0 1px rgba(0,255,65,0.15),
+    0 0 18px rgba(0,255,65,0.18),
+    0 0 36px rgba(0,255,65,0.08);
+}
+
+/* Input focus — terminal cursor glow */
+[data-skin="phantom"] .input:focus {
+  border-color: #00ff41 !important;
+  box-shadow: 0 0 0 2px rgba(0,255,65,0.25), 0 0 10px rgba(0,255,65,0.15) !important;
+}
+
+/* Scrollbar — flat green tick marks */
+[data-skin="phantom"] ::-webkit-scrollbar-thumb {
+  background: rgba(0,255,65,0.35);
+  border-radius: 0;
+}
+[data-skin="phantom"] ::-webkit-scrollbar-track {
+  background: rgba(0,255,65,0.04);
+}
+
+/* Subtle CRT phosphor flicker */
+@keyframes phantom-flicker {
+  0%, 94%, 100% { opacity: 1; }
+  95%            { opacity: 0.96; }
+  96%            { opacity: 1; }
+  97%            { opacity: 0.98; }
+}
+[data-skin="phantom"]:not([data-theme="light"]) body {
+  animation: phantom-flicker 12s ease-in-out infinite;
+}
+
+/* Header glow — green tint in phantom mode */
+[data-skin="phantom"]:not([data-theme="light"]) .header-glow {
+  background: radial-gradient(ellipse at 50% 0%, rgba(0,255,65,0.12) 0%, transparent 70%);
+}
 
 @layer base {
   html { @apply antialiased; }
@@ -184,6 +268,22 @@
     animation: scanning-shimmer 3s ease-in-out infinite;
   }
 
+  /* ── Vuln-scanning shimmer (devices under active vuln scan) ── */
+  @keyframes vuln-scan-shimmer {
+    0%   { background-position: -200% 0; }
+    100% { background-position:  200% 0; }
+  }
+  .device-card-vuln-scanning {
+    background: linear-gradient(
+      90deg,
+      var(--color-surface) 25%,
+      color-mix(in srgb, var(--color-brand) 9%, var(--color-surface)) 50%,
+      var(--color-surface) 75%
+    );
+    background-size: 200% 100%;
+    animation: vuln-scan-shimmer 2s ease-in-out infinite;
+  }
+
   /* ── Skeleton shimmer ── */
   @keyframes skeleton-shimmer {
     0%   { background-position: -200% 0; }
@@ -263,7 +363,7 @@
     50%       { opacity: 0; }
   }
   .terminal-cursor::after {
-    content: '\258c';
+    content: '\u258c';
     display: inline-block;
     margin-left: 2px;
     animation: blink-cursor 1s step-end infinite;
@@ -336,84 +436,6 @@
     to   { opacity: 1; }
   }
   .animate-fade-in { animation: fade-in 0.15s ease both; }
-
-  /* ── Phantom skin overrides ── */
-  [data-skin="phantom"] .card,
-  [data-skin="phantom"] .device-card,
-  [data-skin="phantom"] .glass {
-    border-radius: 0 !important;
-    border-color: rgba(0,255,65,0.15) !important;
-  }
-  [data-skin="phantom"] .device-card:hover {
-    border-color: #00ff41 !important;
-    box-shadow: 0 0 14px rgba(0,255,65,0.25), inset 0 0 40px rgba(0,255,65,0.02) !important;
-  }
-  [data-skin="phantom"] .device-card::before {
-    background: linear-gradient(135deg, rgba(0,255,65,0.06), transparent 60%) !important;
-  }
-  [data-skin="phantom"] .btn-primary {
-    border-radius: 0 !important;
-    border: 1px solid var(--color-brand);
-    font-family: 'JetBrains Mono', monospace;
-    letter-spacing: 0.06em;
-    font-size: 0.75rem;
-    text-transform: uppercase;
-  }
-  [data-skin="phantom"] .btn-ghost {
-    border-radius: 0 !important;
-  }
-  [data-skin="phantom"] .input {
-    border-radius: 0 !important;
-    font-family: 'JetBrains Mono', monospace;
-    font-size: 0.75rem;
-    border-color: rgba(0,255,65,0.2);
-  }
-  [data-skin="phantom"] .input:focus {
-    border-color: #00ff41;
-    box-shadow: 0 0 0 2px rgba(0,255,65,0.15);
-  }
-  [data-skin="phantom"] .drawer-tab {
-    border-radius: 0 !important;
-    font-family: 'JetBrains Mono', monospace;
-    font-size: 0.7rem;
-    letter-spacing: 0.06em;
-    text-transform: uppercase;
-  }
-  [data-skin="phantom"] .badge-online,
-  [data-skin="phantom"] .badge-offline,
-  [data-skin="phantom"] .badge-scanning {
-    border-radius: 0 !important;
-  }
-  [data-skin="phantom"] .header-glow { display: none; }
-  [data-skin="phantom"] .noise-overlay {
-    background-image: repeating-linear-gradient(
-      0deg,
-      transparent,
-      transparent 3px,
-      rgba(0, 255, 65, 0.025) 3px,
-      rgba(0, 255, 65, 0.025) 4px
-    ) !important;
-    opacity: 1 !important;
-  }
-  [data-skin="phantom"] ::-webkit-scrollbar-thumb {
-    background: rgba(0,255,65,0.2);
-  }
-  [data-skin="phantom"][data-theme="light"] ::-webkit-scrollbar-thumb {
-    background: rgba(0,110,35,0.2);
-  }
-  [data-skin="phantom"][data-theme="light"] .noise-overlay {
-    background-image: repeating-linear-gradient(
-      0deg,
-      transparent,
-      transparent 3px,
-      rgba(0, 110, 35, 0.04) 3px,
-      rgba(0, 110, 35, 0.04) 4px
-    ) !important;
-  }
-  [data-skin="phantom"][data-theme="light"] .device-card:hover {
-    border-color: #007a20 !important;
-    box-shadow: 0 0 14px rgba(0,110,35,0.2), inset 0 0 40px rgba(0,110,35,0.03) !important;
-  }
 
   /* ── Live ping indicator ── */
   @keyframes live-ping {

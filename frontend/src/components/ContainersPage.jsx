@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback, useMemo } from 'react'
-import { Box, RefreshCw, Search, AlertCircle, Play, Square, Loader2, LayoutGrid, List, ArrowUpDown, ShieldAlert, Network, GitBranch, X } from 'lucide-react'
+import { Box, RefreshCw, Search, AlertCircle, Play, Square, Loader2, LayoutGrid, List, ArrowUpDown, ShieldAlert, Network, GitBranch, X, Sparkles } from 'lucide-react'
 import { api } from '../api'
 import { ContainerCard } from './ContainerCard'
 import { ContainerDrawer } from './ContainerDrawer'
@@ -24,6 +24,20 @@ const SORT_OPTIONS = [
 ]
 
 const STATUS_SORT_ORDER = ['running', 'restarting', 'paused', 'created', 'exited', 'dead']
+
+const NEW_CONTAINER_DAYS = 7
+function isNewContainer(c) {
+  if (!c.created) return false
+  return Date.now() - new Date(c.created).getTime() < NEW_CONTAINER_DAYS * 24 * 60 * 60 * 1000
+}
+
+function loadAcknowledgedContainers() {
+  try { return new Set(JSON.parse(localStorage.getItem('inspectre_ack_containers') || '[]')) }
+  catch { return new Set() }
+}
+function saveAcknowledgedContainers(s) {
+  localStorage.setItem('inspectre_ack_containers', JSON.stringify([...s]))
+}
 
 const STATUS_COLOR = {
   running:    '#22c55e',
@@ -94,10 +108,11 @@ function EmptyState({ search, filter }) {
   )
 }
 
-function ContainerRow({ container, onClick }) {
-  const color = STATUS_COLOR[container.status] || '#6b7280'
-  const label = STATUS_LABEL[container.status] || container.status
-  const portStr = (container.ports || [])
+function ContainerRow({ container, onClick, isAcknowledged, onAcknowledge }) {
+  const color    = STATUS_COLOR[container.status] || '#6b7280'
+  const label    = STATUS_LABEL[container.status] || container.status
+  const showNew  = isNewContainer(container) && !isAcknowledged
+  const portStr  = (container.ports || [])
     .filter(p => p.host_port)
     .map(p => `${p.host_port}→${p.container_port}`)
     .slice(0, 3).join(', ')
@@ -119,6 +134,24 @@ function ContainerRow({ container, onClick }) {
       <span className="text-xs font-medium w-20 shrink-0" style={{ color }}>
         {label}
       </span>
+
+      {/* NEW badge */}
+      {showNew && (
+        <span className="hidden sm:inline-flex items-center gap-0.5 text-[10px] font-bold rounded-full px-2 py-0.5 shrink-0"
+          style={{ color: '#10b981', background: 'rgba(16,185,129,0.12)', border: '1px solid rgba(16,185,129,0.35)' }}>
+          NEW
+          {onAcknowledge && (
+            <button
+              onClick={e => { e.stopPropagation(); onAcknowledge(container.id) }}
+              className="opacity-60 hover:opacity-100 transition-opacity ml-0.5"
+              title="Acknowledge — stop surfacing to top"
+              aria-label="Acknowledge new container"
+            >
+              <X size={8} />
+            </button>
+          )}
+        </span>
+      )}
 
       {/* Image */}
       <span className="text-xs font-mono truncate flex-1 min-w-0" style={{ color: 'var(--color-text-muted)' }}>
@@ -148,7 +181,7 @@ function ContainerRow({ container, onClick }) {
   )
 }
 
-export function ContainersPage({ openContainer }) {
+export function ContainersPage({ openContainer, skin }) {
   const [containers,    setContainers]    = useState([])
   const [stats,         setStats]         = useState(null)
   const [vulnSummary,   setVulnSummary]   = useState([])
@@ -163,6 +196,8 @@ export function ContainersPage({ openContainer }) {
   const [sort,          setSort]          = useState('name-asc')
   const [layout,        setLayout]        = useState('grid')
   const [refreshing,    setRefreshing]    = useState(false)
+  const [surfaceNewFirst,    setSurfaceNewFirst]    = useState(() => localStorage.getItem('inspectre_containers_surface_new') !== 'false')
+  const [acknowledgedContainers, setAcknowledgedContainers] = useState(loadAcknowledgedContainers)
 
   // Vuln scan state keyed by container ID — persists across drawer open/close
   const [trivyScansByContainer, setTrivyScansByContainer] = useState({})
@@ -171,6 +206,23 @@ export function ContainersPage({ openContainer }) {
       const cur = prev[containerId] || { logs: [], vulns: null, scanning: false, scannedAt: null }
       const patch = typeof patchOrFn === 'function' ? patchOrFn(cur) : patchOrFn
       return { ...prev, [containerId]: { ...cur, ...patch } }
+    })
+  }
+
+  function acknowledgeContainer(id) {
+    setAcknowledgedContainers(prev => {
+      const next = new Set(prev)
+      next.add(id)
+      saveAcknowledgedContainers(next)
+      return next
+    })
+  }
+
+  function toggleSurfaceNewFirst() {
+    setSurfaceNewFirst(prev => {
+      const next = !prev
+      localStorage.setItem('inspectre_containers_surface_new', String(next))
+      return next
     })
   }
 
@@ -272,7 +324,7 @@ export function ContainersPage({ openContainer }) {
     return true
   })
 
-  const sorted = [...filtered].sort((a, b) => {
+  const sortedBase = [...filtered].sort((a, b) => {
     switch (sort) {
       case 'name-desc': return b.name.localeCompare(a.name)
       case 'status': {
@@ -295,6 +347,13 @@ export function ContainersPage({ openContainer }) {
         return a.name.localeCompare(b.name)
     }
   })
+
+  const sorted = surfaceNewFirst
+    ? [
+        ...sortedBase.filter(c => isNewContainer(c) && !acknowledgedContainers.has(c.id)),
+        ...sortedBase.filter(c => !isNewContainer(c) || acknowledgedContainers.has(c.id)),
+      ]
+    : sortedBase
 
   return (
     <div className="space-y-8">
@@ -422,6 +481,18 @@ export function ContainersPage({ openContainer }) {
           )}
 
           <div className="ml-auto flex items-center gap-1">
+            {/* Surface new first toggle */}
+            <button
+              onClick={toggleSurfaceNewFirst}
+              title={surfaceNewFirst ? 'New containers surfaced to top (click to disable)' : 'New containers not surfaced (click to enable)'}
+              className="flex items-center gap-1 px-2.5 py-1.5 rounded-xl text-xs font-medium border transition-colors"
+              style={surfaceNewFirst
+                ? { background: 'rgba(16,185,129,0.12)', color: '#10b981', borderColor: 'rgba(16,185,129,0.35)' }
+                : { background: 'var(--color-surface-offset)', color: 'var(--color-text-faint)', borderColor: 'var(--color-border)' }}
+            >
+              <Sparkles size={11} />
+              <span>New first</span>
+            </button>
             {/* Sort */}
             <div className="flex items-center gap-1 mr-1">
               <ArrowUpDown size={13} style={{ color: 'var(--color-text-faint)' }} />
@@ -466,9 +537,12 @@ export function ContainersPage({ openContainer }) {
           </p>
 
           {layout === 'grid' ? (
-            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-4">
+            <div className={`grid gap-4 grid-cols-1 sm:grid-cols-2 ${skin === 'phantom' ? 'xl:grid-cols-3' : 'lg:grid-cols-3 xl:grid-cols-4'}`}>
               {sorted.map(c => (
-                <ContainerCard key={c.id} container={c} onClick={() => setSelected(c)} />
+                <ContainerCard key={c.id} container={c} onClick={() => setSelected(c)}
+                  isAcknowledged={acknowledgedContainers.has(c.id)}
+                  isTrivyScanning={trivyScansByContainer[c.id]?.scanning || false}
+                  onAcknowledge={acknowledgeContainer} />
               ))}
             </div>
           ) : (
@@ -486,7 +560,9 @@ export function ContainersPage({ openContainer }) {
                 <span className="w-24 text-right hidden sm:block">Uptime</span>
               </div>
               {sorted.map(c => (
-                <ContainerRow key={c.id} container={c} onClick={() => setSelected(c)} />
+                <ContainerRow key={c.id} container={c} onClick={() => setSelected(c)}
+                  isAcknowledged={acknowledgedContainers.has(c.id)}
+                  onAcknowledge={acknowledgeContainer} />
               ))}
             </div>
           )}

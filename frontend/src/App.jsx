@@ -4,7 +4,7 @@ import {
   Search, AlertCircle, Activity,
   LayoutGrid, List, Sun, Moon, ChevronDown,
   Bell, X, Layers, Star, ShieldAlert, Wrench, Ban, BarChart2,
-  ArrowLeft, SlidersHorizontal, LogOut, Eye, EyeOff, Box, Download,
+  ArrowLeft, SlidersHorizontal, LogOut, Eye, EyeOff, Box, Download, Sparkles,
 } from 'lucide-react'
 import { TrafficPage } from './components/TrafficPage'
 import { ContainersPage } from './components/ContainersPage'
@@ -184,6 +184,44 @@ function NotificationToasts({ newAlerts, offlineAlerts, onDismissNew, onDismissO
   )
 }
 
+// ── Generic backend notification toasts ─────────────────────────────────────────────────
+function GenericToast({ notif, onDismiss }) {
+  useEffect(() => {
+    const t = setTimeout(() => onDismiss(notif.id), 8000)
+    return () => clearTimeout(t)
+  }, [notif.id, onDismiss])
+  return (
+    <div className="flex items-start gap-3 px-4 py-3 rounded-xl shadow-lg text-sm animate-fade-in"
+         style={{
+           pointerEvents: 'auto',
+           background: 'var(--color-surface)',
+           border: '1px solid var(--color-brand)',
+         }}>
+      <Bell size={14} style={{ color: 'var(--color-brand)', flexShrink: 0, marginTop: 2 }} />
+      <div className="flex-1 min-w-0">
+        <p className="font-semibold truncate" style={{ color: 'var(--color-brand)' }}>{notif.title}</p>
+        <p className="text-xs mt-0.5" style={{ color: 'var(--color-text)' }}>{notif.body}</p>
+      </div>
+      <button onClick={() => onDismiss(notif.id)}
+              className="opacity-50 hover:opacity-100 transition-opacity shrink-0" style={{ marginTop: 2 }}>
+        <X size={13} />
+      </button>
+    </div>
+  )
+}
+
+function GenericNotificationToasts({ toasts, onDismiss, topOffset = '5rem' }) {
+  if (!toasts.length) return null
+  return (
+    <div className="fixed z-50 flex flex-col gap-2"
+         style={{ top: topOffset, right: '1rem', width: '320px', pointerEvents: 'none' }}>
+      {toasts.map(n => (
+        <GenericToast key={n.id} notif={n} onDismiss={onDismiss} />
+      ))}
+    </div>
+  )
+}
+
 // ── Mobile nav dropdown ──────────────────────────────────────────────────────────────────
 function MobileNavMenu({ pages, onSelect }) {
   const [open, setOpen] = useState(false)
@@ -230,7 +268,7 @@ function MobileNavMenu({ pages, onSelect }) {
 function MainApp({ onLogout }) {
   const [notificationsEnabled,  setNotificationsEnabled]  = useState(true)
   const [browserNotifsEnabled,  setBrowserNotifsEnabled]  = useState(false)
-  const [pushbulletConfigured,  setPushbulletConfigured]  = useState(false)
+  const [genericNotifToasts,    setGenericNotifToasts]    = useState([])
 
   const handleAlert = useCallback((alert) => {
     if (browserNotifsEnabled &&
@@ -242,14 +280,7 @@ function MainApp({ onLogout }) {
         : alert.name || alert.ip || ''
       try { new Notification(title, { body, icon: '/favicon.svg' }) } catch {}
     }
-    if (pushbulletConfigured) {
-      const title = alert.kind === 'new_device' ? 'New device on network' : 'Device went offline'
-      const body  = alert.kind === 'new_device'
-        ? `${alert.ip}${alert.hostname || alert.vendor ? ' — ' + (alert.hostname || alert.vendor) : ''}`
-        : alert.name || alert.ip || ''
-      api.sendPushbullet(title, body).catch(() => {})
-    }
-  }, [browserNotifsEnabled, pushbulletConfigured])
+  }, [browserNotifsEnabled])
 
   const {
     devices, stats, loading, error, refresh,
@@ -267,6 +298,26 @@ function MainApp({ onLogout }) {
       return { ...prev, [mac]: { ...current, ...patch } }
     })
   }
+
+  const [acknowledgedMacs, setAcknowledgedMacs] = useState(() => {
+    try { return new Set(JSON.parse(localStorage.getItem('acknowledged_macs') || '[]')) }
+    catch { return new Set() }
+  })
+  const [floatNewToTop, setFloatNewToTop] = useState(() =>
+    localStorage.getItem('float_new_to_top') !== 'false'
+  )
+
+  function acknowledgeDevice(mac) {
+    optimisticUpdate(mac, { is_acknowledged: true })
+    setAcknowledgedMacs(prev => {
+      const next = new Set(prev)
+      next.add(mac)
+      localStorage.setItem('acknowledged_macs', JSON.stringify([...next]))
+      return next
+    })
+    api.acknowledgeDevice(mac).catch(() => {})
+  }
+
   const { theme, toggle: toggleTheme, skin } = useTheme()
   const clock = useClock()
   const { activeFilters, toggleFilter, clearFilters, applyFilters, savedViews, saveView, loadView, deleteView } = useSmartFilters()
@@ -298,17 +349,40 @@ function MainApp({ onLogout }) {
     api.getSettings().then(s => {
       const n  = s.find(x => x.key === 'notifications_enabled')
       const bn = s.find(x => x.key === 'browser_notifications_enabled')
-      const pb = s.find(x => x.key === 'pushbullet_api_key')
       if (n)  setNotificationsEnabled(n.value === 'true')
       if (bn) setBrowserNotifsEnabled(bn.value === 'true')
-      if (pb) setPushbulletConfigured((pb.value || '').trim().length > 0)
     }).catch(() => {})
+  }, [])
+
+  // Poll for backend-queued toast/browser notifications (from notification profiles)
+  useEffect(() => {
+    let _id = 0
+    async function poll() {
+      try {
+        const { notifications } = await api.notifPending()
+        for (const n of (notifications || [])) {
+          if (n.toast) {
+            const id = ++_id
+            setGenericNotifToasts(ts => [...ts, { id, title: n.title, body: n.body }])
+          }
+          if (n.browser && typeof Notification !== 'undefined' && Notification.permission === 'granted') {
+            try { new Notification(n.title, { body: n.body, icon: '/favicon.svg' }) } catch {}
+          }
+        }
+      } catch { /* ignore */ }
+    }
+    poll()
+    const iv = setInterval(poll, 30000)
+    return () => clearInterval(iv)
   }, [])
 
   function handleSettingChange(key, value) {
     if (key === 'notifications_enabled')         setNotificationsEnabled(value === 'true')
     if (key === 'browser_notifications_enabled') setBrowserNotifsEnabled(value === 'true')
-    if (key === 'pushbullet_api_key')            setPushbulletConfigured((value || '').trim().length > 0)
+    if (key === 'float_new_to_top') {
+      setFloatNewToTop(value === 'true')
+      localStorage.setItem('float_new_to_top', value)
+    }
   }
 
   // Total alerts = new device + offline alerts
@@ -338,6 +412,14 @@ function MainApp({ onLogout }) {
     } catch (e) {
       optimisticUpdate(mac, { is_important: !value })
     }
+  }
+
+  function toggleFloatNewToTop() {
+    setFloatNewToTop(prev => {
+      const next = !prev
+      localStorage.setItem('float_new_to_top', String(next))
+      return next
+    })
   }
 
   const filtered = useMemo(() => {
@@ -373,8 +455,19 @@ function MainApp({ onLogout }) {
       }
     }
     list = applyFilters(list)
-    return sortDevices(list, sort)
-  }, [devices, filter, search, sort, applyFilters, activeFilters])
+    let result = sortDevices(list, sort)
+    if (floatNewToTop) {
+      const now = Date.now()
+      const NEW_MS = 7 * 24 * 60 * 60 * 1000
+      const isNew = d => d.first_seen && (now - new Date(d.first_seen).getTime()) < NEW_MS
+      const acked = d => d.is_acknowledged || acknowledgedMacs.has(d.mac_address)
+      result = [
+        ...result.filter(d => isNew(d) && !acked(d)),
+        ...result.filter(d => !isNew(d) || acked(d)),
+      ]
+    }
+    return result
+  }, [devices, filter, search, sort, applyFilters, activeFilters, floatNewToTop, acknowledgedMacs])
 
   async function handleRename(mac, name) {
     await api.updateDevice(mac, { custom_name: name })
@@ -450,7 +543,7 @@ function MainApp({ onLogout }) {
 
       {activePage === 'traffic' && <TrafficPage />}
 
-      {activePage === 'containers' && <ContainersPage openContainer={containerToOpen} />}
+      {activePage === 'containers' && <ContainersPage openContainer={containerToOpen} skin={skin} />}
 
       {!activePage && (
         <div className="space-y-8">
@@ -510,6 +603,18 @@ function MainApp({ onLogout }) {
                   style={{ color: 'var(--color-text-muted)' }} />
               </div>
             )}
+
+            <button
+              onClick={toggleFloatNewToTop}
+              title={floatNewToTop ? 'New devices surfaced to top (click to disable)' : 'New devices not surfaced (click to enable)'}
+              className="flex items-center gap-1.5 px-2.5 py-2 rounded-xl text-xs font-medium border transition-colors"
+              style={floatNewToTop
+                ? { background: 'rgba(16,185,129,0.12)', color: '#10b981', borderColor: 'rgba(16,185,129,0.35)' }
+                : { background: 'var(--color-surface-offset)', color: 'var(--color-text-faint)', borderColor: 'var(--color-border)' }}
+            >
+              <Sparkles size={12} />
+              <span>New first</span>
+            </button>
 
             <button
               onClick={handleExportCsv}
@@ -587,6 +692,8 @@ function MainApp({ onLogout }) {
                         onClick={() => openDevice(d)}
                         onStarToggle={handleStarToggle}
                         isVulnScanning={vulnScansByMac[d.mac_address]?.scanning || false}
+                        isAcknowledged={d.is_acknowledged || acknowledgedMacs.has(d.mac_address)}
+                        onAcknowledge={acknowledgeDevice}
                       />
                     ))}
                   </div>
@@ -606,7 +713,9 @@ function MainApp({ onLogout }) {
                     {filtered.map((d, i) => (
                       <DeviceRow key={d.mac_address} device={d} onClick={() => openDevice(d)}
                         striped={i % 2 === 1} onStarToggle={handleStarToggle}
-                        isVulnScanning={vulnScansByMac[d.mac_address]?.scanning || false} />
+                        isVulnScanning={vulnScansByMac[d.mac_address]?.scanning || false}
+                        isAcknowledged={d.is_acknowledged || acknowledgedMacs.has(d.mac_address)}
+                        onAcknowledge={acknowledgeDevice} />
                     ))}
                   </div>
                 )}
@@ -874,6 +983,11 @@ function MainApp({ onLogout }) {
               onDeviceClick={handleToastDeviceClick} topOffset="56px"
             />
           )}
+          <GenericNotificationToasts
+            toasts={genericNotifToasts}
+            onDismiss={id => setGenericNotifToasts(ts => ts.filter(t => t.id !== id))}
+            topOffset="56px"
+          />
           {sharedDrawer}
           {sharedSettings}
         </div>
@@ -1037,6 +1151,11 @@ function MainApp({ onLogout }) {
             topOffset="1rem"
           />
         )}
+        <GenericNotificationToasts
+          toasts={genericNotifToasts}
+          onDismiss={id => setGenericNotifToasts(ts => ts.filter(t => t.id !== id))}
+          topOffset="1rem"
+        />
         {sharedDrawer}
         {sharedSettings}
       </div>
@@ -1239,6 +1358,10 @@ function MainApp({ onLogout }) {
           onDeviceClick={handleToastDeviceClick}
         />
       )}
+      <GenericNotificationToasts
+        toasts={genericNotifToasts}
+        onDismiss={id => setGenericNotifToasts(ts => ts.filter(t => t.id !== id))}
+      />
       {sharedDrawer}
       {sharedSettings}
     </div>
