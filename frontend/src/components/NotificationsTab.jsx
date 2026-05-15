@@ -514,7 +514,6 @@ export function NotificationsTab({ settings, dirty, onchange }) {
     if (dirty[key] !== undefined) return dirty[key]
     return settings.find(s => s.key === key)?.value ?? ''
   }
-  const hasBrowserChannel = channels.some(c => c.service === 'browser')
 
   const load = useCallback(async () => {
     setLoading(true)
@@ -635,33 +634,37 @@ export function NotificationsTab({ settings, dirty, onchange }) {
         )
       })}
 
-      {/* Browser permission helper — shown when a browser channel exists */}
-      {hasBrowserChannel && browserPerm !== 'unsupported' && (
+      {/* Browser permission — always shown so the user can grant/revoke at any time */}
+      {browserPerm !== 'unsupported' && (
         <div className="rounded-lg p-3 text-xs space-y-2"
              style={{ background: 'var(--color-surface-offset)', border: '1px solid var(--color-border)' }}>
           <div className="flex items-center justify-between">
-            <span className="font-medium" style={{ color: 'var(--color-text)' }}>Browser permission</span>
-            <span className="text-xs px-1.5 py-0.5 rounded"
+            <div>
+              <span className="font-medium" style={{ color: 'var(--color-text)' }}>Browser notification permission</span>
+              <p className="mt-0.5" style={{ color: 'var(--color-text-faint)' }}>
+                Required for OS-level notifications via a Browser channel in a profile.
+              </p>
+            </div>
+            <span className="text-xs px-1.5 py-0.5 rounded shrink-0 ml-3"
                   style={{
-                    background: browserPerm === 'granted' ? '#16a34a22' : '#f5952222',
-                    color: browserPerm === 'granted' ? '#16a34a' : '#f59522',
+                    background: browserPerm === 'granted' ? '#16a34a22' : browserPerm === 'denied' ? '#ef444422' : '#f5952222',
+                    color:      browserPerm === 'granted' ? '#16a34a'   : browserPerm === 'denied' ? '#ef4444'   : '#f59522',
                   }}>
               {browserPerm}
             </span>
           </div>
           {browserPerm === 'default' && (
-            <>
-              <p style={{ color: 'var(--color-text-muted)' }}>Permission required to show OS-level notifications.</p>
-              <button onClick={handleRequestBrowserPermission} className="btn-secondary text-xs flex items-center gap-1.5">
-                <Bell size={11} /> Request Permission
-              </button>
-            </>
+            <button onClick={handleRequestBrowserPermission} className="btn-secondary text-xs flex items-center gap-1.5">
+              <Bell size={11} /> Grant permission
+            </button>
           )}
           {browserPerm === 'denied' && (
-            <p style={{ color: '#ef4444' }}>Permission denied. Reset in your browser's site settings.</p>
+            <p style={{ color: '#ef4444' }}>
+              Permission was denied. To re-enable, click the lock/info icon in your browser's address bar and reset notification permissions for this site.
+            </p>
           )}
           {browserPerm === 'granted' && (
-            <p style={{ color: 'var(--color-text-muted)' }}>OS notifications are active.</p>
+            <p style={{ color: '#16a34a' }}>Permission granted — browser notifications are active.</p>
           )}
         </div>
       )}

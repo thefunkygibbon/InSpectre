@@ -320,7 +320,7 @@ function StepNetwork({ onNext }) {
         </div>
         <div>
           <label className="block text-xs font-medium mb-1" style={{ color: 'var(--color-text-muted)' }}>
-            DNS Server / Gateway IP
+            DNS Server
           </label>
           <input className="input w-full" placeholder="e.g. 192.168.1.1"
             value={dns} onChange={e => setDns(e.target.value)} disabled={loading} />
