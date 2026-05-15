@@ -11,7 +11,8 @@ InSpectre is a self-hosted home network monitor and security scanner that automa
 Check the [Wiki](https://github.com/thefunkygibbon/InSpectre/wiki) for full admin guide. 
 ---
 
-> **Screenshot placeholder** — _add a screenshot of the main dashboard here_
+<img width="1891" height="832" alt="image" src="https://github.com/user-attachments/assets/1e751db9-1639-4e3f-a912-00999b8d056b" />
+
 
 ---
 
