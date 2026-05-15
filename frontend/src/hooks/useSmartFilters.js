@@ -74,6 +74,23 @@ export const SMART_FILTERS = [
     description: 'Devices marked as ignored (hidden from main list)',
     fn:          d => Boolean(d.is_ignored),
   },
+  {
+    id:          'new_device',
+    label:       'New (14d)',
+    icon:        'Zap',
+    description: 'Devices first seen within the last 14 days',
+    fn:          d => {
+      if (!d.first_seen) return false
+      return Date.now() - new Date(d.first_seen).getTime() < 14 * 24 * 60 * 60 * 1000
+    },
+  },
+  {
+    id:          'dhcp_seen',
+    label:       'DHCP seen',
+    icon:        'Radio',
+    description: 'Devices where a DHCP fingerprint has been captured by the passive sniffer',
+    fn:          d => Boolean(d.dhcp_fingerprint || d.dhcp_vendor_class || d.dhcp_hostname),
+  },
 ]
 
 const SAVED_VIEWS_KEY = 'inspectre_saved_views'

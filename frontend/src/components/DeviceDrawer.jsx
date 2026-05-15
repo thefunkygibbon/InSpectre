@@ -6,7 +6,7 @@ import {
   ChevronDown, ChevronRight, Square, Tag, CheckCircle2,
   FileText, Star as StarIcon, ShieldAlert, EyeOff, Eye, Layers,
   AlertTriangle, Network, Loader2, GitMerge, Radio, BellOff, Plus, Trash2,
-  TrendingUp, TrendingDown,
+  TrendingUp, TrendingDown, Power,
 } from 'lucide-react'
 import { OnlineDot }      from './OnlineDot'
 import { StarButton }     from './StarButton'
@@ -85,16 +85,30 @@ function Collapsible({ title, icon: Icon, defaultOpen = false, children }) {
   )
 }
 
-function IpHistorySection({ mac }) {
-  const [history, setHistory] = useState(null)
-  const [error,   setError]   = useState(null)
-  const [loaded,  setLoaded]  = useState(false)
+function IpHistorySection({ mac, primaryIp, primaryIpLocked, currentIp, onPrimaryChanged }) {
+  const [history,  setHistory]  = useState(null)
+  const [error,    setError]    = useState(null)
+  const [loaded,   setLoaded]   = useState(false)
+  const [setting,  setSetting]  = useState(null) // IP being set as primary
 
   useEffect(() => {
     if (loaded) return
     setLoaded(true)
     api.getIpHistory(mac).then(setHistory).catch(e => { setError(e.message); setHistory([]) })
   }, [mac, loaded])
+
+  async function handleSetPrimary(ip) {
+    setSetting(ip)
+    try {
+      const res = await api.setPrimaryIp(mac, ip)
+      if (onPrimaryChanged) onPrimaryChanged(res.device)
+      setLoaded(false) // force refresh
+    } catch (e) {
+      alert('Failed to set primary IP: ' + e.message)
+    } finally {
+      setSetting(null)
+    }
+  }
 
   if (history === null) return (
     <div className="space-y-2">
@@ -104,20 +118,69 @@ function IpHistorySection({ mac }) {
   if (error)            return <p className="text-xs text-red-400">{error}</p>
   if (history.length === 0) return <p className="text-xs text-text-muted italic">No IP history recorded yet.</p>
 
+  // Two-hour window: IPs seen within this period are "currently active"
+  const ACTIVE_MS = 2 * 60 * 60 * 1000
+
+  function rowRole(row) {
+    if (primaryIpLocked && primaryIp && row.ip === primaryIp) return 'pinned'
+    if (row.ip === currentIp || (!primaryIpLocked && primaryIp && row.ip === primaryIp)) return 'primary'
+    // Device has a pinned IP, and this is the most-recently-seen ARP IP (different from pin)
+    if (primaryIpLocked && primaryIp && row.ip === currentIp)  return 'active_secondary'
+    // Seen while device was already online at another IP = genuinely multi-homed
+    if (row.seen_while_online === true) {
+      const recentEnough = row.last_seen && (Date.now() - new Date(row.last_seen).getTime()) < ACTIVE_MS
+      return recentEnough ? 'active_secondary' : 'past_secondary'
+    }
+    // Appeared after reconnect (DHCP rotation) or first-ever IP — just history
+    return 'dhcp_history'
+  }
+
+  const ROLE_BADGE = {
+    pinned:          { label: 'Pinned',     color: 'var(--color-brand)',       bg: 'rgba(99,102,241,0.12)', border: 'rgba(99,102,241,0.3)' },
+    primary:         { label: 'Current',    color: '#22c55e',                  bg: 'rgba(34,197,94,0.12)',  border: 'rgba(34,197,94,0.3)'  },
+    active_secondary:{ label: 'Secondary',  color: '#f59e0b',                  bg: 'rgba(245,158,11,0.12)', border: 'rgba(245,158,11,0.3)' },
+    past_secondary:  { label: 'Was secondary', color: 'var(--color-text-faint)', bg: 'rgba(255,255,255,0.04)', border: 'rgba(255,255,255,0.08)' },
+    dhcp_history:    { label: 'DHCP history', color: 'var(--color-text-faint)', bg: 'rgba(255,255,255,0.04)', border: 'rgba(255,255,255,0.08)' },
+  }
+
   return (
-    <div className="space-y-0">
-      <div className="grid grid-cols-[1fr_1fr_1fr] gap-2 pb-1.5 border-b border-border">
-        <span className="text-[10px] font-semibold uppercase tracking-wider text-text-faint">IP Address</span>
-        <span className="text-[10px] font-semibold uppercase tracking-wider text-text-faint">First seen</span>
-        <span className="text-[10px] font-semibold uppercase tracking-wider text-text-faint">Last seen</span>
-      </div>
-      {history.map((row, i) => (
-        <div key={i} className="grid grid-cols-[1fr_1fr_1fr] gap-2 py-1.5 border-b border-border last:border-0 items-center">
-          <span className="font-mono text-xs text-brand">{row.ip}</span>
-          <span className="text-xs text-text-muted">{fmtDate(row.first_seen)}</span>
-          <span className="text-xs text-text-muted">{fmtDate(row.last_seen)}</span>
-        </div>
-      ))}
+    <div className="space-y-1">
+      {history.map((row, i) => {
+        const role  = rowRole(row)
+        const badge = ROLE_BADGE[role]
+        const isPinnable = role === 'active_secondary' && row.ip !== primaryIp
+        const isActive   = role === 'pinned' || role === 'primary' || role === 'active_secondary'
+        return (
+          <div key={i} className="flex items-center gap-2 py-1.5 border-b border-border last:border-0"
+            style={{ opacity: isActive ? 1 : 0.6 }}>
+            <div className="flex-1 min-w-0">
+              <div className="flex items-center gap-1.5 flex-wrap">
+                <span className="font-mono text-xs" style={{ color: isActive ? 'var(--color-text)' : 'var(--color-text-faint)' }}>
+                  {row.ip}
+                </span>
+                <span className="inline-flex items-center px-1 py-0.5 rounded text-[9px] font-semibold"
+                  style={{ color: badge.color, background: badge.bg, border: `1px solid ${badge.border}` }}>
+                  {badge.label}
+                </span>
+              </div>
+              <p className="text-[10px] mt-0.5" style={{ color: 'var(--color-text-faint)' }}>
+                {role === 'dhcp_history' ? 'DHCP rotation · last seen ' : 'Last seen '}
+                {fmtDate(row.last_seen)}
+              </p>
+            </div>
+            {isPinnable && (
+              <button
+                onClick={() => handleSetPrimary(row.ip)}
+                disabled={setting !== null}
+                className="shrink-0 text-[10px] px-2 py-1 rounded border font-medium transition-colors"
+                style={{ borderColor: 'rgba(245,158,11,0.4)', color: '#f59e0b' }}
+                title="Pin this as the primary IP for scanning">
+                {setting === row.ip ? '…' : 'Pin'}
+              </button>
+            )}
+          </div>
+        )
+      })}
     </div>
   )
 }
@@ -208,17 +271,71 @@ function IdentityForm({ device, onSaved }) {
 
 // Service label display helper (maps Nerva scheme names to readable labels)
 const SERVICE_LABELS = {
-  http: 'HTTP',         https: 'HTTPS',         ssh: 'SSH',
-  ftp: 'FTP',           telnet: 'Telnet',        smtp: 'SMTP',
-  pop3: 'POP3',         imap: 'IMAP',            imaps: 'IMAPS',
-  mysql: 'MySQL',       postgresql: 'PostgreSQL', mssql: 'MSSQL',
-  redis: 'Redis',       mongodb: 'MongoDB',       elasticsearch: 'Elasticsearch',
-  mqtt: 'MQTT',         mqtts: 'MQTT/TLS',       smb: 'SMB',
-  rdp: 'RDP',           vnc: 'VNC',              ldap: 'LDAP',
-  ldaps: 'LDAPS',       ftps: 'FTPS',
-  dns: 'DNS',           ntp: 'NTP',              amqp: 'AMQP',
-  amqps: 'AMQPS',       cassandra: 'Cassandra',   memcached: 'Memcached',
-  ws: 'WebSocket',      wss: 'WebSocket/TLS',
+  // Standard protocols
+  http: 'HTTP',               https: 'HTTPS',               ssh: 'SSH',
+  ftp: 'FTP',                 telnet: 'Telnet',              smtp: 'SMTP',
+  pop3: 'POP3',               imap: 'IMAP',                  imaps: 'IMAPS',
+  mysql: 'MySQL',             postgresql: 'PostgreSQL',      mssql: 'MSSQL',
+  redis: 'Redis',             mongodb: 'MongoDB',            elasticsearch: 'Elasticsearch',
+  mqtt: 'MQTT',               mqtts: 'MQTT/TLS',             smb: 'SMB',
+  rdp: 'RDP',                 vnc: 'VNC',                    ldap: 'LDAP',
+  ldaps: 'LDAPS',             ftps: 'FTPS',
+  dns: 'DNS',                 ntp: 'NTP',                    amqp: 'AMQP',
+  amqps: 'AMQPS',             cassandra: 'Cassandra',        memcached: 'Memcached',
+  ws: 'WebSocket',            wss: 'WebSocket/TLS',
+  // Nerva 1.4+ HTTP fingerprints — security appliances
+  'checkpoint-firewall':         'Check Point Firewall',
+  'checkpoint-smartconsole':     'Check Point SmartConsole',
+  'fortinet-fortigate':          'Fortinet FortiGate',
+  'cisco-asa':                   'Cisco ASA',
+  'cisco-ios':                   'Cisco IOS Web',
+  'cisco-router':                'Cisco Router',
+  'palo-alto':                   'Palo Alto',
+  'sonicwall':                   'SonicWall',
+  'watchguard':                  'WatchGuard',
+  'juniper':                     'Juniper',
+  'opnsense':                    'OPNsense',
+  'pfsense':                     'pfSense',
+  'mikrotik':                    'MikroTik',
+  // Virtualisation & infrastructure
+  'proxmox':                     'Proxmox VE',
+  'esxi':                        'VMware ESXi',
+  'vcenter':                     'VMware vCenter',
+  'idrac':                       'Dell iDRAC',
+  'ilo':                         'HP iLO',
+  'ipmi':                        'IPMI',
+  // Network / storage
+  'unifi':                       'Ubiquiti UniFi',
+  'synology':                    'Synology NAS',
+  'qnap':                        'QNAP NAS',
+  'freenas':                     'TrueNAS / FreeNAS',
+  // Media & home automation
+  'plex':                        'Plex Media Server',
+  'emby':                        'Emby',
+  'jellyfin':                    'Jellyfin',
+  'homeassistant':               'Home Assistant',
+  'openhab':                     'openHAB',
+  'nodered':                     'Node-RED',
+  // Dev & monitoring
+  'jenkins':                     'Jenkins',
+  'grafana':                     'Grafana',
+  'kibana':                      'Kibana',
+  'prometheus':                  'Prometheus',
+  'sonarqube':                   'SonarQube',
+  'portainer':                   'Portainer',
+  'gitlab':                      'GitLab',
+  'gitea':                       'Gitea',
+  'nextcloud':                   'Nextcloud',
+  // CMS / web apps
+  'wordpress':                   'WordPress',
+  'joomla':                      'Joomla',
+  'drupal':                      'Drupal',
+  // Web servers
+  'apache':                      'Apache httpd',
+  'nginx':                       'nginx',
+  'iis':                         'Microsoft IIS',
+  'tomcat':                      'Apache Tomcat',
+  'lighttpd':                    'lighttpd',
 }
 function svcLabel(scheme) {
   return SERVICE_LABELS[scheme] || scheme
@@ -294,6 +411,112 @@ function ScanPipeline({ device, vulnScanning }) {
   )
 }
 
+function DhcpFingerprintPanel({ localDevice, mac, setLocalDevice }) {
+  const [fbLoading, setFbLoading] = useState(false)
+  const [fbError,   setFbError]   = useState(null)
+
+  const hasDhcp   = localDevice.dhcp_hostname || localDevice.dhcp_vendor_class || localDevice.dhcp_fingerprint
+  const dhcpType  = localDevice.scan_results?.device_type_source === 'dhcp' ? localDevice.scan_results.device_type      : null
+  const dhcpConf  = localDevice.scan_results?.device_type_source === 'dhcp' ? localDevice.scan_results.device_type_conf : null
+  const fb        = localDevice.fingerbank_result
+
+  async function handleFbLookup() {
+    setFbLoading(true); setFbError(null)
+    try {
+      const res = await api.fingerbankLookup(mac)
+      setLocalDevice(prev => ({ ...prev, fingerbank_result: res.result }))
+    } catch (e) {
+      setFbError(e.message || 'Lookup failed')
+    } finally {
+      setFbLoading(false)
+    }
+  }
+
+  if (!hasDhcp) return (
+    <p className="text-xs italic leading-relaxed" style={{ color: 'var(--color-text-faint)' }}>
+      No DHCP packet seen yet. Disconnect and reconnect the device, or force a full DHCP cycle:
+      Windows — <code className="font-mono">ipconfig /release</code> then <code className="font-mono">/renew</code>;
+      Linux — <code className="font-mono">sudo dhclient -r && sudo dhclient</code>.
+      Mid-lease background renewals are unicast and bypass the probe.
+    </p>
+  )
+
+  return (
+    <>
+      {localDevice.dhcp_hostname     && <Row label="DHCP hostname" value={localDevice.dhcp_hostname}     mono />}
+      {localDevice.dhcp_vendor_class && <Row label="Vendor class"  value={localDevice.dhcp_vendor_class} mono />}
+      {localDevice.dhcp_fingerprint  && <Row label="Option 55"     value={localDevice.dhcp_fingerprint}  mono />}
+      {dhcpType && !fb && (
+        <Row label="Local match" value={
+          <span>
+            {dhcpType}
+            {dhcpConf && <span className="ml-1 text-[10px]" style={{ color: 'var(--color-text-faint)' }}>({Math.round(dhcpConf * 100)}% conf)</span>}
+          </span>
+        } />
+      )}
+
+      {/* Fingerbank results */}
+      {fb && !fb.error ? (
+        <div className="mt-2 pt-2 space-y-1.5 border-t" style={{ borderColor: 'var(--color-border)' }}>
+          <div className="flex items-center justify-between mb-1">
+            <div className="flex items-center gap-1.5">
+              <span className="text-[10px] font-semibold uppercase tracking-wider" style={{ color: 'var(--color-brand)' }}>Fingerbank</span>
+              {fb.score != null && (
+                <span className="text-[10px] px-1.5 py-0.5 rounded-full font-medium"
+                  style={{
+                    background: fb.score >= 70 ? 'rgba(34,197,94,0.15)' : fb.score >= 40 ? 'rgba(245,158,11,0.15)' : 'rgba(239,68,68,0.1)',
+                    color:      fb.score >= 70 ? '#22c55e'              : fb.score >= 40 ? '#f59e0b'              : '#ef4444',
+                  }}>
+                  {fb.score}% confidence
+                </span>
+              )}
+            </div>
+            <button onClick={handleFbLookup} disabled={fbLoading}
+              className="text-[10px] flex items-center gap-1 opacity-60 hover:opacity-100 transition-opacity"
+              style={{ color: 'var(--color-brand)' }}>
+              {fbLoading ? <Loader2 size={9} className="animate-spin" /> : <RefreshCw size={9} />}
+              {fbLoading ? 'Fetching…' : 'Re-fetch'}
+            </button>
+          </div>
+          {fb.device_name && <Row label="Identified as" value={fb.device_name} />}
+          {fb.parents?.length > 0 && (
+            <Row label="Hierarchy" value={
+              <span className="text-right leading-snug">{fb.parents.filter(Boolean).join(' › ')}</span>
+            } />
+          )}
+          {fb.mapped_type && <Row label="Mapped type" value={fb.mapped_type} />}
+          {fb.queried_at && (
+            <p className="text-[10px] text-right" style={{ color: 'var(--color-text-faint)' }}>
+              Queried {new Date(fb.queried_at).toLocaleDateString()}
+            </p>
+          )}
+        </div>
+      ) : (
+        <div className="mt-2 flex items-center justify-between gap-2">
+          <p className="text-[11px] italic" style={{ color: 'var(--color-text-faint)' }}>
+            {!fb
+              ? 'Fingerbank lookup pending — will run automatically within a minute.'
+              : fb.status === 'no_match'
+                ? 'No match found in Fingerbank database.'
+                : fb.status === 'auth_error'
+                  ? 'API key rejected — check Settings → Scanner → Device Identification.'
+                  : fb.error
+                    ? `Lookup failed: ${fb.error}`
+                    : 'Fingerbank lookup pending.'}
+          </p>
+          <button onClick={handleFbLookup} disabled={fbLoading}
+            className="shrink-0 text-[10px] px-2 py-1 rounded-lg border font-medium flex items-center gap-1 transition-colors"
+            style={{ borderColor: 'color-mix(in srgb, var(--color-brand) 40%, transparent)', color: 'var(--color-brand)', background: 'color-mix(in srgb, var(--color-brand) 10%, transparent)' }}>
+            {fbLoading ? <Loader2 size={9} className="animate-spin" /> : <RefreshCw size={9} />}
+            {fbLoading ? 'Fetching…' : 'Fetch now'}
+          </button>
+        </div>
+      )}
+      {fbError && <p className="text-[10px] text-red-400 mt-1">{fbError}</p>}
+    </>
+  )
+}
+
 // ---------------------------------------------------------------------------
 // Main component
 // ---------------------------------------------------------------------------
@@ -309,6 +532,7 @@ export function DeviceDrawer({ device, onClose, onRename, onResolveName, onRefre
   const [blocking,     setBlocking]     = useState(false)
   const [ignoring,     setIgnoring]     = useState(false)
   const [deleting,     setDeleting]     = useState(false)
+  const [waking,       setWaking]       = useState(false)
 
   // Vuln scan state is owned by the parent (App.jsx) so it survives drawer close/reopen.
   // Proxy setters propagate functional updaters so rapid SSE lines don't get lost to stale closures.
@@ -411,6 +635,21 @@ export function DeviceDrawer({ device, onClose, onRename, onResolveName, onRefre
       setLocalDevice(prev => ({ ...prev, is_ignored: !newVal }))
     } finally {
       setIgnoring(false)
+    }
+  }
+
+  async function handleWakeOnLan() {
+    setWaking(true)
+    stream.stop()
+    stream.clear()
+    setStaticLines([])
+    try {
+      await api.toolsWakeOnLan(mac)
+      setStaticLines([`[OK] Magic packet sent to ${mac} — device should wake within a few seconds if Wake on LAN is enabled in its BIOS/firmware.`])
+    } catch (e) {
+      setStaticLines([`[ERROR] ${e.message}`])
+    } finally {
+      setWaking(false)
     }
   }
 
@@ -544,6 +783,18 @@ export function DeviceDrawer({ device, onClose, onRename, onResolveName, onRefre
                   <ActionBtn icon={ShieldAlert} label="Vuln scan"     active={activeTab   === 'vulns'}
                     onClick={() => setActiveTab('vulns')} />
                 </div>
+                {!localDevice.is_online && (
+                  <button
+                    onClick={handleWakeOnLan}
+                    disabled={waking}
+                    className={`mt-2 w-full flex items-center justify-center gap-2 py-2 rounded-lg
+                               border text-xs font-medium transition-colors duration-150
+                               border-blue-500/40 bg-blue-500/10 text-blue-400 hover:bg-blue-500/20
+                               ${waking ? 'opacity-60 cursor-wait' : ''}`}>
+                    <Power size={12} className={waking ? 'animate-pulse' : ''} />
+                    {waking ? 'Sending magic packet…' : 'Wake on LAN'}
+                  </button>
+                )}
                 <button
                   onClick={handleBlockToggle}
                   disabled={blocking}
@@ -583,9 +834,35 @@ export function DeviceDrawer({ device, onClose, onRename, onResolveName, onRefre
 
               {/* Network */}
               <Collapsible title="Network" icon={Globe} defaultOpen={true}>
-                <Row label="IP Address"  value={localDevice.ip_address} mono />
+                <Row label="IP Address"
+                  value={
+                    <span className="flex items-center gap-2 flex-wrap">
+                      <span className="font-mono">{localDevice.primary_ip || localDevice.ip_address || '--'}</span>
+                      {localDevice.primary_ip_locked && (
+                        <button
+                          onClick={async () => {
+                            try {
+                              const res = await api.unpinPrimaryIp(mac)
+                              setLocalDevice(prev => ({ ...prev, ...res.device }))
+                              if (onRefresh) onRefresh()
+                            } catch (e) { alert('Failed to unpin: ' + e.message) }
+                          }}
+                          className="text-[10px] px-1 py-0.5 rounded font-semibold cursor-pointer hover:opacity-70 transition-opacity"
+                          title="Click to unpin"
+                          style={{ background: 'rgba(var(--brand-rgb,99,102,241),0.15)', color: 'var(--color-brand)', border: '1px solid rgba(var(--brand-rgb,99,102,241),0.3)' }}>
+                          pinned ✕
+                        </button>
+                      )}
+                      {localDevice.primary_ip_locked && localDevice.primary_ip && localDevice.ip_address && localDevice.primary_ip !== localDevice.ip_address && (
+                        <span className="text-[10px]" style={{ color: 'var(--color-text-faint)' }}>
+                          (last ARP: {localDevice.ip_address})
+                        </span>
+                      )}
+                    </span>
+                  }
+                />
                 <Row label="MAC Address" value={mac} mono />
-                <Row label="Vendor"      value={localDevice.vendor_override || localDevice.vendor || 'Unknown'} />
+                <Row label="Vendor"      value={localDevice.vendor_override || localDevice.vendor || localDevice.vendor_inferred || 'Unknown'} />
                 <Row
                   label="Hostname"
                   value={
@@ -606,12 +883,66 @@ export function DeviceDrawer({ device, onClose, onRename, onResolveName, onRefre
                   if (onZoneChange) onZoneChange(zone)
                 }} />
                 {localDevice.miss_count  !== undefined && <Row label="Miss count" value={localDevice.miss_count} />}
-                <MdnsRow mac={mac} scan={scan} onRefreshed={updated => setLocalDevice(prev => ({ ...prev, scan_results: { ...(prev.scan_results || {}), mdns_services: updated } }))} />
               </Collapsible>
+
+              {/* Grouped interfaces */}
+              {localDevice.group_members?.length > 1 && (
+                <Collapsible title={`Grouped Interfaces (${localDevice.group_members.length})`} icon={GitMerge} defaultOpen={true}>
+                  <div className="space-y-1.5">
+                    {localDevice.group_members.map(m => (
+                      <div key={m.mac_address}
+                        className="flex items-center gap-2 px-2 py-1.5 rounded-lg text-xs"
+                        style={{ background: 'var(--color-surface-offset)' }}>
+                        <span className={`w-2 h-2 rounded-full shrink-0 ${m.is_online ? 'bg-green-400' : 'bg-gray-500'}`} />
+                        <span className="flex-1 font-medium truncate" style={{ color: 'var(--color-text)' }}>
+                          {m.display_name}
+                        </span>
+                        <span className="font-mono text-[10px]" style={{ color: 'var(--color-text-faint)' }}>
+                          {m.ip_address || '—'}
+                        </span>
+                        <span className="font-mono text-[10px]" style={{ color: 'var(--color-text-faint)' }}>
+                          {m.mac_address}
+                        </span>
+                        {m.group_primary && (
+                          <span className="text-[10px] px-1 rounded"
+                            style={{ background: 'var(--color-brand-alpha)', color: 'var(--color-brand)' }}>
+                            primary
+                          </span>
+                        )}
+                      </div>
+                    ))}
+                    <p className="text-[10px] pt-0.5" style={{ color: 'var(--color-text-faint)' }}>
+                      This device shares a hostname with the above interfaces — they are treated as the same physical device.
+                      Manage grouping in the Admin tab.
+                    </p>
+                  </div>
+                </Collapsible>
+              )}
+
+              {/* DHCP Fingerprinting */}
+              <Collapsible title="DHCP Fingerprint" icon={Radio} defaultOpen={false}>
+                <DhcpFingerprintPanel localDevice={localDevice} mac={mac} setLocalDevice={setLocalDevice} />
+              </Collapsible>
+
+              {/* Advertised Services */}
+              <AdvertisedServicesSection
+                mac={mac}
+                scan={scan}
+                onUpdate={updated => setLocalDevice(prev => ({ ...prev, scan_results: { ...(prev.scan_results || {}), ...updated } }))}
+              />
 
               {/* IP History */}
               <Collapsible title="IP History" icon={History} defaultOpen={false}>
-                <IpHistorySection mac={mac} />
+                <IpHistorySection
+                  mac={mac}
+                  primaryIp={localDevice.primary_ip}
+                  primaryIpLocked={localDevice.primary_ip_locked}
+                  currentIp={localDevice.ip_address}
+                  onPrimaryChanged={updated => {
+                    setLocalDevice(prev => ({ ...prev, ...updated }))
+                    if (onRefresh) onRefresh()
+                  }}
+                />
               </Collapsible>
 
               {/* Timeline summary */}
@@ -683,16 +1014,8 @@ export function DeviceDrawer({ device, onClose, onRename, onResolveName, onRefre
                                 TLS
                               </span>
                             )}
-                            {(p.product || p.version) && (
-                              <span className="text-xs text-text-muted truncate max-w-[110px]">
-                                {[p.product, p.version].filter(Boolean).join(' ')}
-                              </span>
-                            )}
                           </div>
                         </div>
-                        {p.cpe && (
-                          <p className="font-mono text-[10px] text-text-faint pl-20 truncate" title={p.cpe}>{p.cpe}</p>
-                        )}
                       </div>
                     )
                   })}
@@ -773,6 +1096,10 @@ export function DeviceDrawer({ device, onClose, onRename, onResolveName, onRefre
                 <SuppressionManager mac={mac} />
               </Collapsible>
 
+              <Collapsible title="Device Grouping" icon={GitMerge} defaultOpen={!!localDevice.group_id}>
+                <GroupManager mac={mac} device={localDevice} onChanged={() => { if (onRefresh) onRefresh() }} />
+              </Collapsible>
+
               {/* Danger zone */}
               <div className="rounded-xl border border-red-500/30 overflow-hidden">
                 <div className="px-4 py-2.5 border-b border-red-500/20"
@@ -815,6 +1142,140 @@ export function DeviceDrawer({ device, onClose, onRename, onResolveName, onRefre
     </>
   )
 }
+
+function GroupManager({ mac, device, onChanged }) {
+  const [group,      setGroup]      = useState(null)
+  const [loading,    setLoading]    = useState(false)
+  const [addMac,     setAddMac]     = useState('')
+  const [addErr,     setAddErr]     = useState(null)
+  const [busy,       setBusy]       = useState(false)
+
+  useEffect(() => {
+    api.getDeviceGroup(mac).then(setGroup).catch(() => {})
+  }, [mac])
+
+  const reload = () => api.getDeviceGroup(mac).then(setGroup).catch(() => {})
+
+  const handleAdd = async () => {
+    const target = addMac.trim().toLowerCase()
+    if (!target) return
+    setAddErr(null)
+    setBusy(true)
+    try {
+      await api.addToGroup(mac, target)
+      setAddMac('')
+      await reload()
+      onChanged()
+    } catch (e) {
+      setAddErr(e.message)
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const handleRemove = async (targetMac) => {
+    setBusy(true)
+    try {
+      await api.removeFromGroup(targetMac)
+      await reload()
+      onChanged()
+    } catch (e) {
+      alert('Error: ' + e.message)
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const handleSetPrimary = async (targetMac) => {
+    setBusy(true)
+    try {
+      await api.setGroupPrimary(targetMac)
+      await reload()
+      onChanged()
+    } catch (e) {
+      alert('Error: ' + e.message)
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const members = group?.members || []
+  const inGroup = members.length > 0
+
+  return (
+    <div className="space-y-3">
+      <p className="text-xs" style={{ color: 'var(--color-text-muted)' }}>
+        Group this device with others that are the same physical device on different network interfaces
+        (e.g. a laptop switching between WiFi and Ethernet). The group representative is shown in the
+        device list; events from all interfaces appear in the unified timeline.
+      </p>
+
+      {inGroup && (
+        <div className="space-y-1">
+          <p className="text-[11px] font-semibold uppercase tracking-wider mb-1" style={{ color: 'var(--color-text-faint)' }}>
+            Group members
+          </p>
+          {members.map(m => (
+            <div key={m.mac_address}
+              className="flex items-center gap-2 px-2 py-1.5 rounded-lg text-xs"
+              style={{ background: 'var(--color-surface-offset)' }}>
+              <span className={`w-1.5 h-1.5 rounded-full shrink-0 ${m.is_online ? 'bg-green-400' : 'bg-gray-500'}`} />
+              <span className="flex-1 font-mono truncate" style={{ color: 'var(--color-text)' }}>
+                {m.display_name}
+              </span>
+              <span className="font-mono text-[10px]" style={{ color: 'var(--color-text-faint)' }}>
+                {m.mac_address}
+              </span>
+              {m.group_primary && (
+                <span className="text-[10px] px-1 rounded" style={{ background: 'var(--color-brand-alpha)', color: 'var(--color-brand)' }}>
+                  primary
+                </span>
+              )}
+              {!m.group_primary && (
+                <button
+                  disabled={busy}
+                  onClick={() => handleSetPrimary(m.mac_address)}
+                  className="text-[10px] px-1.5 py-0.5 rounded border transition-colors"
+                  style={{ borderColor: 'var(--color-border)', color: 'var(--color-text-faint)' }}
+                  title="Set as group primary">
+                  set primary
+                </button>
+              )}
+              <button
+                disabled={busy}
+                onClick={() => handleRemove(m.mac_address)}
+                className="ml-1 p-0.5 rounded hover:bg-red-500/20 text-red-400 transition-colors"
+                title="Remove from group">
+                <Trash2 size={11} />
+              </button>
+            </div>
+          ))}
+        </div>
+      )}
+
+      <div className="flex gap-2">
+        <input
+          value={addMac}
+          onChange={e => setAddMac(e.target.value)}
+          onKeyDown={e => e.key === 'Enter' && handleAdd()}
+          placeholder="MAC address to group with…"
+          className="flex-1 px-2 py-1.5 rounded-lg border text-xs font-mono"
+          style={{ background: 'var(--color-surface-offset)', borderColor: 'var(--color-border)', color: 'var(--color-text)' }}
+        />
+        <button
+          disabled={busy || !addMac.trim()}
+          onClick={handleAdd}
+          className="flex items-center gap-1 px-3 py-1.5 rounded-lg border text-xs font-medium transition-colors disabled:opacity-50"
+          style={{ borderColor: 'var(--color-brand)', color: 'var(--color-brand)', background: 'var(--color-brand-alpha)' }}>
+          <Plus size={12} />
+          Group
+        </button>
+      </div>
+      {addErr && <p className="text-xs text-red-400">{addErr}</p>}
+    </div>
+  )
+}
+
 
 function ActionBtn({ icon: Icon, label, onClick, active, loading }) {
   return (
@@ -964,43 +1425,116 @@ function ZoneEditor({ mac, currentZone, onChanged }) {
   )
 }
 
-function MdnsRow({ mac, scan, onRefreshed }) {
-  const [refreshing, setRefreshing] = useState(false)
-  const services = scan?.mdns_services || []
+// ---------------------------------------------------------------------------
+// Advertised Services section — mDNS/Bonjour + SSDP/UPnP
+// ---------------------------------------------------------------------------
+function ServicePill({ label }) {
+  return (
+    <span className="text-[10px] px-1.5 py-0.5 rounded font-mono"
+      style={{ background: 'var(--color-surface-offset)', color: 'var(--color-text-muted)', border: '1px solid var(--color-border)' }}>
+      {label}
+    </span>
+  )
+}
 
-  async function handleRefresh() {
-    setRefreshing(true)
+function SsdpServiceCard({ svc }) {
+  const label = svc.st
+    ? svc.st.replace('urn:schemas-upnp-org:', '').replace('urn:dial-multiscreen-org:', 'dial:')
+    : svc.usn || 'Unknown'
+  return (
+    <div className="rounded-lg px-3 py-2 mb-1.5 text-[11px]"
+      style={{ background: 'var(--color-surface-offset)', border: '1px solid var(--color-border)' }}>
+      <p className="font-medium text-text truncate" title={svc.st}>{label}</p>
+      {svc.server && <p className="text-[10px] text-text-faint truncate mt-0.5" title={svc.server}>{svc.server}</p>}
+      {svc.location && (
+        <p className="text-[10px] font-mono text-brand truncate mt-0.5" title={svc.location}>{svc.location}</p>
+      )}
+    </div>
+  )
+}
+
+function AdvertisedServicesSection({ mac, scan, onUpdate }) {
+  const [mdnsScanning,  setMdnsScanning]  = useState(false)
+  const [ssdpScanning,  setSsdpScanning]  = useState(false)
+
+  const mdnsServices = scan?.mdns_services || []
+  const ssdpServices = scan?.ssdp_services || []
+  const totalCount   = mdnsServices.length + ssdpServices.length
+
+  async function handleMdnsScan() {
+    setMdnsScanning(true)
     try {
       const result = await api.refreshMdns(mac)
-      onRefreshed(result.mdns_services || [])
+      onUpdate({ mdns_services: result.mdns_services || [] })
     } catch {}
-    finally { setRefreshing(false) }
+    finally { setMdnsScanning(false) }
+  }
+
+  async function handleSsdpScan() {
+    setSsdpScanning(true)
+    try {
+      await api.networkSsdpScan()
+      // SSDP stores by IP — re-fetch device data via polling; just give a short delay
+      await new Promise(r => setTimeout(r, 1500))
+      // Trigger a page refresh via onUpdate with current values so parent re-polls
+    } catch {}
+    finally { setSsdpScanning(false) }
   }
 
   return (
-    <div className="flex items-start justify-between py-1.5 gap-4 border-b border-border last:border-0">
-      <span className="text-xs text-text-muted shrink-0 mt-0.5">mDNS services</span>
-      <div className="flex flex-col items-end gap-1">
-        {services.length > 0 ? (
-          <div className="flex flex-wrap gap-1 justify-end">
-            {services.map(s => (
-              <span key={s} className="text-[10px] px-1.5 py-0.5 rounded font-mono"
-                style={{ background: 'var(--color-surface-offset)', color: 'var(--color-text-muted)', border: '1px solid var(--color-border)' }}>
-                {s}
-              </span>
-            ))}
+    <Collapsible
+      title={`Advertised Services${totalCount > 0 ? ` (${totalCount})` : ''}`}
+      icon={Radio}
+      defaultOpen={totalCount > 0}>
+
+      {/* mDNS / Bonjour */}
+      <div className="mb-4">
+        <div className="flex items-center justify-between mb-2">
+          <span className="text-[10px] font-semibold uppercase tracking-wider" style={{ color: 'var(--color-text-faint)' }}>
+            mDNS / Bonjour
+          </span>
+          <button onClick={handleMdnsScan} disabled={mdnsScanning}
+            className="flex items-center gap-1 text-[10px] transition-opacity opacity-60 hover:opacity-100"
+            style={{ color: 'var(--color-brand)' }}>
+            <Radio size={9} className={mdnsScanning ? 'animate-pulse' : ''} />
+            {mdnsScanning ? 'Scanning…' : 'Scan now'}
+          </button>
+        </div>
+        {mdnsServices.length > 0 ? (
+          <div className="flex flex-wrap gap-1">
+            {mdnsServices.map(s => <ServicePill key={s} label={s} />)}
           </div>
         ) : (
-          <span className="text-xs text-text-faint italic">None discovered</span>
+          <p className="text-[11px] italic" style={{ color: 'var(--color-text-faint)' }}>
+            No mDNS services discovered — passive listener running in background
+          </p>
         )}
-        <button onClick={handleRefresh} disabled={refreshing}
-          className="flex items-center gap-1 text-[10px] opacity-60 hover:opacity-100 transition-opacity"
-          style={{ color: 'var(--color-brand)' }}>
-          <Radio size={9} className={refreshing ? 'animate-pulse' : ''} />
-          {refreshing ? 'Scanning…' : 'Refresh mDNS'}
-        </button>
       </div>
-    </div>
+
+      {/* SSDP / UPnP */}
+      <div>
+        <div className="flex items-center justify-between mb-2">
+          <span className="text-[10px] font-semibold uppercase tracking-wider" style={{ color: 'var(--color-text-faint)' }}>
+            SSDP / UPnP
+          </span>
+          <button onClick={handleSsdpScan} disabled={ssdpScanning}
+            className="flex items-center gap-1 text-[10px] transition-opacity opacity-60 hover:opacity-100"
+            style={{ color: 'var(--color-brand)' }}>
+            <Layers size={9} className={ssdpScanning ? 'animate-pulse' : ''} />
+            {ssdpScanning ? 'Scanning…' : 'Scan now'}
+          </button>
+        </div>
+        {ssdpServices.length > 0 ? (
+          <div>
+            {ssdpServices.map((svc, i) => <SsdpServiceCard key={svc.usn || i} svc={svc} />)}
+          </div>
+        ) : (
+          <p className="text-[11px] italic" style={{ color: 'var(--color-text-faint)' }}>
+            No UPnP services discovered — passive listener running in background
+          </p>
+        )}
+      </div>
+    </Collapsible>
   )
 }
 

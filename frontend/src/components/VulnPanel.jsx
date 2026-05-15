@@ -3,10 +3,11 @@ import {
   ShieldAlert, ShieldCheck, ShieldQuestion, AlertTriangle,
   Info, ChevronDown, ChevronRight, Trash2,
   Clock, Square, Wrench, AlertOctagon, BookOpen, Tag, Globe,
-  ExternalLink,
+  ExternalLink, FileDown,
 } from 'lucide-react'
 import { api, streamSSE } from '../api'
 import { StreamOutput }   from './StreamOutput'
+import { exportDeviceVulnPDF } from '../utils/vulnPdfExport'
 
 // ---------------------------------------------------------------------------
 // Severity config
@@ -292,6 +293,85 @@ function ReportDetail({ mac, report, onDelete }) {
 }
 
 // ---------------------------------------------------------------------------
+// VulnTrendChart — SVG bar chart of vuln_count per scan, coloured by severity
+// ---------------------------------------------------------------------------
+const SEV_ORDER = ['critical', 'high', 'medium', 'low', 'info', 'clean']
+
+function VulnTrendChart({ reports }) {
+  if (!reports || reports.length < 2) return null
+
+  // Oldest → newest left-to-right
+  const sorted = [...reports].reverse()
+  const maxCount = Math.max(...sorted.map(r => r.vuln_count || 0), 1)
+
+  const W = 280, H = 72, BAR_GAP = 2
+  const barW = Math.max(4, Math.floor((W - BAR_GAP * (sorted.length - 1)) / sorted.length))
+  const totalUsed = sorted.length * barW + (sorted.length - 1) * BAR_GAP
+  const offsetX = Math.floor((W - totalUsed) / 2)
+
+  return (
+    <div className="rounded-lg p-3" style={{ background: 'var(--color-surface-offset)', border: '1px solid var(--color-border)' }}>
+      <p className="text-[10px] font-semibold uppercase tracking-wider mb-2" style={{ color: 'var(--color-text-faint)' }}>
+        Vuln count trend ({sorted.length} scans)
+      </p>
+      <svg width="100%" viewBox={`0 0 ${W} ${H + 14}`} style={{ display: 'block' }}>
+        {sorted.map((r, i) => {
+          const x = offsetX + i * (barW + BAR_GAP)
+          const barH = Math.max(2, Math.round(((r.vuln_count || 0) / maxCount) * H))
+          const y = H - barH
+          const cfg = SEV_CONFIG[r.severity] || SEV_CONFIG.info
+          const date = new Date(r.scanned_at)
+          const label = `${date.getMonth() + 1}/${date.getDate()}`
+          return (
+            <g key={r.id}>
+              <title>{`${label}: ${r.vuln_count} finding(s) — ${r.severity}`}</title>
+              <rect x={x} y={y} width={barW} height={barH} rx={2}
+                fill={cfg.color} opacity={0.75} />
+              {barW >= 14 && (
+                <text x={x + barW / 2} y={H + 11} textAnchor="middle"
+                  fontSize="7" fill="var(--color-text-faint)">{label}</text>
+              )}
+            </g>
+          )
+        })}
+        {/* zero line */}
+        <line x1={0} y1={H} x2={W} y2={H} stroke="var(--color-border)" strokeWidth={1} />
+      </svg>
+    </div>
+  )
+}
+
+// ---------------------------------------------------------------------------
+// DurationStats — avg / min / max scan duration
+// ---------------------------------------------------------------------------
+function DurationStats({ reports }) {
+  const durations = (reports || []).map(r => r.duration_s).filter(d => d != null)
+  if (durations.length === 0) return null
+
+  const avg = durations.reduce((a, b) => a + b, 0) / durations.length
+  const min = Math.min(...durations)
+  const max = Math.max(...durations)
+
+  function fmtSec(s) {
+    if (s < 60) return `${s.toFixed(1)}s`
+    return `${(s / 60).toFixed(1)}m`
+  }
+
+  return (
+    <div className="grid grid-cols-3 gap-2">
+      {[['Avg', avg], ['Min', min], ['Max', max]].map(([lbl, val]) => (
+        <div key={lbl} className="rounded-lg p-2 text-center"
+          style={{ background: 'var(--color-surface-offset)', border: '1px solid var(--color-border)' }}>
+          <p className="text-[10px] uppercase tracking-wider" style={{ color: 'var(--color-text-faint)' }}>{lbl}</p>
+          <p className="text-sm font-bold mt-0.5" style={{ color: 'var(--color-text)' }}>{fmtSec(val)}</p>
+          <p className="text-[10px]" style={{ color: 'var(--color-text-faint)' }}>duration</p>
+        </div>
+      ))}
+    </div>
+  )
+}
+
+// ---------------------------------------------------------------------------
 // VulnPanel — main export
 // Scan state (lines, scanning) is owned by the parent (DeviceDrawer) so it
 // survives tab switches within the drawer.
@@ -302,16 +382,33 @@ export function VulnPanel({ device, onScanComplete, lines, setLines, scanning, s
 
   const [reports,  setReports]  = useState(null)
   const [loading,  setLoading]  = useState(false)
-  const abortRef = useRef(null)
+  const abortRef   = useRef(null)
+  const startScanRef = useRef(null)
 
   useEffect(() => {
     if (!mac) return
     setLoading(true)
-    api.getVulnReports(mac, 5)
+    api.getVulnReports(mac, 20)
       .then(setReports)
       .catch(() => setReports([]))
       .finally(() => setLoading(false))
   }, [mac])
+
+  // On mount, check whether the backend has a scan running for this device.
+  // If it does (scan started before drawer was opened or after drawer was closed),
+  // reconnect the SSE stream so the user sees live progress.
+  useEffect(() => {
+    if (!mac || scanning) return
+    let cancelled = false
+    api.getVulnScanStatus(mac)
+      .then(({ scanning: active }) => {
+        if (!cancelled && active && startScanRef.current) {
+          startScanRef.current({ reconnect: true })
+        }
+      })
+      .catch(() => {})
+    return () => { cancelled = true }
+  }, [mac]) // eslint-disable-line react-hooks/exhaustive-deps
 
   function stopScan() {
     if (abortRef.current) {
@@ -321,10 +418,12 @@ export function VulnPanel({ device, onScanComplete, lines, setLines, scanning, s
     setScanning(false)
   }
 
-  async function startScan() {
+  async function startScan({ reconnect = false } = {}) {
     if (scanning) { stopScan(); return }
     setScanning(true)
-    setLines(['[INFO] Initiating vulnerability scan…'])
+    // On reconnect, keep existing lines — the backend will replay buffered output.
+    // On a fresh start, reset to a clean slate.
+    if (!reconnect) setLines(['[INFO] Initiating vulnerability scan…'])
 
     const ctrl = new AbortController()
     abortRef.current = ctrl
@@ -334,7 +433,7 @@ export function VulnPanel({ device, onScanComplete, lines, setLines, scanning, s
         `/devices/${mac}/vuln-scan`,
         (line) => {
           if (line.startsWith('RESULT:')) {
-            api.getVulnReports(mac, 5)
+            api.getVulnReports(mac, 20)
               .then(setReports)
               .catch(() => {})
             if (onScanComplete) onScanComplete()
@@ -352,6 +451,10 @@ export function VulnPanel({ device, onScanComplete, lines, setLines, scanning, s
       abortRef.current = null
     }
   }
+
+  // Keep a stable ref so the reconnect effect can call startScan without
+  // needing it in the dependency array (avoids re-running on every render).
+  startScanRef.current = startScan
 
   function handleDeleteReport(id) {
     setReports(prev => (prev || []).filter(r => r.id !== id))
@@ -371,12 +474,23 @@ export function VulnPanel({ device, onScanComplete, lines, setLines, scanning, s
           </h3>
           {lastReport && <SevBadge severity={lastReport.severity} />}
         </div>
-        {device.vuln_last_scanned && (
-          <span className="text-[10px] text-text-faint flex items-center gap-1">
-            <Clock size={10} />
-            {fmt(device.vuln_last_scanned)}
-          </span>
-        )}
+        <div className="flex items-center gap-2">
+          {device.vuln_last_scanned && (
+            <span className="text-[10px] text-text-faint flex items-center gap-1">
+              <Clock size={10} />
+              {fmt(device.vuln_last_scanned)}
+            </span>
+          )}
+          {reports && reports.length > 0 && (
+            <button
+              onClick={() => exportDeviceVulnPDF(device, reports)}
+              className="flex items-center gap-1 px-2 py-1 rounded text-[10px] font-medium transition-colors"
+              style={{ color: 'var(--color-text-faint)', border: '1px solid var(--color-border)' }}
+              title="Export PDF report">
+              <FileDown size={11} /> Export PDF
+            </button>
+          )}
+        </div>
       </div>
 
       {/* IP warning */}
@@ -426,12 +540,64 @@ export function VulnPanel({ device, onScanComplete, lines, setLines, scanning, s
 
       {!loading && reports && reports.length > 0 && (
         <div className="space-y-3">
+          <VulnTrendChart reports={reports} />
+          <DurationStats reports={reports} />
           <p className="text-[11px] text-text-faint uppercase tracking-wider font-semibold">
             Last {reports.length} scan{reports.length !== 1 ? 's' : ''}
           </p>
           {reports.map(r => (
             <ReportDetail key={r.id} mac={mac} report={r} onDelete={handleDeleteReport} />
           ))}
+
+          {reports.length > 1 && (
+            <div>
+              <p className="text-[11px] text-text-faint uppercase tracking-wider font-semibold mb-2">
+                Scan History
+              </p>
+              <div className="rounded-lg overflow-hidden" style={{ border: '1px solid var(--color-border)' }}>
+                <table className="w-full text-xs">
+                  <thead>
+                    <tr style={{ background: 'var(--color-surface-offset)', borderBottom: '1px solid var(--color-border)' }}>
+                      <th className="text-left px-3 py-2 font-semibold uppercase tracking-wider text-[10px]"
+                        style={{ color: 'var(--color-text-faint)' }}>Date</th>
+                      <th className="text-left px-3 py-2 font-semibold uppercase tracking-wider text-[10px]"
+                        style={{ color: 'var(--color-text-faint)' }}>Severity</th>
+                      <th className="text-right px-3 py-2 font-semibold uppercase tracking-wider text-[10px]"
+                        style={{ color: 'var(--color-text-faint)' }}>Findings</th>
+                      <th className="text-right px-3 py-2 font-semibold uppercase tracking-wider text-[10px]"
+                        style={{ color: 'var(--color-text-faint)' }}>Duration</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {reports.map((r, i) => {
+                      const cfg = SEV_CONFIG[r.severity] || SEV_CONFIG.info
+                      return (
+                        <tr key={r.id} style={{ borderTop: i > 0 ? '1px solid var(--color-border)' : 'none' }}>
+                          <td className="px-3 py-2 font-mono" style={{ color: 'var(--color-text-muted)' }}>
+                            {fmt(r.scanned_at)}
+                          </td>
+                          <td className="px-3 py-2">
+                            <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded-full text-[10px] font-semibold capitalize"
+                              style={{ color: cfg.color, background: cfg.bg, border: `1px solid ${cfg.border}` }}>
+                              {r.severity}
+                            </span>
+                          </td>
+                          <td className="px-3 py-2 text-right font-mono" style={{ color: 'var(--color-text)' }}>
+                            {r.vuln_count}
+                          </td>
+                          <td className="px-3 py-2 text-right font-mono" style={{ color: 'var(--color-text-faint)' }}>
+                            {r.duration_s != null
+                              ? r.duration_s < 60 ? `${r.duration_s.toFixed(1)}s` : `${(r.duration_s / 60).toFixed(1)}m`
+                              : '—'}
+                          </td>
+                        </tr>
+                      )
+                    })}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          )}
         </div>
       )}
     </div>

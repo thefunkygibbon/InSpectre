@@ -2,9 +2,10 @@ import { useState, useEffect, useRef } from 'react'
 import {
   X, Box, Play, Square, RotateCcw, ChevronDown, ChevronRight,
   Network, HardDrive, Tag, Terminal, ShieldAlert, ShieldCheck,
-  Settings2, Clock, ExternalLink, Eye, EyeOff, Loader2, FileText,
+  Settings2, Clock, ExternalLink, Eye, EyeOff, Loader2, FileText, Download, FileDown,
 } from 'lucide-react'
 import { api } from '../api'
+import { exportContainerVulnPDF } from '../utils/vulnPdfExport'
 
 const STATUS_CONFIG = {
   running:    { color: '#22c55e', bg: 'rgba(34,197,94,0.12)',   border: 'rgba(34,197,94,0.3)',   label: 'Running'    },
@@ -18,6 +19,15 @@ const STATUS_CONFIG = {
 function fmt(iso) {
   if (!iso || iso === '0001-01-01T00:00:00Z') return '--'
   return new Date(iso).toLocaleString()
+}
+
+function hostIpFromUrl(url) {
+  if (!url || url.startsWith('unix://')) return 'localhost'
+  try {
+    const m = url.match(/^(?:tcp|http|https):\/\/([^:/]+)/)
+    if (m) return m[1]
+  } catch (_) {}
+  return 'localhost'
 }
 
 function fmtSize(bytes) {
@@ -78,7 +88,15 @@ function Row({ label, value, mono, children }) {
 // ---------------------------------------------------------------------------
 // Log streaming tab
 // ---------------------------------------------------------------------------
-function LogsTab({ containerId, isRunning }) {
+const DOCKER_TS_RE = /^\d{4}-\d{2}-\d{2}T(\d{2}:\d{2}:\d{2})\.\d+Z\s*/
+
+function formatLogLine(line) {
+  const m = line.match(DOCKER_TS_RE)
+  if (m) return `[${m[1]}] ${line.slice(m[0].length)}`
+  return line
+}
+
+function LogsTab({ containerId, containerName, isRunning }) {
   const [lines,   setLines]   = useState([])
   const [running, setRunning] = useState(false)
   const [tail,    setTail]    = useState(100)
@@ -91,14 +109,24 @@ function LogsTab({ containerId, isRunning }) {
     abortRef.current = ctrl
     setLines([])
     setRunning(true)
-    api.dockerLogs(containerId, tail, (line) => {
-      setLines(prev => [...prev.slice(-999), line])
+    const tailVal = tail === 0 ? undefined : tail
+    api.dockerLogs(containerId, tailVal, (line) => {
+      setLines(prev => [...prev.slice(-4999), line])
     }, ctrl.signal).catch(() => {}).finally(() => setRunning(false))
   }
 
   function stopStream() {
     if (abortRef.current) { abortRef.current.abort(); abortRef.current = null }
     setRunning(false)
+  }
+
+  function downloadLogs() {
+    const text = lines.map(formatLogLine).join('\n')
+    const blob = new Blob([text], { type: 'text/plain' })
+    const url  = URL.createObjectURL(blob)
+    const a    = document.createElement('a')
+    a.href = url; a.download = `${containerName || containerId}-logs.txt`; a.click()
+    URL.revokeObjectURL(url)
   }
 
   useEffect(() => () => stopStream(), [])
@@ -116,8 +144,9 @@ function LogsTab({ containerId, isRunning }) {
             className="input text-xs py-1 px-2 h-auto" disabled={running}>
             <option value={50}>50 lines</option>
             <option value={100}>100 lines</option>
-            <option value={200}>200 lines</option>
             <option value={500}>500 lines</option>
+            <option value={1000}>1000 lines</option>
+            <option value={0}>All logs</option>
           </select>
         </div>
         {running ? (
@@ -131,6 +160,13 @@ function LogsTab({ containerId, isRunning }) {
             className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium border
                        border-brand/40 bg-brand/10 text-brand hover:bg-brand/20 transition-colors">
             <Play size={11} /> {lines.length > 0 ? 'Restart' : 'Stream Logs'}
+          </button>
+        )}
+        {lines.length > 0 && !running && (
+          <button onClick={downloadLogs}
+            className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium border
+                       border-border bg-surface-offset text-text-muted hover:text-text transition-colors">
+            <Download size={11} /> Download .txt
           </button>
         )}
         {running && (
@@ -149,15 +185,18 @@ function LogsTab({ containerId, isRunning }) {
         </div>
       ) : (
         <div
-          className="rounded-xl p-3 font-mono text-[11px] overflow-y-auto max-h-[60vh] space-y-0.5"
+          className="rounded-xl p-3 font-mono text-[10px] overflow-y-auto max-h-[60vh] space-y-0.5"
           style={{ background: 'var(--color-surface-offset)', border: '1px solid var(--color-border)' }}
         >
-          {lines.map((line, i) => (
-            <div key={i} className="whitespace-pre-wrap break-all leading-snug"
-              style={{ color: line.includes('[ERROR]') ? '#ef4444' : 'var(--color-text-muted)' }}>
-              {line}
-            </div>
-          ))}
+          {lines.map((line, i) => {
+            const display = formatLogLine(line)
+            return (
+              <div key={i} className="whitespace-pre-wrap break-all leading-snug"
+                style={{ color: display.includes('[ERROR]') || display.includes('ERROR') ? '#ef4444' : 'var(--color-text-muted)' }}>
+                {display}
+              </div>
+            )
+          })}
           {running && <div className="w-2 h-3 inline-block animate-pulse" style={{ background: 'var(--color-brand)' }} />}
           <div ref={endRef} />
         </div>
@@ -351,6 +390,15 @@ function VulnTab({ container, trivyScan, updateTrivyScan }) {
             <Loader2 size={11} className="animate-spin" />Scanning…
           </span>
         )}
+        {vulns !== null && !scanning && (
+          <button
+            onClick={() => exportContainerVulnPDF(container, vulns, scannedAt)}
+            className="flex items-center gap-1 px-2 py-1.5 rounded-lg text-xs font-medium transition-colors ml-auto"
+            style={{ color: 'var(--color-text-faint)', border: '1px solid var(--color-border)' }}
+            title="Export PDF report">
+            <FileDown size={11} /> Export PDF
+          </button>
+        )}
       </div>
 
       {/* Scan errors/warnings only — INFO lines suppressed */}
@@ -440,6 +488,7 @@ export function ContainerDrawer({ container: initialContainer, trivyScan, update
   const cfg       = STATUS_CONFIG[container.status] || STATUS_CONFIG.exited
   const isRunning = container.status === 'running'
   const isStopped = STOPPED_STATES.includes(container.status)
+  const hostIp    = hostIpFromUrl(container.host_url)
 
   async function doAction(action) {
     setActioning(action)
@@ -556,7 +605,7 @@ export function ContainerDrawer({ container: initialContainer, trivyScan, update
                           </span>
                           {(p.container_port.startsWith('80/') || p.container_port.startsWith('443/') || p.host_port) && (
                             <a
-                              href={`${p.container_port.startsWith('443/') ? 'https' : 'http'}://localhost:${p.host_port}`}
+                              href={`${p.container_port.startsWith('443/') ? 'https' : 'http'}://${hostIp}:${p.host_port}`}
                               target="_blank" rel="noopener noreferrer"
                               onClick={e => e.stopPropagation()}
                               className="opacity-50 hover:opacity-100 transition-opacity"
@@ -647,7 +696,7 @@ export function ContainerDrawer({ container: initialContainer, trivyScan, update
 
           {/* ── Logs tab ── */}
           {activeTab === 'logs' && (
-            <LogsTab containerId={container.id} isRunning={isRunning} />
+            <LogsTab containerId={container.id} containerName={container.name} isRunning={isRunning} />
           )}
 
           {/* ── Vuln tab ── */}

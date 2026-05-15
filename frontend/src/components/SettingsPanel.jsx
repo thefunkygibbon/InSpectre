@@ -2,9 +2,12 @@ import { useState, useEffect, useRef } from 'react'
 import {
   Save, RotateCcw, Settings2, X, Download, Upload, FileText,
   Database, Bell, ScanLine, Eye, EyeOff, Send, Globe, User, Key, Box,
+  AlertTriangle, ChevronDown, ChevronRight, Paintbrush, Home, Wifi,
 } from 'lucide-react'
 import { api } from '../api'
 import { HostsManager } from './HostsManager'
+import { useTheme } from '../hooks/useTheme'
+import { NotificationsTab } from './NotificationsTab'
 
 // ── Setting definitions ────────────────────────────────────────────────────────
 const SETTING_META = {
@@ -17,11 +20,19 @@ const SETTING_META = {
     description: 'Number of parallel packet capture threads. Requires probe restart to take effect.' },
   arp_scan_retry:          { label: 'ARP Sweep Retries',   unit: 'extra rounds',  type: 'number', min: 0,  max: 3,    tab: 'scanner',
     description: 'Extra ARP broadcast rounds per sweep (0 = single pass, 1 = two rounds). Each retry wakes sleeping mobile devices and adds broadcast traffic. The passive sniffer catches most devices that miss sweeps.' },
+  primary_ip_mode: { label: 'Primary IP Update Mode', type: 'select', tab: 'scanner',
+    options: [
+      { value: 'locked',  label: 'Locked — respect per-device IP lock (default)' },
+      { value: 'dynamic', label: 'Dynamic — always adopt new IP on offline return (main-style)' },
+    ],
+    description: 'Controls how the primary IP is updated when a device returns from offline at a different IP. Locked: honours the per-device lock flag set in the device drawer. Dynamic: always updates primary IP to track DHCP changes, ignoring any lock.' },
   ip_range:                { label: 'IP Range',            unit: '',              type: 'text',              tab: 'scanner' },
   dns_server:              { label: 'LAN DNS Server',      unit: 'IP',            type: 'text',              tab: 'scanner',
     description: 'DNS server used for hostname resolution. Leave blank to auto-detect from host.' },
   probe_interface:         { label: 'Probe Interface',     unit: '',              type: 'text',              tab: 'scanner',
     description: 'Network interface the probe uses for scanning (e.g. eth0, eno1). Leave blank to auto-detect.' },
+  fingerbank_api_key:      { label: 'Fingerbank API Key',  unit: '',              type: 'text',              tab: 'scanner',
+    description: 'Free API key from fingerbank.org. When set, DHCP fingerprints are sent to Fingerbank for cloud device identification. Results appear in the DHCP Fingerprint section of each device.' },
   vuln_scan_templates:     { label: 'Vuln Scan Templates', unit: '',              type: 'text',              tab: 'scanner',
     description: 'Comma-separated template tags for vulnerability scanning (e.g. cve,exposure,misconfig,default-login,network).' },
   vuln_scan_schedule:      { label: 'Scheduled Vuln Scans', unit: '',             type: 'select', tab: 'scanner',
@@ -61,49 +72,95 @@ const SETTING_META = {
     ],
     description: 'How often the probe automatically updates vulnerability scan templates.' },
 
-  // Notifications tab — in-app
-  notifications_enabled:         { label: 'Toast Notifications',    type: 'toggle', tab: 'notifications',
-    description: 'Show in-app popup toasts when new devices appear or go offline.' },
-  browser_notifications_enabled: { label: 'Browser Notifications',  type: 'toggle', tab: 'notifications',
-    description: 'Show OS-level notifications even when the tab is in the background. Requires browser permission.' },
-
-  // Notifications tab — alert triggers (control the backend dispatch loop)
-  alert_on_new_device: { label: 'Alert on New Device',      type: 'toggle', tab: 'notifications',
-    description: 'Send an external alert when a new device is discovered.' },
-  alert_on_offline:    { label: 'Alert on Device Offline',  type: 'toggle', tab: 'notifications',
-    description: 'Send an external alert when a watched device goes offline.' },
-  alert_on_vuln:       { label: 'Alert on Vulnerability',   type: 'toggle', tab: 'notifications',
-    description: 'Send an external alert when a vulnerability scan finds issues.' },
-
-  // Delivery channels — handled as special sections in the UI, referenced here for tab routing
-  alert_webhook_url: { tab: 'notifications' },
-  ntfy_url:          { tab: 'notifications' },
-  ntfy_topic:        { tab: 'notifications' },
-  gotify_url:        { tab: 'notifications' },
-  gotify_token:      { tab: 'notifications' },
-  pushbullet_api_key:{ tab: 'notifications' },
-
   // Docker monitoring — handled as custom cards, referenced here for tab routing
   docker_enabled:        { tab: 'docker' },
   docker_host:           { tab: 'docker' },
   docker_tls_verify:     { tab: 'docker' },
-  trivy_db_update_hours: { tab: 'docker' },
-  docker_scan_on_new:    { tab: 'docker' },
-  docker_scan_on_update: { tab: 'docker' },
+  trivy_db_update_hours: { label: 'Trivy DB Update Interval', unit: 'hours', type: 'number', min: 0, max: 168, tab: 'docker',
+    description: 'How often to refresh the Trivy vulnerability database (hours). Set to 0 to disable automatic updates.' },
+  docker_scan_on_new:    { label: 'Scan New Containers',     type: 'toggle', tab: 'docker',
+    description: 'Automatically run a Trivy vulnerability scan when a new container is created.' },
+  docker_scan_on_update: { label: 'Scan Updated Containers', type: 'toggle', tab: 'docker',
+    description: 'Automatically run a Trivy vulnerability scan when a container is recreated with an updated image.' },
+
+  // Data tab — traffic monitoring
+  traffic_enabled:        { label: 'Enable Traffic Monitoring',  type: 'toggle', tab: 'data',
+    description: 'Allow per-device traffic capture sessions. Disable to prevent all traffic monitoring.' },
+  traffic_retention_days: { label: 'Traffic Data Retention', unit: 'days',     type: 'number', min: 1, max: 365, tab: 'data',
+    description: 'How many days to keep traffic statistics before automatic deletion.' },
+  traffic_max_sessions:   { label: 'Max Concurrent Sessions', unit: 'sessions', type: 'number', min: 1, max: 50, tab: 'data',
+    description: 'Maximum number of simultaneous traffic monitoring sessions allowed.' },
+
+  // Data tab — speed test
+  speedtest_schedule: { label: 'Scheduled Speed Tests', type: 'select', tab: 'data',
+    options: [
+      { value: 'disabled', label: 'Disabled' },
+      { value: '30m',      label: 'Every 30 minutes' },
+      { value: '1h',       label: 'Hourly' },
+      { value: '6h',       label: 'Every 6 hours' },
+      { value: '24h',      label: 'Daily' },
+    ],
+    description: 'How often to run automatic speed tests in the background.' },
+
+  // Scanner tab — auto-block security responses
+  auto_block_new_devices:   { label: 'Auto-Block New Devices', type: 'toggle', tab: 'scanner',
+    description: 'Automatically ARP-block any newly discovered device until it is manually approved.' },
+  auto_block_vuln_severity: { label: 'Auto-Block on Vulnerability', type: 'select', tab: 'scanner',
+    options: [
+      { value: 'none',     label: 'Disabled' },
+      { value: 'medium',   label: 'Medium and above' },
+      { value: 'high',     label: 'High and above' },
+      { value: 'critical', label: 'Critical only' },
+    ],
+    description: 'Automatically ARP-block a device when a vulnerability scan finds issues at or above the selected severity.' },
+
+  // Phase 9 — device grouping
+  auto_group_by_hostname: { label: 'Auto-group by Hostname', type: 'toggle', tab: 'scanner',
+    description: 'Automatically group devices with the same hostname as the same physical device on a different interface (e.g. laptop on WiFi vs Ethernet). When disabled, a suggestion event is written instead and grouping can be done manually in the device admin panel.' },
+
+  // Here Be Dragons — advanced probe pipeline controls
+  enable_arp_sweep: { label: 'Enable Active ARP Sweep', type: 'toggle', tab: 'scanner',
+    description: 'Send active ARP broadcast packets to discover devices on the configured subnet. Disable to rely on the passive sniffer only — note that without the sweep, device online/offline state will no longer be tracked.' },
+  enable_passive_sniffer: { label: 'Enable Passive ARP Sniffer', type: 'toggle', tab: 'scanner',
+    description: 'Listen passively for ARP traffic on the network interface. Disable to stop all passive packet capture. Takes effect immediately.' },
+  sniffer_subnet_filter: { label: 'Filter Sniffer to Configured Subnet', type: 'toggle', tab: 'scanner',
+    description: 'Restrict the passive sniffer to the configured IP range only. Disable if you intentionally want to track devices from other subnets on the same interface — but note that the active ARP sweep will still only cover the configured range.' },
+  enable_hostname_resolution: { label: 'Enable DNS Hostname Resolution', type: 'toggle', tab: 'scanner',
+    description: 'Attempt reverse-DNS lookups to resolve device hostnames. Disable to stop all DNS queries from the probe — useful if hostname lookups are hammering your DNS server.' },
+  hostname_cooldown_hours: { label: 'Hostname Resolution Cooldown', unit: 'hours', type: 'number', min: 1, max: 168, tab: 'scanner',
+    description: 'Minimum hours between DNS resolution retries for each unresolved device. Lower values mean more frequent DNS queries.' },
+  enable_port_scanning: { label: 'Enable Port Scanning', type: 'toggle', tab: 'scanner',
+    description: 'Run TCP port scans on discovered devices to identify open services. Disable to stop all port scanning and deep scan activity.' },
+  port_scan_method: { label: 'Port Scan Method', type: 'select', tab: 'scanner',
+    options: [
+      { value: 'tcp_connect', label: 'TCP Connect (default — no special privileges)' },
+      { value: 'scapy_syn',   label: 'Scapy SYN Scan (raw packets, faster on LAN)' },
+    ],
+    description: 'TCP Connect uses standard socket connections and works without root. Scapy SYN sends raw TCP SYN packets — often faster on LAN since closed ports return RST immediately rather than waiting for a timeout. Requires CAP_NET_RAW, already granted in the default Docker configuration.' },
+  port_scan_workers: { label: 'Port Scan Worker Threads', unit: 'threads', type: 'number', min: 10, max: 500, tab: 'scanner',
+    description: 'Concurrent TCP connect threads per port scan (applies to TCP Connect method only, default 200).' },
+  gateway_scan_workers: { label: 'Gateway Scan Worker Threads', unit: 'threads', type: 'number', min: 5, max: 200, tab: 'scanner',
+    description: 'Concurrent TCP connect threads when scanning the default gateway (default 50). Kept lower than regular scans to avoid overwhelming the gateway device.' },
+  enable_service_fingerprinting: { label: 'Enable Service Fingerprinting', type: 'toggle', tab: 'scanner',
+    description: 'Run Nerva service fingerprinting after each port scan to identify the service running on each open port. Disable to skip this stage.' },
+  enable_mdns: { label: 'Enable mDNS Discovery', type: 'toggle', tab: 'scanner',
+    description: 'Probe the mDNS/Bonjour multicast group to discover device names and advertised services. Runs every 2 hours in the background.' },
+  enable_nightly_scan: { label: 'Enable Nightly Rescan Window', type: 'toggle', tab: 'scanner',
+    description: 'Re-scan all online devices during the configured nightly scan window. Disable to prevent automatic overnight port scan storms.' },
+  enable_unscanned_retry: { label: 'Retry Unscanned Devices Each Cycle', type: 'toggle', tab: 'scanner',
+    description: 'On each sweep cycle, trigger a port scan for any device that has never been scanned. Disable if new devices are causing too many simultaneous scans.' },
 }
 
-// Keys rendered as custom delivery-channel cards, not through SettingRow
-const DELIVERY_KEYS = new Set(['alert_webhook_url','ntfy_url','ntfy_topic','gotify_url','gotify_token','pushbullet_api_key'])
-
 // Docker keys handled as custom cards
-const DOCKER_KEYS = new Set(['docker_enabled','docker_host','docker_tls_verify','trivy_db_update_hours','docker_scan_on_new','docker_scan_on_update'])
+const DOCKER_KEYS = new Set(['docker_enabled','docker_host','docker_tls_verify'])
 
 const TABS = [
-  { id: 'scanner',       label: 'Scanner',       Icon: ScanLine },
-  { id: 'notifications', label: 'Notifications', Icon: Bell     },
-  { id: 'docker',        label: 'Docker',        Icon: Box      },
-  { id: 'data',          label: 'Data',          Icon: Database },
-  { id: 'account',       label: 'Account',       Icon: User     },
+  { id: 'scanner',       label: 'Scanner',        Icon: ScanLine   },
+  { id: 'notifications', label: 'Notifications',  Icon: Bell       },
+  { id: 'ha',            label: 'Home Assistant', Icon: Home       },
+  { id: 'docker',        label: 'Docker',         Icon: Box        },
+  { id: 'data',          label: 'Data',           Icon: Database   },
+  { id: 'admin',         label: 'Admin',          Icon: Settings2  },
 ]
 
 async function downloadResponse(res, filename) {
@@ -117,6 +174,7 @@ async function downloadResponse(res, filename) {
 }
 
 export function SettingsPanel({ onClose, onSettingChange }) {
+  const { skin, setSkin, isDark } = useTheme()
   const [activeTab,     setActiveTab]     = useState('scanner')
   const [settings,      setSettings]      = useState([])
   const [dirty,         setDirty]         = useState({})
@@ -126,21 +184,25 @@ export function SettingsPanel({ onClose, onSettingChange }) {
   const [exportingDevs, setExportingDevs] = useState(false)
   const [exportingFp,   setExportingFp]   = useState(false)
   const [importStatus,  setImportStatus]  = useState(null)
-  const [backingUp,     setBackingUp]     = useState(false)
-  const [restoreStatus, setRestoreStatus] = useState(null)
+  const [backingUp,      setBackingUp]      = useState(false)
+  const [restoreStatus,  setRestoreStatus]  = useState(null)
+  const [backupPassword, setBackupPassword] = useState('')
+  const [showBackupPwd,  setShowBackupPwd]  = useState(false)
   const restoreInputRef = useRef(null)
-  const [showPbKey,     setShowPbKey]     = useState(false)
-  const [showGotifyToken, setShowGotifyToken] = useState(false)
-  const [pbTestStatus,  setPbTestStatus]  = useState(null)
-  const [pbTestMsg,     setPbTestMsg]     = useState('')
-  const [browserPerm,   setBrowserPerm]   = useState(
-    typeof Notification !== 'undefined' ? Notification.permission : 'unsupported'
-  )
+  const [dragonsOpen,   setDragonsOpen]   = useState(false)
+  const [restarting,    setRestarting]    = useState({})  // { probe: bool, backend: bool }
+  const [haMqttStatus,  setHaMqttStatus]  = useState(null)   // null | { connected: bool }
+  const [haConnecting,  setHaConnecting]  = useState(false)
   const fileInputRef = useRef(null)
+  const [detectedInterface, setDetectedInterface] = useState('')
 
   useEffect(() => {
     api.getSettings().then(setSettings).catch(() => {})
     api.getFingerprintStats().then(setFpStats).catch(() => {})
+    api.setupNetworkInfo().then(info => {
+      if (info?.interface) setDetectedInterface(info.interface)
+    }).catch(() => {})
+    api.haMqttStatus().then(setHaMqttStatus).catch(() => {})
   }, [])
 
   function handleChange(key, value) {
@@ -153,11 +215,25 @@ export function SettingsPanel({ onClose, onSettingChange }) {
     await Promise.all(
       Object.entries(dirty).map(([key, value]) => api.updateSetting(key, value))
     )
+    // Push scanner settings to the probe immediately (no need to wait for next scan cycle)
+    if (activeTab === 'scanner') {
+      api.applySettings().catch(() => {})
+    }
     setSaving(false)
     setDirty({})
     setSaved(true)
     setTimeout(() => setSaved(false), 2000)
     api.getSettings().then(setSettings)
+  }
+
+  async function handleRestart(target) {
+    if (!confirm(`Restart the ${target} container? It will be back online in a few seconds (Docker restart policy).`)) return
+    setRestarting(r => ({ ...r, [target]: true }))
+    try {
+      if (target === 'probe')   await api.restartProbe()
+      if (target === 'backend') await api.restartBackend()
+    } catch { /* container disappears before it can reply — that's expected */ }
+    setTimeout(() => setRestarting(r => ({ ...r, [target]: false })), 5000)
   }
 
   async function handleReset() {
@@ -168,34 +244,6 @@ export function SettingsPanel({ onClose, onSettingChange }) {
       setDirty({})
       s.forEach(x => onSettingChange?.(x.key, x.value))
     })
-  }
-
-  async function handleRequestBrowserPermission() {
-    if (typeof Notification === 'undefined') return
-    const result = await Notification.requestPermission()
-    setBrowserPerm(result)
-  }
-
-  async function handleTestPushbullet() {
-    const currentKey = (
-      dirty['pushbullet_api_key'] ??
-      settings.find(s => s.key === 'pushbullet_api_key')?.value ??
-      ''
-    ).trim()
-    if (!currentKey) {
-      setPbTestStatus('error'); setPbTestMsg('Enter an API key first.')
-      setTimeout(() => setPbTestStatus(null), 4000)
-      return
-    }
-    setPbTestStatus('testing')
-    try {
-      await api.testPushbullet(currentKey)
-      setPbTestStatus('ok'); setPbTestMsg('Test notification sent!')
-    } catch (e) {
-      setPbTestStatus('error')
-      setPbTestMsg((e.message || '').includes('401') ? 'Invalid API key.' : 'Failed — check key and connection.')
-    }
-    setTimeout(() => setPbTestStatus(null), 6000)
   }
 
   async function handleExportDevices() {
@@ -214,7 +262,10 @@ export function SettingsPanel({ onClose, onSettingChange }) {
 
   async function handleBackup() {
     setBackingUp(true)
-    try { await downloadResponse(await api.exportBackup(), 'inspectre-backup.json') }
+    try {
+      const fname = backupPassword ? 'inspectre_backup.ienc' : 'inspectre_backup.json'
+      await downloadResponse(await api.exportBackup(backupPassword), fname)
+    }
     catch (e) { alert('Backup failed: ' + e.message) }
     finally { setBackingUp(false) }
   }
@@ -224,9 +275,12 @@ export function SettingsPanel({ onClose, onSettingChange }) {
     if (!file) return
     setRestoreStatus('loading')
     try {
-      const result = await api.importRestore(file)
+      const result = await api.importRestore(file, backupPassword)
       setRestoreStatus(result)
-    } catch { setRestoreStatus('error') }
+    } catch (err) {
+      const msg = err.message || ''
+      setRestoreStatus(msg.toLowerCase().includes('encrypt') ? 'needs_password' : 'error')
+    }
     finally { if (restoreInputRef.current) restoreInputRef.current.value = '' }
   }
 
@@ -271,27 +325,16 @@ export function SettingsPanel({ onClose, onSettingChange }) {
   }
 
   const hasDirty   = Object.keys(dirty).length > 0
-  const showFooter = activeTab !== 'data' && activeTab !== 'account' && activeTab !== 'docker'
+  const showFooter = activeTab !== 'admin'
 
   // Returns current value for a key (dirty-aware)
   function val(key) {
     return dirty[key] ?? settings.find(s => s.key === key)?.value ?? ''
   }
 
-  // Standard setting rows for a tab (excludes delivery-channel keys)
-  function tabRows(tab) {
-    return settings.filter(s => SETTING_META[s.key]?.tab === tab && !DELIVERY_KEYS.has(s.key))
-  }
-
-  const bnEnabled = val('browser_notifications_enabled') === 'true'
-
   // ── Scanner tab grouping ────────────────────────────────────────────────────
-  const networkScanKeys   = ['scan_interval','offline_miss_threshold','sniffer_workers','arp_scan_retry']
+  const networkScanKeys   = ['scan_interval','offline_miss_threshold']
   const networkConfigKeys = ['ip_range','dns_server','probe_interface']
-
-  // ── Notifications tab grouping ──────────────────────────────────────────────
-  const inAppKeys   = ['notifications_enabled','browser_notifications_enabled']
-  const triggerKeys = ['alert_on_new_device','alert_on_offline','alert_on_vuln']
 
   function settingsByKeys(keys) {
     return keys.map(k => settings.find(s => s.key === k)).filter(Boolean)
@@ -322,20 +365,23 @@ export function SettingsPanel({ onClose, onSettingChange }) {
           <button onClick={onClose} className="btn-ghost p-2" aria-label="Close"><X size={18} /></button>
         </div>
 
-        {/* Tab bar */}
-        <div className="flex px-6 gap-1"
-          style={{ borderBottom: '1px solid var(--color-border)', paddingTop: '12px' }}>
+        {/* Nav grid */}
+        <div className="px-4 py-3 grid grid-cols-3 gap-1.5"
+          style={{ borderBottom: '1px solid var(--color-border)' }}>
           {TABS.map(({ id, label, Icon }) => {
             const isActive = activeTab === id
             return (
               <button key={id} onClick={() => setActiveTab(id)}
-                className="flex items-center gap-1.5 px-3 pb-3 text-sm font-medium transition-colors relative"
+                className="flex flex-col items-center gap-1.5 py-2.5 px-1 rounded-xl text-xs font-medium transition-all"
                 style={{
                   color: isActive ? 'var(--color-brand)' : 'var(--color-text-muted)',
-                  borderBottom: isActive ? '2px solid var(--color-brand)' : '2px solid transparent',
-                  marginBottom: '-1px',
+                  background: isActive
+                    ? 'color-mix(in srgb, var(--color-brand) 10%, var(--color-surface-offset))'
+                    : 'var(--color-surface-offset)',
+                  border: `1px solid ${isActive ? 'color-mix(in srgb, var(--color-brand) 30%, transparent)' : 'var(--color-border)'}`,
                 }}>
-                <Icon size={13} />{label}
+                <Icon size={15} />
+                <span style={{ fontSize: '10px', lineHeight: 1 }}>{label}</span>
               </button>
             )
           })}
@@ -362,159 +408,235 @@ export function SettingsPanel({ onClose, onSettingChange }) {
 
               {/* Network configuration */}
               <SectionHeader label="Network Configuration" Icon={ScanLine} />
-              {settingsByKeys(networkConfigKeys).map(s => (
+              {settingsByKeys(['ip_range','dns_server']).map(s => (
                 <SettingRow key={s.key} s={s} dirty={dirty} onchange={handleChange} />
               ))}
+              {settingsByKeys(['probe_interface']).map(s => (
+                <SettingRow key={s.key} s={s} dirty={dirty} onchange={handleChange}
+                  placeholder={detectedInterface || 'auto-detect'} />
+              ))}
+
+              {/* Device Identification */}
+              <CollapsibleSection label="Device Identification" Icon={Settings2} defaultOpen={false}>
+                {settingsByKeys(['fingerbank_api_key']).map(s => (
+                  <SettingRow key={s.key} s={s} dirty={dirty} onchange={handleChange} />
+                ))}
+              </CollapsibleSection>
+
+              {/* Vulnerability Scanning */}
+              <CollapsibleSection label="Vulnerability Scanning" Icon={AlertTriangle} defaultOpen={false}>
+                {settingsByKeys(['vuln_scan_schedule','vuln_scan_targets','vuln_scan_templates','nuclei_template_update_interval','vuln_scan_on_new_device','vuln_scan_on_port_change']).map(s => (
+                  <SettingRow key={s.key} s={s} dirty={dirty} onchange={handleChange} />
+                ))}
+              </CollapsibleSection>
+
+              {/* Scan Scheduling */}
+              <CollapsibleSection label="Scan Scheduling" Icon={ScanLine} defaultOpen={false}>
+                {settingsByKeys(['nightly_scan_start','nightly_scan_end','offline_rescan_hours','baseline_scan_count_threshold']).map(s => (
+                  <SettingRow key={s.key} s={s} dirty={dirty} onchange={handleChange} />
+                ))}
+              </CollapsibleSection>
+
+              {/* Security Responses */}
+              <CollapsibleSection label="Security Responses" Icon={AlertTriangle} defaultOpen={false}>
+                {settingsByKeys(['auto_block_new_devices','auto_block_vuln_severity']).map(s => (
+                  <SettingRow key={s.key} s={s} dirty={dirty} onchange={handleChange} />
+                ))}
+              </CollapsibleSection>
+
+              {/* ── Here Be Dragons ─────────────────────────────────────── */}
+              <button
+                type="button"
+                onClick={() => setDragonsOpen(o => !o)}
+                className="w-full flex items-center gap-2 pt-3 pb-1 text-left"
+                style={{ color: 'var(--color-text-muted)' }}
+              >
+                {dragonsOpen ? <ChevronDown size={13} /> : <ChevronRight size={13} />}
+                <AlertTriangle size={13} style={{ color: '#f59e0b' }} />
+                <span className="text-sm font-semibold" style={{ color: '#f59e0b' }}>Here Be Dragons</span>
+                <span className="text-xs ml-1" style={{ color: 'var(--color-text-faint)' }}>— advanced probe pipeline controls</span>
+              </button>
+
+              {dragonsOpen && (
+                <div className="space-y-3">
+                  <div className="rounded-lg p-3 text-xs space-y-1"
+                    style={{ background: 'rgba(245,158,11,0.08)', border: '1px solid rgba(245,158,11,0.3)', color: '#d97706' }}>
+                    <p className="font-semibold">Warning — these settings affect probe behaviour directly.</p>
+                    <p style={{ color: 'var(--color-text-muted)' }}>
+                      Changing them can stop device discovery, halt DNS lookups, or reduce network load depending on what you disable.
+                      If unexpected devices are appearing or DNS queries are high, check that <strong>Filter Sniffer to Configured Subnet</strong> is on
+                      — if disabled, the sniffer will process ARP traffic from every subnet visible on the interface.
+                    </p>
+                  </div>
+
+                  <p className="text-xs font-semibold" style={{ color: 'var(--color-text-muted)', paddingTop: '4px' }}>Advanced Scanning</p>
+                  {settingsByKeys(['sniffer_workers','arp_scan_retry','primary_ip_mode']).map(s => (
+                    <SettingRow key={s.key} s={s} dirty={dirty} onchange={handleChange} />
+                  ))}
+
+                  <p className="text-xs font-semibold" style={{ color: 'var(--color-text-muted)', paddingTop: '4px' }}>Active ARP Sweep</p>
+                  {settingsByKeys(['enable_arp_sweep']).map(s => (
+                    <SettingRow key={s.key} s={s} dirty={dirty} onchange={handleChange} />
+                  ))}
+
+                  <p className="text-xs font-semibold" style={{ color: 'var(--color-text-muted)', paddingTop: '4px' }}>Passive Sniffer</p>
+                  {settingsByKeys(['enable_passive_sniffer','sniffer_subnet_filter']).map(s => (
+                    <SettingRow key={s.key} s={s} dirty={dirty} onchange={handleChange} />
+                  ))}
+
+                  <p className="text-xs font-semibold" style={{ color: 'var(--color-text-muted)', paddingTop: '4px' }}>Hostname / DNS Resolution</p>
+                  {settingsByKeys(['enable_hostname_resolution','hostname_cooldown_hours']).map(s => (
+                    <SettingRow key={s.key} s={s} dirty={dirty} onchange={handleChange} />
+                  ))}
+
+                  <p className="text-xs font-semibold" style={{ color: 'var(--color-text-muted)', paddingTop: '4px' }}>Port Scanning</p>
+                  {settingsByKeys(['enable_port_scanning','port_scan_method','port_scan_workers','gateway_scan_workers','enable_service_fingerprinting']).map(s => (
+                    <SettingRow key={s.key} s={s} dirty={dirty} onchange={handleChange} />
+                  ))}
+
+                  <p className="text-xs font-semibold" style={{ color: 'var(--color-text-muted)', paddingTop: '4px' }}>Periodic Activity</p>
+                  {settingsByKeys(['enable_mdns','enable_nightly_scan','enable_unscanned_retry']).map(s => (
+                    <SettingRow key={s.key} s={s} dirty={dirty} onchange={handleChange} />
+                  ))}
+
+                  <p className="text-xs font-semibold" style={{ color: 'var(--color-text-muted)', paddingTop: '4px' }}>Device Grouping</p>
+                  {settingsByKeys(['auto_group_by_hostname']).map(s => (
+                    <SettingRow key={s.key} s={s} dirty={dirty} onchange={handleChange} />
+                  ))}
+
+                  <p className="text-xs font-semibold" style={{ color: 'var(--color-text-muted)', paddingTop: '4px' }}>Container Restart</p>
+                  <div className="card p-4 space-y-3">
+                    <p className="text-xs" style={{ color: 'var(--color-text-faint)' }}>
+                      Force-restart individual containers. Docker brings them back immediately.
+                      Required after changing Probe Interface or Sniffer Workers.
+                    </p>
+                    <div className="flex gap-2 flex-wrap">
+                      <button onClick={() => handleRestart('probe')} disabled={restarting.probe}
+                        className="btn-secondary flex items-center gap-2 text-sm"
+                        style={{ opacity: restarting.probe ? 0.5 : 1 }}>
+                        <AlertTriangle size={12} style={{ color: '#f59e0b' }} />
+                        {restarting.probe ? 'Restarting…' : 'Restart Probe'}
+                      </button>
+                      <button onClick={() => handleRestart('backend')} disabled={restarting.backend}
+                        className="btn-secondary flex items-center gap-2 text-sm"
+                        style={{ opacity: restarting.backend ? 0.5 : 1 }}>
+                        <AlertTriangle size={12} style={{ color: '#f59e0b' }} />
+                        {restarting.backend ? 'Restarting…' : 'Restart Backend'}
+                      </button>
+                    </div>
+                  </div>
+                </div>
+              )}
 
             </>
           )}
 
           {/* ── Notifications tab ───────────────────────────────────────────── */}
           {activeTab === 'notifications' && (
-            <>
+            <NotificationsTab settings={settings} dirty={dirty} onchange={handleChange} />
+          )}
+
+          {/* ── Home Assistant tab ──────────────────────────────────────────── */}
+          {activeTab === 'ha' && (
+            <div className="space-y-4">
               <p className="text-xs" style={{ color: 'var(--color-text-faint)' }}>
-                Configure how and where you receive alerts about network events.
+                Publishes InSpectre device state to Home Assistant via MQTT Auto-Discovery.
+                Each network device gets presence, IP, open-ports and vulnerability sensors.
+                A system device tracks total devices online, vulnerabilities, and scan state.
               </p>
 
-              {settings.length === 0 && <SkeletonRows count={5} />}
-
-              {/* In-app */}
-              <SectionHeader label="In-App" Icon={Bell} />
-              {settingsByKeys(inAppKeys).map(s => (
-                <SettingRow key={s.key} s={s} dirty={dirty} onchange={handleChange} />
-              ))}
-
-              {/* Browser permission helper */}
-              {bnEnabled && browserPerm !== 'unsupported' && (
-                <div className="rounded-lg p-3 text-xs space-y-2"
-                  style={{ background: 'var(--color-surface-offset)', border: '1px solid var(--color-border)' }}>
-                  <div className="flex items-center justify-between">
-                    <span className="font-medium" style={{ color: 'var(--color-text)' }}>Browser permission</span>
-                    <PermBadge perm={browserPerm} />
-                  </div>
-                  {browserPerm === 'default' && (
-                    <>
-                      <p style={{ color: 'var(--color-text-muted)' }}>Permission required to show OS-level notifications.</p>
-                      <button onClick={handleRequestBrowserPermission}
-                        className="btn-secondary text-xs flex items-center gap-1.5">
-                        <Bell size={11} /> Request Permission
-                      </button>
-                    </>
-                  )}
-                  {browserPerm === 'denied' && (
-                    <p style={{ color: '#ef4444' }}>Permission denied. Reset in your browser's site settings, then reload.</p>
-                  )}
-                  {browserPerm === 'granted' && (
-                    <p style={{ color: 'var(--color-text-muted)' }}>OS notifications are active.</p>
-                  )}
-                </div>
-              )}
-
-              {/* Alert triggers */}
-              <SectionHeader label="Alert Triggers" Icon={Bell} />
-              <p className="text-xs -mt-2" style={{ color: 'var(--color-text-faint)' }}>
-                Which events fire alerts to the delivery channels below.
-              </p>
-              {settingsByKeys(triggerKeys).map(s => (
-                <SettingRow key={s.key} s={s} dirty={dirty} onchange={handleChange} />
-              ))}
-
-              {/* Delivery: Webhook */}
-              <SectionHeader label="Webhook" Icon={Globe} />
-              <div className="card p-4 space-y-2">
-                <p className="text-xs" style={{ color: 'var(--color-text-faint)' }}>
-                  POST JSON to a URL when an alert fires. Leave blank to disable.
-                </p>
-                <input
-                  type="url"
-                  className="input text-sm"
-                  placeholder="https://example.com/webhook"
-                  value={val('alert_webhook_url')}
-                  onChange={e => handleChange('alert_webhook_url', e.target.value)}
-                  style={dirty['alert_webhook_url'] !== undefined ? { borderColor: 'color-mix(in srgb, var(--color-brand) 50%, transparent)' } : {}}
-                />
-              </div>
-
-              {/* Delivery: ntfy */}
-              <SectionHeader label="ntfy" Icon={Globe} />
-              <div className="card p-4 space-y-3">
-                <p className="text-xs" style={{ color: 'var(--color-text-faint)' }}>
-                  Self-hosted or ntfy.sh push notifications. Leave topic blank to disable.
-                </p>
-                <div className="space-y-1.5">
-                  <label className="text-xs font-medium" style={{ color: 'var(--color-text-muted)' }}>Server URL</label>
-                  <input type="url" className="input text-sm" placeholder="https://ntfy.sh"
-                    value={val('ntfy_url')} onChange={e => handleChange('ntfy_url', e.target.value)}
-                    style={dirty['ntfy_url'] !== undefined ? { borderColor: 'color-mix(in srgb, var(--color-brand) 50%, transparent)' } : {}} />
-                </div>
-                <div className="space-y-1.5">
-                  <label className="text-xs font-medium" style={{ color: 'var(--color-text-muted)' }}>Topic</label>
-                  <input type="text" className="input text-sm" placeholder="my-inspectre-alerts"
-                    value={val('ntfy_topic')} onChange={e => handleChange('ntfy_topic', e.target.value)}
-                    style={dirty['ntfy_topic'] !== undefined ? { borderColor: 'color-mix(in srgb, var(--color-brand) 50%, transparent)' } : {}} />
-                </div>
-              </div>
-
-              {/* Delivery: Gotify */}
-              <SectionHeader label="Gotify" Icon={Globe} />
-              <div className="card p-4 space-y-3">
-                <p className="text-xs" style={{ color: 'var(--color-text-faint)' }}>
-                  Self-hosted Gotify push notifications. Leave URL blank to disable.
-                </p>
-                <div className="space-y-1.5">
-                  <label className="text-xs font-medium" style={{ color: 'var(--color-text-muted)' }}>Server URL</label>
-                  <input type="url" className="input text-sm" placeholder="https://gotify.example.com"
-                    value={val('gotify_url')} onChange={e => handleChange('gotify_url', e.target.value)}
-                    style={dirty['gotify_url'] !== undefined ? { borderColor: 'color-mix(in srgb, var(--color-brand) 50%, transparent)' } : {}} />
-                </div>
-                <div className="space-y-1.5">
-                  <label className="text-xs font-medium" style={{ color: 'var(--color-text-muted)' }}>App Token</label>
-                  <div className="relative">
-                    <input type={showGotifyToken ? 'text' : 'password'} className="input text-sm pr-10 font-mono"
-                      placeholder="A1b2C3d4…"
-                      value={val('gotify_token')} onChange={e => handleChange('gotify_token', e.target.value)}
-                      style={dirty['gotify_token'] !== undefined ? { borderColor: 'color-mix(in srgb, var(--color-brand) 50%, transparent)' } : {}} />
-                    <button type="button" onClick={() => setShowGotifyToken(v => !v)}
-                      className="absolute right-3 top-1/2 -translate-y-1/2 opacity-50 hover:opacity-100 transition-opacity"
-                      aria-label={showGotifyToken ? 'Hide token' : 'Show token'}>
-                      {showGotifyToken ? <EyeOff size={14} /> : <Eye size={14} />}
+              <SectionHeader label="MQTT Broker" Icon={Wifi} />
+              {[
+                { key: 'ha_mqtt_enabled',          label: 'Enable HA Integration',  type: 'toggle'   },
+                { key: 'ha_mqtt_host',             label: 'Broker Host',            type: 'text',     placeholder: '192.168.0.1' },
+                { key: 'ha_mqtt_port',             label: 'Broker Port',            type: 'number',   placeholder: '1883' },
+                { key: 'ha_mqtt_user',             label: 'Username',               type: 'text',     placeholder: 'optional' },
+                { key: 'ha_mqtt_password',         label: 'Password',               type: 'password', placeholder: 'optional' },
+              ].map(f => {
+                const val = settings.find(s => s.key === f.key)?.value ?? ''
+                const dv  = dirty[f.key] ?? val
+                if (f.type === 'toggle') return (
+                  <div key={f.key} className="flex items-center justify-between py-1">
+                    <span className="text-sm">{f.label}</span>
+                    <button type="button" onClick={() => handleChange(f.key, dv === 'true' ? 'false' : 'true')}
+                      className={`relative inline-flex h-5 w-9 rounded-full transition-colors ${dv === 'true' ? 'bg-blue-500' : 'bg-gray-400'}`}
+                      style={{ minWidth: '36px' }}>
+                      <span className={`inline-block h-4 w-4 mt-0.5 rounded-full bg-white shadow transition-transform ${dv === 'true' ? 'translate-x-4' : 'translate-x-0.5'}`} />
                     </button>
                   </div>
+                )
+                return (
+                  <div key={f.key} className="space-y-1">
+                    <label className="text-xs font-medium" style={{ color: 'var(--color-text-muted)' }}>{f.label}</label>
+                    {f.type === 'password'
+                      ? <input type="password" className="input text-sm w-full" value={dirty[f.key] ?? val}
+                               onChange={e => handleChange(f.key, e.target.value)} placeholder={f.placeholder} />
+                      : <input type={f.type} className="input text-sm w-full" value={dirty[f.key] ?? val}
+                               onChange={e => handleChange(f.key, e.target.value)} placeholder={f.placeholder} />
+                    }
+                  </div>
+                )
+              })}
+
+              <SectionHeader label="Topic Prefixes" Icon={Home} />
+              {[
+                { key: 'ha_mqtt_discovery_prefix', label: 'Discovery Prefix', type: 'text', placeholder: 'homeassistant' },
+                { key: 'ha_mqtt_state_prefix',     label: 'State Prefix',     type: 'text', placeholder: 'inspectre' },
+              ].map(f => {
+                const val = settings.find(s => s.key === f.key)?.value ?? ''
+                return (
+                  <div key={f.key} className="space-y-1">
+                    <label className="text-xs font-medium" style={{ color: 'var(--color-text-muted)' }}>{f.label}</label>
+                    <input type="text" className="input text-sm w-full" value={dirty[f.key] ?? val}
+                           onChange={e => handleChange(f.key, e.target.value)} placeholder={f.placeholder} />
+                  </div>
+                )
+              })}
+
+              <SectionHeader label="Connection" Icon={Wifi} />
+              <div className="flex items-center gap-3">
+                <div className={`flex items-center gap-2 text-xs px-2 py-1 rounded ${
+                  haMqttStatus?.connected ? 'bg-green-500/20 text-green-400' : 'bg-gray-500/20 text-gray-400'
+                }`}>
+                  <span className={`w-2 h-2 rounded-full ${haMqttStatus?.connected ? 'bg-green-400' : 'bg-gray-400'}`} />
+                  {haMqttStatus?.connected ? 'Connected' : haMqttStatus === null ? 'Unknown' : 'Disconnected'}
                 </div>
+                <button className="btn-secondary text-xs" disabled={haConnecting}
+                  onClick={async () => {
+                    setHaConnecting(true)
+                    try {
+                      // Save pending settings first
+                      const pendingKeys = ['ha_mqtt_enabled','ha_mqtt_host','ha_mqtt_port',
+                                           'ha_mqtt_user','ha_mqtt_password',
+                                           'ha_mqtt_discovery_prefix','ha_mqtt_state_prefix']
+                      for (const k of pendingKeys) {
+                        if (dirty[k] !== undefined) await api.saveSetting(k, dirty[k])
+                      }
+                      const status = await api.haMqttReconnect()
+                      setHaMqttStatus(status)
+                    } catch { setHaMqttStatus({ connected: false }) }
+                    finally { setHaConnecting(false) }
+                  }}>
+                  {haConnecting ? 'Connecting…' : 'Save & Connect'}
+                </button>
+                {haMqttStatus?.connected && (
+                  <button className="btn-secondary text-xs" onClick={async () => {
+                    await api.haMqttDisconnect().catch(() => {})
+                    setHaMqttStatus({ connected: false })
+                  }}>Disconnect</button>
+                )}
               </div>
 
-              {/* Delivery: Pushbullet */}
-              <SectionHeader label="Pushbullet" Icon={Send} />
-              <div className="card p-4 space-y-3">
-                <p className="text-xs" style={{ color: 'var(--color-text-faint)' }}>
-                  Push to your phone and desktop via the Pushbullet app.
-                  Get your token at <span style={{ color: 'var(--color-brand)' }}>pushbullet.com/account</span>.
-                </p>
-                <div className="space-y-1.5">
-                  <label className="text-xs font-medium" style={{ color: 'var(--color-text-muted)' }}>API Key</label>
-                  <div className="relative">
-                    <input type={showPbKey ? 'text' : 'password'} className="input text-sm pr-10 font-mono"
-                      placeholder="o.XXXXXXXXXXXXXXXXXXXXXXXX"
-                      value={val('pushbullet_api_key')} onChange={e => handleChange('pushbullet_api_key', e.target.value)}
-                      style={dirty['pushbullet_api_key'] !== undefined ? { borderColor: 'color-mix(in srgb, var(--color-brand) 50%, transparent)' } : {}} />
-                    <button type="button" onClick={() => setShowPbKey(v => !v)}
-                      className="absolute right-3 top-1/2 -translate-y-1/2 opacity-50 hover:opacity-100 transition-opacity"
-                      aria-label={showPbKey ? 'Hide key' : 'Show key'}>
-                      {showPbKey ? <EyeOff size={14} /> : <Eye size={14} />}
-                    </button>
-                  </div>
-                </div>
-                <div className="flex items-center gap-3 flex-wrap">
-                  <button onClick={handleTestPushbullet} disabled={pbTestStatus === 'testing'}
-                    className="btn-secondary flex items-center gap-2 text-sm">
-                    <Send size={12} />
-                    {pbTestStatus === 'testing' ? 'Sending…' : 'Send test push'}
-                  </button>
-                  {pbTestStatus === 'ok'    && <span className="text-xs" style={{ color: 'var(--color-success)' }}>✓ {pbTestMsg}</span>}
-                  {pbTestStatus === 'error' && <span className="text-xs" style={{ color: '#ef4444' }}>{pbTestMsg}</span>}
-                </div>
+              <div className="text-xs space-y-1 pt-2" style={{ color: 'var(--color-text-faint)' }}>
+                <p><strong>Topic structure:</strong></p>
+                <p className="font-mono">inspectre/system/status  (LWT: online/offline)</p>
+                <p className="font-mono">inspectre/system/total_devices</p>
+                <p className="font-mono">inspectre/clients/&lt;mac&gt;/presence  (ON/OFF)</p>
+                <p className="font-mono">inspectre/clients/&lt;mac&gt;/ip</p>
+                <p className="font-mono">inspectre/clients/&lt;mac&gt;/open_ports</p>
+                <p className="font-mono">inspectre/clients/&lt;mac&gt;/vulnerabilities</p>
               </div>
-            </>
+            </div>
           )}
 
           {/* ── Docker tab ──────────────────────────────────────────────────── */}
@@ -528,109 +650,89 @@ export function SettingsPanel({ onClose, onSettingChange }) {
               <SectionHeader label="Container Hosts" Icon={Box} />
               <HostsManager />
 
-              <SectionHeader label="Image Vulnerability Scanning (Trivy)" Icon={Box} />
-              <div className="card p-4 space-y-4">
-                <p className="text-xs" style={{ color: 'var(--color-text-faint)' }}>
-                  Trivy scans container images for known CVEs. The vulnerability database is pre-downloaded
-                  during the backend build and refreshed automatically at the interval below. Rebuild with{' '}
-                  <code className="font-mono text-[10px] px-1 py-0.5 rounded"
-                    style={{ background: 'var(--color-surface-offset)' }}>./inspectre.sh rebuild keep-data</code> to update Trivy itself.
-                </p>
-
-                {/* DB update interval */}
-                <div className="space-y-1.5">
-                  <label className="text-xs font-medium" style={{ color: 'var(--color-text-muted)' }}>
-                    Vulnerability DB update interval (hours)
-                  </label>
-                  <input
-                    type="number" min="0" className="input text-sm w-28"
-                    value={val('trivy_db_update_hours')}
-                    onChange={e => handleChange('trivy_db_update_hours', e.target.value)}
-                    style={dirty['trivy_db_update_hours'] !== undefined ? { borderColor: 'color-mix(in srgb, var(--color-brand) 50%, transparent)' } : {}}
-                  />
-                  <p className="text-xs" style={{ color: 'var(--color-text-faint)' }}>
-                    How often the backend refreshes the Trivy CVE database. Set to 0 to disable automatic updates.
-                  </p>
-                </div>
-
-                {/* Auto-scan on new container */}
-                {(() => {
-                  const isOn = val('docker_scan_on_new') === 'true'
-                  return (
-                    <div className="flex items-center justify-between">
-                      <div>
-                        <p className="text-sm font-medium" style={{ color: 'var(--color-text)' }}>Scan on new container</p>
-                        <p className="text-xs mt-0.5" style={{ color: 'var(--color-text-faint)' }}>
-                          Automatically run a Trivy scan when a new container is created.
-                        </p>
-                      </div>
-                      <button type="button" role="switch" aria-checked={isOn}
-                        onClick={() => handleChange('docker_scan_on_new', isOn ? 'false' : 'true')}
-                        className="relative inline-flex h-6 w-11 items-center rounded-full transition-colors duration-200 focus:outline-none shrink-0"
-                        style={{ background: isOn ? 'var(--color-brand)' : 'var(--color-border)' }}>
-                        <span className="inline-block h-4 w-4 rounded-full bg-white shadow transition-transform duration-200"
-                          style={{ transform: isOn ? 'translateX(22px)' : 'translateX(4px)' }} />
-                      </button>
-                    </div>
-                  )
-                })()}
-
-                {/* Auto-scan on container update */}
-                {(() => {
-                  const isOn = val('docker_scan_on_update') === 'true'
-                  return (
-                    <div className="flex items-center justify-between">
-                      <div>
-                        <p className="text-sm font-medium" style={{ color: 'var(--color-text)' }}>Scan on image update</p>
-                        <p className="text-xs mt-0.5" style={{ color: 'var(--color-text-faint)' }}>
-                          Automatically scan when a container restarts with a different image (updated version).
-                        </p>
-                      </div>
-                      <button type="button" role="switch" aria-checked={isOn}
-                        onClick={() => handleChange('docker_scan_on_update', isOn ? 'false' : 'true')}
-                        className="relative inline-flex h-6 w-11 items-center rounded-full transition-colors duration-200 focus:outline-none shrink-0"
-                        style={{ background: isOn ? 'var(--color-brand)' : 'var(--color-border)' }}>
-                        <span className="inline-block h-4 w-4 rounded-full bg-white shadow transition-transform duration-200"
-                          style={{ transform: isOn ? 'translateX(22px)' : 'translateX(4px)' }} />
-                      </button>
-                    </div>
-                  )
-                })()}
-              </div>
+              <CollapsibleSection label="Vulnerability Scanning" Icon={AlertTriangle} defaultOpen={false}>
+                {settingsByKeys(['trivy_db_update_hours','docker_scan_on_new','docker_scan_on_update']).map(s => (
+                  <SettingRow key={s.key} s={s} dirty={dirty} onchange={handleChange} />
+                ))}
+              </CollapsibleSection>
             </>
           )}
 
           {/* ── Data tab ────────────────────────────────────────────────────── */}
           {activeTab === 'data' && (
             <>
+              <CollapsibleSection label="Traffic Monitoring" Icon={Eye} defaultOpen={false}>
+                {settingsByKeys(['traffic_enabled','traffic_max_sessions','traffic_retention_days']).map(s => (
+                  <SettingRow key={s.key} s={s} dirty={dirty} onchange={handleChange} />
+                ))}
+              </CollapsibleSection>
+
+              <CollapsibleSection label="Speed Tests" Icon={Globe} defaultOpen={false}>
+                {settingsByKeys(['speedtest_schedule']).map(s => (
+                  <SettingRow key={s.key} s={s} dirty={dirty} onchange={handleChange} />
+                ))}
+              </CollapsibleSection>
+
               <SectionHeader label="Database Backup & Restore" Icon={Database} />
               <div className="card p-4 space-y-3">
                 <p className="text-xs" style={{ color: 'var(--color-text-faint)' }}>
-                  Export a full backup of your settings and fingerprint data. Devices can be re-discovered
-                  automatically, but custom names, tags, and identity overrides are included.
+                  Full backup of all devices, events, vuln reports, speed test history, settings, users, and fingerprints. Restoring on a fresh install brings everything back exactly as it was.
                 </p>
+
+                {/* Optional encryption password */}
+                <div>
+                  <label className="text-xs block mb-1.5" style={{ color: 'var(--color-text-muted)' }}>
+                    Backup password
+                    <span className="ml-1" style={{ color: 'var(--color-text-faint)' }}>(optional — leave blank for unencrypted)</span>
+                  </label>
+                  <div className="flex gap-2 items-center">
+                    <input
+                      type={showBackupPwd ? 'text' : 'password'}
+                      className="input text-sm"
+                      style={{ maxWidth: '260px' }}
+                      placeholder="Leave blank for no encryption"
+                      value={backupPassword}
+                      onChange={e => setBackupPassword(e.target.value)}
+                    />
+                    <button
+                      onClick={() => setShowBackupPwd(v => !v)}
+                      className="p-1.5 rounded transition-colors"
+                      style={{ color: 'var(--color-text-faint)' }}
+                      title={showBackupPwd ? 'Hide password' : 'Show password'}
+                    >
+                      {showBackupPwd ? <EyeOff size={14} /> : <Eye size={14} />}
+                    </button>
+                  </div>
+                </div>
+
                 <div className="flex gap-2 flex-wrap">
                   <button onClick={handleBackup} disabled={backingUp}
                     className="btn-secondary flex items-center gap-2 text-sm">
                     <Download size={13} />
-                    {backingUp ? 'Exporting…' : 'Download backup.json'}
+                    {backingUp ? 'Exporting…' : backupPassword ? 'Download encrypted backup' : 'Download backup.json'}
                   </button>
                   <button onClick={() => restoreInputRef.current?.click()}
                     className="btn-secondary flex items-center gap-2 text-sm">
                     <Upload size={13} /> Restore from backup
                   </button>
-                  <input ref={restoreInputRef} type="file" accept=".json,application/json"
+                  <input ref={restoreInputRef} type="file" accept=".json,.ienc,application/json,application/octet-stream"
                     className="sr-only" onChange={handleRestoreBackup} />
                 </div>
+
                 {restoreStatus === 'loading' && (
                   <p className="text-xs" style={{ color: 'var(--color-text-muted)' }}>Restoring…</p>
                 )}
-                {restoreStatus === 'error' && (
-                  <p className="text-xs" style={{ color: '#ef4444' }}>
-                    Restore failed — check the file is a valid InSpectre backup.json.
+                {restoreStatus === 'needs_password' && (
+                  <p className="text-xs" style={{ color: '#f59e0b' }}>
+                    This backup is encrypted — enter the password above, then try restoring again.
                   </p>
                 )}
-                {restoreStatus && restoreStatus !== 'loading' && restoreStatus !== 'error' && (
+                {restoreStatus === 'error' && (
+                  <p className="text-xs" style={{ color: '#ef4444' }}>
+                    Restore failed — check the file is a valid InSpectre backup, or the password is wrong.
+                  </p>
+                )}
+                {restoreStatus && !['loading', 'error', 'needs_password'].includes(restoreStatus) && (
                   <div className="rounded-lg p-3 text-xs space-y-1"
                     style={{
                       background: 'color-mix(in srgb, var(--color-success) 10%, var(--color-surface-offset))',
@@ -638,8 +740,8 @@ export function SettingsPanel({ onClose, onSettingChange }) {
                     }}>
                     <p className="font-medium">Restore complete ✓</p>
                     <p>
-                      {restoreStatus.settings_restored != null
-                        ? `${restoreStatus.settings_restored} settings · ${restoreStatus.fingerprints_restored} fingerprints restored`
+                      {restoreStatus.devices != null
+                        ? `${restoreStatus.devices} devices · ${restoreStatus.settings} settings · ${restoreStatus.device_events} events · ${restoreStatus.speedtest_results ?? 0} speed tests`
                         : JSON.stringify(restoreStatus)}
                     </p>
                   </div>
@@ -709,11 +811,88 @@ export function SettingsPanel({ onClose, onSettingChange }) {
             </>
           )}
 
-          {/* ── Account tab ─────────────────────────────────────────────────── */}
-          {activeTab === 'account' && (
+          {/* ── Admin tab (Appearance + Account) ────────────────────────────── */}
+          {activeTab === 'admin' && (
             <>
+              <SectionHeader label="UI Style" Icon={Paintbrush} />
               <p className="text-xs" style={{ color: 'var(--color-text-faint)' }}>
-                Manage your account credentials.
+                Choose a UI style. Changes take effect immediately — no reload required.
+              </p>
+
+              <div className="grid grid-cols-2 gap-3">
+                {/* Spectre card */}
+                <button
+                  onClick={() => setSkin('spectre')}
+                  style={{
+                    position: 'relative', padding: '14px', textAlign: 'left', cursor: 'pointer',
+                    background: skin === 'spectre'
+                      ? 'color-mix(in srgb, var(--color-brand) 8%, var(--color-surface))'
+                      : 'var(--color-surface-offset)',
+                    border: `2px solid ${skin === 'spectre' ? 'var(--color-brand)' : 'var(--color-border)'}`,
+                    borderRadius: '0.75rem', transition: 'border-color 0.15s',
+                  }}
+                >
+                  <div style={{
+                    width: '100%', height: '52px', marginBottom: '10px', overflow: 'hidden',
+                    background: '#0d0d0f', border: '1px solid rgba(255,255,255,0.08)', borderRadius: '6px',
+                    padding: '8px', display: 'flex', flexDirection: 'column', gap: '4px',
+                  }}>
+                    <div style={{ height: '6px', borderRadius: '9999px', width: '55%', background: '#4fa8b0' }} />
+                    <div style={{ height: '4px', borderRadius: '9999px', width: '75%', background: 'rgba(255,255,255,0.12)' }} />
+                    <div style={{ height: '4px', borderRadius: '9999px', width: '60%', background: 'rgba(255,255,255,0.08)' }} />
+                    <div style={{ height: '4px', borderRadius: '9999px', width: '45%', background: 'rgba(255,255,255,0.06)' }} />
+                  </div>
+                  <div style={{ fontSize: '13px', fontWeight: 600, color: 'var(--color-text)', marginBottom: '2px' }}>Spectre</div>
+                  <div style={{ fontSize: '11px', color: 'var(--color-text-muted)' }}>Clean · Modern · Rounded</div>
+                  {skin === 'spectre' && (
+                    <div style={{
+                      position: 'absolute', top: '8px', right: '8px',
+                      width: '16px', height: '16px', borderRadius: '50%',
+                      background: 'var(--color-brand)', display: 'flex', alignItems: 'center', justifyContent: 'center',
+                      fontSize: '10px', color: 'white', fontWeight: 700,
+                    }}>✓</div>
+                  )}
+                </button>
+
+                {/* Phantom card */}
+                <button
+                  onClick={() => setSkin('phantom')}
+                  style={{
+                    position: 'relative', padding: '14px', textAlign: 'left', cursor: 'pointer',
+                    background: skin === 'phantom'
+                      ? 'color-mix(in srgb, var(--color-brand) 8%, var(--color-surface))'
+                      : 'var(--color-surface-offset)',
+                    border: `2px solid ${skin === 'phantom' ? 'var(--color-brand)' : 'var(--color-border)'}`,
+                    borderRadius: '0.75rem', transition: 'border-color 0.15s',
+                  }}
+                >
+                  <div style={{
+                    width: '100%', height: '52px', marginBottom: '10px', overflow: 'hidden',
+                    background: isDark ? '#000' : '#f0f7f1',
+                    border: `1px solid ${isDark ? 'rgba(0,255,65,0.2)' : 'rgba(0,110,35,0.2)'}`,
+                    padding: '8px', display: 'flex', flexDirection: 'column', gap: '4px',
+                  }}>
+                    <div style={{ height: '6px', width: '55%', background: isDark ? '#00ff41' : '#007a20' }} />
+                    <div style={{ height: '4px', width: '75%', background: isDark ? 'rgba(0,255,65,0.25)' : 'rgba(0,110,35,0.2)' }} />
+                    <div style={{ height: '4px', width: '60%', background: isDark ? 'rgba(0,255,65,0.15)' : 'rgba(0,110,35,0.12)' }} />
+                    <div style={{ height: '4px', width: '45%', background: isDark ? 'rgba(0,255,65,0.1)' : 'rgba(0,110,35,0.08)' }} />
+                  </div>
+                  <div style={{ fontSize: '13px', fontWeight: 600, color: 'var(--color-text)', marginBottom: '2px' }}>Phantom</div>
+                  <div style={{ fontSize: '11px', color: 'var(--color-text-muted)' }}>Terminal · SOC · Sidebar</div>
+                  {skin === 'phantom' && (
+                    <div style={{
+                      position: 'absolute', top: '8px', right: '8px',
+                      width: '16px', height: '16px', borderRadius: '50%',
+                      background: 'var(--color-brand)', display: 'flex', alignItems: 'center', justifyContent: 'center',
+                      fontSize: '10px', color: 'white', fontWeight: 700,
+                    }}>✓</div>
+                  )}
+                </button>
+              </div>
+
+              <p className="text-xs mt-2" style={{ color: 'var(--color-text-faint)' }}>
+                <strong style={{ color: 'var(--color-text-muted)' }}>Spectre</strong> — top nav bar, rounded cards, teal accent. Follows dark/light mode.<br />
+                <strong style={{ color: 'var(--color-text-muted)' }}>Phantom</strong> — fixed left sidebar, JetBrains Mono, sharp corners. Green on black (dark) or green on white (light).
               </p>
 
               <SectionHeader label="Change Password" Icon={Key} />
@@ -820,6 +999,22 @@ function SectionHeader({ label, Icon }) {
   )
 }
 
+function CollapsibleSection({ label, Icon, defaultOpen = true, children }) {
+  const [open, setOpen] = useState(defaultOpen)
+  return (
+    <div>
+      <button type="button" onClick={() => setOpen(o => !o)}
+        className="w-full flex items-center gap-2 pt-1 pb-0.5 text-left group">
+        {open ? <ChevronDown size={12} style={{ color: 'var(--color-text-muted)' }} />
+               : <ChevronRight size={12} style={{ color: 'var(--color-text-muted)' }} />}
+        {Icon && <Icon size={13} style={{ color: 'var(--color-text-muted)' }} />}
+        <h3 className="text-sm font-semibold" style={{ color: 'var(--color-text)' }}>{label}</h3>
+      </button>
+      {open && <div className="space-y-2 pt-1">{children}</div>}
+    </div>
+  )
+}
+
 function PermBadge({ perm }) {
   const color = perm === 'granted' ? 'var(--color-success)' : perm === 'denied' ? '#ef4444' : 'var(--color-brand)'
   const bg    = perm === 'granted'
@@ -845,7 +1040,7 @@ function SkeletonRows({ count }) {
   )
 }
 
-function SettingRow({ s, dirty, onchange }) {
+function SettingRow({ s, dirty, onchange, placeholder }) {
   const meta    = SETTING_META[s.key] || { label: s.key, type: 'text', unit: '' }
   const value   = dirty[s.key] ?? s.value
   const isDirty = dirty[s.key] !== undefined
@@ -894,6 +1089,7 @@ function SettingRow({ s, dirty, onchange }) {
       </div>
       <input type={meta.type || 'text'} min={meta.min} max={meta.max}
         className="input" style={dirtyStyle} value={value}
+        placeholder={placeholder || ''}
         onChange={e => onchange(s.key, e.target.value)} />
       {(meta.description || s.description) && (
         <p className="text-xs" style={{ color: 'var(--color-text-faint)' }}>{meta.description || s.description}</p>

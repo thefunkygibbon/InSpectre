@@ -2,12 +2,16 @@ import { useState, useEffect } from 'react'
 
 export function useTheme() {
   const [theme, setTheme] = useState(() => {
-    // Read from localStorage, fallback to system preference
     try {
       const stored = localStorage.getItem('inspectre-theme')
       if (stored) return stored
     } catch (_) {}
     return window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light'
+  })
+
+  const [skin, setSkinState] = useState(() => {
+    try { return localStorage.getItem('inspectre-skin') || 'spectre' } catch (_) {}
+    return 'spectre'
   })
 
   useEffect(() => {
@@ -16,7 +20,14 @@ export function useTheme() {
     try { localStorage.setItem('inspectre-theme', theme) } catch (_) {}
   }, [theme])
 
-  const toggle = () => setTheme(t => t === 'dark' ? 'light' : 'dark')
+  useEffect(() => {
+    const root = document.documentElement
+    root.setAttribute('data-skin', skin)
+    try { localStorage.setItem('inspectre-skin', skin) } catch (_) {}
+  }, [skin])
 
-  return { theme, toggle, isDark: theme === 'dark' }
+  const toggle  = () => setTheme(t => t === 'dark' ? 'light' : 'dark')
+  const setSkin = (s) => setSkinState(s)
+
+  return { theme, toggle, isDark: theme === 'dark', skin, setSkin }
 }

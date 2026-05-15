@@ -421,6 +421,9 @@ function normaliseMac(mac) {
 export function classifyDevice(device) {
   if (device.device_type_override) return device.device_type_override
 
+  // Trust backend-computed inference (Fingerbank + DHCP) — avoids re-implementing here
+  if (device.device_type_inferred) return device.device_type_inferred
+
   const scores = {}
   function add(key, points) {
     scores[key] = (scores[key] || 0) + points
@@ -429,8 +432,10 @@ export function classifyDevice(device) {
   const mac      = normaliseMac(device.mac_address)
   const vendor   = (device.vendor_override || device.vendor || '').toLowerCase()
   const hostname = (device.hostname || device.custom_name || '').toLowerCase()
+  const dhcpHn   = (device.dhcp_hostname     || '').toLowerCase()
+  const dhcpVc   = (device.dhcp_vendor_class || '').toLowerCase()
   const os       = ((device.scan_results?.os_matches || []).map(m => m.name).join(' ')).toLowerCase()
-  const combined = `${vendor} ${hostname} ${os}`
+  const combined = `${vendor} ${hostname} ${dhcpHn} ${dhcpVc} ${os}`
 
   // 1. OUI prefix lookup
   for (const [oui, cat, score] of OUI_MAP) {

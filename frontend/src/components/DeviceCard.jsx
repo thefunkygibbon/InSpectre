@@ -1,7 +1,7 @@
 import {
   Wifi, Laptop, Smartphone, Server, Printer, Tv,
   HelpCircle, Camera, Gamepad2, Cpu, Router,
-  MonitorSpeaker, Tablet, Radio, Network, Shield, Monitor
+  MonitorSpeaker, Tablet, Radio, Network, Shield, Monitor, GitMerge, X
 } from 'lucide-react'
 import { OnlineDot } from './OnlineDot'
 import { StarButton } from './StarButton'
@@ -88,14 +88,23 @@ function baselineDrift(device) {
   return { newPorts, closedPorts }
 }
 
-export function DeviceCard({ device, onClick, onStarToggle, isVulnScanning }) {
+const NEW_DEVICE_DAYS = 7
+
+function isNewDevice(device) {
+  if (!device.first_seen) return false
+  return Date.now() - new Date(device.first_seen).getTime() < NEW_DEVICE_DAYS * 24 * 60 * 60 * 1000
+}
+
+export function DeviceCard({ device, onClick, onStarToggle, isVulnScanning, isAcknowledged, onAcknowledge }) {
   const name     = deviceDisplayName(device)
-  const vendor   = cleanVendor(device.vendor_override || device.vendor)
+  const vendor   = cleanVendor(device.vendor_override || device.vendor || device.vendor_inferred)
   const DevIcon  = getDeviceIcon(device)
   const category = getDeviceCategory(device)
   const ports    = openPortCount(device)
-  const scanning = !device.deep_scanned
-  const drift    = baselineDrift(device)
+  const scanning     = !device.deep_scanned
+  const drift        = baselineDrift(device)
+  const isNew        = isNewDevice(device)
+  const showNew      = isNew && !isAcknowledged
 
 // Show vendor only when it adds info the title doesn't already give
   const showVendorSubtitle = vendor && vendor !== name && !device.ip_address?.startsWith(name)
@@ -103,7 +112,7 @@ export function DeviceCard({ device, onClick, onStarToggle, isVulnScanning }) {
   return (
     <button
       onClick={onClick}
-      className={`device-card${scanning ? ' device-card-scanning' : ''}${device.is_important ? ' ring-1 ring-amber-400/30' : ''} p-5 text-left w-full flex flex-col gap-3 group relative`}
+      className={`device-card${scanning ? ' device-card-scanning' : ''}${isVulnScanning && !scanning ? ' device-card-vuln-scanning' : ''}${device.is_important ? ' ring-1 ring-amber-400/30' : ''} p-5 text-left w-full flex flex-col gap-3 group relative`}
     >
       {/* Star button — top right corner */}
       {onStarToggle && (
@@ -130,6 +139,22 @@ export function DeviceCard({ device, onClick, onStarToggle, isVulnScanning }) {
           </div>
         </div>
         <div className="flex flex-col gap-1 items-end shrink-0">
+          {showNew && (
+            <span className="flex items-center gap-0.5 text-[10px] font-bold rounded-full px-2 py-0.5"
+              style={{ color: '#10b981', background: 'rgba(16,185,129,0.12)', border: '1px solid rgba(16,185,129,0.35)' }}>
+              NEW
+              {onAcknowledge && (
+                <button
+                  onClick={e => { e.stopPropagation(); onAcknowledge(device.mac_address) }}
+                  className="opacity-60 hover:opacity-100 transition-opacity ml-0.5"
+                  title="Acknowledge — stop surfacing to top"
+                  aria-label="Acknowledge new device"
+                >
+                  <X size={8} />
+                </button>
+              )}
+            </span>
+          )}
           {scanning && (
             <span className="text-[10px] font-medium text-amber-400 bg-amber-400/10
                              border border-amber-400/20 rounded-full px-2 py-0.5">
@@ -152,7 +177,14 @@ export function DeviceCard({ device, onClick, onStarToggle, isVulnScanning }) {
         <span style={{ color: 'var(--color-text-muted)' }}>MAC</span>
         <span className="font-mono truncate text-[11px]" style={{ color: 'var(--color-text)' }}>{device.mac_address}</span>
         <span style={{ color: 'var(--color-text-muted)' }}>Type</span>
-        <span className="truncate capitalize" style={{ color: 'var(--color-text)' }}>{category.label}</span>
+        <span className="truncate capitalize" style={{ color: 'var(--color-text)' }}>
+          {category.label}
+          {device.fingerbank_result?.device_name && (device.fingerbank_result.score || 0) >= 50 && (
+            <span className="block text-[10px] truncate" style={{ color: 'var(--color-brand)', opacity: 0.85 }}>
+              {device.fingerbank_result.device_name}
+            </span>
+          )}
+        </span>
         {ports !== null && (
           <>
             <span style={{ color: 'var(--color-text-muted)' }}>Ports</span>
@@ -163,6 +195,21 @@ export function DeviceCard({ device, onClick, onStarToggle, isVulnScanning }) {
           <>
             <span style={{ color: 'var(--color-text-muted)' }}>Location</span>
             <span className="truncate" style={{ color: 'var(--color-text)' }}>{device.location}</span>
+          </>
+        )}
+        {device.group_members?.length > 1 && (
+          <>
+            <span className="flex items-center gap-1" style={{ color: 'var(--color-text-muted)' }}>
+              <GitMerge size={10} />Interfaces
+            </span>
+            <span className="flex flex-col gap-0.5">
+              {device.group_members.map(m => (
+                <span key={m.mac_address} className="flex items-center gap-1 text-[11px]">
+                  <span className={`w-1.5 h-1.5 rounded-full shrink-0 ${m.is_online ? 'bg-green-400' : 'bg-gray-500'}`} />
+                  <span className="truncate" style={{ color: 'var(--color-text)' }}>{m.display_name}</span>
+                </span>
+              ))}
+            </span>
           </>
         )}
       </div>

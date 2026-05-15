@@ -61,6 +61,7 @@ export const api = {
       database: { ok: false, message: 'Unknown' },
       probe:    { ok: false, message: 'Unknown' },
       all_ok: false,
+      active_scans: { port: [], vuln: [] },
     }))
   },
 
@@ -87,19 +88,28 @@ export const api = {
   updateDevice:    (mac, body)  => request('PATCH', `/devices/${mac}`, body),
   updateIdentity:  (mac, body)  => request('PATCH', `/devices/${mac}/identity`, body),
   updateMetadata:  (mac, body)  => request('PATCH', `/devices/${mac}/metadata`, body),
-  resolveName:     (mac)        => request('POST',  `/devices/${mac}/resolve-name`),
-  rescanDevice:    (mac)        => request('POST',  `/devices/${mac}/rescan`),
-  resetBaseline:   (mac)        => request('POST',  `/devices/${mac}/reset-baseline`),
+  resolveName:      (mac) => request('POST', `/devices/${mac}/resolve-name`),
+  rescanDevice:     (mac) => request('POST', `/devices/${mac}/rescan`),
+  resetBaseline:    (mac) => request('POST', `/devices/${mac}/reset-baseline`),
+  fingerbankLookup: (mac) => request('POST', `/devices/${mac}/fingerbank/lookup`),
   getScanResults:  (mac)        => request('GET',   `/devices/${mac}/scan`),
   getIpHistory:    (mac)        => request('GET',   `/devices/${mac}/ip-history`),
+  setPrimaryIp:    (mac, ip)    => request('POST',  `/devices/${mac}/set-primary-ip`, { ip_address: ip }),
+  unpinPrimaryIp:  (mac)        => request('POST',  `/devices/${mac}/unpin-ip`),
   getDeviceEvents: (mac, limit, type) => {
     const p = new URLSearchParams()
     if (limit) p.set('limit', limit)
     if (type)  p.set('type', type)
     return request('GET', `/devices/${mac}/events${p.toString() ? '?' + p : ''}`)
   },
-  getDeviceServices: (mac)      => request('GET',  `/devices/${mac}/services`),
+  getDeviceServices:  (mac)           => request('GET',  `/devices/${mac}/services`),
+  getDeviceGroup:     (mac)           => request('GET',  `/devices/${mac}/group`),
+  addToGroup:         (mac, targetMac)=> request('POST', `/devices/${mac}/group/add`, { target_mac: targetMac }),
+  removeFromGroup:    (mac)           => request('POST', `/devices/${mac}/group/remove`),
+  setGroupPrimary:    (mac)           => request('PUT',  `/devices/${mac}/group/primary`),
   refreshMdns:       (mac)      => request('POST', `/devices/${mac}/mdns-refresh`),
+  networkMdnsScan:   ()         => request('POST', '/network/mdns-scan'),
+  networkSsdpScan:   ()         => request('POST', '/network/ssdp-scan'),
   getDeviceZones:    ()         => request('GET',  '/devices/meta/zones'),
   getStats:          ()         => request('GET',  '/stats'),
 
@@ -124,6 +134,8 @@ export const api = {
   updateSetting:   (key, value) => request('PUT',  `/settings/${key}`, { value: String(value) }),
   resetSettings:   ()           => request('POST', '/settings/reset'),
   applySettings:   ()           => request('POST', '/settings/apply'),
+  restartProbe:    ()           => request('POST', '/settings/restart-probe'),
+  restartBackend:  ()           => request('POST', '/settings/restart-backend'),
 
   // Export (include auth header so the global middleware allows through)
   exportDevicesCsv: () => {
@@ -145,10 +157,6 @@ export const api = {
       .then(r => { if (!r.ok) throw new Error(`Import failed: ${r.status}`); return r.json() })
   },
 
-  // Notifications
-  sendPushbullet: (title, body) => request('POST', '/notify/pushbullet', { title, body }),
-  testPushbullet: (apiKey)      => request('POST', '/notify/test', { api_key: apiKey || '' }),
-
   // Streaming
   streamPing:       (mac, signal) => streamSSE(`/devices/${mac}/ping`,       (l) => l, signal),
   streamTraceroute: (mac, signal) => streamSSE(`/devices/${mac}/traceroute`, (l) => l, signal),
@@ -160,6 +168,8 @@ export const api = {
   // Phase 3 — Vuln scanning
   getVulnReports:       (mac, limit) => request('GET',    `/devices/${mac}/vuln-reports${limit ? `?limit=${limit}` : ''}`),
   getVulnReportDetail:  (mac, id)    => request('GET',    `/devices/${mac}/vuln-reports/${id}`),
+  getVulnScanStatus:    (mac)        => request('GET',    `/devices/${mac}/vuln-scan-status`),
+  acknowledgeDevice:    (mac)        => request('POST',   `/devices/${mac}/acknowledge`),
   deleteVulnReport:     (mac, id)    => request('DELETE', `/devices/${mac}/vuln-reports/${id}`),
   getAllVulnReports:     (severity)   => request('GET',    `/vuln-reports${severity ? `?severity=${severity}` : ''}`),
   getVulnSummary:       ()           => request('GET',    '/vulns/summary'),
@@ -198,21 +208,29 @@ export const api = {
   deleteDevice:       (mac)             => request('DELETE', `/devices/${mac}`),
 
   // Backup / restore
-  exportBackup: () => {
+  exportBackup: (password = '') => {
+    const form = new FormData()
+    form.append('password', password)
     const token = getToken()
-    return fetch(`${BASE}/export/backup`, { headers: token ? { Authorization: `Bearer ${token}` } : {} })
+    const headers = token ? { Authorization: `Bearer ${token}` } : {}
+    return fetch(`${BASE}/export/backup`, { method: 'POST', body: form, headers })
   },
-  importRestore: (file) => {
+  importRestore: (file, password = '') => {
     const form = new FormData()
     form.append('file', file)
+    form.append('password', password)
     const token = getToken()
     const headers = token ? { Authorization: `Bearer ${token}` } : {}
     return fetch(`${BASE}/import/restore`, { method: 'POST', body: form, headers })
-      .then(r => { if (!r.ok) throw new Error(`Restore failed: ${r.status}`); return r.json() })
+      .then(async r => {
+        if (!r.ok) { const e = await r.json().catch(() => ({})); throw new Error(e.detail || `Restore failed: ${r.status}`) }
+        return r.json()
+      })
   },
-  setupRestoreFromBackup: (file) => {
+  setupRestoreFromBackup: (file, password = '') => {
     const form = new FormData()
     form.append('file', file)
+    form.append('password', password)
     return fetch(`${BASE}/setup/restore-from-backup`, { method: 'POST', body: form })
       .then(r => { if (!r.ok) throw new Error(`Restore failed: ${r.status}`); return r.json() })
   },
@@ -269,6 +287,9 @@ export const api = {
   deleteContainerHost:    (id)        => request('DELETE', `/container-hosts/${id}`),
   testContainerHost:      (id)        => request('POST',   `/container-hosts/${id}/test`),
 
+  // Device acknowledgement
+  acknowledgeDevice:  (mac)        => request('POST',   `/devices/${mac}/acknowledge`),
+
   // Traffic monitoring
   trafficStart:       (mac)        => request('POST',   `/traffic/start/${mac}`),
   trafficStop:        (mac)        => request('DELETE', `/traffic/stop/${mac}`),
@@ -278,6 +299,27 @@ export const api = {
   trafficTopDomains:  (mac, days)  => request('GET',    `/traffic/top-domains/${mac}${days ? `?days=${days}` : ''}`),
   trafficSummary:     ()           => request('GET',    '/traffic/summary'),
   trafficStream:      (mac, onLine, signal) => streamSSE(`/traffic/stream/${mac}`, onLine, signal),
+
+  // Notification channels
+  notifChannels:        ()          => request('GET',    '/notifications/channels'),
+  createNotifChannel:   (body)      => request('POST',   '/notifications/channels', body),
+  updateNotifChannel:   (id, body)  => request('PUT',    `/notifications/channels/${id}`, body),
+  deleteNotifChannel:   (id)        => request('DELETE', `/notifications/channels/${id}`),
+  testNotifChannel:     (id)        => request('POST',   `/notifications/channels/${id}/test`),
+
+  // Notification profiles
+  notifProfiles:        ()          => request('GET',    '/notifications/profiles'),
+  createNotifProfile:   (body)      => request('POST',   '/notifications/profiles', body),
+  updateNotifProfile:   (id, body)  => request('PUT',    `/notifications/profiles/${id}`, body),
+  deleteNotifProfile:   (id)        => request('DELETE', `/notifications/profiles/${id}`),
+
+  // Notification event definitions and pending browser queue
+  notifEvents:          ()          => request('GET',    '/notifications/events'),
+  notifPending:         ()          => request('GET',    '/notifications/pending'),
+  // Home Assistant MQTT integration
+  haMqttStatus:         ()          => request('GET',    '/ha-mqtt/status'),
+  haMqttReconnect:      ()          => request('POST',   '/ha-mqtt/reconnect'),
+  haMqttDisconnect:     ()          => request('POST',   '/ha-mqtt/disconnect'),
 }
 
 export { streamSSE }

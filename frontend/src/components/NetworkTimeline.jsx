@@ -27,7 +27,9 @@ function StatusDot({ status }) {
 }
 
 function TimelineBar({ segments, windowStart, windowEnd, deviceName }) {
-  const totalMs = new Date(windowEnd) - new Date(windowStart)
+  const winStart = new Date(windowStart)
+  const winEnd   = new Date(windowEnd)
+  const totalMs  = winEnd - winStart
   if (totalMs <= 0) return null
 
   const STATUS_COLORS = {
@@ -37,17 +39,26 @@ function TimelineBar({ segments, windowStart, windowEnd, deviceName }) {
   }
 
   return (
-    <div className="flex-1 h-6 rounded overflow-hidden flex" style={{ background: 'var(--color-surface-offset)' }}>
+    <div className="flex-1 h-6 rounded overflow-hidden relative" style={{ background: 'var(--color-surface-offset)' }}>
       {segments.map((seg, i) => {
-        const segStart = new Date(seg.from)
-        const segEnd   = new Date(seg.to)
-        const pct = Math.max(0.1, ((segEnd - segStart) / totalMs) * 100)
-        const color = STATUS_COLORS[seg.status] || STATUS_COLORS.unknown
+        // Clamp each segment to the window so out-of-range data can't overflow
+        const segStart = Math.max(new Date(seg.from), winStart)
+        const segEnd   = Math.min(new Date(seg.to),   winEnd)
+        if (segEnd <= segStart) return null
+        const leftPct  = ((segStart - winStart) / totalMs) * 100
+        const widthPct = ((segEnd   - segStart) / totalMs) * 100
+        const color    = STATUS_COLORS[seg.status] || STATUS_COLORS.unknown
         return (
           <div key={i}
             title={`${deviceName}: ${seg.status} from ${fmtDateTime(seg.from)} to ${fmtDateTime(seg.to)}`}
-            className="h-full transition-opacity hover:opacity-80 cursor-default"
-            style={{ width: `${pct}%`, background: color, opacity: seg.status === 'unknown' ? 0.3 : 0.85 }}
+            className="absolute top-0 bottom-0 transition-opacity hover:opacity-80 cursor-default"
+            style={{
+              left:    `${leftPct}%`,
+              width:   `${widthPct}%`,
+              minWidth: '2px',
+              background: color,
+              opacity: seg.status === 'unknown' ? 0.3 : 0.85,
+            }}
           />
         )
       })}
@@ -148,19 +159,34 @@ function ContainerTimelineRow({ container, windowStart, windowEnd }) {
         </span>
       </div>
 
-      <div className="flex-1 h-6 rounded overflow-hidden flex" style={{ background: 'var(--color-surface-offset)' }}>
-        {container.segments.map((seg, i) => {
-          const totalMs = new Date(windowEnd) - new Date(windowStart)
-          const pct = Math.max(0.1, ((new Date(seg.to) - new Date(seg.from)) / totalMs) * 100)
-          const color = STATUS_COLORS[seg.status] || STATUS_COLORS.unknown
-          return (
-            <div key={i}
-              title={`${container.name}: ${seg.status} from ${new Date(seg.from).toLocaleString()} to ${new Date(seg.to).toLocaleString()}`}
-              className="h-full transition-opacity hover:opacity-80 cursor-default"
-              style={{ width: `${pct}%`, background: color, opacity: seg.status === 'unknown' ? 0.3 : 0.85 }}
-            />
-          )
-        })}
+      <div className="flex-1 h-6 rounded overflow-hidden relative" style={{ background: 'var(--color-surface-offset)' }}>
+        {(() => {
+          const winStart = new Date(windowStart)
+          const winEnd   = new Date(windowEnd)
+          const totalMs  = winEnd - winStart
+          if (totalMs <= 0) return null
+          return container.segments.map((seg, i) => {
+            const segStart = Math.max(new Date(seg.from), winStart)
+            const segEnd   = Math.min(new Date(seg.to),   winEnd)
+            if (segEnd <= segStart) return null
+            const leftPct  = ((segStart - winStart) / totalMs) * 100
+            const widthPct = ((segEnd   - segStart) / totalMs) * 100
+            const color    = STATUS_COLORS[seg.status] || STATUS_COLORS.unknown
+            return (
+              <div key={i}
+                title={`${container.name}: ${seg.status} from ${new Date(seg.from).toLocaleString()} to ${new Date(seg.to).toLocaleString()}`}
+                className="absolute top-0 bottom-0 transition-opacity hover:opacity-80 cursor-default"
+                style={{
+                  left:    `${leftPct}%`,
+                  width:   `${widthPct}%`,
+                  minWidth: '2px',
+                  background: color,
+                  opacity: seg.status === 'unknown' ? 0.3 : 0.85,
+                }}
+              />
+            )
+          })
+        })()}
       </div>
 
       <div className="w-[70px] sm:w-[80px] text-right shrink-0">

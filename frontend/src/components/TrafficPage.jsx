@@ -141,20 +141,12 @@ function fmtDate(iso) {
   return new Date(iso).toLocaleString()
 }
 
-const SPEEDTEST_PHASES = [
-  { prefix: 'Retrieving speedtest.net', icon: '🔍', label: 'Finding servers…' },
-  { prefix: 'Testing from',             icon: '📍', label: 'Located ISP' },
-  { prefix: 'Hosted by',                icon: '🌐', label: 'Connected to server' },
-  { prefix: 'Ping:',                    icon: '📡', label: 'Ping test' },
-  { prefix: 'Download:',                icon: '⬇', label: 'Download test' },
-  { prefix: 'Upload:',                  icon: '⬆', label: 'Upload test' },
-]
-
-function parseSpeedtestLine(line) {
-  for (const phase of SPEEDTEST_PHASES) {
-    if (line.includes(phase.prefix)) return phase
-  }
-  return null
+const OOKLA_PHASES = {
+  testStart: { icon: '🔍', label: 'Starting test…' },
+  ping:      { icon: '📡', label: 'Ping test' },
+  download:  { icon: '⬇',  label: 'Download test' },
+  upload:    { icon: '⬆',  label: 'Upload test' },
+  result:    { icon: '✓',  label: 'Complete' },
 }
 
 function SpeedTestPanel() {
@@ -162,9 +154,11 @@ function SpeedTestPanel() {
   const [phase,      setPhase]      = useState(null)
   const [liveNums,   setLiveNums]   = useState({ down: null, up: null, ping: null })
   const [result,     setResult]     = useState(null)
+  const [error,      setError]      = useState(null)
   const [history,    setHistory]    = useState([])
   const [serverId,   setServerId]   = useState('')
   const [servers,    setServers]    = useState([])
+  const [serverErr,  setServerErr]  = useState(null)
   const [showServers,setShowServers]= useState(false)
   const [schedule,   setSchedule]   = useState('disabled')
   const abortRef = useRef(null)
@@ -182,31 +176,47 @@ function SpeedTestPanel() {
     setPhase(null)
     setLiveNums({ down: null, up: null, ping: null })
     setResult(null)
+    setError(null)
     const ctrl = new AbortController()
     abortRef.current = ctrl
-    const path = `/tools/speedtest${serverId ? `?server_id=${serverId}` : ''}`
+    const params = []
+    if (serverId) params.push(`server_id=${serverId}`)
+    const path = `/tools/speedtest${params.length ? '?' + params.join('&') : ''}`
     try {
       await streamSSE(path, (text) => {
         if (text.startsWith('RESULT:')) {
           try {
             const r = JSON.parse(text.slice(7))
-            setResult(r)
-            setPhase({ icon: '✓', label: 'Complete' })
+            if (r.download_mbps != null || r.upload_mbps != null) {
+              setResult(r)
+              setPhase(OOKLA_PHASES.result)
+            }
             api.speedtestResults().then(setHistory).catch(() => {})
           } catch {}
-        } else {
-          const p = parseSpeedtestLine(text)
-          if (p) setPhase(p)
-          // Extract live numbers
-          const downMatch = text.match(/Download:\s*([\d.]+)\s*Mbit/)
-          const upMatch   = text.match(/Upload:\s*([\d.]+)\s*Mbit/)
-          const pingMatch = text.match(/Ping:\s*([\d.]+)\s*ms/)
-          if (downMatch) setLiveNums(n => ({ ...n, down: parseFloat(downMatch[1]) }))
-          if (upMatch)   setLiveNums(n => ({ ...n, up:   parseFloat(upMatch[1]) }))
-          if (pingMatch) setLiveNums(n => ({ ...n, ping: parseFloat(pingMatch[1]) }))
+          return
         }
+        if (text.startsWith('ERROR:')) {
+          setError(text.slice(6).trim())
+          setPhase(null)
+          return
+        }
+        try {
+          const obj = JSON.parse(text)
+          const t = obj.type
+          if (OOKLA_PHASES[t]) setPhase(OOKLA_PHASES[t])
+          if (t === 'log' && obj.level === 'error')
+            setError(obj.message || 'Speed test error')
+          if (t === 'ping' && obj.ping?.latency != null)
+            setLiveNums(n => ({ ...n, ping: obj.ping.latency }))
+          if (t === 'download' && obj.download?.bandwidth != null)
+            setLiveNums(n => ({ ...n, down: parseFloat((obj.download.bandwidth * 8 / 1e6).toFixed(2)) }))
+          if (t === 'upload' && obj.upload?.bandwidth != null)
+            setLiveNums(n => ({ ...n, up: parseFloat((obj.upload.bandwidth * 8 / 1e6).toFixed(2)) }))
+        } catch {}
       }, ctrl.signal)
-    } catch {}
+    } catch (e) {
+      if (e?.name !== 'AbortError') setError(String(e))
+    }
     setRunning(false)
   }
 
@@ -218,10 +228,14 @@ function SpeedTestPanel() {
   async function handleLoadServers() {
     setShowServers(true)
     if (servers.length > 0) return
+    setServerErr(null)
     try {
       const data = await api.speedtestServers()
+      if (data.error) setServerErr(data.error)
       setServers(data.servers || [])
-    } catch {}
+    } catch (e) {
+      setServerErr(String(e))
+    }
   }
 
   async function handleDeleteResult(id) {
@@ -237,7 +251,7 @@ function SpeedTestPanel() {
           <Gauge size={15} style={{ color: 'var(--color-brand)' }} />
           <span className="text-sm font-semibold" style={{ color: 'var(--color-text)' }}>Speed Test</span>
         </div>
-        <span className="text-[10px]" style={{ color: 'var(--color-text-faint)' }}>Powered by Speedtest.net</span>
+        <span className="text-[10px]" style={{ color: 'var(--color-text-faint)' }}>Powered by Ookla</span>
       </div>
       <div className="p-5 space-y-4">
         {/* Controls row */}
@@ -255,6 +269,7 @@ function SpeedTestPanel() {
               <Square size={12} /> Stop
             </button>
           )}
+
           <button
             onClick={() => { if (showServers) { setShowServers(false) } else { handleLoadServers() } }}
             className="text-xs px-3 py-1.5 rounded-lg border"
@@ -296,19 +311,32 @@ function SpeedTestPanel() {
           </div>
         </div>
 
+        {/* Error banner */}
+        {error && (
+          <div className="flex items-center gap-2 px-3 py-2 rounded-lg text-xs"
+            style={{ background: 'rgba(239,68,68,0.08)', color: '#ef4444', border: '1px solid rgba(239,68,68,0.2)' }}>
+            <AlertTriangle size={12} />
+            {error}
+          </div>
+        )}
+
         {/* Server picker */}
         {showServers && (
-          <div>
-            <label className="text-xs mb-1 block" style={{ color: 'var(--color-text-muted)' }}>
+          <div className="space-y-1">
+            <label className="text-xs block" style={{ color: 'var(--color-text-muted)' }}>
               Test server
             </label>
-            <select className="input text-xs w-full max-w-sm"
-              value={serverId} onChange={e => setServerId(e.target.value)}>
-              <option value="">Auto-select nearest</option>
-              {servers.map(s => (
-                <option key={s.id} value={s.id}>{s.label}</option>
-              ))}
-            </select>
+            {serverErr ? (
+              <p className="text-xs" style={{ color: '#ef4444' }}>{serverErr}</p>
+            ) : (
+              <select className="input text-xs w-full max-w-sm"
+                value={serverId} onChange={e => setServerId(e.target.value)}>
+                <option value="">Auto-select nearest</option>
+                {servers.map(s => (
+                  <option key={s.id} value={s.id}>{s.label}</option>
+                ))}
+              </select>
+            )}
           </div>
         )}
 
@@ -350,6 +378,16 @@ function SpeedTestPanel() {
 
         {/* Result summary */}
         {result && (
+          <div className="space-y-3">
+          {result.server && (
+            <p className="text-[10px]" style={{ color: 'var(--color-text-faint)' }}>
+              Server: <span style={{ color: 'var(--color-text-muted)' }}>{result.server}</span>
+              {result.result_url && (
+                <> &mdash; <a href={result.result_url} target="_blank" rel="noopener noreferrer"
+                  style={{ color: 'var(--color-brand)' }}>View result ↗</a></>
+              )}
+            </p>
+          )}
           <div className="grid grid-cols-3 gap-3">
             <div className="text-center p-3 rounded-lg" style={{ background: 'var(--color-surface-offset)' }}>
               <div className="flex items-center justify-center gap-1 mb-1">
@@ -381,6 +419,7 @@ function SpeedTestPanel() {
               </div>
               <div className="text-[9px]" style={{ color: 'var(--color-text-faint)' }}>ms</div>
             </div>
+          </div>
           </div>
         )}
 

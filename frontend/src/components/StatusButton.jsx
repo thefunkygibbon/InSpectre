@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback } from 'react'
-import { Activity, X, CheckCircle2, XCircle, AlertCircle, Database, Server, Cpu, RefreshCw } from 'lucide-react'
+import { Activity, X, CheckCircle2, XCircle, AlertCircle, Database, Server, Cpu, RefreshCw, Scan, Shield } from 'lucide-react'
 import { api } from '../api'
 
 const POLL_MS = 60_000
@@ -32,6 +32,32 @@ function ComponentRow({ label, Icon, status }) {
   )
 }
 
+function ActiveScansList({ scans, icon: Icon, label, color }) {
+  if (!scans?.length) return null
+  return (
+    <div className="mt-3">
+      <div className="flex items-center gap-1.5 mb-1.5">
+        <Icon size={11} style={{ color, flexShrink: 0 }} />
+        <span className="text-[11px] font-semibold uppercase tracking-wider" style={{ color }}>
+          {label}
+        </span>
+      </div>
+      <div className="flex flex-col gap-1">
+        {scans.map(s => (
+          <div key={s.mac} className="flex items-center gap-2 px-2 py-1 rounded-lg text-xs"
+            style={{ background: 'var(--color-surface-offset)' }}>
+            <span className="w-1.5 h-1.5 rounded-full shrink-0 animate-pulse" style={{ background: color }} />
+            <span className="font-medium truncate" style={{ color: 'var(--color-text)' }}>{s.name}</span>
+            {s.name !== s.mac && (
+              <span className="font-mono text-[10px] shrink-0" style={{ color: 'var(--color-text-faint)' }}>{s.mac}</span>
+            )}
+          </div>
+        ))}
+      </div>
+    </div>
+  )
+}
+
 export function StatusButton() {
   const [health, setHealth]           = useState(null)
   const [showModal, setShowModal]     = useState(false)
@@ -49,6 +75,7 @@ export function StatusButton() {
         database: { ok: false, message: 'Unknown' },
         probe:    { ok: false, message: 'Unknown' },
         all_ok: false,
+        active_scans: { port: [], vuln: [] },
       })
     } finally {
       setLastChecked(new Date())
@@ -70,6 +97,10 @@ export function StatusButton() {
     ? 'Checking…'
     : allOk ? 'All systems OK' : 'System issue'
 
+  const portScans = health?.active_scans?.port || []
+  const vulnScans = health?.active_scans?.vuln || []
+  const totalActive = portScans.length + vulnScans.length
+
   return (
     <>
       <button
@@ -80,6 +111,12 @@ export function StatusButton() {
       >
         <Activity size={12} />
         <span>{label}</span>
+        {totalActive > 0 && (
+          <span className="px-1.5 py-0.5 rounded-full text-[10px] font-semibold"
+            style={{ background: 'color-mix(in srgb, var(--color-brand) 15%, transparent)', color: 'var(--color-brand)' }}>
+            {totalActive} active
+          </span>
+        )}
       </button>
 
       {showModal && (
@@ -113,6 +150,18 @@ export function StatusButton() {
               <ComponentRow label="Database"    Icon={Database} status={health?.database} />
               <ComponentRow label="Probe"       Icon={Cpu}      status={health?.probe}    />
             </div>
+
+            {/* Active scan activity */}
+            {(portScans.length > 0 || vulnScans.length > 0) && (
+              <div className="mt-4 pt-4" style={{ borderTop: '1px solid var(--color-border)' }}>
+                <p className="text-xs font-semibold uppercase tracking-wider mb-1"
+                  style={{ color: 'var(--color-text-muted)' }}>
+                  Probe Activity
+                </p>
+                <ActiveScansList scans={portScans} icon={Scan}   label="Port scanning" color="#f59e0b" />
+                <ActiveScansList scans={vulnScans} icon={Shield} label="Vuln scanning"  color="var(--color-brand)" />
+              </div>
+            )}
 
             {/* Footer row */}
             <div className="mt-4 flex items-center justify-between gap-2">

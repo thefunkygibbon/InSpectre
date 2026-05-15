@@ -2,14 +2,16 @@ import { useState, useEffect } from 'react'
 import {
   ShieldAlert, ShieldCheck, RefreshCw, ScanLine,
   AlertTriangle, Info, Clock, ChevronDown, ChevronRight,
-  Settings2, Save, Loader, X, Box,
+  Settings2, Save, Loader, X, Box, FileDown,
 } from 'lucide-react'
 import { api } from '../api'
+import { exportDashboardVulnPDF } from '../utils/vulnPdfExport'
 
 // ---------------------------------------------------------------------------
 // Vuln scan settings panel
 // ---------------------------------------------------------------------------
 const VULN_SETTING_META = {
+  // ── Network device scanning (Nuclei) ──────────────────────────────────────
   vuln_scan_schedule: {
     label: 'Scheduled Scans', type: 'select',
     options: [
@@ -49,8 +51,23 @@ const VULN_SETTING_META = {
     label: 'Template Tags', type: 'text',
     description: 'Comma-separated tags (e.g. cve,exposure,misconfig,default-login,network).',
   },
+  // ── Container image scanning (Trivy) ──────────────────────────────────────
+  trivy_db_update_hours: {
+    label: 'Trivy DB Update Interval', type: 'number', min: 0, unit: 'hours',
+    description: 'How often to refresh the Trivy CVE database. Set to 0 to disable.',
+  },
+  docker_scan_on_new: {
+    label: 'Scan New Containers', type: 'toggle',
+    description: 'Run a Trivy scan automatically when a new container is created.',
+  },
+  docker_scan_on_update: {
+    label: 'Scan on Image Update', type: 'toggle',
+    description: 'Run a Trivy scan when a container restarts with a new image.',
+  },
 }
 
+const NETWORK_VULN_KEYS    = ['vuln_scan_schedule','vuln_scan_targets','vuln_scan_on_new_device','vuln_scan_on_port_change','nuclei_template_update_interval','vuln_scan_templates']
+const CONTAINER_VULN_KEYS  = ['trivy_db_update_hours','docker_scan_on_new','docker_scan_on_update']
 const VULN_KEYS = Object.keys(VULN_SETTING_META)
 
 function VulnSettingsPanel({ onClose }) {
@@ -98,15 +115,16 @@ function VulnSettingsPanel({ onClose }) {
         </button>
       </div>
       <div className="px-4 py-4 grid grid-cols-1 sm:grid-cols-2 gap-4">
-        {VULN_KEYS.map(key => {
+        {VULN_KEYS.flatMap(key => {
           const meta = VULN_SETTING_META[key]
           const v = val(key)
           const isDirty = dirty[key] !== undefined
           const dirtyStyle = isDirty ? { borderColor: 'color-mix(in srgb, var(--color-brand) 50%, transparent)' } : {}
 
+          let element
           if (meta.type === 'toggle') {
             const isOn = v === 'true'
-            return (
+            element = (
               <div key={key} className="space-y-1 sm:col-span-2">
                 <div className="flex items-center justify-between">
                   <div>
@@ -125,10 +143,8 @@ function VulnSettingsPanel({ onClose }) {
                 </div>
               </div>
             )
-          }
-
-          if (meta.type === 'select') {
-            return (
+          } else if (meta.type === 'select') {
+            element = (
               <div key={key} className="space-y-1">
                 <label className="text-xs font-medium" style={{ color: 'var(--color-text)' }}>{meta.label}</label>
                 <select className="input text-xs w-full" style={dirtyStyle} value={v}
@@ -137,18 +153,49 @@ function VulnSettingsPanel({ onClose }) {
                 </select>
               </div>
             )
+          } else if (meta.type === 'number') {
+            element = (
+              <div key={key} className="space-y-1">
+                <label className="text-xs font-medium" style={{ color: 'var(--color-text)' }}>{meta.label}</label>
+                <div className="flex items-center gap-2">
+                  <input type="number" min={meta.min} className="input text-xs w-24" style={dirtyStyle} value={v}
+                    onChange={e => handleChange(key, e.target.value)} />
+                  {meta.unit && (
+                    <span className="text-xs" style={{ color: 'var(--color-text-faint)' }}>{meta.unit}</span>
+                  )}
+                </div>
+                {meta.description && (
+                  <p className="text-[10px]" style={{ color: 'var(--color-text-faint)' }}>{meta.description}</p>
+                )}
+              </div>
+            )
+          } else {
+            element = (
+              <div key={key} className="space-y-1 sm:col-span-2">
+                <label className="text-xs font-medium" style={{ color: 'var(--color-text)' }}>{meta.label}</label>
+                <input type="text" className="input text-xs font-mono w-full" style={dirtyStyle} value={v}
+                  onChange={e => handleChange(key, e.target.value)} />
+                {meta.description && (
+                  <p className="text-[10px]" style={{ color: 'var(--color-text-faint)' }}>{meta.description}</p>
+                )}
+              </div>
+            )
           }
 
-          return (
-            <div key={key} className="space-y-1 sm:col-span-2">
-              <label className="text-xs font-medium" style={{ color: 'var(--color-text)' }}>{meta.label}</label>
-              <input type="text" className="input text-xs font-mono w-full" style={dirtyStyle} value={v}
-                onChange={e => handleChange(key, e.target.value)} />
-              {meta.description && (
-                <p className="text-[10px]" style={{ color: 'var(--color-text-faint)' }}>{meta.description}</p>
-              )}
-            </div>
-          )
+          if (key === CONTAINER_VULN_KEYS[0]) {
+            return [
+              <div key="container-divider" className="sm:col-span-2 pt-2 border-t flex items-center gap-2"
+                style={{ borderColor: 'var(--color-border)' }}>
+                <Box size={11} style={{ color: 'var(--color-text-faint)' }} />
+                <span className="text-[10px] font-semibold uppercase tracking-wider"
+                  style={{ color: 'var(--color-text-faint)' }}>
+                  Container Image Scanning (Trivy)
+                </span>
+              </div>,
+              element,
+            ]
+          }
+          return [element]
         })}
       </div>
       {hasDirty && (
@@ -392,10 +439,10 @@ export function SecurityDashboard({ onDeviceClick, onContainerClick }) {
   const [dockerEnabled,   setDockerEnabled]   = useState(false)
   const [containerVulns,  setContainerVulns]  = useState([])
   const [scanningContainers, setScanningContainers] = useState(false)
+  const [exporting,          setExporting]          = useState(false)
 
-  async function load() {
-    setLoading(true)
-    setError(null)
+  async function load(silent = false) {
+    if (!silent) { setLoading(true); setError(null) }
     try {
       const [d, t] = await Promise.all([
         api.getVulnSummary(),
@@ -404,9 +451,9 @@ export function SecurityDashboard({ onDeviceClick, onContainerClick }) {
       setData(d)
       setTrend(t)
     } catch (e) {
-      setError(e.message)
+      if (!silent) setError(e.message)
     } finally {
-      setLoading(false)
+      if (!silent) setLoading(false)
     }
     // Load docker container vuln data if available
     api.dockerVulnSummary().then(rows => {
@@ -418,7 +465,11 @@ export function SecurityDashboard({ onDeviceClick, onContainerClick }) {
     })
   }
 
-  useEffect(() => { load() }, [])
+  useEffect(() => {
+    load()
+    const id = setInterval(() => load(true), 60_000)
+    return () => clearInterval(id)
+  }, [])
 
   async function handleScanAll() {
     setScanning(true)
@@ -447,6 +498,22 @@ export function SecurityDashboard({ onDeviceClick, onContainerClick }) {
       setTimeout(() => {
         api.dockerVulnSummary().then(rows => setContainerVulns(rows)).catch(() => {})
       }, 3000)
+    }
+  }
+
+  async function handleExportPDF() {
+    setExporting(true)
+    try {
+      const deviceFindings = {}
+      await Promise.all(topVuln.map(async (d) => {
+        try {
+          const reports = await api.getVulnReports(d.mac_address, 1)
+          deviceFindings[d.mac_address] = reports?.[0]?.findings || []
+        } catch { deviceFindings[d.mac_address] = [] }
+      }))
+      exportDashboardVulnPDF(data, containerVulns, deviceFindings)
+    } finally {
+      setExporting(false)
     }
   }
 
@@ -502,6 +569,13 @@ export function SecurityDashboard({ onDeviceClick, onContainerClick }) {
               title="Run vulnerability scan on all eligible devices">
               <ScanLine size={13} className={scanning ? 'animate-pulse' : ''} />
               {scanning ? 'Starting…' : 'Scan all devices'}
+            </button>
+            <button onClick={handleExportPDF} disabled={exporting || loading || !data}
+              className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold disabled:opacity-50 transition-opacity"
+              style={{ border: '1px solid var(--color-border)', color: 'var(--color-text-muted)' }}
+              title="Export security report as PDF">
+              <FileDown size={13} className={exporting ? 'animate-pulse' : ''} />
+              {exporting ? 'Preparing…' : 'Export PDF'}
             </button>
             <button onClick={load} disabled={loading} className="btn-ghost p-2" title="Refresh data">
               <RefreshCw size={15} className={loading ? 'animate-spin' : ''} />
@@ -618,26 +692,37 @@ export function SecurityDashboard({ onDeviceClick, onContainerClick }) {
                       const isOpen = !!exp
                       return (
                         <div key={d.mac_address} className="card overflow-hidden">
-                          <button
-                            onClick={() => toggleVulnExpand(d.mac_address)}
-                            className="w-full p-3 text-left flex items-center gap-3 hover:bg-surface-offset/40 transition-colors"
-                          >
-                            {isOpen
-                              ? <ChevronDown size={12} style={{ color: 'var(--color-text-faint)', flexShrink: 0 }} />
-                              : <ChevronRight size={12} style={{ color: 'var(--color-text-faint)', flexShrink: 0 }} />}
+                          <div className="p-3 flex items-center gap-3">
+                            <button
+                              onClick={() => toggleVulnExpand(d.mac_address)}
+                              className="p-0.5 hover:opacity-70 transition-opacity shrink-0"
+                              aria-label={isOpen ? 'Collapse' : 'Expand findings'}
+                            >
+                              {isOpen
+                                ? <ChevronDown size={12} style={{ color: 'var(--color-text-faint)' }} />
+                                : <ChevronRight size={12} style={{ color: 'var(--color-text-faint)' }} />}
+                            </button>
                             <SevBadge severity={d.severity} />
                             <div className="flex-1 min-w-0">
-                              <p className="text-sm font-medium truncate" style={{ color: 'var(--color-text)' }}>
+                              <button
+                                onClick={() => onDeviceClick && onDeviceClick(d.mac_address, 'vulns')}
+                                className="text-sm font-medium truncate block text-left hover:underline"
+                                style={{ color: 'var(--color-brand)' }}
+                              >
                                 {d.display_name}
-                              </p>
+                              </button>
                               <p className="text-xs font-mono" style={{ color: 'var(--color-text-faint)' }}>
                                 {d.ip_address || d.mac_address}
                               </p>
                             </div>
-                            <span className="text-xs shrink-0" style={{ color: 'var(--color-text-faint)' }}>
+                            <button
+                              onClick={() => toggleVulnExpand(d.mac_address)}
+                              className="text-xs shrink-0 hover:opacity-70 transition-opacity"
+                              style={{ color: 'var(--color-text-faint)' }}
+                            >
                               {d.vuln_count} finding{d.vuln_count !== 1 ? 's' : ''}
-                            </span>
-                          </button>
+                            </button>
+                          </div>
                           {isOpen && (
                             <div className="px-3 pb-3 pt-1 border-t" style={{ borderColor: 'var(--color-border)' }}>
                               {exp.loading ? (
@@ -685,25 +770,70 @@ export function SecurityDashboard({ onDeviceClick, onContainerClick }) {
                   <div className="card divide-y" style={{ '--tw-divide-opacity': 1 }}>
                     {recentScan.slice(0, 10).map((r, i) => {
                       const cfg = SEV_CFG[r.severity] || SEV_CFG.info
+                      const exp = expandedVuln[r.mac_address]
+                      const isOpen = !!exp
                       return (
-                        <button
-                          key={i}
-                          onClick={() => onDeviceClick && onDeviceClick(r.mac_address, 'vulns')}
-                          className="w-full px-3 py-2.5 flex items-center gap-3 text-left hover:bg-surface-offset transition-colors first:rounded-t-lg last:rounded-b-lg"
-                        >
-                          <span className="w-2 h-2 rounded-full shrink-0 mt-0.5" style={{ background: cfg.color }} />
-                          <div className="flex-1 min-w-0">
-                            <p className="text-xs font-medium truncate" style={{ color: 'var(--color-text)' }}>
-                              {r.display_name}
-                            </p>
+                        <div key={i}>
+                          <div className="px-3 py-2.5 flex items-center gap-3 hover:bg-surface-offset transition-colors first:rounded-t-lg last:rounded-b-lg">
+                            <span className="w-2 h-2 rounded-full shrink-0 mt-0.5" style={{ background: cfg.color }} />
+                            <div className="flex-1 min-w-0">
+                              <button
+                                onClick={() => onDeviceClick && onDeviceClick(r.mac_address, 'vulns')}
+                                className="text-xs font-medium truncate block text-left hover:underline"
+                                style={{ color: 'var(--color-brand)' }}
+                              >
+                                {r.display_name}
+                              </button>
+                            </div>
+                            <SevBadge severity={r.severity} />
+                            <span className="text-[10px] shrink-0 flex items-center gap-1"
+                              style={{ color: 'var(--color-text-faint)' }}>
+                              <Clock size={9} />
+                              {fmtRelative(r.scanned_at)}
+                            </span>
+                            <button
+                              onClick={() => toggleVulnExpand(r.mac_address)}
+                              className="p-0.5 hover:opacity-70 transition-opacity shrink-0"
+                              aria-label={isOpen ? 'Collapse findings' : 'Expand findings'}
+                            >
+                              {isOpen
+                                ? <ChevronDown size={12} style={{ color: 'var(--color-text-faint)' }} />
+                                : <ChevronRight size={12} style={{ color: 'var(--color-text-faint)' }} />}
+                            </button>
                           </div>
-                          <SevBadge severity={r.severity} />
-                          <span className="text-[10px] shrink-0 flex items-center gap-1"
-                            style={{ color: 'var(--color-text-faint)' }}>
-                            <Clock size={9} />
-                            {fmtRelative(r.scanned_at)}
-                          </span>
-                        </button>
+                          {isOpen && (
+                            <div className="px-3 pb-3 pt-1 border-t" style={{ borderColor: 'var(--color-border)' }}>
+                              {exp.loading ? (
+                                <p className="text-[11px] animate-pulse" style={{ color: 'var(--color-text-faint)' }}>Loading findings…</p>
+                              ) : exp.findings?.length === 0 ? (
+                                <p className="text-[11px]" style={{ color: '#22c55e' }}>No findings in latest report</p>
+                              ) : (
+                                <div className="space-y-1 mt-1">
+                                  {(exp.findings || []).map((f, fi) => {
+                                    const fcfg = SEV_CFG[f.severity] || SEV_CFG.info
+                                    return (
+                                      <div key={fi} className="flex items-center gap-2">
+                                        <span className="px-1.5 py-0.5 rounded text-[9px] font-bold uppercase shrink-0"
+                                          style={{ background: fcfg.bg, color: fcfg.color, border: `1px solid ${fcfg.border}` }}>
+                                          {f.severity.slice(0, 4)}
+                                        </span>
+                                        <span className="text-[11px] truncate" style={{ color: 'var(--color-text-muted)' }}>
+                                          {f.name}
+                                        </span>
+                                        {f.matched_at && (
+                                          <span className="text-[10px] font-mono shrink-0 truncate max-w-[100px]"
+                                            style={{ color: 'var(--color-text-faint)' }}>
+                                            {f.matched_at}
+                                          </span>
+                                        )}
+                                      </div>
+                                    )
+                                  })}
+                                </div>
+                              )}
+                            </div>
+                          )}
+                        </div>
                       )
                     })}
                   </div>

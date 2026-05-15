@@ -1,3 +1,4 @@
+import { X } from 'lucide-react'
 import { OnlineDot } from './OnlineDot'
 import { StarButton } from './StarButton'
 
@@ -19,8 +20,16 @@ function cleanVendor(vendor) {
     .trim()
 }
 
-export function DeviceRow({ device, onClick, striped, onStarToggle, isVulnScanning }) {
-  const name = device.custom_name || device.hostname || device.ip_address || device.mac_address
+const NEW_DEVICE_DAYS = 7
+function isNewDevice(device) {
+  if (!device.first_seen) return false
+  return Date.now() - new Date(device.first_seen).getTime() < NEW_DEVICE_DAYS * 24 * 60 * 60 * 1000
+}
+
+export function DeviceRow({ device, onClick, striped, onStarToggle, isVulnScanning, isAcknowledged, onAcknowledge }) {
+  const name    = device.custom_name || device.hostname || device.ip_address || device.mac_address
+  const isNew   = isNewDevice(device)
+  const showNew = isNew && !isAcknowledged
 
   return (
     <div
@@ -35,7 +44,12 @@ export function DeviceRow({ device, onClick, striped, onStarToggle, isVulnScanni
 
       <div className="min-w-0">
         <p className="text-sm font-medium truncate" style={{ color: 'var(--color-text)' }}>{name}</p>
-        <p className="text-xs font-mono truncate" style={{ color: 'var(--color-text-faint)' }}>{device.ip_address}</p>
+        <p className="text-xs font-mono truncate" style={{ color: 'var(--color-text-faint)' }}>{device.primary_ip || device.ip_address}</p>
+        {(device.secondary_ips || []).length > 0 && (
+          <p className="text-[10px] font-mono truncate" style={{ color: 'var(--color-text-faint)', opacity: 0.7 }}>
+            +{(device.secondary_ips).join(', ')}
+          </p>
+        )}
       </div>
 
       <span className="hidden sm:block font-mono text-xs truncate" style={{ color: 'var(--color-text-muted)' }}>
@@ -61,6 +75,22 @@ export function DeviceRow({ device, onClick, striped, onStarToggle, isVulnScanni
           <span className="hidden sm:inline-flex text-[10px] font-medium rounded-full px-2 py-0.5"
             style={{ color: 'var(--color-brand)', background: 'color-mix(in srgb, var(--color-brand) 12%, transparent)', border: '1px solid color-mix(in srgb, var(--color-brand) 25%, transparent)' }}>
             Vuln Scan
+          </span>
+        )}
+        {showNew && (
+          <span className="hidden sm:inline-flex items-center gap-0.5 text-[10px] font-bold rounded-full px-2 py-0.5"
+            style={{ color: '#10b981', background: 'rgba(16,185,129,0.12)', border: '1px solid rgba(16,185,129,0.35)' }}>
+            NEW
+            {onAcknowledge && (
+              <button
+                onClick={e => { e.stopPropagation(); onAcknowledge(device.mac_address) }}
+                className="opacity-60 hover:opacity-100 transition-opacity ml-0.5"
+                title="Acknowledge — stop surfacing to top"
+                aria-label="Acknowledge new device"
+              >
+                <X size={8} />
+              </button>
+            )}
           </span>
         )}
       </div>

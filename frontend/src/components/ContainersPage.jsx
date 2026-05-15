@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback, useMemo } from 'react'
-import { Box, RefreshCw, Search, AlertCircle, Play, Square, Loader2, LayoutGrid, List } from 'lucide-react'
+import { Box, RefreshCw, Search, AlertCircle, Play, Square, Loader2, LayoutGrid, List, ArrowUpDown, ShieldAlert, Network, GitBranch, X, Sparkles } from 'lucide-react'
 import { api } from '../api'
 import { ContainerCard } from './ContainerCard'
 import { ContainerDrawer } from './ContainerDrawer'
@@ -14,6 +14,30 @@ const STATUS_FILTERS = [
   { value: 'paused',     label: 'Paused' },
   { value: 'restarting', label: 'Restarting' },
 ]
+
+const SORT_OPTIONS = [
+  { value: 'name-asc',  label: 'Name (A → Z)' },
+  { value: 'name-desc', label: 'Name (Z → A)' },
+  { value: 'status',    label: 'Status' },
+  { value: 'host',      label: 'Host' },
+  { value: 'newest',    label: 'Newest First' },
+]
+
+const STATUS_SORT_ORDER = ['running', 'restarting', 'paused', 'created', 'exited', 'dead']
+
+const NEW_CONTAINER_DAYS = 7
+function isNewContainer(c) {
+  if (!c.created) return false
+  return Date.now() - new Date(c.created).getTime() < NEW_CONTAINER_DAYS * 24 * 60 * 60 * 1000
+}
+
+function loadAcknowledgedContainers() {
+  try { return new Set(JSON.parse(localStorage.getItem('inspectre_ack_containers') || '[]')) }
+  catch { return new Set() }
+}
+function saveAcknowledgedContainers(s) {
+  localStorage.setItem('inspectre_ack_containers', JSON.stringify([...s]))
+}
 
 const STATUS_COLOR = {
   running:    '#22c55e',
@@ -84,10 +108,11 @@ function EmptyState({ search, filter }) {
   )
 }
 
-function ContainerRow({ container, onClick }) {
-  const color = STATUS_COLOR[container.status] || '#6b7280'
-  const label = STATUS_LABEL[container.status] || container.status
-  const portStr = (container.ports || [])
+function ContainerRow({ container, onClick, isAcknowledged, onAcknowledge }) {
+  const color    = STATUS_COLOR[container.status] || '#6b7280'
+  const label    = STATUS_LABEL[container.status] || container.status
+  const showNew  = isNewContainer(container) && !isAcknowledged
+  const portStr  = (container.ports || [])
     .filter(p => p.host_port)
     .map(p => `${p.host_port}→${p.container_port}`)
     .slice(0, 3).join(', ')
@@ -109,6 +134,24 @@ function ContainerRow({ container, onClick }) {
       <span className="text-xs font-medium w-20 shrink-0" style={{ color }}>
         {label}
       </span>
+
+      {/* NEW badge */}
+      {showNew && (
+        <span className="hidden sm:inline-flex items-center gap-0.5 text-[10px] font-bold rounded-full px-2 py-0.5 shrink-0"
+          style={{ color: '#10b981', background: 'rgba(16,185,129,0.12)', border: '1px solid rgba(16,185,129,0.35)' }}>
+          NEW
+          {onAcknowledge && (
+            <button
+              onClick={e => { e.stopPropagation(); onAcknowledge(container.id) }}
+              className="opacity-60 hover:opacity-100 transition-opacity ml-0.5"
+              title="Acknowledge — stop surfacing to top"
+              aria-label="Acknowledge new container"
+            >
+              <X size={8} />
+            </button>
+          )}
+        </span>
+      )}
 
       {/* Image */}
       <span className="text-xs font-mono truncate flex-1 min-w-0" style={{ color: 'var(--color-text-muted)' }}>
@@ -138,18 +181,23 @@ function ContainerRow({ container, onClick }) {
   )
 }
 
-export function ContainersPage({ openContainer }) {
-  const [containers,  setContainers]  = useState([])
-  const [stats,       setStats]       = useState(null)
-  const [loading,     setLoading]     = useState(true)
-  const [error,       setError]       = useState(null)
-  const [disabled,    setDisabled]    = useState(false)
-  const [selected,    setSelected]    = useState(null)
-  const [search,      setSearch]      = useState('')
-  const [filter,      setFilter]      = useState('all')
-  const [hostFilter,  setHostFilter]  = useState('all')
-  const [layout,      setLayout]      = useState('grid')
-  const [refreshing,  setRefreshing]  = useState(false)
+export function ContainersPage({ openContainer, skin }) {
+  const [containers,    setContainers]    = useState([])
+  const [stats,         setStats]         = useState(null)
+  const [vulnSummary,   setVulnSummary]   = useState([])
+  const [loading,       setLoading]       = useState(true)
+  const [error,         setError]         = useState(null)
+  const [disabled,      setDisabled]      = useState(false)
+  const [selected,      setSelected]      = useState(null)
+  const [search,        setSearch]        = useState('')
+  const [filter,        setFilter]        = useState('all')
+  const [smartFilters,  setSmartFilters]  = useState({})
+  const [hostFilter,    setHostFilter]    = useState('all')
+  const [sort,          setSort]          = useState('name-asc')
+  const [layout,        setLayout]        = useState('grid')
+  const [refreshing,    setRefreshing]    = useState(false)
+  const [surfaceNewFirst,    setSurfaceNewFirst]    = useState(() => localStorage.getItem('inspectre_containers_surface_new') !== 'false')
+  const [acknowledgedContainers, setAcknowledgedContainers] = useState(loadAcknowledgedContainers)
 
   // Vuln scan state keyed by container ID — persists across drawer open/close
   const [trivyScansByContainer, setTrivyScansByContainer] = useState({})
@@ -161,18 +209,37 @@ export function ContainersPage({ openContainer }) {
     })
   }
 
+  function acknowledgeContainer(id) {
+    setAcknowledgedContainers(prev => {
+      const next = new Set(prev)
+      next.add(id)
+      saveAcknowledgedContainers(next)
+      return next
+    })
+  }
+
+  function toggleSurfaceNewFirst() {
+    setSurfaceNewFirst(prev => {
+      const next = !prev
+      localStorage.setItem('inspectre_containers_surface_new', String(next))
+      return next
+    })
+  }
+
   const load = useCallback(async (silent = false) => {
     if (!silent) setLoading(true)
     else setRefreshing(true)
     setError(null)
     setDisabled(false)
     try {
-      const [statsData, containerList] = await Promise.all([
+      const [statsData, containerList, vulnData] = await Promise.all([
         api.dockerStats(),
         api.dockerContainers(),
+        api.dockerVulnSummary().catch(() => []),
       ])
       setStats(statsData)
       setContainers(containerList)
+      setVulnSummary(Array.isArray(vulnData) ? vulnData : [])
     } catch (e) {
       if (e.message?.includes('503') || e.message?.toLowerCase().includes('disabled')) {
         setDisabled(true)
@@ -216,12 +283,39 @@ export function ContainersPage({ openContainer }) {
     return [...seen.values()]
   }, [containers])
 
+  const vulnNameSet = useMemo(() => {
+    const s = new Set()
+    for (const v of vulnSummary) {
+      if (v.severity && v.severity !== 'clean') s.add(v.name)
+    }
+    return s
+  }, [vulnSummary])
+
   const filtered = containers.filter(c => {
     if (hostFilter !== 'all' && c.host_id !== hostFilter) return false
     if (filter === 'stopped' && !STOPPED_STATES.includes(c.status)) return false
-    if (filter !== 'all' && filter !== 'stopped' && c.status !== filter) return false
+    if (filter === 'other' && !['paused', 'restarting'].includes(c.status)) return false
+    if (filter !== 'all' && filter !== 'stopped' && filter !== 'other' && c.status !== filter) return false
+    const _sfMatch = {
+      vulnerable: () => vulnNameSet.has(c.name),
+      host_net:   () => (c.networks || []).includes('host'),
+      bridge_net: () => (c.networks || []).includes('bridge'),
+    }
+    for (const [key, mode] of Object.entries(smartFilters)) {
+      const fn = _sfMatch[key]
+      if (!fn) continue
+      if (mode === 'include' && !fn()) return false
+      if (mode === 'exclude' &&  fn()) return false
+    }
     if (search.trim()) {
-      const q = search.toLowerCase()
+      const q = search.toLowerCase().trim()
+      const portMatch = q.match(/^port:(\d+)$/)
+      if (portMatch) {
+        const portNum = portMatch[1]
+        return (c.ports || []).some(p =>
+          String(p.host_port) === portNum || String(p.container_port?.split('/')[0]) === portNum
+        )
+      }
       return c.name.toLowerCase().includes(q)
           || c.image.toLowerCase().includes(q)
           || c.short_id.toLowerCase().includes(q)
@@ -230,6 +324,37 @@ export function ContainersPage({ openContainer }) {
     return true
   })
 
+  const sortedBase = [...filtered].sort((a, b) => {
+    switch (sort) {
+      case 'name-desc': return b.name.localeCompare(a.name)
+      case 'status': {
+        const ai = STATUS_SORT_ORDER.indexOf(a.status)
+        const bi = STATUS_SORT_ORDER.indexOf(b.status)
+        if (ai !== bi) return (ai === -1 ? 99 : ai) - (bi === -1 ? 99 : bi)
+        return a.name.localeCompare(b.name)
+      }
+      case 'host':
+        return (a.host_name || '').localeCompare(b.host_name || '') || a.name.localeCompare(b.name)
+      case 'newest': {
+        const at = a.state?.started_at || ''
+        const bt = b.state?.started_at || ''
+        if (at && bt) return bt.localeCompare(at)
+        if (at) return -1
+        if (bt) return 1
+        return a.name.localeCompare(b.name)
+      }
+      default:
+        return a.name.localeCompare(b.name)
+    }
+  })
+
+  const sorted = surfaceNewFirst
+    ? [
+        ...sortedBase.filter(c => isNewContainer(c) && !acknowledgedContainers.has(c.id)),
+        ...sortedBase.filter(c => !isNewContainer(c) || acknowledgedContainers.has(c.id)),
+      ]
+    : sortedBase
+
   return (
     <div className="space-y-8">
 
@@ -237,14 +362,14 @@ export function ContainersPage({ openContainer }) {
       {stats && (
         <section>
           <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
-            <StatCard label="Total"     value={stats.total}     icon={Box}     color="brand"
+            <StatCard label="Total Containers"    value={stats.total}     icon={Box}     color="brand"
               onClick={() => setFilter('all')}      active={filter === 'all'} />
-            <StatCard label="Running"   value={stats.running}   icon={Play}    color="emerald"
+            <StatCard label="Running Containers"   value={stats.running}   icon={Play}    color="emerald"
               onClick={() => setFilter('running')}  active={filter === 'running'} />
-            <StatCard label="Stopped"   value={stats.stopped}   icon={Square}  color="red"
+            <StatCard label="Stopped Containers"   value={stats.stopped}   icon={Square}  color="red"
               onClick={() => setFilter('stopped')}  active={filter === 'stopped'} />
-            <StatCard label="Other"     value={(stats.paused || 0) + (stats.restarting || 0)} icon={Loader2} color="amber"
-              onClick={() => setFilter('all')} active={false} />
+            <StatCard label="Paused / Restarting"  value={(stats.paused || 0) + (stats.restarting || 0)} icon={Loader2} color="amber"
+              onClick={() => setFilter(filter === 'other' ? 'all' : 'other')} active={filter === 'other'} />
           </div>
           {stats.docker_version && (
             <p className="text-xs mt-2" style={{ color: 'var(--color-text-faint)' }}>
@@ -271,6 +396,13 @@ export function ContainersPage({ openContainer }) {
               style={{ color: 'var(--color-text-muted)' }} />
             <input className="input pl-9 w-full" placeholder="Search containers…"
               value={search} onChange={e => setSearch(e.target.value)} />
+            {search && (
+              <button onClick={() => setSearch('')}
+                className="absolute right-2 top-1/2 -translate-y-1/2 rounded p-0.5 transition-colors hover:opacity-70"
+                style={{ color: 'var(--color-text-muted)' }} aria-label="Clear search">
+                <X size={13} />
+              </button>
+            )}
           </div>
 
           <div className="flex items-center gap-1 flex-wrap">
@@ -284,6 +416,44 @@ export function ContainersPage({ openContainer }) {
                 {f.label}
               </button>
             ))}
+          </div>
+
+          {/* Smart filters — click to cycle: off → include (green) → exclude (red) → off */}
+          <div className="flex items-center gap-1 flex-wrap">
+            {[
+              { key: 'vulnerable',  label: 'Vulnerable',     icon: ShieldAlert },
+              { key: 'host_net',    label: 'Host Network',   icon: Network },
+              { key: 'bridge_net',  label: 'Bridge Network', icon: GitBranch },
+            ].map(({ key, label, icon: Icon }) => {
+              const state = smartFilters[key] || null
+              const style = state === 'include'
+                ? { background: 'rgba(34,197,94,0.18)',  color: '#22c55e', borderColor: 'rgba(34,197,94,0.45)' }
+                : state === 'exclude'
+                  ? { background: 'rgba(239,68,68,0.15)', color: '#ef4444', borderColor: 'rgba(239,68,68,0.4)' }
+                  : { background: 'var(--color-surface-offset)', color: 'var(--color-text-muted)', borderColor: 'var(--color-border)' }
+              return (
+                <button key={key}
+                  onClick={() => setSmartFilters(prev => {
+                    const cur = prev[key]
+                    if (!cur)              return { ...prev, [key]: 'include' }
+                    if (cur === 'include') return { ...prev, [key]: 'exclude' }
+                    const next = { ...prev }; delete next[key]; return next
+                  })}
+                  title={state ? `${label}: ${state} — click to cycle` : `${label}: off — click to include`}
+                  className="flex items-center gap-1 px-3 py-1.5 rounded-xl text-xs font-medium border transition-colors"
+                  style={style}>
+                  <Icon size={11} />
+                  {label}{state && <span className="ml-0.5 opacity-70 text-[10px]">{state === 'include' ? '✓' : '✕'}</span>}
+                </button>
+              )
+            })}
+            {Object.keys(smartFilters).length > 0 && (
+              <button onClick={() => setSmartFilters({})}
+                className="px-2 py-1.5 rounded-xl text-xs border transition-colors"
+                style={{ color: 'var(--color-text-faint)', borderColor: 'var(--color-border)', background: 'transparent' }}>
+                Clear
+              </button>
+            )}
           </div>
 
           {hostOptions.length > 1 && (
@@ -311,6 +481,25 @@ export function ContainersPage({ openContainer }) {
           )}
 
           <div className="ml-auto flex items-center gap-1">
+            {/* Surface new first toggle */}
+            <button
+              onClick={toggleSurfaceNewFirst}
+              title={surfaceNewFirst ? 'New containers surfaced to top (click to disable)' : 'New containers not surfaced (click to enable)'}
+              className="flex items-center gap-1 px-2.5 py-1.5 rounded-xl text-xs font-medium border transition-colors"
+              style={surfaceNewFirst
+                ? { background: 'rgba(16,185,129,0.12)', color: '#10b981', borderColor: 'rgba(16,185,129,0.35)' }
+                : { background: 'var(--color-surface-offset)', color: 'var(--color-text-faint)', borderColor: 'var(--color-border)' }}
+            >
+              <Sparkles size={11} />
+              <span>New first</span>
+            </button>
+            {/* Sort */}
+            <div className="flex items-center gap-1 mr-1">
+              <ArrowUpDown size={13} style={{ color: 'var(--color-text-faint)' }} />
+              <select className="input text-xs py-1" value={sort} onChange={e => setSort(e.target.value)}>
+                {SORT_OPTIONS.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
+              </select>
+            </div>
             {/* Layout toggle */}
             <button onClick={() => setLayout('grid')} className="btn-ghost p-2"
               title="Grid view" aria-label="Grid view"
@@ -335,12 +524,12 @@ export function ContainersPage({ openContainer }) {
         <SkeletonCards />
       ) : disabled ? (
         <DisabledState />
-      ) : filtered.length === 0 ? (
+      ) : sorted.length === 0 ? (
         <EmptyState search={search} filter={filter} />
       ) : (
         <section>
           <p className="text-xs mb-4" style={{ color: 'var(--color-text-faint)' }}>
-            Showing {filtered.length} of {containers.length} container{containers.length !== 1 ? 's' : ''}
+            Showing {sorted.length} of {containers.length} container{containers.length !== 1 ? 's' : ''}
             {filter !== 'all' && (
               <span className="ml-2 px-2 py-0.5 rounded-full text-[10px] font-semibold uppercase"
                 style={{ background: 'var(--color-brand)', color: 'white' }}>{filter}</span>
@@ -348,9 +537,12 @@ export function ContainersPage({ openContainer }) {
           </p>
 
           {layout === 'grid' ? (
-            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-4">
-              {filtered.map(c => (
-                <ContainerCard key={c.id} container={c} onClick={() => setSelected(c)} />
+            <div className={`grid gap-4 grid-cols-1 sm:grid-cols-2 ${skin === 'phantom' ? 'xl:grid-cols-3' : 'lg:grid-cols-3 xl:grid-cols-4'}`}>
+              {sorted.map(c => (
+                <ContainerCard key={c.id} container={c} onClick={() => setSelected(c)}
+                  isAcknowledged={acknowledgedContainers.has(c.id)}
+                  isTrivyScanning={trivyScansByContainer[c.id]?.scanning || false}
+                  onAcknowledge={acknowledgeContainer} />
               ))}
             </div>
           ) : (
@@ -367,8 +559,10 @@ export function ContainersPage({ openContainer }) {
                 <span className="w-28 hidden xl:block">Host</span>
                 <span className="w-24 text-right hidden sm:block">Uptime</span>
               </div>
-              {filtered.map(c => (
-                <ContainerRow key={c.id} container={c} onClick={() => setSelected(c)} />
+              {sorted.map(c => (
+                <ContainerRow key={c.id} container={c} onClick={() => setSelected(c)}
+                  isAcknowledged={acknowledgedContainers.has(c.id)}
+                  onAcknowledge={acknowledgeContainer} />
               ))}
             </div>
           )}

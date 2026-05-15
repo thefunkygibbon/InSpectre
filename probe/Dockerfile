@@ -1,9 +1,8 @@
 FROM python:3.12-slim
 
-# nmap + network tools + wget/unzip for Nuclei
+# Network tools + wget/curl/gnupg/unzip (gnupg needed for Ookla packagecloud key)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libpcap-dev gcc \
-    nmap \
     avahi-utils \
     samba-common-bin \
     dnsutils \
@@ -12,12 +11,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     iproute2 \
     iptables \
     wget \
+    curl \
+    gnupg \
     unzip \
     && rm -rf /var/lib/apt/lists/*
 
 # Install Nuclei vulnerability scanner (fetch latest release, fall back to known-good version)
 RUN NUCLEI_VERSION=$(wget -qO- https://api.github.com/repos/projectdiscovery/nuclei/releases/latest \
-        | grep '"tag_name"' | sed 's/.*"v\([^"]*\)".*/\1/' || echo "3.4.4") \
+        | grep '"tag_name"' | sed 's/.*"v\([^"]*\)".*/\1/' || echo "3.5.0") \
     && wget -q "https://github.com/projectdiscovery/nuclei/releases/download/v${NUCLEI_VERSION}/nuclei_${NUCLEI_VERSION}_linux_amd64.zip" \
          -O /tmp/nuclei.zip \
     && unzip -q /tmp/nuclei.zip -d /tmp/nuclei_unzip \
@@ -26,7 +27,7 @@ RUN NUCLEI_VERSION=$(wget -qO- https://api.github.com/repos/projectdiscovery/nuc
     && rm -rf /tmp/nuclei.zip /tmp/nuclei_unzip
 
 # Install Nerva service fingerprinting tool (graceful failure — probe handles absence)
-ARG NERVA_VERSION=1.3.0
+ARG NERVA_VERSION=1.4.0
 RUN wget -q "https://github.com/praetorian-inc/nerva/releases/download/v${NERVA_VERSION}/nerva-linux-amd64.tar.gz" \
          -O /tmp/nerva.tar.gz \
     && tar -xzf /tmp/nerva.tar.gz -C /tmp/ \
@@ -38,12 +39,24 @@ RUN wget -q "https://github.com/praetorian-inc/nerva/releases/download/v${NERVA_
 # Pre-fetch Nuclei community templates (baked into image; rebuild to refresh)
 RUN nuclei -update-templates -no-color 2>&1 | tail -5 || true
 
+# Install Ookla speedtest CLI via official packagecloud repo
+# Graceful failure: if Ookla's repo is unreachable the probe still starts;
+# the speedtest endpoint will return an error message to the UI.
+RUN if curl -s https://packagecloud.io/install/repositories/ookla/speedtest-cli/script.deb.sh | bash \
+       && apt-get install -y speedtest; then \
+      speedtest --accept-license --accept-gdpr > /dev/null 2>&1 || true; \
+      rm -rf /var/lib/apt/lists/*; \
+    else \
+      echo "[WARN] Ookla speedtest CLI install failed — speed tests will be unavailable"; \
+    fi
+
 WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 COPY main.py .
 COPY vuln_scanner.py .
 COPY traffic_monitor.py .
+COPY dhcp_classify.py .
 COPY mac-vendors-export.csv .
 
 # Download GeoLite2-Country database if MAXMIND_LICENSE_KEY is provided at build time.

@@ -28,6 +28,7 @@ Check the [Wiki](https://github.com/thefunkygibbon/InSpectre/wiki) for full admi
 - **Watched flag** — star important devices for elevated offline alerts and priority sorting
 - **Ignore flag** — hide known-benign devices from the main view
 - **Notes** — free-text notes attached to any device
+- **Device grouping** — devices sharing the same hostname (e.g. `laptop` and `laptop.lan`) are automatically grouped as a single physical device with multiple interfaces. Grouped devices share a unified event timeline and appear as one card on the dashboard. Manual grouping and ungrouping is available from the device drawer.
 
 ### Scanning & Security
 - **Port scanning** — nmap-based TCP port sweep with OS detection and service fingerprinting
@@ -52,7 +53,7 @@ Check the [Wiki](https://github.com/thefunkygibbon/InSpectre/wiki) for full admi
 
 ### Traffic Monitoring
 - **Per-device traffic analysis** — bytes, packets, domains contacted, countries, and unusual port activity
-- **Live speed test** — run a speedtest-cli speed test directly from the UI with optional scheduled auto-runs (every 30m / 1h / 6h / daily)
+- **Live speed test** — run an Ookla-powered speed test from the probe container and report download/upload speeds and ping. Optional server selector and scheduled auto-runs (every 30m / 1h / 6h / daily). Results are stored and shown in the history list.
 
 ### Network Tools
 - **IP Tools** — Ping, Traceroute, Port Scan, Reverse DNS, ARP Lookup, Wake-on-LAN
@@ -67,16 +68,25 @@ Check the [Wiki](https://github.com/thefunkygibbon/InSpectre/wiki) for full admi
 - **ntfy** — self-hosted push notification support
 - **Gotify** — self-hosted Gotify server support
 - **Webhooks** — generic outbound webhook for any alerting system
+- **Channels & Profiles system** — reusable Notification Channels (each with a service type and credentials) are grouped into Profiles that map specific event types to one or more channels; multiple channels can fire for the same event and one channel can serve multiple profiles
+- **Supported channel services** — ntfy, Gotify, Pushbullet, Webhook, Home Assistant (direct REST), Matrix, SMTP (email), Slack, Telegram, Discord, and Apprise generic URL
+- **Per-channel testing** — each channel can be tested individually from the Settings panel
+- **Home Assistant direct notifications** — a `home_assistant` channel type POSTs alerts directly to the HA REST API (`persistent_notification/create` or any custom `domain/service`); configure host, port, long-lived access token, optional notifier path, and TLS toggle
+- **Home Assistant MQTT Auto-Discovery** — dedicated Settings tab publishes InSpectre entities to Home Assistant via MQTT using the standard Auto-Discovery protocol; creates a system device (total devices online, total vulnerabilities, scan state, last scan time) and per-client sensors: presence, new device binary sensor, IP address, open port count, and vulnerability level
 
 ### Fingerprinting & Identity
 - **OUI lookup** — MAC vendor resolution from the IEEE OUI database
+- **DHCP passive capture** — the probe passively captures DHCP packets to collect hostname (Option 12), vendor class ID (Option 60), and parameter request list (Option 55) from every device that broadcasts a lease request
+- **Local DHCP classification** — collected DHCP data is matched against known vendor class patterns to infer device type and OS without sending data anywhere
+- **Fingerbank cloud lookup** — optionally send DHCP fingerprint data to [Fingerbank](https://fingerbank.org/) (free tier, 600 lookups/hour) for deeper device identification; results include device name, hierarchy, and a confidence score
 - **Port pattern matching** — classify device type from open port signature
 - **Manual + community + auto fingerprints** — all stored locally, importable/exportable
+- **New device acknowledgement** — newly discovered devices float to the top of the device list and are marked as new until acknowledged; clicking Acknowledge on the device card or in the drawer marks the device as known, removing the badge and the float; the acknowledged state is stored server-side and also drives the MQTT `new` binary sensor
 
 ### Authentication & Setup
 - **Built-in authentication** — username and password login with JWT session tokens
-- **First-run setup wizard** — guided configuration of network settings, vulnerability scanning, notifications, and container hosts on first launch
-- **Backup/restore** — full JSON backup of all data, restorable from within the setup wizard or settings
+- **First-run setup wizard** — guided 7-step configuration of network settings, vulnerability scanning, notifications, container hosts, and Fingerbank device identification on first launch
+- **Backup/restore** — full JSON backup covering all devices, events, vuln reports, speed test history, settings, users, fingerprints, block schedules, and saved views. Optional AES-256-GCM encryption with a user-supplied password. Restorable from the setup wizard or settings panel; encrypted backups are supported in both locations.
 
 ---
 
@@ -92,11 +102,10 @@ Check the [Wiki](https://github.com/thefunkygibbon/InSpectre/wiki) for full admi
 ```bash
 git clone https://github.com/thefunkygibbon/InSpectre.git
 cd InSpectre
-
 ./inspectre.sh up
 ```
 
-Open **http://localhost:3000** in your browser and complete the first-run setup wizard to create your admin account.
+Open **http://localhost:3000** in your browser and complete the first-run setup wizard. The wizard configures your network settings, scan range, and notifications — no file editing required.
 
 ### Available helper commands
 
@@ -118,16 +127,17 @@ docker compose up -d
 
 ## Configuration
 
-Key environment variables are set in `docker-compose.yml`:
+All configuration is done through the **Settings** panel in the UI — no file editing needed after `./inspectre.sh up`. The setup wizard on first run covers scan range, DNS, notifications, and container hosts.
 
-| Variable | Description | Example |
-|---|---|---|
-| `IP_RANGE` | CIDR range to scan | `192.168.1.0/24` |
-| `INTERFACE` | Network interface for the probe | `eth0` |
-| `LAN_DNS_SERVER` | DNS server for hostname resolution | `192.168.1.1` |
-| `DATABASE_URL` | PostgreSQL connection string (pre-set) | `postgresql://...` |
+The probe auto-detects the correct network interface and IP range from the host's routing table. If auto-detection picks the wrong interface (e.g. on a machine with multiple NICs), you can override it by uncommenting the relevant lines in `docker-compose.yml`:
 
-All other settings (scan interval, nmap arguments, alert channels, nightly scan window, container hosts, etc.) are managed from the **Settings** panel inside the UI after first run — no restart required for most of them.
+```yaml
+# IP_RANGE: "192.168.1.0/24"
+# INTERFACE: "eth0"
+# LAN_DNS_SERVER: "192.168.1.1"
+```
+
+Everything else — scan interval, nmap arguments, alert channels, nightly scan window, container hosts, etc. — is managed from the Settings panel at runtime with no restart required.
 
 ---
 

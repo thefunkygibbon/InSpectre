@@ -50,7 +50,7 @@ function HostForm({ initial, onSave, onCancel, saving }) {
     setError('')
     if (!name.trim()) { setError('Name is required.'); return }
     if (type !== 'docker_local' && !url.trim()) { setError('URL is required.'); return }
-    if (type === 'proxmox' && !authUser.trim()) { setError('Proxmox user (e.g. root@pam) is required.'); return }
+    if (type === 'proxmox' && !authUser.trim()) { setError('Token ID (e.g. root@pam!mytoken) is required.'); return }
     const body = {
       name: name.trim(), type, url: url.trim() || null,
       auth_user: authUser.trim() || null,
@@ -109,21 +109,21 @@ function HostForm({ initial, onSave, onCancel, saving }) {
         <>
           <div className="space-y-1">
             <label className="text-xs font-medium" style={{ color: 'var(--color-text-muted)' }}>
-              API User (e.g. root@pam)
+              Token ID <span className="font-mono">(user@realm!tokenname)</span>
             </label>
             <input className="input w-full font-mono text-sm" value={authUser}
-              onChange={e => setAuthUser(e.target.value)} placeholder="root@pam" />
+              onChange={e => setAuthUser(e.target.value)} placeholder="root@pam!mytoken" />
+            <p className="text-[11px]" style={{ color: 'var(--color-text-faint)' }}>
+              The Token ID shown in Datacenter → API Tokens in the Proxmox UI.
+            </p>
           </div>
           <div className="space-y-1">
             <label className="text-xs font-medium" style={{ color: 'var(--color-text-muted)' }}>
-              API Token (<span className="font-mono">TOKENID=SECRET</span>)
+              Token Secret <span className="font-mono">(UUID)</span>
             </label>
             <input className="input w-full font-mono text-sm" type="password"
               value={authToken} onChange={e => setAuthToken(e.target.value)}
-              placeholder={initial ? '(unchanged)' : 'mytoken=xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx'} />
-            <p className="text-[11px]" style={{ color: 'var(--color-text-faint)' }}>
-              Create via Datacenter → API Tokens in the Proxmox UI.
-            </p>
+              placeholder={initial ? '(unchanged)' : 'xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx'} />
           </div>
           <div className="space-y-1">
             <label className="text-xs font-medium" style={{ color: 'var(--color-text-muted)' }}>Default Node</label>

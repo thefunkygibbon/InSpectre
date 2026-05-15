@@ -50,6 +50,24 @@ class Device(Base):
     # Scan type determined at discovery time: 'syn' (default) or 'tcp_connect' (probe host)
     scan_type               = Column(String, nullable=False, server_default='syn')
 
+    # When True, probe never overwrites primary_ip (user has pinned it)
+    primary_ip_locked       = Column(Boolean, server_default='false', nullable=False)
+
+    # DHCP fingerprinting (populated passively by probe sniffer)
+    dhcp_hostname           = Column(String, nullable=True)
+    dhcp_vendor_class       = Column(String, nullable=True)
+    dhcp_fingerprint        = Column(String, nullable=True)
+
+    # Fingerbank API identification result
+    fingerbank_result       = Column(JSON, nullable=True)
+
+    # Phase 9 — device grouping (migration adds columns; model exposes them to ORM)
+    group_id      = Column(String, nullable=True)
+    group_primary = Column(Boolean, server_default='false', nullable=False)
+
+    # Phase 10 — device acknowledgement
+    is_acknowledged = Column(Boolean, server_default='false', nullable=False)
+
     ip_history   = relationship("IPHistory",    back_populates="device",
                                 order_by="IPHistory.first_seen.desc()")
     events       = relationship("DeviceEvent",  back_populates="device",
@@ -59,13 +77,14 @@ class Device(Base):
     
 class IPHistory(Base):
     __tablename__ = "ip_history"
-    id          = Column(Integer, primary_key=True, autoincrement=True)
-    mac_address = Column(String, ForeignKey("devices.mac_address", ondelete="CASCADE"),
-                         nullable=False, index=True)
-    ip_address  = Column(String, nullable=False)
-    first_seen  = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
-    last_seen   = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
-    device      = relationship("Device", back_populates="ip_history")
+    id                = Column(Integer, primary_key=True, autoincrement=True)
+    mac_address       = Column(String, ForeignKey("devices.mac_address", ondelete="CASCADE"),
+                               nullable=False, index=True)
+    ip_address        = Column(String, nullable=False)
+    first_seen        = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+    last_seen         = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+    seen_while_online = Column(Boolean, nullable=True)
+    device            = relationship("Device", back_populates="ip_history")
 
 
 class DeviceEvent(Base):
@@ -116,8 +135,9 @@ class Alert(Base):
     ip_address  = Column(String, nullable=True)
     message     = Column(String, nullable=False)
     detail      = Column(JSON, nullable=True)
-    seen        = Column(Boolean, default=False)
-    created_at  = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+    seen           = Column(Boolean, default=False)
+    acknowledged_at = Column(DateTime(timezone=True), nullable=True)
+    created_at     = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
 
 
 class Setting(Base):
