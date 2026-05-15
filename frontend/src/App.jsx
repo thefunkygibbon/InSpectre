@@ -267,20 +267,11 @@ function MobileNavMenu({ pages, onSelect }) {
 // ── Main App ────────────────────────────────────────────────────────────────────────────
 function MainApp({ onLogout }) {
   const [notificationsEnabled,  setNotificationsEnabled]  = useState(true)
-  const [browserNotifsEnabled,  setBrowserNotifsEnabled]  = useState(false)
   const [genericNotifToasts,    setGenericNotifToasts]    = useState([])
 
-  const handleAlert = useCallback((alert) => {
-    if (browserNotifsEnabled &&
-        typeof Notification !== 'undefined' &&
-        Notification.permission === 'granted') {
-      const title = alert.kind === 'new_device' ? 'New device detected' : 'Device went offline'
-      const body  = alert.kind === 'new_device'
-        ? `${alert.ip}${alert.hostname || alert.vendor ? ' — ' + (alert.hostname || alert.vendor) : ''}`
-        : alert.name || alert.ip || ''
-      try { new Notification(title, { body, icon: '/favicon.svg' }) } catch {}
-    }
-  }, [browserNotifsEnabled])
+  // handleAlert drives in-app toasts only; browser notifications come through
+  // the profile system via the backend polling loop (api.notifPending).
+  const handleAlert = useCallback((_alert) => {}, [])
 
   const {
     devices, stats, loading, error, refresh,
@@ -347,10 +338,8 @@ function MainApp({ onLogout }) {
 
   useEffect(() => {
     api.getSettings().then(s => {
-      const n  = s.find(x => x.key === 'notifications_enabled')
-      const bn = s.find(x => x.key === 'browser_notifications_enabled')
-      if (n)  setNotificationsEnabled(n.value === 'true')
-      if (bn) setBrowserNotifsEnabled(bn.value === 'true')
+      const n = s.find(x => x.key === 'notifications_enabled')
+      if (n) setNotificationsEnabled(n.value === 'true')
     }).catch(() => {})
   }, [])
 
@@ -377,8 +366,7 @@ function MainApp({ onLogout }) {
   }, [])
 
   function handleSettingChange(key, value) {
-    if (key === 'notifications_enabled')         setNotificationsEnabled(value === 'true')
-    if (key === 'browser_notifications_enabled') setBrowserNotifsEnabled(value === 'true')
+    if (key === 'notifications_enabled') setNotificationsEnabled(value === 'true')
     if (key === 'float_new_to_top') {
       setFloatNewToTop(value === 'true')
       localStorage.setItem('float_new_to_top', value)
