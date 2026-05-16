@@ -171,19 +171,19 @@ class HAMQTTManager:
                           open_ports: int | None = None, vulns: int | None = None,
                           is_new: bool | None = None):
         mid, sp = self._mid(mac), self._sp
-        self.publish(f"{sp}/clients/{mid}/presence", "ON" if is_online else "OFF")
-        if ip         is not None: self.publish(f"{sp}/clients/{mid}/ip",              ip)
-        if open_ports is not None: self.publish(f"{sp}/clients/{mid}/open_ports",  str(open_ports))
-        if vulns      is not None: self.publish(f"{sp}/clients/{mid}/vulnerabilities", str(vulns))
-        if is_new     is not None: self.publish(f"{sp}/clients/{mid}/new",  "ON" if is_new else "OFF")
+        self.publish(f"{sp}/clients/{mid}/presence", "ON" if is_online else "OFF", retain=True)
+        if ip         is not None: self.publish(f"{sp}/clients/{mid}/ip",              ip,           retain=True)
+        if open_ports is not None: self.publish(f"{sp}/clients/{mid}/open_ports",  str(open_ports), retain=True)
+        if vulns      is not None: self.publish(f"{sp}/clients/{mid}/vulnerabilities", str(vulns),  retain=True)
+        if is_new     is not None: self.publish(f"{sp}/clients/{mid}/new",  "ON" if is_new else "OFF", retain=True)
 
     def pub_system_state(self, total_devices: int | None = None, total_vulns: int | None = None,
                           scan_state: str | None = None, last_scan: str | None = None):
         sp = self._sp
-        if total_devices is not None: self.publish(f"{sp}/system/total_devices",         str(total_devices))
-        if total_vulns   is not None: self.publish(f"{sp}/system/total_vulnerabilities",  str(total_vulns))
-        if scan_state    is not None: self.publish(f"{sp}/system/scan_state",             scan_state)
-        if last_scan     is not None: self.publish(f"{sp}/system/last_scan",              last_scan)
+        if total_devices is not None: self.publish(f"{sp}/system/total_devices",         str(total_devices), retain=True)
+        if total_vulns   is not None: self.publish(f"{sp}/system/total_vulnerabilities",  str(total_vulns),  retain=True)
+        if scan_state    is not None: self.publish(f"{sp}/system/scan_state",             scan_state,        retain=True)
+        if last_scan     is not None: self.publish(f"{sp}/system/last_scan",              last_scan,         retain=True)
 
 
 _ha_mqtt = HAMQTTManager()

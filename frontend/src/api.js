@@ -316,10 +316,6 @@ export const api = {
   // Notification event definitions and pending browser queue
   notifEvents:          ()          => request('GET',    '/notifications/events'),
   notifPending:         ()          => request('GET',    '/notifications/pending'),
-  // Home Assistant MQTT integration
-  haMqttStatus:         ()          => request('GET',    '/ha-mqtt/status'),
-  haMqttReconnect:      ()          => request('POST',   '/ha-mqtt/reconnect'),
-  haMqttDisconnect:     ()          => request('POST',   '/ha-mqtt/disconnect'),
 }
 
 export { streamSSE }
