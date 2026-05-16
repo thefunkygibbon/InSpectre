@@ -610,7 +610,7 @@ export function SettingsPanel({ onClose, onSettingChange }) {
                                            'ha_mqtt_user','ha_mqtt_password',
                                            'ha_mqtt_discovery_prefix','ha_mqtt_state_prefix']
                       for (const k of pendingKeys) {
-                        if (dirty[k] !== undefined) await api.saveSetting(k, dirty[k])
+                        if (dirty[k] !== undefined) await api.updateSetting(k, dirty[k])
                       }
                       const status = await api.haMqttReconnect()
                       setHaMqttStatus(status)

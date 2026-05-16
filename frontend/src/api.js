@@ -137,6 +137,11 @@ export const api = {
   restartProbe:    ()           => request('POST', '/settings/restart-probe'),
   restartBackend:  ()           => request('POST', '/settings/restart-backend'),
 
+  // Home Assistant MQTT
+  haMqttStatus:     ()         => request('GET',  '/ha-mqtt/status'),
+  haMqttReconnect:  ()         => request('POST', '/ha-mqtt/reconnect'),
+  haMqttDisconnect: ()         => request('POST', '/ha-mqtt/disconnect'),
+
   // Export (include auth header so the global middleware allows through)
   exportDevicesCsv: () => {
     const token = getToken()
