@@ -209,6 +209,27 @@ function ConfigField({ field, value, onChange }) {
     )
   }
 
+  if (type === 'filepath') {
+    return (
+      <div className="card p-4 space-y-1.5">
+        <label className="text-sm font-medium" style={{ color: 'var(--color-text)' }}>{label}</label>
+        <input
+          type="text"
+          className="input w-full font-mono text-xs"
+          value={value ?? ''}
+          onChange={e => onChange(key, e.target.value)}
+          placeholder="/data/leases.txt"
+          spellCheck={false}
+          autoComplete="off"
+        />
+        <p className="text-xs" style={{ color: 'var(--color-text-faint)' }}>
+          Container-internal path. Mount the file via <code>volumes:</code> in <code>docker-compose.yml</code>.
+        </p>
+        {help && <p className="text-xs" style={{ color: 'var(--color-text-faint)' }}>{help}</p>}
+      </div>
+    )
+  }
+
   // string, integer, url → text/number input
   const inputType = type === 'integer' ? 'number' : (type === 'url' ? 'url' : 'text')
   return (

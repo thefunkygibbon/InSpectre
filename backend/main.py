@@ -31,6 +31,7 @@ from plugin_engine import (
     PluginRegistry, PluginRunner, PluginEventBus, PluginScheduler,
     validate_manifest, PluginValidationError,
     encrypt_field, decrypt_field, get_decrypted_config,
+    verify_webhook_signature,
 )
 
 DATABASE_URL = os.environ.get("DATABASE_URL", "postgresql://admin:password123@db:5432/inspectre")
@@ -4250,6 +4251,44 @@ def _redact_plugin_config(manifest: dict, config: dict) -> dict:
     return redacted
 
 
+async def _plugin_block_hook(mac: str, ip: Optional[str], action: str):
+    """Fire plugin block/unblock actions for any enabled plugin with 'blocking' capability."""
+    for plugin_info in _plugin_registry.list_all():
+        if not plugin_info.get("enabled"):
+            continue
+        caps = plugin_info["manifest"].get("capabilities", [])
+        if "blocking" not in caps:
+            continue
+        pid = plugin_info["id"]
+        actions = plugin_info["manifest"].get("actions") or {}
+        action_name = action if action in actions else None
+        if not action_name:
+            action_name = "block_host" if action == "block" else "unblock_host"
+            if action_name not in actions:
+                continue
+        # Look up any plugin-specific device ID stored in plugin_device_data
+        plugin_id_val = None
+        _db = SessionLocal()
+        try:
+            row = _db.execute(
+                text("SELECT data FROM plugin_device_data WHERE plugin_id = :pid AND mac_address = :mac"),
+                {"pid": pid, "mac": mac},
+            ).fetchone()
+            if row and isinstance(row.data, dict):
+                plugin_id_val = row.data.get("id") or row.data.get("device_id")
+        except Exception:
+            pass
+        finally:
+            _db.close()
+        ctx = {"mac": mac, "ip": ip or "", "plugin_device_id": plugin_id_val or ""}
+        try:
+            result = await _plugin_runner.execute_action(pid, action_name, ctx)
+            if not result.get("ok"):
+                print(f"[plugin-block] {pid}.{action_name} failed: {result.get('error')}", flush=True)
+        except Exception as exc:
+            print(f"[plugin-block] {pid}: {exc}", flush=True)
+
+
 def _plugin_to_dict(plugin_info: dict) -> dict:
     manifest = plugin_info["manifest"]
     return {
@@ -4397,6 +4436,7 @@ def save_plugin_config(
     )
     db.commit()
     _plugin_registry.update_config(plugin_id, encrypted)
+    _plugin_runner.clear_session(plugin_id)
     return {"ok": True}
 
 
@@ -4455,6 +4495,7 @@ def disable_plugin(
         _ha_mqtt.disconnect()
     db.commit()
     _plugin_registry.set_enabled(plugin_id, False, "disabled")
+    _plugin_runner.clear_session(plugin_id)
     return {"ok": True, "enabled": False}
 
 
@@ -4512,6 +4553,54 @@ def get_plugin_data(
         }
         for r in rows
     ]
+
+
+@app.post("/plugins/{plugin_id}/webhook")
+async def plugin_webhook(plugin_id: str, request: Request, db: Session = Depends(get_db)):
+    plugin = _plugin_registry.get(plugin_id)
+    if not plugin or not plugin.get("enabled"):
+        raise HTTPException(404, "Plugin not found or disabled")
+
+    body_bytes = await request.body()
+
+    # Optional HMAC-SHA256 signature validation
+    cfg = get_decrypted_config(plugin["manifest"], plugin.get("config") or {})
+    secret = cfg.get("webhook_secret", "")
+    if secret:
+        sig_header = request.headers.get("X-Hub-Signature-256", "")
+        if not verify_webhook_signature(body_bytes, secret, sig_header):
+            raise HTTPException(403, "Invalid webhook signature")
+
+    try:
+        payload = json.loads(body_bytes) if body_bytes else {}
+    except Exception:
+        raise HTTPException(400, "Invalid JSON payload")
+
+    # Find the action marked trigger=webhook
+    actions = plugin["manifest"].get("actions") or {}
+    action_def = next(
+        (a for a in actions.values() if a.get("trigger") == "webhook"),
+        None,
+    )
+    if not action_def:
+        raise HTTPException(422, "No webhook-triggered action defined in plugin manifest")
+
+    action_name = next(k for k, v in actions.items() if v is action_def)
+
+    result = await _plugin_runner.execute_action(plugin_id, action_name, payload)
+    if not result.get("ok"):
+        raise HTTPException(502, result.get("error", "Plugin action failed"))
+
+    # Feed discovered devices into the event bus
+    for dev in (result.get("devices") or []):
+        mac = dev.get("mac_address", "")
+        if mac:
+            event = "device.online" if dev.get("is_online", True) else "device.offline"
+            asyncio.ensure_future(_plugin_event_bus.notify(event, {
+                "mac": mac, "ip": dev.get("ip_address", ""), "name": dev.get("hostname", ""),
+            }))
+
+    return {"ok": True, "devices_received": len(result.get("devices") or [])}
 
 
 @app.get("/notifications/channels")
@@ -5478,6 +5567,8 @@ async def block_device(mac: str, db: Session = Depends(get_db)):
     d.is_blocked = True
     _add_event(db, mac.lower(), "blocked", {"ip": d.ip_address})
     db.commit(); db.refresh(d)
+    # Plugin blocking hook (fire-and-forget)
+    asyncio.ensure_future(_plugin_block_hook(mac.lower(), d.ip_address, "block"))
     return _to_dict(d)
 
 
@@ -5497,6 +5588,7 @@ async def unblock_device(mac: str, db: Session = Depends(get_db)):
     d.is_blocked = False
     _add_event(db, mac.lower(), "unblocked", {"ip": d.ip_address})
     db.commit(); db.refresh(d)
+    asyncio.ensure_future(_plugin_block_hook(mac.lower(), d.ip_address, "unblock"))
     return _to_dict(d)
 
 

@@ -2,7 +2,7 @@
 InSpectre Plugin Engine
 -----------------------
 PluginRegistry  — loads, validates, and maintains the in-memory plugin catalogue.
-PluginRunner    — executes plugin actions (HTTP or delegated to HAMQTTManager).
+PluginRunner    — executes plugin actions (HTTP, file, SNMP, or delegated to HAMQTTManager).
 PluginEventBus  — routes InSpectre events to matching plugin hooks.
 PluginScheduler — polls plugins that have a polling block configured.
 """
@@ -10,10 +10,15 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import csv
 import hashlib
+import hmac
+import io
 import json
 import os
 import re
+import time
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Optional
 from urllib.parse import urlparse
@@ -30,7 +35,7 @@ VALID_CAPABILITIES = frozenset([
 ])
 VALID_FIELD_TYPES = frozenset([
     "string", "password", "integer", "boolean",
-    "select", "multiline", "url",
+    "select", "multiline", "url", "filepath",
 ])
 VALID_EVENT_KEYS = frozenset([
     "device.new", "device.online", "device.offline",
@@ -40,7 +45,16 @@ VALID_AUTH_METHODS = frozenset([
     "none", "basic", "bearer", "cookie",
     "api-key-header", "api-key-param",
 ])
-VALID_URL_SCHEMES = frozenset(["http", "https", "mqtt", "mqtts"])
+VALID_URL_SCHEMES = frozenset(["http", "https", "mqtt", "mqtts", "snmp", "snmps"])
+VALID_FILE_FORMATS = frozenset(["dnsmasq", "isc_dhcp", "csv", "json"])
+
+# InSpectre canonical device fields that data_mapping may write
+INSPECTRE_DEVICE_FIELDS = frozenset([
+    "mac_address", "ip_address", "hostname", "vendor",
+    "device_type", "is_online", "vlan",
+])
+
+_MAX_CHAIN_DEPTH = 3
 
 
 # ---------------------------------------------------------------------------
@@ -81,6 +95,35 @@ def get_decrypted_config(manifest: dict, stored_config: dict) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# MAC normalisation
+# ---------------------------------------------------------------------------
+
+def _normalise_mac(mac: str) -> Optional[str]:
+    clean = re.sub(r'[:\-.\s]', '', mac.upper())
+    if len(clean) != 12 or not re.match(r'^[0-9A-F]{12}$', clean):
+        return None
+    return ':'.join(clean[i:i+2] for i in range(0, 12, 2))
+
+
+# ---------------------------------------------------------------------------
+# Session store
+# ---------------------------------------------------------------------------
+
+@dataclass
+class PluginSession:
+    cookies: dict = field(default_factory=dict)
+    bearer_token: Optional[str] = None
+    token_expiry: Optional[float] = None   # unix timestamp; None = no expiry
+    extras: dict = field(default_factory=dict)  # arbitrary extracted values
+
+    def is_valid(self) -> bool:
+        if self.token_expiry is not None:
+            if time.time() >= self.token_expiry:
+                return False
+        return bool(self.cookies or self.bearer_token or self.extras)
+
+
+# ---------------------------------------------------------------------------
 # Manifest validation
 # ---------------------------------------------------------------------------
 
@@ -90,9 +133,9 @@ class PluginValidationError(Exception):
 
 def validate_manifest(m: dict):
     """Validate a plugin manifest dict. Raises PluginValidationError on failure."""
-    for field in ("id", "name", "version", "capabilities", "config_schema"):
-        if field not in m:
-            raise PluginValidationError(f"Missing required field: '{field}'")
+    for f in ("id", "name", "version", "capabilities", "config_schema"):
+        if f not in m:
+            raise PluginValidationError(f"Missing required field: '{f}'")
 
     pid = m["id"]
     if not re.match(r'^[a-z0-9][a-z0-9\-]*[a-z0-9]$', pid) and not re.match(r'^[a-z0-9]$', pid):
@@ -106,10 +149,10 @@ def validate_manifest(m: dict):
                 f"Unknown capability '{cap}'. Valid: {sorted(VALID_CAPABILITIES)}"
             )
 
-    for field in m.get("config_schema", []):
-        if "key" not in field or "label" not in field:
+    for fld in m.get("config_schema", []):
+        if "key" not in fld or "label" not in fld:
             raise PluginValidationError("Each config_schema field must have 'key' and 'label'")
-        ftype = field.get("type", "string")
+        ftype = fld.get("type", "string")
         if ftype not in VALID_FIELD_TYPES:
             raise PluginValidationError(
                 f"Unknown field type '{ftype}'. Valid: {sorted(VALID_FIELD_TYPES)}"
@@ -135,6 +178,21 @@ def validate_manifest(m: dict):
         if event_key not in VALID_EVENT_KEYS:
             raise PluginValidationError(
                 f"Unknown event hook '{event_key}'. Valid: {sorted(VALID_EVENT_KEYS)}"
+            )
+
+    # Validate per-action fields
+    for action_name, action_def in (m.get("actions") or {}).items():
+        if not isinstance(action_def, dict):
+            raise PluginValidationError(f"Action '{action_name}' must be a dict")
+        dep = action_def.get("depends_on")
+        if dep and dep not in (m.get("actions") or {}):
+            raise PluginValidationError(
+                f"Action '{action_name}' depends_on '{dep}' which is not defined"
+            )
+        fmt = action_def.get("file_format")
+        if fmt and fmt not in VALID_FILE_FORMATS:
+            raise PluginValidationError(
+                f"Unknown file_format '{fmt}'. Valid: {sorted(VALID_FILE_FORMATS)}"
             )
 
 
@@ -168,7 +226,6 @@ class PluginRegistry:
         # Phase 2: register each builtin with defaults first, then try DB sync
         for manifest in builtins:
             pid = manifest["id"]
-            # Always register with defaults so the plugin is visible even if DB fails
             self._plugins[pid] = {
                 "manifest":   manifest,
                 "config":     {},
@@ -177,7 +234,6 @@ class PluginRegistry:
                 "status":     "disabled",
                 "last_error": None,
             }
-            # Now try to read/write DB state
             try:
                 row = db.execute(
                     text(
@@ -302,9 +358,15 @@ class PluginRegistry:
 
 class PluginRunner:
     def __init__(self, registry: PluginRegistry, ha_mqtt=None):
-        self._registry   = registry
-        self._ha_mqtt    = ha_mqtt
+        self._registry    = registry
+        self._ha_mqtt     = ha_mqtt
         self._rate_limits: dict[str, float] = {}
+        self._sessions:    dict[str, PluginSession] = {}
+
+    def clear_session(self, plugin_id: str):
+        self._sessions.pop(plugin_id, None)
+
+    # ── Public entry point ────────────────────────────────────────────────────
 
     async def execute_action(
         self,
@@ -319,7 +381,6 @@ class PluginRunner:
         manifest = plugin["manifest"]
         config   = get_decrypted_config(manifest, plugin.get("config") or {})
 
-        # Delegate built-in MQTT plugin to HAMQTTManager
         if plugin_id == "home-assistant":
             return await self._execute_ha_action(action_name, config, context or {})
 
@@ -327,16 +388,91 @@ class PluginRunner:
         if action_name not in actions:
             return {"ok": False, "error": f"Action '{action_name}' not defined in manifest"}
 
-        endpoints = manifest.get("endpoints") or {}
-        base_url  = self._sub(endpoints.get("base_url", ""), config)
-        path      = self._sub((actions[action_name]).get("path", ""), config)
-        url       = base_url + path
+        return await self._resolve_action(
+            plugin_id, manifest, config, action_name, dict(context or {})
+        )
 
-        scheme = urlparse(url).scheme
-        if scheme not in ("http", "https"):
-            return {"ok": False, "error": f"Rejected URL scheme '{scheme}' — only http/https allowed"}
+    # ── Dependency chain resolver ─────────────────────────────────────────────
 
-        # Rate limiting
+    async def _resolve_action(
+        self,
+        plugin_id: str,
+        manifest: dict,
+        config: dict,
+        action_name: str,
+        context: dict,
+        _depth: int = 0,
+    ) -> dict:
+        if _depth > _MAX_CHAIN_DEPTH:
+            return {"ok": False, "error": "Maximum action chain depth exceeded"}
+
+        actions    = manifest.get("actions") or {}
+        action_def = actions.get(action_name, {})
+        dep_name   = action_def.get("depends_on")
+
+        if dep_name:
+            dep_result = await self._resolve_action(
+                plugin_id, manifest, config, dep_name, context, _depth + 1
+            )
+            if not dep_result.get("ok"):
+                return {
+                    "ok": False,
+                    "error": f"Dependency '{dep_name}' failed: {dep_result.get('error')}",
+                }
+            # Flatten dep result data into context for template substitution
+            dep_data = dep_result.get("data")
+            if isinstance(dep_data, dict):
+                for k, v in dep_data.items():
+                    context[f"{dep_name}.{k}"] = str(v) if not isinstance(v, (dict, list)) else json.dumps(v)
+            elif isinstance(dep_data, list):
+                for i, item in enumerate(dep_data[:10]):
+                    if isinstance(item, dict):
+                        for k, v in item.items():
+                            context[f"{dep_name}.{i}.{k}"] = str(v) if not isinstance(v, (dict, list)) else json.dumps(v)
+                # Convenience: first element's fields accessible without index too
+                if dep_data and isinstance(dep_data[0], dict):
+                    for k, v in dep_data[0].items():
+                        context.setdefault(f"{dep_name}.{k}", str(v) if not isinstance(v, (dict, list)) else json.dumps(v))
+
+        return await self._execute_single_action(
+            plugin_id, manifest, config, action_name, context, _depth
+        )
+
+    # ── Single action executor ────────────────────────────────────────────────
+
+    async def _execute_single_action(
+        self,
+        plugin_id: str,
+        manifest: dict,
+        config: dict,
+        action_name: str,
+        context: dict,
+        _depth: int = 0,
+    ) -> dict:
+        actions    = manifest.get("actions") or {}
+        action_def = actions.get(action_name, {})
+        endpoints  = manifest.get("endpoints") or {}
+
+        # ── File source ──────────────────────────────────────────────────────
+        if action_def.get("source") == "file":
+            return self._execute_file_action(action_def, config)
+
+        # ── Build URL ────────────────────────────────────────────────────────
+        base_url = self._sub(endpoints.get("base_url", ""), config, context)
+        path     = self._sub(action_def.get("path", ""), config, context)
+        url      = base_url + path
+
+        parsed_scheme = urlparse(url).scheme
+
+        # ── SNMP ─────────────────────────────────────────────────────────────
+        if parsed_scheme in ("snmp", "snmps"):
+            return await self._execute_snmp_action(url, action_def, config)
+
+        # ── HTTP scheme gate ─────────────────────────────────────────────────
+        if parsed_scheme not in ("http", "https"):
+            return {"ok": False, "error": f"Rejected URL scheme '{parsed_scheme}'"}
+
+        # ── Rate limiting ────────────────────────────────────────────────────
         max_rate = (manifest.get("polling") or {}).get("max_rate_per_minute")
         if max_rate:
             now  = datetime.now(timezone.utc).timestamp()
@@ -345,25 +481,275 @@ class PluginRunner:
                 return {"ok": False, "error": "Rate limit exceeded"}
             self._rate_limits[plugin_id] = now
 
-        method   = actions[action_name].get("method", "GET").upper()
-        body_tpl = actions[action_name].get("body")
+        # ── Session / auth ───────────────────────────────────────────────────
+        auth_method = endpoints.get("auth", "none")
+        session = self._sessions.get(plugin_id)
+
+        # Auto-login if the auth method requires a valid session and we don't have one
+        if auth_method in ("bearer", "cookie") and action_name != "login":
+            if session is None or not session.is_valid():
+                login_result = await self._auto_login(plugin_id, manifest, config, context)
+                if not login_result.get("ok"):
+                    return login_result
+                session = self._sessions.get(plugin_id)
+
+        method   = action_def.get("method", "GET").upper()
+        body_tpl = action_def.get("body")
         body     = (
-            json.loads(self._sub(json.dumps(body_tpl), config))
-            if body_tpl
-            else None
+            json.loads(self._sub(json.dumps(body_tpl), config, context))
+            if body_tpl else None
         )
 
         headers = dict(endpoints.get("headers") or {})
-        self._apply_auth(headers, endpoints.get("auth", "none"), config)
+        cookies: dict = {}
 
+        if auth_method == "cookie" and session:
+            cookies = dict(session.cookies)
+        elif auth_method == "bearer" and session and session.bearer_token:
+            headers["Authorization"] = f"Bearer {session.bearer_token}"
+        else:
+            self._apply_auth(headers, auth_method, config, session)
+
+        # ── Execute HTTP request ─────────────────────────────────────────────
+        result = await self._http_request(method, url, body, headers, cookies)
+
+        # ── 401/403 retry with fresh session ────────────────────────────────
+        if not result.get("ok") and result.get("status_code") in (401, 403):
+            self.clear_session(plugin_id)
+            if action_name != "login" and auth_method in ("bearer", "cookie"):
+                login_result = await self._auto_login(plugin_id, manifest, config, context)
+                if login_result.get("ok"):
+                    session = self._sessions.get(plugin_id)
+                    if auth_method == "cookie" and session:
+                        cookies = dict(session.cookies)
+                    elif auth_method == "bearer" and session and session.bearer_token:
+                        headers["Authorization"] = f"Bearer {session.bearer_token}"
+                    result = await self._http_request(method, url, body, headers, cookies)
+
+        if not result.get("ok"):
+            return result
+
+        # ── Extract session from login response ──────────────────────────────
+        if action_name == "login":
+            self._extract_session(plugin_id, action_def, result)
+
+        # ── Data mapping ─────────────────────────────────────────────────────
+        response_mapping = action_def.get("response_mapping")
+        if response_mapping:
+            devices = self._apply_response_mapping(result.get("data"), response_mapping)
+            result["devices"] = devices
+
+        return result
+
+    async def _http_request(
+        self, method: str, url: str, body, headers: dict, cookies: dict
+    ) -> dict:
         try:
-            async with httpx.AsyncClient(timeout=15.0) as client:
+            async with httpx.AsyncClient(timeout=15.0, cookies=cookies) as client:
                 resp = await client.request(method, url, json=body, headers=headers)
+            status = resp.status_code
+            if status in (401, 403):
+                return {"ok": False, "status_code": status, "error": f"HTTP {status}"}
             resp.raise_for_status()
             data = resp.json() if resp.content else {}
-            return {"ok": True, "data": data}
+            return {"ok": True, "status_code": status, "data": data,
+                    "_resp_cookies": dict(resp.cookies), "_resp_headers": dict(resp.headers)}
+        except httpx.HTTPStatusError as exc:
+            return {"ok": False, "status_code": exc.response.status_code, "error": str(exc)}
         except Exception as exc:
             return {"ok": False, "error": str(exc)}
+
+    # ── Auto-login ────────────────────────────────────────────────────────────
+
+    async def _auto_login(
+        self, plugin_id: str, manifest: dict, config: dict, context: dict
+    ) -> dict:
+        actions = manifest.get("actions") or {}
+        if "login" not in actions:
+            return {"ok": False, "error": "No login action defined for session auth"}
+        result = await self._execute_single_action(
+            plugin_id, manifest, config, "login", context
+        )
+        return result
+
+    # ── Session extraction ────────────────────────────────────────────────────
+
+    def _extract_session(self, plugin_id: str, action_def: dict, result: dict):
+        se = action_def.get("session_extract")
+        if not se:
+            return
+
+        session = self._sessions.get(plugin_id) or PluginSession()
+        source  = se.get("from", "response_body")
+        key     = se.get("key", "")
+        jpath   = se.get("json_path", "")
+        ttl_fld = se.get("ttl_field", "")
+
+        if source == "response_cookies":
+            cookies = result.get("_resp_cookies", {})
+            if key and key in cookies:
+                session.cookies[key] = cookies[key]
+        elif source == "response_headers":
+            hdrs = result.get("_resp_headers", {})
+            val = hdrs.get(key) or hdrs.get(key.lower())
+            if val:
+                session.extras[key] = val
+                if key.lower() in ("authorization", "x-auth-token"):
+                    token = val.replace("Bearer ", "").strip()
+                    session.bearer_token = token
+        elif source == "response_body":
+            data = result.get("data") or {}
+            # Navigate dot-path
+            val = data
+            for part in (jpath or key).split("."):
+                if isinstance(val, dict):
+                    val = val.get(part)
+                else:
+                    val = None
+                    break
+            if val is not None:
+                store_as = se.get("store_as") or jpath or key
+                session.extras[store_as] = val
+                session.bearer_token = str(val)
+                # TTL
+                if ttl_fld:
+                    ttl_val = data.get(ttl_fld)
+                    if ttl_val:
+                        try:
+                            session.token_expiry = time.time() + float(ttl_val) - 30
+                        except (ValueError, TypeError):
+                            pass
+
+        self._sessions[plugin_id] = session
+
+    # ── File action ───────────────────────────────────────────────────────────
+
+    def _execute_file_action(self, action_def: dict, config: dict) -> dict:
+        file_key    = action_def.get("file_key", "filepath")
+        file_format = action_def.get("file_format", "json")
+        path        = config.get(file_key, "")
+        if not path:
+            return {"ok": False, "error": f"No file path configured (config key: '{file_key}')"}
+        if not os.path.isfile(path):
+            return {"ok": False, "error": f"File not found: {path}"}
+
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as fh:
+                raw = fh.read()
+        except Exception as exc:
+            return {"ok": False, "error": f"Cannot read file: {exc}"}
+
+        try:
+            if file_format == "json":
+                data = json.loads(raw)
+            elif file_format == "csv":
+                reader = csv.DictReader(io.StringIO(raw))
+                data = list(reader)
+            elif file_format == "dnsmasq":
+                data = self._parse_dnsmasq(raw)
+            elif file_format == "isc_dhcp":
+                data = self._parse_isc_dhcp(raw)
+            else:
+                return {"ok": False, "error": f"Unknown file_format '{file_format}'"}
+        except Exception as exc:
+            return {"ok": False, "error": f"Parse error ({file_format}): {exc}"}
+
+        result: dict = {"ok": True, "data": data}
+        response_mapping = action_def.get("response_mapping")
+        if response_mapping:
+            result["devices"] = self._apply_response_mapping(data, response_mapping)
+        return result
+
+    @staticmethod
+    def _parse_dnsmasq(raw: str) -> list:
+        records = []
+        for line in raw.splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = line.split()
+            if len(parts) < 3:
+                continue
+            rec: dict = {
+                "mac_address": parts[1],
+                "ip_address":  parts[2],
+            }
+            if len(parts) >= 4 and parts[3] != "*":
+                rec["hostname"] = parts[3]
+            records.append(rec)
+        return records
+
+    @staticmethod
+    def _parse_isc_dhcp(raw: str) -> list:
+        records = []
+        current: dict = {}
+        for line in raw.splitlines():
+            line = line.strip()
+            if line.startswith("lease "):
+                current = {"ip_address": line.split()[1]}
+            elif line.startswith("hardware ethernet"):
+                mac = line.split()[-1].rstrip(";")
+                current["mac_address"] = mac
+            elif line.startswith("client-hostname"):
+                hostname = line.split(None, 1)[-1].strip('";')
+                current["hostname"] = hostname
+            elif line == "}" and current.get("mac_address"):
+                records.append(current)
+                current = {}
+        return records
+
+    # ── SNMP action ───────────────────────────────────────────────────────────
+
+    async def _execute_snmp_action(self, url: str, action_def: dict, config: dict) -> dict:
+        try:
+            from pysnmp.hlapi.asyncio import (
+                CommunityData, UdpTransportTarget, ContextData,
+                ObjectType, ObjectIdentity, SnmpEngine, getCmd, nextCmd,
+            )
+        except ImportError:
+            return {"ok": False, "error": "pysnmp not installed — add pysnmp to requirements.txt"}
+
+        parsed   = urlparse(url)
+        host     = parsed.hostname or config.get("host", "")
+        port     = parsed.port or int(config.get("snmp_port", 161))
+        community = config.get("community", "public")
+        oid      = action_def.get("snmp_oid", "1.3.6.1.2.1.1")
+        operation = action_def.get("snmp_operation", "GET").upper()
+
+        engine = SnmpEngine()
+        transport = UdpTransportTarget((host, port))
+        auth = CommunityData(community)
+        ctx  = ContextData()
+        obj  = ObjectType(ObjectIdentity(oid))
+
+        results = {}
+        try:
+            if operation == "GET":
+                err_ind, err_stat, err_idx, var_binds = await getCmd(
+                    engine, auth, transport, ctx, obj
+                )
+                if err_ind:
+                    return {"ok": False, "error": str(err_ind)}
+                for oid_obj, val in var_binds:
+                    results[str(oid_obj)] = str(val)
+            else:  # WALK
+                async for err_ind, err_stat, err_idx, var_binds in nextCmd(
+                    engine, auth, transport, ctx, obj, lexicographicMode=False
+                ):
+                    if err_ind:
+                        break
+                    for oid_obj, val in var_binds:
+                        results[str(oid_obj)] = str(val)
+        except Exception as exc:
+            return {"ok": False, "error": f"SNMP error: {exc}"}
+
+        result: dict = {"ok": True, "data": results}
+        rm = action_def.get("response_mapping")
+        if rm:
+            result["devices"] = self._apply_response_mapping(results, rm)
+        return result
+
+    # ── HA MQTT delegation ────────────────────────────────────────────────────
 
     async def _execute_ha_action(self, action_name: str, config: dict, context: dict) -> dict:
         ha = self._ha_mqtt
@@ -383,8 +769,7 @@ class PluginRunner:
                     discovery_prefix = config.get("discovery_prefix", "homeassistant"),
                     state_prefix     = config.get("state_prefix", "inspectre"),
                 )
-                import time
-                time.sleep(1.5)
+                import time as _t; _t.sleep(1.5)
                 ok = ha.connected
                 return {"ok": ok, "error": None if ok else "MQTT connection refused or timed out"}
             except Exception as exc:
@@ -417,14 +802,65 @@ class PluginRunner:
         except Exception as exc:
             return {"ok": False, "error": str(exc)}
 
-    @staticmethod
-    def _sub(template: str, config: dict) -> str:
-        def replace(m):
-            return str(config.get(m.group(1), m.group(0)))
-        return re.sub(r'\{(\w+)\}', replace, template)
+    # ── Data mapping ──────────────────────────────────────────────────────────
 
     @staticmethod
-    def _apply_auth(headers: dict, method: str, config: dict):
+    def _apply_response_mapping(raw_data, mapping: dict) -> list:
+        root_path = mapping.get("root_path", "")
+        field_map = mapping.get("fields", {})
+
+        data = raw_data
+        if root_path:
+            for part in root_path.split("."):
+                if isinstance(data, dict):
+                    data = data.get(part)
+                else:
+                    data = None
+                    break
+            if data is None:
+                return []
+
+        if not isinstance(data, list):
+            data = [data] if data else []
+
+        devices = []
+        for item in data:
+            if not isinstance(item, dict):
+                continue
+            device: dict = {}
+            for plugin_field, inspectre_field in field_map.items():
+                val = item.get(plugin_field)
+                if val is None:
+                    continue
+                if inspectre_field == "mac_address":
+                    val = _normalise_mac(str(val))
+                    if not val:
+                        continue
+                elif inspectre_field == "is_online":
+                    val = bool(val) if not isinstance(val, str) else val.lower() in ("true", "1", "yes", "online", "connected")
+                device[inspectre_field] = val
+            if device.get("mac_address"):
+                devices.append(device)
+        return devices
+
+    # ── Template substitution ─────────────────────────────────────────────────
+
+    @staticmethod
+    def _sub(template: str, config: dict, context: Optional[dict] = None) -> str:
+        merged = dict(config)
+        if context:
+            merged.update(context)
+
+        def replace(m):
+            key = m.group(1)
+            return str(merged.get(key, m.group(0)))
+
+        return re.sub(r'\{([\w.]+)\}', replace, template)
+
+    # ── Auth helpers ──────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _apply_auth(headers: dict, method: str, config: dict, session: Optional[PluginSession] = None):
         if method == "basic":
             import base64 as _b64
             creds = _b64.b64encode(
@@ -432,7 +868,8 @@ class PluginRunner:
             ).decode()
             headers["Authorization"] = f"Basic {creds}"
         elif method == "bearer":
-            headers["Authorization"] = f"Bearer {config.get('token', '')}"
+            token = (session.bearer_token if session else None) or config.get("token", "")
+            headers["Authorization"] = f"Bearer {token}"
         elif method == "api-key-header":
             key_name = config.get("api_key_header", "X-API-Key")
             headers[key_name] = config.get("api_key", "")
@@ -509,6 +946,13 @@ class PluginScheduler:
                     {"pid": plugin_id},
                 )
                 self._registry.set_status(plugin_id, "active")
+
+                # Upsert discovered devices
+                devices = result.get("devices") or []
+                plugin_info = self._registry.get(plugin_id)
+                caps = set((plugin_info or {}).get("manifest", {}).get("capabilities", []))
+                if devices and caps & {"discovery", "presence"}:
+                    self._upsert_devices(db, plugin_id, devices)
             else:
                 err = result.get("error", "Unknown error")
                 db.execute(
@@ -525,3 +969,59 @@ class PluginScheduler:
             db.rollback()
         finally:
             db.close()
+
+    def _upsert_devices(self, db: Session, plugin_id: str, devices: list):
+        for dev in devices:
+            mac = (dev.get("mac_address") or "").lower().replace(":", "").strip()
+            if len(mac) != 12:
+                continue
+            mac_fmt = ':'.join(mac[i:i+2] for i in range(0, 12, 2))
+            try:
+                # Upsert device (only fields we have; never overwrite user-set names)
+                db.execute(text("""
+                    INSERT INTO devices (mac_address, ip_address, hostname, is_online, first_seen, last_seen)
+                    VALUES (:mac, :ip, :hostname, :online, NOW(), NOW())
+                    ON CONFLICT (mac_address) DO UPDATE SET
+                        ip_address = COALESCE(EXCLUDED.ip_address, devices.ip_address),
+                        hostname   = CASE
+                                        WHEN devices.custom_name IS NOT NULL THEN devices.hostname
+                                        ELSE COALESCE(EXCLUDED.hostname, devices.hostname)
+                                     END,
+                        is_online  = EXCLUDED.is_online,
+                        last_seen  = NOW()
+                """), {
+                    "mac":      mac_fmt,
+                    "ip":       dev.get("ip_address"),
+                    "hostname": dev.get("hostname"),
+                    "online":   bool(dev.get("is_online", True)),
+                })
+
+                # Store full enrichment payload in plugin_device_data
+                enrichment = {k: v for k, v in dev.items() if k not in INSPECTRE_DEVICE_FIELDS}
+                if enrichment:
+                    db.execute(text("""
+                        INSERT INTO plugin_device_data (plugin_id, mac_address, data, updated_at)
+                        VALUES (:pid, :mac, CAST(:data AS jsonb), NOW())
+                        ON CONFLICT (plugin_id, mac_address) DO UPDATE SET
+                            data       = CAST(EXCLUDED.data AS jsonb),
+                            updated_at = NOW()
+                    """), {
+                        "pid":  plugin_id,
+                        "mac":  mac_fmt,
+                        "data": json.dumps(enrichment),
+                    })
+            except Exception as exc:
+                print(f"[plugin-scheduler] upsert failed for {mac_fmt}: {exc}", flush=True)
+                db.rollback()
+
+
+# ---------------------------------------------------------------------------
+# Webhook helpers (used by main.py webhook endpoint)
+# ---------------------------------------------------------------------------
+
+def verify_webhook_signature(body_bytes: bytes, secret: str, header_value: str) -> bool:
+    """Validate X-Hub-Signature-256: sha256=<hex> header."""
+    expected = "sha256=" + hmac.new(
+        secret.encode(), body_bytes, hashlib.sha256
+    ).hexdigest()
+    return hmac.compare_digest(expected, header_value or "")
