@@ -137,10 +137,34 @@ export const api = {
   restartProbe:    ()           => request('POST', '/settings/restart-probe'),
   restartBackend:  ()           => request('POST', '/settings/restart-backend'),
 
-  // Home Assistant MQTT
+  // Home Assistant MQTT (legacy — kept for backward compat)
   haMqttStatus:     ()         => request('GET',  '/ha-mqtt/status'),
   haMqttReconnect:  ()         => request('POST', '/ha-mqtt/reconnect'),
   haMqttDisconnect: ()         => request('POST', '/ha-mqtt/disconnect'),
+
+  // Plugins
+  listPlugins:      ()              => request('GET',    '/plugins'),
+  getPlugin:        (id)            => request('GET',    `/plugins/${id}`),
+  savePluginConfig: (id, config)    => request('PUT',    `/plugins/${id}/config`, { config }),
+  enablePlugin:     (id)            => request('PATCH',  `/plugins/${id}/enable`),
+  disablePlugin:    (id)            => request('PATCH',  `/plugins/${id}/disable`),
+  deletePlugin:     (id)            => request('DELETE', `/plugins/${id}`),
+  testPlugin:       (id)            => request('POST',   `/plugins/${id}/test`),
+  getPluginData:    (id)            => request('GET',    `/plugins/${id}/data`),
+  uploadPlugin: (file) => {
+    const form = new FormData()
+    form.append('file', file)
+    const token = getToken()
+    const headers = token ? { Authorization: `Bearer ${token}` } : {}
+    return fetch(`${BASE}/plugins/upload`, { method: 'POST', body: form, headers })
+      .then(async r => {
+        if (!r.ok) {
+          const e = await r.json().catch(() => ({}))
+          throw new Error(e.detail || `Upload failed: ${r.status}`)
+        }
+        return r.json()
+      })
+  },
 
   // Export (include auth header so the global middleware allows through)
   exportDevicesCsv: () => {

@@ -1,0 +1,98 @@
+{
+  "id": "home-assistant",
+  "name": "Home Assistant",
+  "version": "1.0.0",
+  "author": "InSpectre",
+  "description": "Publishes InSpectre device state to Home Assistant via MQTT Auto-Discovery. Each network device gets presence, IP address, open-ports count, and vulnerability sensors in Home Assistant. A system device tracks total devices online, vulnerabilities, and scan state.",
+  "homepage": "https://www.home-assistant.io/",
+  "min_inspectre_version": "1.0.0",
+  "icon": null,
+  "capabilities": ["export", "notification"],
+  "config_schema": [
+    {
+      "key": "host",
+      "label": "Broker Host",
+      "type": "string",
+      "default": "",
+      "required": true,
+      "help": "MQTT broker hostname or IP address (e.g. 192.168.0.1)."
+    },
+    {
+      "key": "port",
+      "label": "Broker Port",
+      "type": "integer",
+      "default": 1883,
+      "required": false,
+      "help": "MQTT broker port (default: 1883)."
+    },
+    {
+      "key": "user",
+      "label": "Username",
+      "type": "string",
+      "default": "",
+      "required": false,
+      "help": "MQTT username (leave blank if authentication is not required)."
+    },
+    {
+      "key": "password",
+      "label": "Password",
+      "type": "password",
+      "default": "",
+      "required": false,
+      "help": "MQTT password (leave blank if authentication is not required)."
+    },
+    {
+      "key": "discovery_prefix",
+      "label": "Discovery Prefix",
+      "type": "string",
+      "default": "homeassistant",
+      "required": false,
+      "help": "MQTT discovery prefix configured in Home Assistant (default: homeassistant)."
+    },
+    {
+      "key": "state_prefix",
+      "label": "State Prefix",
+      "type": "string",
+      "default": "inspectre",
+      "required": false,
+      "help": "MQTT topic prefix for InSpectre state messages (default: inspectre)."
+    }
+  ],
+  "endpoints": {
+    "base_url": "mqtt://{host}:{port}",
+    "auth": "none",
+    "headers": {}
+  },
+  "actions": {
+    "test_connection": {
+      "description": "Connect to the MQTT broker and verify connectivity"
+    },
+    "publish_device_joined": {
+      "description": "Publish HA discovery config and initial online state for a newly discovered device"
+    },
+    "publish_device_online": {
+      "description": "Publish device online state"
+    },
+    "publish_device_offline": {
+      "description": "Publish device offline state"
+    },
+    "publish_port_change": {
+      "description": "Publish updated open port count"
+    },
+    "publish_vuln_change": {
+      "description": "Publish updated vulnerability count"
+    },
+    "publish_device_renamed": {
+      "description": "Re-publish HA discovery config after a device is renamed"
+    }
+  },
+  "event_hooks": {
+    "device.new":     "publish_device_joined",
+    "device.online":  "publish_device_online",
+    "device.offline": "publish_device_offline",
+    "port.opened":    "publish_port_change",
+    "vuln.found":     "publish_vuln_change"
+  },
+  "data_mapping": {},
+  "polling": null
+}

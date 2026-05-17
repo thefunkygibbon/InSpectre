@@ -2,12 +2,13 @@ import { useState, useEffect, useRef } from 'react'
 import {
   Save, RotateCcw, Settings2, X, Download, Upload, FileText,
   Database, Bell, ScanLine, Eye, EyeOff, Send, Globe, User, Key, Box,
-  AlertTriangle, ChevronDown, ChevronRight, Paintbrush, Home, Wifi,
+  AlertTriangle, ChevronDown, ChevronRight, Paintbrush, Package,
 } from 'lucide-react'
 import { api } from '../api'
 import { HostsManager } from './HostsManager'
 import { useTheme } from '../hooks/useTheme'
 import { NotificationsTab } from './NotificationsTab'
+import { PluginsTab } from './PluginsTab'
 
 // ── Setting definitions ────────────────────────────────────────────────────────
 const SETTING_META = {
@@ -155,12 +156,12 @@ const SETTING_META = {
 const DOCKER_KEYS = new Set(['docker_enabled','docker_host','docker_tls_verify'])
 
 const TABS = [
-  { id: 'scanner',       label: 'Scanner',        Icon: ScanLine   },
-  { id: 'notifications', label: 'Notifications',  Icon: Bell       },
-  { id: 'ha',            label: 'Home Assistant', Icon: Home       },
-  { id: 'docker',        label: 'Docker',         Icon: Box        },
-  { id: 'data',          label: 'Data',           Icon: Database   },
-  { id: 'admin',         label: 'Admin',          Icon: Settings2  },
+  { id: 'scanner',       label: 'Scanner',       Icon: ScanLine  },
+  { id: 'notifications', label: 'Notifications', Icon: Bell      },
+  { id: 'plugins',       label: 'Plugins',       Icon: Package   },
+  { id: 'docker',        label: 'Docker',        Icon: Box       },
+  { id: 'data',          label: 'Data',          Icon: Database  },
+  { id: 'admin',         label: 'Admin',         Icon: Settings2 },
 ]
 
 async function downloadResponse(res, filename) {
@@ -191,8 +192,6 @@ export function SettingsPanel({ onClose, onSettingChange }) {
   const restoreInputRef = useRef(null)
   const [dragonsOpen,   setDragonsOpen]   = useState(false)
   const [restarting,    setRestarting]    = useState({})  // { probe: bool, backend: bool }
-  const [haMqttStatus,  setHaMqttStatus]  = useState(null)   // null | { connected: bool }
-  const [haConnecting,  setHaConnecting]  = useState(false)
   const fileInputRef = useRef(null)
   const [detectedInterface, setDetectedInterface] = useState('')
 
@@ -202,7 +201,6 @@ export function SettingsPanel({ onClose, onSettingChange }) {
     api.setupNetworkInfo().then(info => {
       if (info?.interface) setDetectedInterface(info.interface)
     }).catch(() => {})
-    api.haMqttStatus().then(setHaMqttStatus).catch(() => {})
   }, [])
 
   function handleChange(key, value) {
@@ -325,7 +323,7 @@ export function SettingsPanel({ onClose, onSettingChange }) {
   }
 
   const hasDirty   = Object.keys(dirty).length > 0
-  const showFooter = activeTab !== 'admin'
+  const showFooter = activeTab !== 'admin' && activeTab !== 'plugins'
 
   // Returns current value for a key (dirty-aware)
   function val(key) {
@@ -536,108 +534,8 @@ export function SettingsPanel({ onClose, onSettingChange }) {
             <NotificationsTab settings={settings} dirty={dirty} onchange={handleChange} />
           )}
 
-          {/* ── Home Assistant tab ──────────────────────────────────────────── */}
-          {activeTab === 'ha' && (
-            <div className="space-y-4">
-              <p className="text-xs" style={{ color: 'var(--color-text-faint)' }}>
-                Publishes InSpectre device state to Home Assistant via MQTT Auto-Discovery.
-                Each network device gets presence, IP, open-ports and vulnerability sensors.
-                A system device tracks total devices online, vulnerabilities, and scan state.
-              </p>
-
-              <SectionHeader label="MQTT Broker" Icon={Wifi} />
-              {[
-                { key: 'ha_mqtt_enabled',          label: 'Enable HA Integration',  type: 'toggle'   },
-                { key: 'ha_mqtt_host',             label: 'Broker Host',            type: 'text',     placeholder: '192.168.0.1' },
-                { key: 'ha_mqtt_port',             label: 'Broker Port',            type: 'number',   placeholder: '1883' },
-                { key: 'ha_mqtt_user',             label: 'Username',               type: 'text',     placeholder: 'optional' },
-                { key: 'ha_mqtt_password',         label: 'Password',               type: 'password', placeholder: 'optional' },
-              ].map(f => {
-                const val = settings.find(s => s.key === f.key)?.value ?? ''
-                const dv  = dirty[f.key] ?? val
-                if (f.type === 'toggle') return (
-                  <div key={f.key} className="flex items-center justify-between py-1">
-                    <span className="text-sm">{f.label}</span>
-                    <button type="button" onClick={() => handleChange(f.key, dv === 'true' ? 'false' : 'true')}
-                      className={`relative inline-flex h-5 w-9 rounded-full transition-colors ${dv === 'true' ? 'bg-blue-500' : 'bg-gray-400'}`}
-                      style={{ minWidth: '36px' }}>
-                      <span className={`inline-block h-4 w-4 mt-0.5 rounded-full bg-white shadow transition-transform ${dv === 'true' ? 'translate-x-4' : 'translate-x-0.5'}`} />
-                    </button>
-                  </div>
-                )
-                return (
-                  <div key={f.key} className="space-y-1">
-                    <label className="text-xs font-medium" style={{ color: 'var(--color-text-muted)' }}>{f.label}</label>
-                    {f.type === 'password'
-                      ? <input type="password" className="input text-sm w-full" value={dirty[f.key] ?? val}
-                               onChange={e => handleChange(f.key, e.target.value)} placeholder={f.placeholder} />
-                      : <input type={f.type} className="input text-sm w-full" value={dirty[f.key] ?? val}
-                               onChange={e => handleChange(f.key, e.target.value)} placeholder={f.placeholder} />
-                    }
-                  </div>
-                )
-              })}
-
-              <SectionHeader label="Topic Prefixes" Icon={Home} />
-              {[
-                { key: 'ha_mqtt_discovery_prefix', label: 'Discovery Prefix', type: 'text', placeholder: 'homeassistant' },
-                { key: 'ha_mqtt_state_prefix',     label: 'State Prefix',     type: 'text', placeholder: 'inspectre' },
-              ].map(f => {
-                const val = settings.find(s => s.key === f.key)?.value ?? ''
-                return (
-                  <div key={f.key} className="space-y-1">
-                    <label className="text-xs font-medium" style={{ color: 'var(--color-text-muted)' }}>{f.label}</label>
-                    <input type="text" className="input text-sm w-full" value={dirty[f.key] ?? val}
-                           onChange={e => handleChange(f.key, e.target.value)} placeholder={f.placeholder} />
-                  </div>
-                )
-              })}
-
-              <SectionHeader label="Connection" Icon={Wifi} />
-              <div className="flex items-center gap-3">
-                <div className={`flex items-center gap-2 text-xs px-2 py-1 rounded ${
-                  haMqttStatus?.connected ? 'bg-green-500/20 text-green-400' : 'bg-gray-500/20 text-gray-400'
-                }`}>
-                  <span className={`w-2 h-2 rounded-full ${haMqttStatus?.connected ? 'bg-green-400' : 'bg-gray-400'}`} />
-                  {haMqttStatus?.connected ? 'Connected' : haMqttStatus === null ? 'Unknown' : 'Disconnected'}
-                </div>
-                <button className="btn-secondary text-xs" disabled={haConnecting}
-                  onClick={async () => {
-                    setHaConnecting(true)
-                    try {
-                      // Save pending settings first
-                      const pendingKeys = ['ha_mqtt_enabled','ha_mqtt_host','ha_mqtt_port',
-                                           'ha_mqtt_user','ha_mqtt_password',
-                                           'ha_mqtt_discovery_prefix','ha_mqtt_state_prefix']
-                      for (const k of pendingKeys) {
-                        if (dirty[k] !== undefined) await api.updateSetting(k, dirty[k])
-                      }
-                      const status = await api.haMqttReconnect()
-                      setHaMqttStatus(status)
-                    } catch { setHaMqttStatus({ connected: false }) }
-                    finally { setHaConnecting(false) }
-                  }}>
-                  {haConnecting ? 'Connecting…' : 'Save & Connect'}
-                </button>
-                {haMqttStatus?.connected && (
-                  <button className="btn-secondary text-xs" onClick={async () => {
-                    await api.haMqttDisconnect().catch(() => {})
-                    setHaMqttStatus({ connected: false })
-                  }}>Disconnect</button>
-                )}
-              </div>
-
-              <div className="text-xs space-y-1 pt-2" style={{ color: 'var(--color-text-faint)' }}>
-                <p><strong>Topic structure:</strong></p>
-                <p className="font-mono">inspectre/system/status  (LWT: online/offline)</p>
-                <p className="font-mono">inspectre/system/total_devices</p>
-                <p className="font-mono">inspectre/clients/&lt;mac&gt;/presence  (ON/OFF)</p>
-                <p className="font-mono">inspectre/clients/&lt;mac&gt;/ip</p>
-                <p className="font-mono">inspectre/clients/&lt;mac&gt;/open_ports</p>
-                <p className="font-mono">inspectre/clients/&lt;mac&gt;/vulnerabilities</p>
-              </div>
-            </div>
-          )}
+          {/* ── Plugins tab ─────────────────────────────────────────────────── */}
+          {activeTab === 'plugins' && <PluginsTab />}
 
           {/* ── Docker tab ──────────────────────────────────────────────────── */}
           {activeTab === 'docker' && (
