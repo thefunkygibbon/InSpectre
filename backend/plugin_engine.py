@@ -344,13 +344,14 @@ class PluginRegistry:
             raise PluginValidationError(
                 f"Plugin ID '{pid}' conflicts with a built-in plugin"
             )
+        existing = self._plugins.get(pid, {})
         self._plugins[pid] = {
             "manifest":   manifest,
-            "config":     {},
+            "config":     existing.get("config") or {},
             "source":     "uploaded",
-            "enabled":    False,
-            "status":     "disabled",
-            "last_error": None,
+            "enabled":    existing.get("enabled", False),
+            "status":     existing.get("status", "disabled"),
+            "last_error": existing.get("last_error"),
         }
         return pid
 
