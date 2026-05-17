@@ -4364,7 +4364,7 @@ async def upload_plugin(
                     (plugin_id, display_name, version, enabled,
                      manifest, config, install_source, status)
                 VALUES (:pid, :name, :ver, false,
-                        :manifest::jsonb, '{}'::jsonb, 'uploaded', 'disabled')
+                        CAST(:manifest AS jsonb), CAST('{}' AS jsonb), 'uploaded', 'disabled')
                 ON CONFLICT (plugin_id) DO UPDATE
                     SET manifest = EXCLUDED.manifest,
                         display_name = EXCLUDED.display_name,
@@ -4380,6 +4380,10 @@ async def upload_plugin(
         db.commit()
     except PluginValidationError as exc:
         raise HTTPException(400, str(exc))
+    except Exception as exc:
+        db.rollback()
+        _plugin_registry.remove(pid)
+        raise HTTPException(500, f"Database error: {exc}")
 
     return {"id": pid, "name": manifest.get("name"), "status": "disabled"}
 
@@ -4430,11 +4434,15 @@ def save_plugin_config(
             else:
                 db.add(Setting(key=setting_key, value=str(val), description=""))
 
-    db.execute(
-        text("UPDATE plugins SET config = :cfg::jsonb WHERE plugin_id = :pid"),
-        {"cfg": json.dumps(encrypted), "pid": plugin_id},
-    )
-    db.commit()
+    try:
+        db.execute(
+            text("UPDATE plugins SET config = CAST(:cfg AS jsonb) WHERE plugin_id = :pid"),
+            {"cfg": json.dumps(encrypted), "pid": plugin_id},
+        )
+        db.commit()
+    except Exception as exc:
+        db.rollback()
+        raise HTTPException(500, f"Failed to save plugin config: {exc}")
     _plugin_registry.update_config(plugin_id, encrypted)
     _plugin_runner.clear_session(plugin_id)
     return {"ok": True}

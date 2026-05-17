@@ -362,6 +362,7 @@ class PluginRunner:
         self._ha_mqtt     = ha_mqtt
         self._rate_limits: dict[str, float] = {}
         self._sessions:    dict[str, PluginSession] = {}
+        self._logging_in:  set[str] = set()  # plugins currently mid-login; prevents recursive auto-login
 
     def clear_session(self, plugin_id: str):
         self._sessions.pop(plugin_id, None)
@@ -457,9 +458,16 @@ class PluginRunner:
         if action_def.get("source") == "file":
             return self._execute_file_action(action_def, config)
 
+        # ── Build substitution context (merge session.extras so {omadacId}-style
+        #    placeholders set by earlier dep actions are available in URLs/bodies)
+        _pre_session = self._sessions.get(plugin_id)
+        sub_ctx = dict(context)
+        if _pre_session:
+            sub_ctx.update(_pre_session.extras)
+
         # ── Build URL ────────────────────────────────────────────────────────
-        base_url = self._sub(endpoints.get("base_url", ""), config, context)
-        path     = self._sub(action_def.get("path", ""), config, context)
+        base_url = self._sub(endpoints.get("base_url", ""), config, sub_ctx)
+        path     = self._sub(action_def.get("path", ""), config, sub_ctx)
         url      = base_url + path
 
         parsed_scheme = urlparse(url).scheme
@@ -475,28 +483,40 @@ class PluginRunner:
         # ── Rate limiting ────────────────────────────────────────────────────
         max_rate = (manifest.get("polling") or {}).get("max_rate_per_minute")
         if max_rate:
+            rate_key = f"{plugin_id}:{action_name}"
             now  = datetime.now(timezone.utc).timestamp()
-            last = self._rate_limits.get(plugin_id, 0.0)
+            last = self._rate_limits.get(rate_key, 0.0)
             if (now - last) < (60.0 / float(max_rate)):
                 return {"ok": False, "error": "Rate limit exceeded"}
-            self._rate_limits[plugin_id] = now
+            self._rate_limits[rate_key] = now
 
         # ── Session / auth ───────────────────────────────────────────────────
         auth_method = endpoints.get("auth", "none")
         session = self._sessions.get(plugin_id)
 
-        # Auto-login if the auth method requires a valid session and we don't have one
+        # Auto-login if auth method requires a session and we don't have a valid one.
+        # Guard with _logging_in to prevent recursive auto-login: pre-auth actions like
+        # get_controller_id that run inside _auto_login's dep chain must NOT trigger
+        # another auto-login themselves.
         if auth_method in ("bearer", "cookie") and action_name != "login":
-            if session is None or not session.is_valid():
+            if (session is None or not session.is_valid()) and plugin_id not in self._logging_in:
                 login_result = await self._auto_login(plugin_id, manifest, config, context)
                 if not login_result.get("ok"):
                     return login_result
                 session = self._sessions.get(plugin_id)
+                # Rebuild sub_ctx and URL now that session.extras are populated
+                sub_ctx = dict(context)
+                if session:
+                    sub_ctx.update(session.extras)
+                url = (
+                    self._sub(endpoints.get("base_url", ""), config, sub_ctx)
+                    + self._sub(action_def.get("path", ""), config, sub_ctx)
+                )
 
         method   = action_def.get("method", "GET").upper()
         body_tpl = action_def.get("body")
         body     = (
-            json.loads(self._sub(json.dumps(body_tpl), config, context))
+            json.loads(self._sub(json.dumps(body_tpl), config, sub_ctx))
             if body_tpl else None
         )
 
@@ -519,8 +539,14 @@ class PluginRunner:
                 if val:
                     headers[header_name] = str(val)
 
+        # Resolve SSL verification: config key wins, then manifest endpoints default
+        _ssl_raw = config.get("verify_ssl")
+        if _ssl_raw is None:
+            _ssl_raw = endpoints.get("verify_ssl", True)
+        ssl_verify = _ssl_raw if isinstance(_ssl_raw, bool) else str(_ssl_raw).lower() not in ("false", "0", "no")
+
         # ── Execute HTTP request ─────────────────────────────────────────────
-        result = await self._http_request(method, url, body, headers, cookies)
+        result = await self._http_request(method, url, body, headers, cookies, ssl_verify)
 
         # ── 401/403 retry with fresh session ────────────────────────────────
         if not result.get("ok") and result.get("status_code") in (401, 403):
@@ -529,6 +555,18 @@ class PluginRunner:
                 login_result = await self._auto_login(plugin_id, manifest, config, context)
                 if login_result.get("ok"):
                     session = self._sessions.get(plugin_id)
+                    # Rebuild URL and headers with fresh session extras
+                    sub_ctx = dict(context)
+                    if session:
+                        sub_ctx.update(session.extras)
+                    url = (
+                        self._sub(endpoints.get("base_url", ""), config, sub_ctx)
+                        + self._sub(action_def.get("path", ""), config, sub_ctx)
+                    )
+                    body = (
+                        json.loads(self._sub(json.dumps(body_tpl), config, sub_ctx))
+                        if body_tpl else None
+                    )
                     if auth_method == "cookie" and session:
                         cookies = dict(session.cookies)
                     elif auth_method == "bearer" and session and session.bearer_token:
@@ -538,14 +576,26 @@ class PluginRunner:
                             val = session.extras.get(extras_key)
                             if val:
                                 headers[header_name] = str(val)
-                    result = await self._http_request(method, url, body, headers, cookies)
+                    result = await self._http_request(method, url, body, headers, cookies, ssl_verify)
 
         if not result.get("ok"):
             return result
 
-        # ── Extract session from login response ──────────────────────────────
-        if action_name == "login":
+        # ── Extract session from any action that declares session_extract ─────
+        # (not just "login" — e.g. get_controller_id may extract omadacId)
+        if action_def.get("session_extract"):
             self._extract_session(plugin_id, action_def, result)
+
+        # ── Auto-capture all response cookies for cookie-auth login actions ──
+        # For auth:cookie plugins the login response sets the session cookie
+        # (e.g. TPOMADA_SESSIONID). Capture all Set-Cookie values automatically
+        # so the manifest doesn't need to name every cookie explicitly.
+        if endpoints.get("auth") == "cookie" and action_name == "login":
+            resp_cookies = result.get("_resp_cookies") or {}
+            if resp_cookies:
+                session = self._sessions.get(plugin_id) or PluginSession()
+                session.cookies.update(resp_cookies)
+                self._sessions[plugin_id] = session
 
         # ── Data mapping ─────────────────────────────────────────────────────
         response_mapping = action_def.get("response_mapping")
@@ -556,20 +606,32 @@ class PluginRunner:
         return result
 
     async def _http_request(
-        self, method: str, url: str, body, headers: dict, cookies: dict
+        self, method: str, url: str, body, headers: dict, cookies: dict, verify: bool = True
     ) -> dict:
         try:
-            async with httpx.AsyncClient(timeout=15.0, cookies=cookies) as client:
+            async with httpx.AsyncClient(
+                timeout=15.0, cookies=cookies, verify=verify, follow_redirects=False
+            ) as client:
                 resp = await client.request(method, url, json=body, headers=headers)
             status = resp.status_code
+            # Always capture cookies and headers before any error handling —
+            # some controllers (e.g. Omada) return 302 after a successful login
+            resp_cookies = dict(resp.cookies)
+            resp_headers = dict(resp.headers)
             if status in (401, 403):
-                return {"ok": False, "status_code": status, "error": f"HTTP {status}"}
-            resp.raise_for_status()
-            data = resp.json() if resp.content else {}
+                return {"ok": False, "status_code": status, "error": f"HTTP {status}",
+                        "_resp_cookies": resp_cookies, "_resp_headers": resp_headers}
+            # 3xx redirects are treated as success so session cookies are captured;
+            # only genuine 4xx/5xx (excluding 401/403 above) are errors
+            if status >= 400:
+                return {"ok": False, "status_code": status, "error": f"HTTP {status}",
+                        "_resp_cookies": resp_cookies, "_resp_headers": resp_headers}
+            try:
+                data = resp.json() if resp.content else {}
+            except Exception:
+                data = {}
             return {"ok": True, "status_code": status, "data": data,
-                    "_resp_cookies": dict(resp.cookies), "_resp_headers": dict(resp.headers)}
-        except httpx.HTTPStatusError as exc:
-            return {"ok": False, "status_code": exc.response.status_code, "error": str(exc)}
+                    "_resp_cookies": resp_cookies, "_resp_headers": resp_headers}
         except Exception as exc:
             return {"ok": False, "error": str(exc)}
 
@@ -581,58 +643,69 @@ class PluginRunner:
         actions = manifest.get("actions") or {}
         if "login" not in actions:
             return {"ok": False, "error": "No login action defined for session auth"}
-        result = await self._execute_single_action(
-            plugin_id, manifest, config, "login", context
-        )
-        return result
+        # Set flag so pre-auth dep actions (e.g. get_controller_id) don't recurse into auto-login
+        self._logging_in.add(plugin_id)
+        try:
+            return await self._resolve_action(plugin_id, manifest, config, "login", dict(context))
+        finally:
+            self._logging_in.discard(plugin_id)
 
     # ── Session extraction ────────────────────────────────────────────────────
 
     def _extract_session(self, plugin_id: str, action_def: dict, result: dict):
-        se = action_def.get("session_extract")
-        if not se:
+        se_raw = action_def.get("session_extract")
+        if not se_raw:
             return
 
         session = self._sessions.get(plugin_id) or PluginSession()
-        source  = se.get("from", "response_body")
-        key     = se.get("key", "")
-        jpath   = se.get("json_path", "")
-        ttl_fld = se.get("ttl_field", "")
 
-        if source == "response_cookies":
-            cookies = result.get("_resp_cookies", {})
-            if key and key in cookies:
-                session.cookies[key] = cookies[key]
-        elif source == "response_headers":
-            hdrs = result.get("_resp_headers", {})
-            val = hdrs.get(key) or hdrs.get(key.lower())
-            if val:
-                session.extras[key] = val
-                if key.lower() in ("authorization", "x-auth-token"):
-                    token = val.replace("Bearer ", "").strip()
-                    session.bearer_token = token
-        elif source == "response_body":
-            data = result.get("data") or {}
-            # Navigate dot-path
-            val = data
-            for part in (jpath or key).split("."):
-                if isinstance(val, dict):
-                    val = val.get(part)
+        # Support both a single extract dict and a list of extract dicts
+        extracts = se_raw if isinstance(se_raw, list) else [se_raw]
+
+        for se in extracts:
+            source  = se.get("from", "response_body")
+            key     = se.get("key", "")
+            jpath   = se.get("json_path", "")
+            ttl_fld = se.get("ttl_field", "")
+
+            if source == "response_cookies":
+                resp_cookies = result.get("_resp_cookies", {})
+                if key:
+                    # Specific named cookie
+                    if key in resp_cookies:
+                        store_as = se.get("store_as") or key
+                        session.cookies[store_as] = resp_cookies[key]
                 else:
-                    val = None
-                    break
-            if val is not None:
-                store_as = se.get("store_as") or jpath or key
-                session.extras[store_as] = val
-                session.bearer_token = str(val)
-                # TTL
-                if ttl_fld:
-                    ttl_val = data.get(ttl_fld)
-                    if ttl_val:
-                        try:
-                            session.token_expiry = time.time() + float(ttl_val) - 30
-                        except (ValueError, TypeError):
-                            pass
+                    # No key specified — capture all response cookies
+                    session.cookies.update(resp_cookies)
+            elif source == "response_headers":
+                hdrs = result.get("_resp_headers", {})
+                val = hdrs.get(key) or hdrs.get(key.lower())
+                if val:
+                    store_as = se.get("store_as") or key
+                    session.extras[store_as] = val
+                    if key.lower() in ("authorization", "x-auth-token"):
+                        session.bearer_token = val.replace("Bearer ", "").strip()
+            elif source == "response_body":
+                data = result.get("data") or {}
+                val = data
+                for part in (jpath or key).split("."):
+                    if isinstance(val, dict):
+                        val = val.get(part)
+                    else:
+                        val = None
+                        break
+                if val is not None:
+                    store_as = se.get("store_as") or jpath or key
+                    session.extras[store_as] = val
+                    session.bearer_token = str(val)
+                    if ttl_fld:
+                        ttl_val = data.get(ttl_fld)
+                        if ttl_val:
+                            try:
+                                session.token_expiry = time.time() + float(ttl_val) - 30
+                            except (ValueError, TypeError):
+                                pass
 
         self._sessions[plugin_id] = session
 
