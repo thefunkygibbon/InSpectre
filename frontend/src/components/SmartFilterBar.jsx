@@ -1,13 +1,13 @@
 import { useState } from 'react'
 import {
   Star, HelpCircle, Tag, Unlock, ScanLine,
-  WifiOff, Tags, MapPin, ShieldAlert, Ban, FileText,
+  WifiOff, Wifi, Network, Tags, MapPin, ShieldAlert, Ban, FileText,
   Bookmark, BookmarkCheck, X, Layers, ShieldCheck, ShieldOff, Cpu, Users, EyeOff, Radio, Zap,
 } from 'lucide-react'
 import { SMART_FILTERS } from '../hooks/useSmartFilters'
 
 const ICON_MAP = {
-  Star, HelpCircle, Tag, Unlock, ScanLine, WifiOff, Tags, MapPin,
+  Star, HelpCircle, Tag, Unlock, ScanLine, WifiOff, Wifi, Network, Tags, MapPin,
   ShieldAlert, Ban, FileText, Layers, ShieldCheck, ShieldOff, Cpu, Users, EyeOff, Radio, Zap,
 }
 
@@ -15,7 +15,11 @@ export function SmartFilterBar({ devices, activeFilters, onToggle, onClear, save
   const [saveMode,   setSaveMode]   = useState(false)
   const [viewName,   setViewName]   = useState('')
 
-  function countFor(filter) {
+  function countFor(filter, activeStateVal) {
+    if (filter.states) {
+      const s = filter.states.find(st => st.value === activeStateVal)
+      return s ? devices.filter(s.fn).length : 0
+    }
     return devices.filter(filter.fn).length
   }
 
@@ -62,19 +66,25 @@ export function SmartFilterBar({ devices, activeFilters, onToggle, onClear, save
       {/* Filter chips row */}
       <div className="flex flex-wrap gap-2 items-center">
         {SMART_FILTERS.map(f => {
-          const state = activeFilters[f.id] || null   // null | 'include' | 'exclude'
-          const count = countFor(f)
-          const Icon  = ICON_MAP[f.icon] || HelpCircle
+          const state      = activeFilters[f.id] || null
+          const activeState = f.states?.find(s => s.value === state) || null
+          const count      = countFor(f, state)
+          const Icon       = ICON_MAP[activeState?.icon || f.icon] || HelpCircle
+          const label      = activeState ? activeState.label : (f.labelFn ? f.labelFn(state) : f.label)
 
           const buttonStyle =
-            state === 'include'
+            activeState
+              ? { background: 'color-mix(in srgb, var(--color-brand) 15%, transparent)', color: 'var(--color-brand)', border: '1px solid color-mix(in srgb, var(--color-brand) 40%, transparent)' }
+              : state === 'include'
               ? { background: 'rgba(34,197,94,0.18)', color: '#16a34a', border: '1px solid rgba(34,197,94,0.45)' }
               : state === 'exclude'
               ? { background: 'rgba(239,68,68,0.15)', color: '#dc2626', border: '1px solid rgba(239,68,68,0.4)' }
               : { background: 'var(--color-surface-offset)', color: 'var(--color-text-muted)', border: '1px solid transparent' }
 
           const badgeStyle =
-            state === 'include'
+            activeState
+              ? { background: 'color-mix(in srgb, var(--color-brand) 25%, transparent)', color: 'var(--color-brand)' }
+              : state === 'include'
               ? { background: 'rgba(34,197,94,0.25)', color: '#16a34a' }
               : state === 'exclude'
               ? { background: 'rgba(239,68,68,0.2)', color: '#dc2626' }
@@ -89,7 +99,7 @@ export function SmartFilterBar({ devices, activeFilters, onToggle, onClear, save
               style={buttonStyle}
             >
               <Icon size={12} />
-              {f.label}
+              {label}
               {count > 0 && (
                 <span
                   className="ml-0.5 px-1.5 py-0.5 rounded-full text-[10px] font-semibold"

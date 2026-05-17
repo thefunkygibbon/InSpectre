@@ -1097,6 +1097,34 @@ class PluginScheduler:
                         "mac":  mac_fmt,
                         "data": json.dumps(enrichment),
                     })
+
+                # Write tag_fields from manifest's data_mapping back to devices.tags
+                plugin_info = self._registry.get(plugin_id)
+                tag_fields = (
+                    (plugin_info or {})
+                    .get("manifest", {})
+                    .get("data_mapping", {})
+                    .get("tag_fields", [])
+                )
+                if tag_fields:
+                    new_tags = [
+                        str(dev[tf]).strip().lower()
+                        for tf in tag_fields
+                        if dev.get(tf) is not None and str(dev[tf]).strip()
+                    ]
+                    if new_tags:
+                        db.execute(text("""
+                            UPDATE devices SET tags = CASE
+                                WHEN tags IS NULL OR tags = '' THEN :new_tags
+                                ELSE (
+                                    SELECT string_agg(DISTINCT trim(t), ',')
+                                    FROM unnest(string_to_array(tags || ',' || :new_tags, ',')) t
+                                    WHERE trim(t) != ''
+                                )
+                            END
+                            WHERE mac_address = :mac
+                        """), {"mac": mac_fmt, "new_tags": ','.join(new_tags)})
+
             except Exception as exc:
                 print(f"[plugin-scheduler] upsert failed for {mac_fmt}: {exc}", flush=True)
                 db.rollback()

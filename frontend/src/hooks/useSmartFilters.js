@@ -91,6 +91,33 @@ export const SMART_FILTERS = [
     description: 'Devices where a DHCP fingerprint has been captured by the passive sniffer',
     fn:          d => Boolean(d.dhcp_fingerprint || d.dhcp_vendor_class || d.dhcp_hostname),
   },
+  {
+    id:          'connection_type',
+    label:       'Wired / Wireless',
+    icon:        'Wifi',
+    description: 'Click once for wired only, again for wireless only, again to clear',
+    // Multi-state filter: cycles null → each state.value → null
+    states: [
+      {
+        value: 'wired',
+        label: 'Wired',
+        icon:  'Network',
+        fn:    d => {
+          const tags = (d.tags || '').toLowerCase().split(',').map(t => t.trim()).filter(Boolean)
+          return tags.includes('wired')
+        },
+      },
+      {
+        value: 'wireless',
+        label: 'Wireless',
+        icon:  'Wifi',
+        fn:    d => {
+          const tags = (d.tags || '').toLowerCase().split(',').map(t => t.trim()).filter(Boolean)
+          return tags.includes('wireless')
+        },
+      },
+    ],
+  },
 ]
 
 const SAVED_VIEWS_KEY = 'inspectre_saved_views'
@@ -111,17 +138,33 @@ export function useSmartFilters() {
   const [activeFilters, setActiveFilters] = useState({})
   const [savedViews,    setSavedViews]    = useState(() => loadSavedViews())
 
-  // Cycle: off → include → exclude → off
+  // Cycle: off → include → exclude → off (standard filters)
+  //        off → state[0] → state[1] → … → off (multi-state filters)
   const toggleFilter = useCallback(id => {
-    setActiveFilters(prev => {
-      const current = prev[id]
-      if (!current)             return { ...prev, [id]: 'include' }
-      if (current === 'include') return { ...prev, [id]: 'exclude' }
-      // exclude → remove key entirely
-      const next = { ...prev }
-      delete next[id]
-      return next
-    })
+    const filter = SMART_FILTERS.find(f => f.id === id)
+    if (filter?.states) {
+      setActiveFilters(prev => {
+        const current = prev[id]
+        const values  = filter.states.map(s => s.value)
+        const idx     = values.indexOf(current)
+        const nextVal = values[idx + 1]   // undefined when at last state
+        if (!nextVal) {
+          const next = { ...prev }
+          delete next[id]
+          return next
+        }
+        return { ...prev, [id]: nextVal }
+      })
+    } else {
+      setActiveFilters(prev => {
+        const current = prev[id]
+        if (!current)             return { ...prev, [id]: 'include' }
+        if (current === 'include') return { ...prev, [id]: 'exclude' }
+        const next = { ...prev }
+        delete next[id]
+        return next
+      })
+    }
   }, [])
 
   const clearFilters = useCallback(() => setActiveFilters({}), [])
@@ -134,9 +177,15 @@ export function useSmartFilters() {
       for (const [id, mode] of entries) {
         const filter = SMART_FILTERS.find(f => f.id === id)
         if (!filter) continue
-        const match = filter.fn(d)
-        if (mode === 'include' && !match) return false
-        if (mode === 'exclude' &&  match) return false
+        if (filter.states) {
+          // Multi-state: mode is a state value — use that state's fn
+          const state = filter.states.find(s => s.value === mode)
+          if (state && !state.fn(d)) return false
+        } else {
+          const match = filter.fn(d)
+          if (mode === 'include' && !match) return false
+          if (mode === 'exclude' &&  match) return false
+        }
       }
       return true
     })
