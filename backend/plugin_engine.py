@@ -56,6 +56,12 @@ INSPECTRE_DEVICE_FIELDS = frozenset([
 
 _MAX_CHAIN_DEPTH = 3
 
+# Maps boolean response fields to (true_label, false_label) tag strings.
+# e.g. Omada's "wireless": true  → tag "wireless", false → tag "wired"
+BOOL_TAG_LABELS: dict[str, tuple[str, str]] = {
+    "wireless": ("wireless", "wired"),
+}
+
 
 # ---------------------------------------------------------------------------
 # Encryption helpers (Fernet with SECRET_KEY-derived key)
@@ -1107,11 +1113,15 @@ class PluginScheduler:
                     .get("tag_fields", [])
                 )
                 if tag_fields:
-                    new_tags = [
-                        str(dev[tf]).strip().lower()
-                        for tf in tag_fields
-                        if dev.get(tf) is not None and str(dev[tf]).strip()
-                    ]
+                    new_tags = []
+                    for tf in tag_fields:
+                        val = dev.get(tf)
+                        if val is None:
+                            continue
+                        if tf in BOOL_TAG_LABELS and isinstance(val, bool):
+                            new_tags.append(BOOL_TAG_LABELS[tf][0 if val else 1])
+                        elif str(val).strip():
+                            new_tags.append(str(val).strip().lower())
                     if new_tags:
                         db.execute(text("""
                             UPDATE devices SET tags = CASE
