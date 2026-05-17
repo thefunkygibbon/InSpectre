@@ -510,6 +510,15 @@ class PluginRunner:
         else:
             self._apply_auth(headers, auth_method, config, session)
 
+        # Inject session extras as custom headers per manifest session_headers map
+        # e.g. {"loginToken": "Csrf-Token"} injects session.extras["loginToken"] as "Csrf-Token"
+        session_header_map = endpoints.get("session_headers") or {}
+        if session_header_map and session:
+            for extras_key, header_name in session_header_map.items():
+                val = session.extras.get(extras_key)
+                if val:
+                    headers[header_name] = str(val)
+
         # ── Execute HTTP request ─────────────────────────────────────────────
         result = await self._http_request(method, url, body, headers, cookies)
 
@@ -524,6 +533,11 @@ class PluginRunner:
                         cookies = dict(session.cookies)
                     elif auth_method == "bearer" and session and session.bearer_token:
                         headers["Authorization"] = f"Bearer {session.bearer_token}"
+                    if session_header_map and session:
+                        for extras_key, header_name in session_header_map.items():
+                            val = session.extras.get(extras_key)
+                            if val:
+                                headers[header_name] = str(val)
                     result = await self._http_request(method, url, body, headers, cookies)
 
         if not result.get("ok"):
