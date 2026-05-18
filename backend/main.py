@@ -2071,10 +2071,16 @@ async def on_startup():
         _seed_settings(db)
         _seed_default_user(db)
         _migrate_legacy_docker_host(db)
-        _migrate_legacy_notifications(db)
+        try:
+            _migrate_legacy_notifications(db)
+        except Exception as exc:
+            print(f"[startup] notifications migration failed (non-fatal): {exc}", flush=True)
+            db.rollback()
         _migrate_legacy_ha_mqtt(db)
         _plugin_registry.load_all(db)
         _ha_startup_connect(db)
+    except Exception as exc:
+        print(f"[startup] CRITICAL startup error: {exc}", flush=True)
     finally:
         db.close()
     asyncio.ensure_future(_scheduled_vuln_scan_loop())
@@ -4292,20 +4298,22 @@ async def _plugin_block_hook(mac: str, ip: Optional[str], action: str):
 def _plugin_to_dict(plugin_info: dict) -> dict:
     manifest = plugin_info["manifest"]
     return {
-        "id":          plugin_info["id"],
-        "name":        manifest.get("name"),
-        "version":     manifest.get("version"),
-        "author":      manifest.get("author"),
-        "description": manifest.get("description"),
-        "icon":        manifest.get("icon"),
-        "homepage":    manifest.get("homepage"),
-        "capabilities":manifest.get("capabilities", []),
-        "source":      plugin_info["source"],
-        "enabled":     plugin_info["enabled"],
-        "status":      plugin_info["status"],
-        "last_error":  plugin_info["last_error"],
-        "config":      _redact_plugin_config(manifest, plugin_info.get("config") or {}),
-        "manifest":    manifest,
+        "id":                plugin_info["id"],
+        "name":              manifest.get("name"),
+        "version":           manifest.get("version"),
+        "author":            manifest.get("author"),
+        "description":       manifest.get("description"),
+        "icon":              manifest.get("icon"),
+        "homepage":          manifest.get("homepage"),
+        "capabilities":      manifest.get("capabilities", []),
+        "source":            plugin_info["source"],
+        "enabled":           plugin_info["enabled"],
+        "status":            plugin_info["status"],
+        "last_error":        plugin_info["last_error"],
+        "last_polled":       plugin_info.get("last_polled"),
+        "last_device_count": plugin_info.get("last_device_count"),
+        "config":            _redact_plugin_config(manifest, plugin_info.get("config") or {}),
+        "manifest":          manifest,
     }
 
 
@@ -4536,6 +4544,31 @@ async def test_plugin_connection(
         raise HTTPException(404, "Plugin not found")
     result = await _plugin_runner.execute_action(plugin_id, "test_connection")
     return result
+
+
+@app.post("/plugins/{plugin_id}/poll")
+async def poll_plugin_now(
+    plugin_id: str,
+    username: str = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Manually trigger the plugin's polling action and upsert discovered devices immediately."""
+    plugin = _plugin_registry.get(plugin_id)
+    if not plugin:
+        raise HTTPException(404, "Plugin not found")
+    polling = plugin["manifest"].get("polling") or {}
+    action = polling.get("action")
+    if not action:
+        raise HTTPException(400, "This plugin has no polling action configured")
+    await _plugin_scheduler._poll_plugin(plugin_id, action)
+    updated = _plugin_registry.get(plugin_id)
+    ok = updated.get("status") == "active"
+    return {
+        "ok":                ok,
+        "status":            updated.get("status"),
+        "error":             updated.get("last_error") if not ok else None,
+        "last_device_count": updated.get("last_device_count"),
+    }
 
 
 @app.get("/plugins/{plugin_id}/data")

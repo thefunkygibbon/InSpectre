@@ -150,6 +150,7 @@ export const api = {
   disablePlugin:    (id)            => request('PATCH',  `/plugins/${id}/disable`),
   deletePlugin:     (id)            => request('DELETE', `/plugins/${id}`),
   testPlugin:       (id)            => request('POST',   `/plugins/${id}/test`),
+  pollPlugin:       (id)            => request('POST',   `/plugins/${id}/poll`),
   getPluginData:    (id)            => request('GET',    `/plugins/${id}/data`),
   uploadPlugin: (file) => {
     const form = new FormData()

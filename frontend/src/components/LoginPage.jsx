@@ -20,7 +20,14 @@ export function LoginPage({ onLogin }) {
       setToken(data.token)
       onLogin(data.must_change_password ?? false)
     } catch (err) {
-      setError('Invalid username or password')
+      const msg = err?.message || ''
+      if (msg.includes('Failed to fetch') || msg.includes('NetworkError') || msg.includes('Load failed')) {
+        setError('Cannot reach server — is the backend running?')
+      } else if (msg.includes('\u2192 5')) {
+        setError('Server error — check backend logs')
+      } else {
+        setError('Invalid username or password')
+      }
     } finally {
       setLoading(false)
     }

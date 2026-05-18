@@ -296,6 +296,17 @@ class PluginRegistry:
             rows = []
         for row in rows:
             try:
+                # Uploaded plugins must never overwrite a builtin — the builtin's manifest
+                # on disk always wins. Only config/enabled/status are taken from the DB row
+                # (already handled in the builtin phase above).
+                existing = self._plugins.get(row.plugin_id)
+                if existing and existing.get("source") == "builtin":
+                    print(
+                        f"[plugins] Uploaded row for '{row.plugin_id}' superseded by builtin"
+                        f" — using builtin manifest, skipping uploaded manifest.",
+                        flush=True,
+                    )
+                    continue
                 manifest = (
                     row.manifest
                     if isinstance(row.manifest, dict)
@@ -337,6 +348,11 @@ class PluginRegistry:
             self._plugins[plugin_id]["status"] = status
             self._plugins[plugin_id]["last_error"] = error
 
+    def set_poll_result(self, plugin_id: str, device_count: int, ts: datetime):
+        if plugin_id in self._plugins:
+            self._plugins[plugin_id]["last_polled"] = ts.isoformat()
+            self._plugins[plugin_id]["last_device_count"] = device_count
+
     def add_uploaded(self, manifest: dict) -> str:
         validate_manifest(manifest)
         pid = manifest["id"]
@@ -344,13 +360,14 @@ class PluginRegistry:
             raise PluginValidationError(
                 f"Plugin ID '{pid}' conflicts with a built-in plugin"
             )
+        existing = self._plugins.get(pid, {})
         self._plugins[pid] = {
             "manifest":   manifest,
-            "config":     {},
+            "config":     existing.get("config") or {},
             "source":     "uploaded",
-            "enabled":    False,
-            "status":     "disabled",
-            "last_error": None,
+            "enabled":    existing.get("enabled", False),
+            "status":     existing.get("status", "disabled"),
+            "last_error": existing.get("last_error"),
         }
         return pid
 
@@ -526,7 +543,10 @@ class PluginRunner:
             if body_tpl else None
         )
 
-        headers = dict(endpoints.get("headers") or {})
+        headers = {
+            k: self._sub(str(v), config, sub_ctx)
+            for k, v in (endpoints.get("headers") or {}).items()
+        }
         cookies: dict = {}
 
         if auth_method == "cookie" and session:
@@ -538,7 +558,8 @@ class PluginRunner:
 
         # Inject session extras as custom headers per manifest session_headers map
         # e.g. {"loginToken": "Csrf-Token"} injects session.extras["loginToken"] as "Csrf-Token"
-        session_header_map = endpoints.get("session_headers") or {}
+        # Check endpoints block first, fall back to top-level manifest key for backwards compat
+        session_header_map = endpoints.get("session_headers") or manifest.get("session_headers") or {}
         if session_header_map and session:
             for extras_key, header_name in session_header_map.items():
                 val = session.extras.get(extras_key)
@@ -577,8 +598,9 @@ class PluginRunner:
                         cookies = dict(session.cookies)
                     elif auth_method == "bearer" and session and session.bearer_token:
                         headers["Authorization"] = f"Bearer {session.bearer_token}"
-                    if session_header_map and session:
-                        for extras_key, header_name in session_header_map.items():
+                    retry_header_map = endpoints.get("session_headers") or manifest.get("session_headers") or {}
+                    if retry_header_map and session:
+                        for extras_key, header_name in retry_header_map.items():
                             val = session.extras.get(extras_key)
                             if val:
                                 headers[header_name] = str(val)
@@ -587,10 +609,34 @@ class PluginRunner:
         if not result.get("ok"):
             return result
 
+        # ── API-level error check (for APIs that always return HTTP 200) ──────
+        # e.g. Omada returns {"errorCode": -1001, "msg": "..."} on failure
+        error_check = endpoints.get("error_check")
+        if error_check:
+            data = result.get("data") or {}
+            check_path  = error_check.get("json_path", "errorCode")
+            success_val = error_check.get("success_value", 0)
+            msg_path    = error_check.get("message_path", "msg")
+            code_val = data
+            for part in check_path.split("."):
+                code_val = code_val.get(part) if isinstance(code_val, dict) else None
+            if code_val is not None and code_val != success_val:
+                msg_val = data
+                for part in msg_path.split("."):
+                    msg_val = msg_val.get(part) if isinstance(msg_val, dict) else None
+                err = str(msg_val) if msg_val else f"API error {code_val}"
+                print(f"[plugin-runner] {plugin_id}/{action_name}: API error — {err} (code {code_val})", flush=True)
+                return {"ok": False, "error": err, "api_error_code": code_val}
+
+        # ── Verbose response logging for diagnosis ────────────────────────────
+        if action_def.get("session_extract") or action_def.get("response_mapping"):
+            raw = str(result.get("data", {}))
+            print(f"[plugin-runner] {plugin_id}/{action_name}: response={raw[:600]}", flush=True)
+
         # ── Extract session from any action that declares session_extract ─────
         # (not just "login" — e.g. get_controller_id may extract omadacId)
         if action_def.get("session_extract"):
-            self._extract_session(plugin_id, action_def, result)
+            self._extract_session(plugin_id, action_def, result, config)
 
         # ── Auto-capture all response cookies for cookie-auth login actions ──
         # For auth:cookie plugins the login response sets the session cookie
@@ -608,6 +654,16 @@ class PluginRunner:
         if response_mapping:
             devices = self._apply_response_mapping(result.get("data"), response_mapping)
             result["devices"] = devices
+            if devices:
+                print(f"[plugin-runner] {plugin_id}/{action_name}: mapped {len(devices)} device(s)", flush=True)
+            else:
+                raw_snippet = str(result.get("data", {}))[:400]
+                print(
+                    f"[plugin-runner] {plugin_id}/{action_name}: 0 devices mapped"
+                    f" (root_path={response_mapping.get('root_path', '')!r})"
+                    f" raw={raw_snippet}",
+                    flush=True,
+                )
 
         return result
 
@@ -615,6 +671,7 @@ class PluginRunner:
         self, method: str, url: str, body, headers: dict, cookies: dict, verify: bool = True
     ) -> dict:
         try:
+            print(f"[plugin-http] {method} {url}", flush=True)
             async with httpx.AsyncClient(
                 timeout=15.0, cookies=cookies, verify=verify, follow_redirects=False
             ) as client:
@@ -624,12 +681,17 @@ class PluginRunner:
             # some controllers (e.g. Omada) return 302 after a successful login
             resp_cookies = dict(resp.cookies)
             resp_headers = dict(resp.headers)
+            print(f"[plugin-http] → {status} ({len(resp.content)} bytes)", flush=True)
             if status in (401, 403):
                 return {"ok": False, "status_code": status, "error": f"HTTP {status}",
                         "_resp_cookies": resp_cookies, "_resp_headers": resp_headers}
-            # 3xx redirects are treated as success so session cookies are captured;
-            # only genuine 4xx/5xx (excluding 401/403 above) are errors
+            # 3xx with no body = auth redirect (e.g. wrong endpoint or missing cookie auth)
+            if 300 <= status < 400 and not resp.content:
+                print(f"[plugin-http] redirect with empty body — wrong endpoint or auth method", flush=True)
+                return {"ok": False, "status_code": status, "error": f"HTTP {status} redirect — check URL path and auth method",
+                        "_resp_cookies": resp_cookies, "_resp_headers": resp_headers}
             if status >= 400:
+                print(f"[plugin-http] error body: {resp.text[:500]}", flush=True)
                 return {"ok": False, "status_code": status, "error": f"HTTP {status}",
                         "_resp_cookies": resp_cookies, "_resp_headers": resp_headers}
             try:
@@ -639,6 +701,7 @@ class PluginRunner:
             return {"ok": True, "status_code": status, "data": data,
                     "_resp_cookies": resp_cookies, "_resp_headers": resp_headers}
         except Exception as exc:
+            print(f"[plugin-http] → ERROR: {exc}", flush=True)
             return {"ok": False, "error": str(exc)}
 
     # ── Auto-login ────────────────────────────────────────────────────────────
@@ -658,7 +721,7 @@ class PluginRunner:
 
     # ── Session extraction ────────────────────────────────────────────────────
 
-    def _extract_session(self, plugin_id: str, action_def: dict, result: dict):
+    def _extract_session(self, plugin_id: str, action_def: dict, result: dict, config: Optional[dict] = None):
         se_raw = action_def.get("session_extract")
         if not se_raw:
             return
@@ -694,30 +757,85 @@ class PluginRunner:
                         session.bearer_token = val.replace("Bearer ", "").strip()
             elif source == "response_body":
                 data = result.get("data") or {}
-                val = data
-                for part in (jpath or key).split("."):
-                    if isinstance(val, dict):
-                        val = val.get(part)
-                    elif isinstance(val, list):
-                        try:
-                            val = val[int(part)]
-                        except (ValueError, IndexError):
+                list_find = se.get("list_find")
+                if list_find:
+                    # Navigate to the list using list_path
+                    list_path = se.get("list_path", "")
+                    lst = data
+                    for part in (list_path.split(".") if list_path else []):
+                        if isinstance(lst, dict):
+                            lst = lst.get(part)
+                        elif isinstance(lst, list):
+                            try:
+                                lst = lst[int(part)]
+                            except (ValueError, IndexError):
+                                lst = None
+                                break
+                        else:
+                            lst = None
+                            break
+
+                    val = None
+                    if isinstance(lst, list):
+                        find_field = list_find.get("field", "name")
+                        config_key = list_find.get("config_key", "")
+                        find_value = (config or {}).get(config_key, "") if config_key else ""
+                        value_key  = se.get("value_key", "id")
+                        fallback   = se.get("fallback", "first")
+
+                        matched = None
+                        if find_value:
+                            for item in lst:
+                                if isinstance(item, dict) and str(item.get(find_field, "")) == str(find_value):
+                                    matched = item
+                                    break
+
+                        if matched is None and fallback == "first" and lst:
+                            if find_value:
+                                first_name = lst[0].get(find_field, "?") if isinstance(lst[0], dict) else "?"
+                                print(
+                                    f"[plugin-session] {plugin_id}: site '{find_value}' not found"
+                                    f" in {len(lst)} site(s), falling back to first ('{first_name}')",
+                                    flush=True,
+                                )
+                            matched = lst[0] if isinstance(lst[0], dict) else None
+
+                        if matched is not None:
+                            val = matched.get(value_key)
+                            store_as = se.get("store_as") or value_key
+                            print(
+                                f"[plugin-session] {plugin_id}: stored {store_as}={val!r}"
+                                f" (matched site: {matched.get(find_field, '?')!r})",
+                                flush=True,
+                            )
+                    if val is not None:
+                        store_as = se.get("store_as") or value_key or "value"
+                        session.extras[store_as] = val
+                else:
+                    val = data
+                    for part in (jpath or key).split("."):
+                        if isinstance(val, dict):
+                            val = val.get(part)
+                        elif isinstance(val, list):
+                            try:
+                                val = val[int(part)]
+                            except (ValueError, IndexError):
+                                val = None
+                                break
+                        else:
                             val = None
                             break
-                    else:
-                        val = None
-                        break
-                if val is not None:
-                    store_as = se.get("store_as") or jpath or key
-                    session.extras[store_as] = val
-                    session.bearer_token = str(val)
-                    if ttl_fld:
-                        ttl_val = data.get(ttl_fld)
-                        if ttl_val:
-                            try:
-                                session.token_expiry = time.time() + float(ttl_val) - 30
-                            except (ValueError, TypeError):
-                                pass
+                    if val is not None:
+                        store_as = se.get("store_as") or jpath or key
+                        session.extras[store_as] = val
+                        session.bearer_token = str(val)
+                        if ttl_fld:
+                            ttl_val = data.get(ttl_fld)
+                            if ttl_val:
+                                try:
+                                    session.token_expiry = time.time() + float(ttl_val) - 30
+                                except (ValueError, TypeError):
+                                    pass
 
         self._sessions[plugin_id] = session
 
@@ -913,6 +1031,12 @@ class PluginRunner:
             for part in root_path.split("."):
                 if isinstance(data, dict):
                     data = data.get(part)
+                elif isinstance(data, list):
+                    try:
+                        data = data[int(part)]
+                    except (ValueError, IndexError):
+                        data = None
+                        break
                 else:
                     data = None
                     break
@@ -1035,8 +1159,20 @@ class PluginScheduler:
     async def _poll_plugin(self, plugin_id: str, action: str):
         result = await self._runner.execute_action(plugin_id, action)
         db = self._db_factory()
+        now = datetime.now(timezone.utc)
         try:
             if result.get("ok"):
+                devices = result.get("devices") or []
+                plugin_info = self._registry.get(plugin_id)
+                caps = set((plugin_info or {}).get("manifest", {}).get("capabilities", []))
+                upserted = 0
+                if devices and caps & {"discovery", "presence"}:
+                    upserted = self._upsert_devices(db, plugin_id, devices)
+                print(
+                    f"[plugin-scheduler] {plugin_id}: poll OK — {len(devices)} device(s) returned,"
+                    f" {upserted} upserted",
+                    flush=True,
+                )
                 db.execute(
                     text(
                         "UPDATE plugins SET last_polled = NOW(), status = 'active',"
@@ -1045,15 +1181,10 @@ class PluginScheduler:
                     {"pid": plugin_id},
                 )
                 self._registry.set_status(plugin_id, "active")
-
-                # Upsert discovered devices
-                devices = result.get("devices") or []
-                plugin_info = self._registry.get(plugin_id)
-                caps = set((plugin_info or {}).get("manifest", {}).get("capabilities", []))
-                if devices and caps & {"discovery", "presence"}:
-                    self._upsert_devices(db, plugin_id, devices)
+                self._registry.set_poll_result(plugin_id, len(devices), now)
             else:
                 err = result.get("error", "Unknown error")
+                print(f"[plugin-scheduler] {plugin_id}: poll FAILED — {err}", flush=True)
                 db.execute(
                     text(
                         "UPDATE plugins SET last_polled = NOW(), status = 'error',"
@@ -1062,6 +1193,7 @@ class PluginScheduler:
                     {"pid": plugin_id, "err": err},
                 )
                 self._registry.set_status(plugin_id, "error", err)
+                self._registry.set_poll_result(plugin_id, 0, now)
             db.commit()
         except Exception as exc:
             print(f"[plugin-scheduler] DB error for {plugin_id}: {exc}", flush=True)
@@ -1069,14 +1201,19 @@ class PluginScheduler:
         finally:
             db.close()
 
-    def _upsert_devices(self, db: Session, plugin_id: str, devices: list):
+    def _upsert_devices(self, db: Session, plugin_id: str, devices: list) -> int:
+        count = 0
         for dev in devices:
-            mac = (dev.get("mac_address") or "").lower().replace(":", "").strip()
+            # Strip all non-hex characters so both colon and dash separated MACs normalise correctly
+            mac = re.sub(r'[^0-9a-f]', '', (dev.get("mac_address") or "").lower())
             if len(mac) != 12:
                 continue
             mac_fmt = ':'.join(mac[i:i+2] for i in range(0, 12, 2))
             try:
-                # Upsert device (only fields we have; never overwrite user-set names)
+                # Upsert device. Hostname priority (highest→lowest):
+                #   1. User custom_name set → never touch hostname
+                #   2. Device already has a hostname (from probe/ARP/DNS) → keep it
+                #   3. No hostname yet → accept plugin-provided name as fallback only
                 db.execute(text("""
                     INSERT INTO devices (mac_address, ip_address, hostname, is_online, first_seen, last_seen)
                     VALUES (:mac, :ip, :hostname, :online, NOW(), NOW())
@@ -1084,7 +1221,8 @@ class PluginScheduler:
                         ip_address = COALESCE(EXCLUDED.ip_address, devices.ip_address),
                         hostname   = CASE
                                         WHEN devices.custom_name IS NOT NULL THEN devices.hostname
-                                        ELSE COALESCE(EXCLUDED.hostname, devices.hostname)
+                                        WHEN devices.hostname IS NOT NULL AND devices.hostname != '' THEN devices.hostname
+                                        ELSE EXCLUDED.hostname
                                      END,
                         is_online  = EXCLUDED.is_online,
                         last_seen  = NOW()
@@ -1141,9 +1279,11 @@ class PluginScheduler:
                             WHERE mac_address = :mac
                         """), {"mac": mac_fmt, "new_tags": ','.join(new_tags)})
 
+                count += 1
             except Exception as exc:
                 print(f"[plugin-scheduler] upsert failed for {mac_fmt}: {exc}", flush=True)
                 db.rollback()
+        return count
 
 
 # ---------------------------------------------------------------------------

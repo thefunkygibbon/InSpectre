@@ -1,0 +1,175 @@
+{
+  "id": "tplink-omada",
+  "name": "TP-Link Omada",
+  "version": "1.7.0",
+  "author": "InSpectre Community",
+  "description": "Integrates with a TP-Link Omada SDN Controller (v5.13+) using the Open API (OAuth2 client credentials) to discover devices and enrich inventory with client metadata.",
+  "homepage": "https://www.tp-link.com/en/omada-sdn/",
+  "min_inspectre_version": "1.0.0",
+  "icon": null,
+  "capabilities": [
+    "discovery",
+    "presence",
+    "blocking",
+    "enrichment"
+  ],
+  "config_schema": [
+    {
+      "key": "host",
+      "label": "Controller Host",
+      "type": "url",
+      "default": "https://192.168.0.1:8043",
+      "required": true,
+      "help": "Full URL of your Omada Controller including port, e.g. https://192.168.1.1:8043."
+    },
+    {
+      "key": "client_id",
+      "label": "Client ID",
+      "type": "string",
+      "default": "",
+      "required": true,
+      "help": "Client ID from Settings > Platform Integration > New App in your Omada controller."
+    },
+    {
+      "key": "client_secret",
+      "label": "Client Secret",
+      "type": "password",
+      "default": "",
+      "required": true,
+      "help": "Client Secret from Settings > Platform Integration > New App in your Omada controller."
+    },
+    {
+      "key": "site_id",
+      "label": "Site ID",
+      "type": "string",
+      "default": "",
+      "required": true,
+      "help": "Your Omada site ID. Log into the Omada web UI, navigate to your site, then look at the URL: it will be https://controller:8043/#/site/CONTROLLERID/SITEID/... — the SITEID is the second long hex string. Copy and paste it here."
+    },
+    {
+      "key": "verify_ssl",
+      "label": "Verify SSL Certificate",
+      "type": "boolean",
+      "default": false,
+      "required": false,
+      "help": "Disable if your controller uses a self-signed certificate (common for home installs)."
+    }
+  ],
+  "endpoints": {
+    "base_url": "{host}",
+    "auth": "none",
+    "headers": {
+      "Content-Type": "application/json",
+      "Authorization": "AccessToken={access_token}"
+    },
+    "error_check": {
+      "json_path": "errorCode",
+      "success_value": 0,
+      "message_path": "msg"
+    }
+  },
+  "actions": {
+    "get_controller_id": {
+      "description": "Fetch the Omada controller ID required as a path prefix. No auth required.",
+      "method": "GET",
+      "path": "/api/info",
+      "session_extract": {
+        "from": "response_body",
+        "json_path": "result.omadacId",
+        "store_as": "omadacId"
+      }
+    },
+    "get_token": {
+      "description": "Exchange client credentials for a short-lived access token (valid 2 hours).",
+      "depends_on": "get_controller_id",
+      "method": "POST",
+      "path": "/openapi/authorize/token?grant_type=client_credentials",
+      "body": {
+        "client_id": "{client_id}",
+        "client_secret": "{client_secret}",
+        "omadacId": "{omadacId}"
+      },
+      "session_extract": {
+        "from": "response_body",
+        "json_path": "result.accessToken",
+        "store_as": "access_token"
+      }
+    },
+    "get_clients": {
+      "description": "Retrieve currently connected clients for the configured site (online only).",
+      "depends_on": "get_token",
+      "method": "GET",
+      "path": "/openapi/v1/{omadacId}/sites/{site_id}/clients?page=1&pageSize=200",
+      "response_mapping": {
+        "root_path": "result.data",
+        "fields": {
+          "mac": "mac_address",
+          "ip": "ip_address",
+          "name": "hostname",
+          "devName": "hostname",
+          "vendor": "vendor",
+          "wireless": "wireless",
+          "vid": "vlan",
+          "active": "is_online"
+        }
+      }
+    },
+    "get_all_clients": {
+      "description": "Retrieve all clients including recently disconnected (v2 POST endpoint).",
+      "depends_on": "get_token",
+      "method": "POST",
+      "path": "/openapi/v2/{omadacId}/sites/{site_id}/clients",
+      "body": {
+        "page": 1,
+        "pageSize": 200
+      },
+      "response_mapping": {
+        "root_path": "result.data",
+        "fields": {
+          "mac": "mac_address",
+          "ip": "ip_address",
+          "name": "hostname",
+          "devName": "hostname",
+          "vendor": "vendor",
+          "wireless": "wireless",
+          "vid": "vlan",
+          "active": "is_online"
+        }
+      }
+    },
+    "block_client": {
+      "description": "Block a client by MAC address.",
+      "depends_on": "get_token",
+      "method": "POST",
+      "path": "/openapi/v1/{omadacId}/sites/{site_id}/cmd/clients/block",
+      "body": {
+        "mac": "{mac}"
+      }
+    },
+    "unblock_client": {
+      "description": "Unblock a previously blocked client by MAC address.",
+      "depends_on": "get_token",
+      "method": "POST",
+      "path": "/openapi/v1/{omadacId}/sites/{site_id}/cmd/clients/unblock",
+      "body": {
+        "mac": "{mac}"
+      }
+    },
+    "test_connection": {
+      "description": "Verify connectivity and credentials by fetching one page of clients.",
+      "depends_on": "get_token",
+      "method": "GET",
+      "path": "/openapi/v1/{omadacId}/sites/{site_id}/clients?page=1&pageSize=1"
+    }
+  },
+  "event_hooks": {},
+  "data_mapping": {
+    "block_id_field": "mac_address",
+    "tag_fields": ["wireless"]
+  },
+  "polling": {
+    "action": "get_all_clients",
+    "interval_seconds": 60,
+    "run_on_startup": true
+  }
+}

@@ -2,9 +2,18 @@ import { useState, useEffect, useRef } from 'react'
 import {
   ChevronLeft, ChevronDown, ChevronRight, Upload, AlertTriangle,
   CheckCircle, XCircle, ToggleLeft, ToggleRight, Trash2, Eye, EyeOff,
-  ExternalLink, Package, Loader,
+  ExternalLink, Package, Loader, RefreshCw,
 } from 'lucide-react'
 import { api } from '../api'
+
+function relativeTime(iso) {
+  if (!iso) return ''
+  const diff = Math.floor((Date.now() - new Date(iso).getTime()) / 1000)
+  if (diff < 60)  return `${diff}s ago`
+  if (diff < 3600) return `${Math.floor(diff / 60)}m ago`
+  if (diff < 86400) return `${Math.floor(diff / 3600)}h ago`
+  return `${Math.floor(diff / 86400)}d ago`
+}
 
 // ── Capability badge colours ──────────────────────────────────────────────────
 const CAP_COLORS = {
@@ -108,6 +117,13 @@ function PluginCard({ plugin, onOpen, onToggle }) {
           {plugin.status === 'error' && plugin.last_error && (
             <p className="text-xs mt-1.5 truncate" style={{ color: '#ef4444' }}>
               {plugin.last_error}
+            </p>
+          )}
+
+          {plugin.enabled && plugin.last_polled && (
+            <p className="text-xs mt-1" style={{ color: 'var(--color-text-faint)' }}>
+              Last sync: {relativeTime(plugin.last_polled)}
+              {plugin.last_device_count != null && ` · ${plugin.last_device_count} device(s)`}
             </p>
           )}
         </div>
@@ -248,8 +264,8 @@ function ConfigField({ field, value, onChange }) {
 
 // ── Plugin config panel ───────────────────────────────────────────────────────
 
-function PluginConfigPanel({ plugin, config, onChange, onSave, onTest, onBack, onDelete,
-                             saving, testing, testResult, showRawManifest, setShowRawManifest }) {
+function PluginConfigPanel({ plugin, config, onChange, onSave, onTest, onPoll, onBack, onDelete,
+                             saving, testing, testResult, polling, pollResult, showRawManifest, setShowRawManifest }) {
   const manifest = plugin.manifest
 
   return (
@@ -336,8 +352,8 @@ function PluginConfigPanel({ plugin, config, onChange, onSave, onTest, onBack, o
         </div>
       )}
 
-      {/* Save + Test buttons */}
-      <div className="flex gap-2 pt-1">
+      {/* Save + Test + Sync buttons */}
+      <div className="flex gap-2 pt-1 flex-wrap">
         <button onClick={onSave} disabled={saving}
           className="btn-primary flex-1 flex items-center justify-center gap-2 text-sm"
           style={{ opacity: saving ? 0.5 : 1 }}>
@@ -352,7 +368,33 @@ function PluginConfigPanel({ plugin, config, onChange, onSave, onTest, onBack, o
             {testing ? 'Testing…' : 'Test Connection'}
           </button>
         )}
+        {manifest.polling?.action && plugin.enabled && (
+          <button onClick={onPoll} disabled={polling}
+            className="btn-secondary flex items-center gap-2 text-sm"
+            style={{ opacity: polling ? 0.5 : 1 }}
+            title="Trigger a manual device sync right now">
+            {polling ? <Loader size={13} className="animate-spin" /> : <RefreshCw size={13} />}
+            {polling ? 'Syncing…' : 'Sync Now'}
+          </button>
+        )}
       </div>
+
+      {/* Polling status */}
+      {plugin.enabled && plugin.last_polled && (
+        <div className="rounded-lg p-3 text-xs space-y-0.5"
+          style={{ background: 'var(--color-surface-offset)', border: '1px solid var(--color-border)' }}>
+          <div className="flex justify-between">
+            <span style={{ color: 'var(--color-text-muted)' }}>Last sync</span>
+            <span style={{ color: 'var(--color-text)' }}>{relativeTime(plugin.last_polled)}</span>
+          </div>
+          {plugin.last_device_count != null && (
+            <div className="flex justify-between">
+              <span style={{ color: 'var(--color-text-muted)' }}>Devices returned</span>
+              <span style={{ color: 'var(--color-text)' }}>{plugin.last_device_count}</span>
+            </div>
+          )}
+        </div>
+      )}
 
       {/* Test result */}
       {testResult && (
@@ -364,6 +406,23 @@ function PluginConfigPanel({ plugin, config, onChange, onSave, onTest, onBack, o
           }}>
           {testResult.ok ? <CheckCircle size={14} className="flex-shrink-0 mt-0.5" /> : <XCircle size={14} className="flex-shrink-0 mt-0.5" />}
           <p>{testResult.ok ? 'Connection successful' : (testResult.error || 'Connection failed')}</p>
+        </div>
+      )}
+
+      {/* Poll result */}
+      {pollResult && (
+        <div className="rounded-lg p-3 text-xs flex gap-2"
+          style={{
+            background: pollResult.ok ? 'rgba(16,185,129,0.08)' : 'rgba(239,68,68,0.08)',
+            border:     `1px solid ${pollResult.ok ? 'rgba(16,185,129,0.3)' : 'rgba(239,68,68,0.3)'}`,
+            color:      pollResult.ok ? '#10b981' : '#ef4444',
+          }}>
+          {pollResult.ok
+            ? <CheckCircle size={14} className="flex-shrink-0 mt-0.5" />
+            : <XCircle size={14} className="flex-shrink-0 mt-0.5" />}
+          <p>{pollResult.ok
+            ? `Sync complete — ${pollResult.last_device_count ?? 0} device(s) found`
+            : (pollResult.error || pollResult.last_error || 'Sync failed')}</p>
         </div>
       )}
 
@@ -427,6 +486,8 @@ export function PluginsTab() {
   const [saving,           setSaving]           = useState(false)
   const [testing,          setTesting]          = useState(false)
   const [testResult,       setTestResult]       = useState(null)
+  const [polling,          setPolling]          = useState(false)
+  const [pollResult,       setPollResult]       = useState(null)
   const [uploading,        setUploading]        = useState(false)
   const [uploadError,      setUploadError]      = useState(null)
   const [fetchError,       setFetchError]       = useState(null)
@@ -478,6 +539,17 @@ export function PluginsTab() {
     try { setTestResult(await api.testPlugin(selectedId)) }
     catch (e) { setTestResult({ ok: false, error: e.message }) }
     finally { setTesting(false) }
+  }
+
+  async function handlePoll() {
+    setPolling(true)
+    setPollResult(null)
+    try {
+      const r = await api.pollPlugin(selectedId)
+      setPollResult(r)
+      await loadPlugins()
+    } catch (e) { setPollResult({ ok: false, error: e.message }) }
+    finally { setPolling(false) }
   }
 
   async function handleToggle(pluginId, currentEnabled) {
@@ -532,11 +604,14 @@ export function PluginsTab() {
         onChange={handleChange}
         onSave={handleSave}
         onTest={handleTest}
+        onPoll={handlePoll}
         onBack={() => setSelectedId(null)}
         onDelete={handleDelete}
         saving={saving}
         testing={testing}
         testResult={testResult}
+        polling={polling}
+        pollResult={pollResult}
         showRawManifest={showRawManifest}
         setShowRawManifest={setShowRawManifest}
       />
