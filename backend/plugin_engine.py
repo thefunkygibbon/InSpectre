@@ -344,14 +344,13 @@ class PluginRegistry:
             raise PluginValidationError(
                 f"Plugin ID '{pid}' conflicts with a built-in plugin"
             )
-        existing = self._plugins.get(pid, {})
         self._plugins[pid] = {
             "manifest":   manifest,
-            "config":     existing.get("config") or {},
+            "config":     {},
             "source":     "uploaded",
-            "enabled":    existing.get("enabled", False),
-            "status":     existing.get("status", "disabled"),
-            "last_error": existing.get("last_error"),
+            "enabled":    False,
+            "status":     "disabled",
+            "last_error": None,
         }
         return pid
 
@@ -699,6 +698,12 @@ class PluginRunner:
                 for part in (jpath or key).split("."):
                     if isinstance(val, dict):
                         val = val.get(part)
+                    elif isinstance(val, list):
+                        try:
+                            val = val[int(part)]
+                        except (ValueError, IndexError):
+                            val = None
+                            break
                     else:
                         val = None
                         break
