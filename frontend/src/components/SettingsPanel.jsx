@@ -192,6 +192,7 @@ export function SettingsPanel({ onClose, onSettingChange }) {
   const restoreInputRef = useRef(null)
   const [dragonsOpen,   setDragonsOpen]   = useState(false)
   const [restarting,    setRestarting]    = useState({})  // { probe: bool, backend: bool }
+  const [recheckNames,  setRecheckNames]  = useState({ running: false, result: null })
   const fileInputRef = useRef(null)
   const [detectedInterface, setDetectedInterface] = useState('')
 
@@ -486,6 +487,41 @@ export function SettingsPanel({ onClose, onSettingChange }) {
                   {settingsByKeys(['enable_hostname_resolution','hostname_cooldown_hours']).map(s => (
                     <SettingRow key={s.key} s={s} dirty={dirty} onchange={handleChange} />
                   ))}
+                  <div className="card p-4 space-y-3">
+                    <p className="text-xs" style={{ color: 'var(--color-text-faint)' }}>
+                      Re-run the full 6-step hostname resolution chain (dig → gethostbyaddr → host → nslookup → avahi → nmblookup)
+                      for every device. Names set manually (custom name) are never overwritten.
+                      Plugin-provided names are used only as a last resort by the probe during normal discovery — this button will
+                      overwrite any plugin name with a properly resolved hostname if one is found.
+                    </p>
+                    <div className="flex items-center gap-3 flex-wrap">
+                      <button
+                        onClick={async () => {
+                          setRecheckNames({ running: true, result: null })
+                          try {
+                            const r = await api.resolveAllNames()
+                            setRecheckNames({ running: false, result: r })
+                          } catch {
+                            setRecheckNames({ running: false, result: { error: true } })
+                          }
+                        }}
+                        disabled={recheckNames.running}
+                        className="btn-secondary flex items-center gap-2 text-sm"
+                        style={{ opacity: recheckNames.running ? 0.5 : 1 }}>
+                        <RotateCcw size={12} />
+                        {recheckNames.running ? 'Re-checking…' : 'Re-check all device names'}
+                      </button>
+                      {recheckNames.result && !recheckNames.result.error && (
+                        <span className="text-xs" style={{ color: 'var(--color-text-muted)' }}>
+                          Updated {recheckNames.result.updated} of {recheckNames.result.total} devices
+                          {recheckNames.result.failed > 0 && ` (${recheckNames.result.failed} probe errors)`}
+                        </span>
+                      )}
+                      {recheckNames.result?.error && (
+                        <span className="text-xs" style={{ color: '#ef4444' }}>Failed — check backend logs</span>
+                      )}
+                    </div>
+                  </div>
 
                   <p className="text-xs font-semibold" style={{ color: 'var(--color-text-muted)', paddingTop: '4px' }}>Port Scanning</p>
                   {settingsByKeys(['enable_port_scanning','port_scan_method','port_scan_workers','gateway_scan_workers','enable_service_fingerprinting']).map(s => (

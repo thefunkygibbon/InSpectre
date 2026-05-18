@@ -89,6 +89,7 @@ export const api = {
   updateIdentity:  (mac, body)  => request('PATCH', `/devices/${mac}/identity`, body),
   updateMetadata:  (mac, body)  => request('PATCH', `/devices/${mac}/metadata`, body),
   resolveName:      (mac) => request('POST', `/devices/${mac}/resolve-name`),
+  resolveAllNames:  ()    => request('POST', `/devices/resolve-all-names`),
   rescanDevice:     (mac) => request('POST', `/devices/${mac}/rescan`),
   resetBaseline:    (mac) => request('POST', `/devices/${mac}/reset-baseline`),
   fingerbankLookup: (mac) => request('POST', `/devices/${mac}/fingerbank/lookup`),

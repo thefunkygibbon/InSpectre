@@ -3010,15 +3010,51 @@ def acknowledge_device(mac: str, db: Session = Depends(get_db)):
 
 
 @app.post("/devices/{mac}/resolve-name")
-def resolve_name(mac: str, db: Session = Depends(get_db)):
+async def resolve_name(mac: str, db: Session = Depends(get_db)):
     d = db.get(Device, mac.lower())
     if not d:
         raise HTTPException(404, "Device not found")
-    name = _resolve_hostname(d.ip_address)
-    if name:
+    ip = d.ip_address
+    name = None
+    if ip:
+        try:
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                r = await client.get(f"{PROBE_URL}/resolve/{ip}")
+                if r.status_code == 200:
+                    name = r.json().get("hostname")
+        except Exception:
+            pass
+    if name and not d.custom_name:
         d.hostname = name
         db.commit(); db.refresh(d)
     return {"mac": mac, "resolved": name, "device": _to_dict(d)}
+
+
+@app.post("/devices/resolve-all-names")
+async def resolve_all_names(db: Session = Depends(get_db)):
+    devices = db.query(Device).filter(
+        Device.is_ignored == False,
+        Device.ip_address != None,
+        Device.ip_address != "",
+    ).all()
+    updated = 0
+    failed = 0
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        for d in devices:
+            ip = d.ip_address
+            if not ip:
+                continue
+            try:
+                r = await client.get(f"{PROBE_URL}/resolve/{ip}")
+                if r.status_code == 200:
+                    name = r.json().get("hostname")
+                    if name and not d.custom_name:
+                        d.hostname = name
+                        updated += 1
+            except Exception:
+                failed += 1
+    db.commit()
+    return {"updated": updated, "failed": failed, "total": len(devices)}
 
 
 @app.post("/devices/{mac}/rescan")

@@ -1208,6 +1208,10 @@ class PluginScheduler:
             mac = re.sub(r'[^0-9a-f]', '', (dev.get("mac_address") or "").lower())
             if len(mac) != 12:
                 continue
+            # Skip devices with no IP — they can't be scanned or interacted with,
+            # and the probe will add them properly once they appear on the network
+            if not dev.get("ip_address"):
+                continue
             mac_fmt = ':'.join(mac[i:i+2] for i in range(0, 12, 2))
             try:
                 # Upsert device. Hostname priority (highest→lowest):
