@@ -203,6 +203,9 @@ Contributions are welcome. Please open an issue to discuss a change before submi
 
 ---
 
-## License
+## Licence
 
-MIT — see [LICENSE](LICENSE) for details.
+InSpectre is dual-licensed:
+
+- **Open Source (AGPL-3.0)** — Free for personal use, home labs, and open-source projects. See [LICENSE](LICENSE).
+- **Commercial** — Required for embedding in proprietary products or offering as a hosted service. See [LICENSE-COMMERCIAL.md](LICENSE-COMMERCIAL.md) or contact [your-email].
