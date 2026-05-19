@@ -583,8 +583,11 @@ DEFAULT_SETTINGS = {
     # Phase 8 — speed test
     "speedtest_schedule":      ("disabled", "Scheduled speed test interval. Options: disabled, 30m, 1h, 6h, 24h."),
     # Phase 8 — auto-block
-    "auto_block_new_devices":    ("false", "Automatically ARP-block newly discovered devices until manually approved."),
+    "auto_block_new_devices":    ("false", "Automatically block newly discovered devices until manually approved."),
     "auto_block_vuln_severity":  ("none",  "Minimum vuln severity to trigger auto-block. Options: none, medium, high, critical."),
+    # Blocking method
+    "block_method":    ("arp",  "Active blocking method: arp (probe ARP poisoning), dns (AdGuard Home / Pi-hole), infrastructure (TP-Link Omada / UniFi)."),
+    "block_plugin_id": ("",    "Plugin ID used for blocking when block_method is not arp. Must be an enabled plugin with blocking capability and block_client/unblock_client actions defined."),
     # Phase 9 — device grouping
     "auto_group_by_hostname":    ("true",  "Automatically group devices with the same hostname as the same physical device on a different interface (e.g. laptop switching between WiFi and Ethernet). When disabled, a suggestion event is written instead."),
     # Network / probe identity
@@ -1217,7 +1220,7 @@ async def _notification_loop():
                         dispatches.append(("device.new", "New Device",
                                            f"{name} ({ip}) appeared on the network", mac))
                         if auto_block_new:
-                            devices_to_block.append(mac)
+                            devices_to_block.append((mac, ip))
                         if vuln_on_new and ip:
                             scripts_s = db.get(Setting, "vuln_scan_templates")
                             vuln_scans.append((mac, ip, (scripts_s.value or "").strip() if scripts_s else ""))
@@ -1262,7 +1265,7 @@ async def _notification_loop():
                         if auto_block_sev != "none":
                             try:
                                 if SEV_ORDER.index(severity) >= SEV_ORDER.index(auto_block_sev):
-                                    devices_to_block.append(mac)
+                                    devices_to_block.append((mac, ip))
                             except ValueError:
                                 pass
 
@@ -1357,17 +1360,17 @@ async def _notification_loop():
             for mac, ip, scripts in vuln_scans:
                 asyncio.ensure_future(_run_single_vuln_scan(mac, ip, scripts))
 
-            for mac in devices_to_block:
+            for mac, ip in devices_to_block:
                 try:
-                    async with httpx.AsyncClient(timeout=10) as c:
-                        await c.post(f"{PROBE_URL}/block/{mac}")
+                    await _execute_block_bg(mac, ip, "block")
                     db2 = SessionLocal()
                     try:
                         db2.execute(text("UPDATE devices SET is_blocked=true WHERE mac_address=:mac"), {"mac": mac})
-                        _add_event(db2, mac, "blocked", {"reason": "auto"})
+                        _add_event(db2, mac, "blocked", {"reason": "auto", "ip": ip})
                         db2.commit()
                     finally:
                         db2.close()
+                    asyncio.ensure_future(_plugin_event_bus.notify("device.blocked", {"mac": mac, "ip": ip or ""}))
                     print(f"[notify] Auto-blocked {mac}", flush=True)
                 except Exception as exc:
                     print(f"[notify] Auto-block {mac}: {exc}", flush=True)
@@ -4139,6 +4142,18 @@ def update_setting(key: str, payload: SettingUpdate, db: Session = Depends(get_d
     s = db.get(Setting, key)
     if not s:
         raise HTTPException(404, "Setting not found")
+    if key == "block_plugin_id" and payload.value:
+        plugin = _plugin_registry.get(payload.value)
+        if not plugin:
+            raise HTTPException(400, f"Plugin '{payload.value}' not found")
+        if not plugin.get("enabled"):
+            raise HTTPException(400, f"Plugin '{payload.value}' is not enabled")
+        caps = plugin["manifest"].get("capabilities", [])
+        if "blocking" not in caps:
+            raise HTTPException(400, f"Plugin '{payload.value}' does not declare the 'blocking' capability")
+        actions = plugin["manifest"].get("actions") or {}
+        if "block_client" not in actions or "unblock_client" not in actions:
+            raise HTTPException(400, f"Plugin '{payload.value}' must define both block_client and unblock_client actions")
     s.value = payload.value
     db.commit()
     return {"key": key, "value": s.value}
@@ -4293,42 +4308,94 @@ def _redact_plugin_config(manifest: dict, config: dict) -> dict:
     return redacted
 
 
-async def _plugin_block_hook(mac: str, ip: Optional[str], action: str):
-    """Fire plugin block/unblock actions for any enabled plugin with 'blocking' capability."""
-    for plugin_info in _plugin_registry.list_all():
-        if not plugin_info.get("enabled"):
-            continue
-        caps = plugin_info["manifest"].get("capabilities", [])
-        if "blocking" not in caps:
-            continue
-        pid = plugin_info["id"]
-        actions = plugin_info["manifest"].get("actions") or {}
-        action_name = action if action in actions else None
-        if not action_name:
-            action_name = "block_host" if action == "block" else "unblock_host"
-            if action_name not in actions:
-                continue
-        # Look up any plugin-specific device ID stored in plugin_device_data
-        plugin_id_val = None
-        _db = SessionLocal()
+def _get_block_method_settings(db: Session) -> tuple[str, str]:
+    method_row    = db.get(Setting, "block_method")
+    plugin_id_row = db.get(Setting, "block_plugin_id")
+    method    = (method_row.value    if method_row    else None) or "arp"
+    plugin_id = (plugin_id_row.value if plugin_id_row else None) or ""
+    return method, plugin_id
+
+
+async def _execute_block(mac: str, ip: Optional[str], db: Session, action: str) -> None:
+    """
+    Unified blocking coordinator (synchronous path, raises HTTPException on failure).
+    action: "block" or "unblock"
+    """
+    method, plugin_id = _get_block_method_settings(db)
+
+    if method == "arp":
         try:
-            row = _db.execute(
-                text("SELECT data FROM plugin_device_data WHERE plugin_id = :pid AND mac_address = :mac"),
-                {"pid": pid, "mac": mac},
-            ).fetchone()
-            if row and isinstance(row.data, dict):
-                plugin_id_val = row.data.get("id") or row.data.get("device_id")
-        except Exception:
-            pass
-        finally:
-            _db.close()
-        ctx = {"mac": mac, "ip": ip or "", "plugin_device_id": plugin_id_val or ""}
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                if action == "block":
+                    resp = await client.post(f"{PROBE_URL}/block/{mac.lower()}")
+                else:
+                    resp = await client.delete(f"{PROBE_URL}/block/{mac.lower()}")
+                if resp.status_code >= 400:
+                    raise HTTPException(502, f"Probe error: {resp.text[:200]}")
+        except httpx.ConnectError:
+            raise HTTPException(502, f"Cannot reach probe at {PROBE_URL}")
+    else:
+        if not plugin_id:
+            raise HTTPException(400, "block_plugin_id is not configured")
+        plugin = _plugin_registry.get(plugin_id)
+        if not plugin or not plugin.get("enabled"):
+            raise HTTPException(400, f"Blocking plugin '{plugin_id}' is not enabled")
+        action_name = "block_client" if action == "block" else "unblock_client"
+        if action_name not in (plugin["manifest"].get("actions") or {}):
+            raise HTTPException(400, f"Plugin '{plugin_id}' has no '{action_name}' action")
+        mac_lower = mac.lower()
+        mac_dash  = mac_lower.replace(":", "-").upper()
+        print(f"[block-coord] {action} via plugin '{plugin_id}': mac={mac_lower} mac_dash={mac_dash} ip={ip}", flush=True)
+        result = await _plugin_runner.execute_action(
+            plugin_id, action_name, {"mac": mac_lower, "mac_dash": mac_dash, "ip": ip or ""}
+        )
+        print(f"[block-coord] {action} result: ok={result.get('ok')} error={result.get('error')} status={result.get('status_code')} api_code={result.get('api_error_code')}", flush=True)
+        if not result.get("ok"):
+            raise HTTPException(502, f"Plugin block failed: {result.get('error', 'unknown error')}")
+
+
+async def _execute_block_bg(mac: str, ip: Optional[str], action: str) -> None:
+    """
+    Blocking coordinator for background loops — logs failures instead of raising.
+    action: "block" or "unblock"
+    """
+    db = SessionLocal()
+    try:
+        method, plugin_id = _get_block_method_settings(db)
+    finally:
+        db.close()
+
+    if method == "arp":
         try:
-            result = await _plugin_runner.execute_action(pid, action_name, ctx)
-            if not result.get("ok"):
-                print(f"[plugin-block] {pid}.{action_name} failed: {result.get('error')}", flush=True)
+            async with httpx.AsyncClient(timeout=10) as c:
+                if action == "block":
+                    await c.post(f"{PROBE_URL}/block/{mac.lower()}")
+                else:
+                    await c.delete(f"{PROBE_URL}/block/{mac.lower()}")
         except Exception as exc:
-            print(f"[plugin-block] {pid}: {exc}", flush=True)
+            print(f"[block-coord] ARP {action} {mac}: {exc}", flush=True)
+    else:
+        if not plugin_id:
+            print(f"[block-coord] block_plugin_id not configured — skipping {action} for {mac}", flush=True)
+            return
+        plugin = _plugin_registry.get(plugin_id)
+        if not plugin or not plugin.get("enabled"):
+            print(f"[block-coord] Plugin '{plugin_id}' not enabled — skipping {action} for {mac}", flush=True)
+            return
+        action_name = "block_client" if action == "block" else "unblock_client"
+        if action_name not in (plugin["manifest"].get("actions") or {}):
+            print(f"[block-coord] Plugin '{plugin_id}' has no '{action_name}' action — skipping {mac}", flush=True)
+            return
+        mac_lower = mac.lower()
+        mac_dash  = mac_lower.replace(":", "-").upper()
+        try:
+            result = await _plugin_runner.execute_action(
+                plugin_id, action_name, {"mac": mac_lower, "mac_dash": mac_dash, "ip": ip or ""}
+            )
+            if not result.get("ok"):
+                print(f"[block-coord] Plugin {action} {mac}: {result.get('error')}", flush=True)
+        except Exception as exc:
+            print(f"[block-coord] Plugin {action} {mac}: {exc}", flush=True)
 
 
 def _plugin_to_dict(plugin_info: dict) -> dict:
@@ -5633,19 +5700,11 @@ async def block_device(mac: str, db: Session = Depends(get_db)):
     d = db.get(Device, mac.lower())
     if not d:
         raise HTTPException(404, "Device not found")
-    try:
-        async with httpx.AsyncClient(timeout=15.0) as client:
-            resp = await client.post(f"{PROBE_URL}/block/{mac.lower()}")
-            if resp.status_code >= 400:
-                body = resp.text
-                raise HTTPException(502, f"Probe error: {body[:200]}")
-    except httpx.ConnectError:
-        raise HTTPException(502, f"Cannot reach probe at {PROBE_URL}")
+    await _execute_block(mac, d.ip_address, db, "block")
     d.is_blocked = True
     _add_event(db, mac.lower(), "blocked", {"ip": d.ip_address})
     db.commit(); db.refresh(d)
-    # Plugin blocking hook (fire-and-forget)
-    asyncio.ensure_future(_plugin_block_hook(mac.lower(), d.ip_address, "block"))
+    asyncio.ensure_future(_plugin_event_bus.notify("device.blocked", {"mac": mac.lower(), "ip": d.ip_address or ""}))
     return _to_dict(d)
 
 
@@ -5654,18 +5713,11 @@ async def unblock_device(mac: str, db: Session = Depends(get_db)):
     d = db.get(Device, mac.lower())
     if not d:
         raise HTTPException(404, "Device not found")
-    try:
-        async with httpx.AsyncClient(timeout=15.0) as client:
-            resp = await client.delete(f"{PROBE_URL}/block/{mac.lower()}")
-            if resp.status_code >= 400:
-                body = resp.text
-                raise HTTPException(502, f"Probe error: {body[:200]}")
-    except httpx.ConnectError:
-        raise HTTPException(502, f"Cannot reach probe at {PROBE_URL}")
+    await _execute_block(mac, d.ip_address, db, "unblock")
     d.is_blocked = False
     _add_event(db, mac.lower(), "unblocked", {"ip": d.ip_address})
     db.commit(); db.refresh(d)
-    asyncio.ensure_future(_plugin_block_hook(mac.lower(), d.ip_address, "unblock"))
+    asyncio.ensure_future(_plugin_event_bus.notify("device.unblocked", {"mac": mac.lower(), "ip": d.ip_address or ""}))
     return _to_dict(d)
 
 
@@ -6847,27 +6899,21 @@ async def _block_schedule_loop():
 
                     if should_block and not is_sched_blocked:
                         # Need to block
-                        try:
-                            async with httpx.AsyncClient(timeout=8.0) as client:
-                                await client.post(f"{PROBE_URL}/block/{mac.lower()}")
-                        except Exception:
-                            pass
+                        await _execute_block_bg(mac, ip, "block")
                         db.execute(text(
                             "UPDATE devices SET is_blocked = TRUE, is_schedule_blocked = TRUE WHERE mac_address = :mac"
                         ), {"mac": mac})
                         _add_event(db, mac, "blocked", {"ip": ip, "reason": "schedule"})
+                        asyncio.ensure_future(_plugin_event_bus.notify("device.blocked", {"mac": mac, "ip": ip or ""}))
 
                     elif not should_block and is_sched_blocked:
                         # Schedule says unblock (only if blocked by schedule, not manually)
-                        try:
-                            async with httpx.AsyncClient(timeout=8.0) as client:
-                                await client.delete(f"{PROBE_URL}/block/{mac.lower()}")
-                        except Exception:
-                            pass
+                        await _execute_block_bg(mac, ip, "unblock")
                         db.execute(text(
                             "UPDATE devices SET is_blocked = FALSE, is_schedule_blocked = FALSE WHERE mac_address = :mac"
                         ), {"mac": mac})
                         _add_event(db, mac, "unblocked", {"ip": ip, "reason": "schedule_end"})
+                        asyncio.ensure_future(_plugin_event_bus.notify("device.unblocked", {"mac": mac, "ip": ip or ""}))
 
                 db.commit()
             finally:

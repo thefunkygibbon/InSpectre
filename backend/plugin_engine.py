@@ -31,7 +31,7 @@ BUILTIN_DIR = os.path.join(os.path.dirname(__file__), "plugins", "builtin")
 
 VALID_CAPABILITIES = frozenset([
     "discovery", "blocking", "enrichment", "dns",
-    "presence", "traffic", "export", "notification",
+    "presence", "traffic", "export", "notification", "firewall",
 ])
 VALID_FIELD_TYPES = frozenset([
     "string", "password", "integer", "boolean",
@@ -40,6 +40,7 @@ VALID_FIELD_TYPES = frozenset([
 VALID_EVENT_KEYS = frozenset([
     "device.new", "device.online", "device.offline",
     "port.opened", "vuln.found", "vuln.critical", "vuln.high",
+    "device.blocked", "device.unblocked",
 ])
 VALID_AUTH_METHODS = frozenset([
     "none", "basic", "bearer", "cookie",
@@ -1166,8 +1167,9 @@ class PluginScheduler:
                 plugin_info = self._registry.get(plugin_id)
                 caps = set((plugin_info or {}).get("manifest", {}).get("capabilities", []))
                 upserted = 0
+                has_presence = "presence" in caps
                 if devices and caps & {"discovery", "presence"}:
-                    upserted = self._upsert_devices(db, plugin_id, devices)
+                    upserted = self._upsert_devices(db, plugin_id, devices, has_presence)
                 print(
                     f"[plugin-scheduler] {plugin_id}: poll OK — {len(devices)} device(s) returned,"
                     f" {upserted} upserted",
@@ -1201,7 +1203,7 @@ class PluginScheduler:
         finally:
             db.close()
 
-    def _upsert_devices(self, db: Session, plugin_id: str, devices: list) -> int:
+    def _upsert_devices(self, db: Session, plugin_id: str, devices: list, has_presence: bool = True) -> int:
         count = 0
         for dev in devices:
             # Strip all non-hex characters so both colon and dash separated MACs normalise correctly
@@ -1218,24 +1220,43 @@ class PluginScheduler:
                 #   1. User custom_name set → never touch hostname
                 #   2. Device already has a hostname (from probe/ARP/DNS) → keep it
                 #   3. No hostname yet → accept plugin-provided name as fallback only
-                db.execute(text("""
-                    INSERT INTO devices (mac_address, ip_address, hostname, is_online, first_seen, last_seen)
-                    VALUES (:mac, :ip, :hostname, :online, NOW(), NOW())
-                    ON CONFLICT (mac_address) DO UPDATE SET
-                        ip_address = COALESCE(EXCLUDED.ip_address, devices.ip_address),
-                        hostname   = CASE
-                                        WHEN devices.custom_name IS NOT NULL THEN devices.hostname
-                                        WHEN devices.hostname IS NOT NULL AND devices.hostname != '' THEN devices.hostname
-                                        ELSE EXCLUDED.hostname
-                                     END,
-                        is_online  = EXCLUDED.is_online,
-                        last_seen  = NOW()
-                """), {
-                    "mac":      mac_fmt,
-                    "ip":       dev.get("ip_address"),
-                    "hostname": dev.get("hostname"),
-                    "online":   bool(dev.get("is_online", True)),
-                })
+                online_val = bool(dev.get("is_online")) if has_presence else False
+                if has_presence:
+                    db.execute(text("""
+                        INSERT INTO devices (mac_address, ip_address, hostname, is_online, first_seen, last_seen)
+                        VALUES (:mac, :ip, :hostname, :online, NOW(), NOW())
+                        ON CONFLICT (mac_address) DO UPDATE SET
+                            ip_address = COALESCE(EXCLUDED.ip_address, devices.ip_address),
+                            hostname   = CASE
+                                            WHEN devices.custom_name IS NOT NULL THEN devices.hostname
+                                            WHEN devices.hostname IS NOT NULL AND devices.hostname != '' THEN devices.hostname
+                                            ELSE EXCLUDED.hostname
+                                         END,
+                            is_online  = EXCLUDED.is_online,
+                            last_seen  = NOW()
+                    """), {
+                        "mac":      mac_fmt,
+                        "ip":       dev.get("ip_address"),
+                        "hostname": dev.get("hostname"),
+                        "online":   online_val,
+                    })
+                else:
+                    db.execute(text("""
+                        INSERT INTO devices (mac_address, ip_address, hostname, is_online, first_seen, last_seen)
+                        VALUES (:mac, :ip, :hostname, false, NOW(), NOW())
+                        ON CONFLICT (mac_address) DO UPDATE SET
+                            ip_address = COALESCE(EXCLUDED.ip_address, devices.ip_address),
+                            hostname   = CASE
+                                            WHEN devices.custom_name IS NOT NULL THEN devices.hostname
+                                            WHEN devices.hostname IS NOT NULL AND devices.hostname != '' THEN devices.hostname
+                                            ELSE EXCLUDED.hostname
+                                         END,
+                            last_seen  = NOW()
+                    """), {
+                        "mac":      mac_fmt,
+                        "ip":       dev.get("ip_address"),
+                        "hostname": dev.get("hostname"),
+                    })
 
                 # Store full enrichment payload in plugin_device_data
                 enrichment = {k: v for k, v in dev.items() if k not in INSPECTRE_DEVICE_FIELDS}

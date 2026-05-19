@@ -11,7 +11,8 @@
     "discovery",
     "enrichment",
     "dns",
-    "traffic"
+    "traffic",
+    "blocking"
   ],
   "config_schema": [
     {
@@ -53,6 +54,14 @@
       "default": true,
       "required": false,
       "help": "Disable if your Pi-hole uses a self-signed HTTPS certificate."
+    },
+    {
+      "key": "block_group_id",
+      "label": "Block Group ID",
+      "type": "integer",
+      "default": 1,
+      "required": false,
+      "help": "Pi-hole group ID to assign blocked clients to. Create a dedicated group in Pi-hole (Settings → Groups) with a blocklist that blocks all traffic, then enter its numeric ID here. Default: 1."
     }
   ],
   "endpoints": {
@@ -115,6 +124,26 @@
       "depends_on": "login",
       "method": "GET",
       "path": "/api/dns/blocking"
+    },
+    "block_client": {
+      "description": "Block a client by assigning it to the configured block group in Pi-hole. Requires a group whose ID matches block_group_id to exist in Pi-hole with an appropriate blocklist.",
+      "depends_on": "login",
+      "method": "PUT",
+      "path": "/api/clients/{ip}",
+      "body": {
+        "comment": "Blocked by InSpectre",
+        "groups": [1]
+      }
+    },
+    "unblock_client": {
+      "description": "Unblock a client by returning it to Pi-hole's default group (group 0).",
+      "depends_on": "login",
+      "method": "PUT",
+      "path": "/api/clients/{ip}",
+      "body": {
+        "comment": "Managed by InSpectre",
+        "groups": [0]
+      }
     }
   },
   "event_hooks": {},

@@ -105,7 +105,7 @@ const SETTING_META = {
 
   // Scanner tab — auto-block security responses
   auto_block_new_devices:   { label: 'Auto-Block New Devices', type: 'toggle', tab: 'scanner',
-    description: 'Automatically ARP-block any newly discovered device until it is manually approved.' },
+    description: 'Automatically block any newly discovered device until it is manually approved. Uses the active block method below.' },
   auto_block_vuln_severity: { label: 'Auto-Block on Vulnerability', type: 'select', tab: 'scanner',
     options: [
       { value: 'none',     label: 'Disabled' },
@@ -113,7 +113,10 @@ const SETTING_META = {
       { value: 'high',     label: 'High and above' },
       { value: 'critical', label: 'Critical only' },
     ],
-    description: 'Automatically ARP-block a device when a vulnerability scan finds issues at or above the selected severity.' },
+    description: 'Automatically block a device when a vulnerability scan finds issues at or above the selected severity. Uses the active block method below.' },
+  // Blocking method (custom UI renders these)
+  block_method:    { tab: 'scanner' },
+  block_plugin_id: { tab: 'scanner' },
 
   // Phase 9 — device grouping
   auto_group_by_hostname: { label: 'Auto-group by Hostname', type: 'toggle', tab: 'scanner',
@@ -195,12 +198,17 @@ export function SettingsPanel({ onClose, onSettingChange }) {
   const [recheckNames,  setRecheckNames]  = useState({ running: false, result: null })
   const fileInputRef = useRef(null)
   const [detectedInterface, setDetectedInterface] = useState('')
+  const [blockPlugins,      setBlockPlugins]      = useState([])
+  const [blockPluginError,  setBlockPluginError]  = useState('')
 
   useEffect(() => {
     api.getSettings().then(setSettings).catch(() => {})
     api.getFingerprintStats().then(setFpStats).catch(() => {})
     api.setupNetworkInfo().then(info => {
       if (info?.interface) setDetectedInterface(info.interface)
+    }).catch(() => {})
+    api.listPlugins().then(plugins => {
+      setBlockPlugins(plugins.filter(p => p.capabilities?.includes('blocking')))
     }).catch(() => {})
   }, [])
 
@@ -211,9 +219,19 @@ export function SettingsPanel({ onClose, onSettingChange }) {
 
   async function handleSave() {
     setSaving(true)
-    await Promise.all(
-      Object.entries(dirty).map(([key, value]) => api.updateSetting(key, value))
-    )
+    setBlockPluginError('')
+    try {
+      await Promise.all(
+        Object.entries(dirty).map(([key, value]) => api.updateSetting(key, value))
+      )
+    } catch (e) {
+      const msg = e?.message || String(e)
+      if (msg.includes('block_plugin') || dirty.block_plugin_id !== undefined) {
+        setBlockPluginError(msg.replace(/^.*\d+\s*/, ''))
+      }
+      setSaving(false)
+      return
+    }
     // Push scanner settings to the probe immediately (no need to wait for next scan cycle)
     if (activeTab === 'scanner') {
       api.applySettings().catch(() => {})
@@ -441,6 +459,100 @@ export function SettingsPanel({ onClose, onSettingChange }) {
                 {settingsByKeys(['auto_block_new_devices','auto_block_vuln_severity']).map(s => (
                   <SettingRow key={s.key} s={s} dirty={dirty} onchange={handleChange} />
                 ))}
+
+                {/* Blocking Method — custom UI */}
+                {(() => {
+                  const currentMethod   = val('block_method') || 'arp'
+                  const currentPluginId = val('block_plugin_id') || ''
+
+                  // Derive which methods have a qualifying plugin
+                  const dnsPlugins   = blockPlugins.filter(p => p.capabilities?.includes('dns'))
+                  const fwPlugins    = blockPlugins.filter(p => p.capabilities?.includes('firewall'))
+                  const infraPlugins = blockPlugins.filter(p =>
+                    !p.capabilities?.includes('dns') && !p.capabilities?.includes('firewall')
+                  )
+
+                  const methodOptions = [
+                    { value: 'arp',            label: 'ARP Poisoning (probe-native)',           always: true  },
+                    { value: 'dns',            label: 'DNS Block (AdGuard Home / Pi-hole)',      always: false, plugins: dnsPlugins   },
+                    { value: 'firewall',       label: 'Firewall Rule (OPNsense / pfSense)',      always: false, plugins: fwPlugins    },
+                    { value: 'infrastructure', label: 'Infrastructure (TP-Link Omada / UniFi)', always: false, plugins: infraPlugins },
+                  ].filter(o => o.always || o.plugins.length > 0)
+
+                  const pluginsForMethod = currentMethod === 'arp' ? [] :
+                    methodOptions.find(o => o.value === currentMethod)?.plugins ?? []
+
+                  const selectedPlugin = blockPlugins.find(p => p.id === currentPluginId)
+                  const pluginUnhealthy = selectedPlugin && selectedPlugin.status === 'error'
+
+                  return (
+                    <div className="space-y-2 pt-1">
+                      <p className="text-xs font-semibold pt-1" style={{ color: 'var(--color-text-muted)' }}>Blocking Method</p>
+
+                      {/* Method selector */}
+                      <div className="space-y-1">
+                        <label className="text-xs" style={{ color: 'var(--color-text-muted)' }}>Method</label>
+                        <select
+                          className="w-full rounded-lg px-3 py-2 text-sm"
+                          style={{ background: 'var(--color-surface-offset)', border: '1px solid var(--color-border)', color: 'var(--color-text)' }}
+                          value={currentMethod}
+                          onChange={e => {
+                            handleChange('block_method', e.target.value)
+                            handleChange('block_plugin_id', '')
+                            setBlockPluginError('')
+                          }}
+                        >
+                          {methodOptions.map(o => (
+                            <option key={o.value} value={o.value}>{o.label}</option>
+                          ))}
+                        </select>
+                        <p className="text-xs" style={{ color: 'var(--color-text-faint)' }}>
+                          {currentMethod === 'arp'
+                            ? 'The probe uses ARP poisoning to redirect traffic. No plugin required.'
+                            : 'Only methods with an enabled, configured blocking plugin are shown.'}
+                        </p>
+                      </div>
+
+                      {/* Plugin selector (hidden for ARP) */}
+                      {currentMethod !== 'arp' && (
+                        <div className="space-y-1">
+                          <label className="text-xs" style={{ color: 'var(--color-text-muted)' }}>Blocking Plugin</label>
+                          {pluginsForMethod.length === 0 ? (
+                            <p className="text-xs rounded-lg px-3 py-2"
+                              style={{ background: 'rgba(245,158,11,0.08)', border: '1px solid rgba(245,158,11,0.3)', color: '#d97706' }}>
+                              No enabled plugin found for the selected method. Enable and configure a qualifying plugin in the Plugins tab first.
+                            </p>
+                          ) : (
+                            <select
+                              className="w-full rounded-lg px-3 py-2 text-sm"
+                              style={{ background: 'var(--color-surface-offset)', border: '1px solid var(--color-border)', color: 'var(--color-text)' }}
+                              value={currentPluginId}
+                              onChange={e => { handleChange('block_plugin_id', e.target.value); setBlockPluginError('') }}
+                            >
+                              <option value="">— select plugin —</option>
+                              {pluginsForMethod.map(p => (
+                                <option key={p.id} value={p.id}>{p.name} ({p.status})</option>
+                              ))}
+                            </select>
+                          )}
+                          {blockPluginError && (
+                            <p className="text-xs rounded-lg px-3 py-2"
+                              style={{ background: 'rgba(239,68,68,0.08)', border: '1px solid rgba(239,68,68,0.3)', color: '#ef4444' }}>
+                              {blockPluginError}
+                            </p>
+                          )}
+                          {pluginUnhealthy && (
+                            <p className="text-xs rounded-lg px-3 py-2"
+                              style={{ background: 'rgba(245,158,11,0.08)', border: '1px solid rgba(245,158,11,0.3)', color: '#d97706' }}>
+                              Warning: {selectedPlugin.name} last poll failed — blocks may not execute until the plugin recovers.
+                              {selectedPlugin.last_error && <span> Error: {selectedPlugin.last_error}</span>}
+                            </p>
+                          )}
+                        </div>
+                      )}
+                    </div>
+                  )
+                })()}
               </CollapsibleSection>
 
               {/* ── Here Be Dragons ─────────────────────────────────────── */}

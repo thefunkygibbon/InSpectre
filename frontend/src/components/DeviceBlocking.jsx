@@ -476,7 +476,7 @@ export function DeviceBlocking({ devices, onDeviceClick }) {
             <div>
               <p className="text-sm font-medium" style={{ color: 'var(--color-text)' }}>Block new devices on discovery</p>
               <p className="text-xs mt-0.5" style={{ color: 'var(--color-text-muted)' }}>
-                Automatically ARP-block any device the moment it is first discovered. Useful for a whitelist-style approach — manually unblock trusted devices.
+                Automatically block any device the moment it is first discovered. Useful for a whitelist-style approach — manually unblock trusted devices.
               </p>
             </div>
           </div>
@@ -518,7 +518,7 @@ export function DeviceBlocking({ devices, onDeviceClick }) {
             </p>
             <p className="text-xs mt-0.5" style={{ color: 'var(--color-text-muted)' }}>
               {isPaused
-                ? `${networkStatus?.blocked_count ?? 0} device(s) currently blocked. All traffic is being intercepted via ARP.`
+                ? `${networkStatus?.blocked_count ?? 0} device(s) currently blocked.`
                 : 'All devices have normal internet access. Use this toggle to cut access for the entire network instantly.'}
             </p>
             <button onClick={handleNetworkToggle} disabled={pausing}

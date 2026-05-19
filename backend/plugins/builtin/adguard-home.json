@@ -11,7 +11,8 @@
     "discovery",
     "enrichment",
     "dns",
-    "traffic"
+    "traffic",
+    "blocking"
   ],
   "config_schema": [
     {
@@ -136,6 +137,26 @@
       "description": "Verify connectivity and credentials by fetching DNS general settings.",
       "method": "GET",
       "path": "/control/dns_info"
+    },
+    "block_client": {
+      "description": "Block a client by IP address. Posts the IP to AdGuard Home's disallowed_clients access list. Note: this replaces the entire access list — pre-existing manual access rules will be cleared.",
+      "method": "POST",
+      "path": "/control/access/set",
+      "body": {
+        "allowed_clients": [],
+        "disallowed_clients": ["{ip}"],
+        "blocked_hosts": []
+      }
+    },
+    "unblock_client": {
+      "description": "Remove a client from AdGuard Home's disallowed_clients access list. Note: this clears the entire disallowed list.",
+      "method": "POST",
+      "path": "/control/access/set",
+      "body": {
+        "allowed_clients": [],
+        "disallowed_clients": [],
+        "blocked_hosts": []
+      }
     }
   },
   "event_hooks": {},

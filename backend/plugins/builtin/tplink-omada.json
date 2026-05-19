@@ -138,22 +138,16 @@
       }
     },
     "block_client": {
-      "description": "Block a client by MAC address.",
+      "description": "Block a client. MAC in URL path, uppercase dash format (AA-BB-CC-DD-EE-FF). Open API: POST /openapi/v1/{omadacId}/sites/{siteId}/clients/{clientMac}/block",
       "depends_on": "get_token",
       "method": "POST",
-      "path": "/openapi/v1/{omadacId}/sites/{site_id}/cmd/clients/block",
-      "body": {
-        "mac": "{mac}"
-      }
+      "path": "/openapi/v1/{omadacId}/sites/{site_id}/clients/{mac_dash}/block"
     },
     "unblock_client": {
-      "description": "Unblock a previously blocked client by MAC address.",
+      "description": "Unblock a client. MAC in URL path, uppercase dash format.",
       "depends_on": "get_token",
       "method": "POST",
-      "path": "/openapi/v1/{omadacId}/sites/{site_id}/cmd/clients/unblock",
-      "body": {
-        "mac": "{mac}"
-      }
+      "path": "/openapi/v1/{omadacId}/sites/{site_id}/clients/{mac_dash}/unblock"
     },
     "test_connection": {
       "description": "Verify connectivity and credentials by fetching one page of clients.",

@@ -608,7 +608,7 @@ export function DeviceDrawer({ device, onClose, onRename, onResolveName, onRefre
       if (onRefresh) onRefresh()
       setStaticLines([
         action === 'block'
-          ? `[OK] Device ${updated.ip_address} is now blocked from the internet via ARP spoofing.`
+          ? `[OK] Device ${updated.ip_address} is now blocked from the internet.`
           : `[OK] Device ${updated.ip_address} has been unblocked — internet access restored.`,
       ])
     } catch (e) {
