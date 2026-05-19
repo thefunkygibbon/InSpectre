@@ -1,7 +1,7 @@
 {
   "id": "adguard-home",
   "name": "AdGuard Home",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "author": "InSpectre Community",
   "description": "Integrates with AdGuard Home REST API to pull known clients (device inventory with hostname resolution), DHCP leases, and DNS query logs for traffic analysis and suspicious domain alerting.",
   "homepage": "https://github.com/AdguardTeam/AdGuardHome",
@@ -98,7 +98,7 @@
       }
     },
     "get_dhcp_leases": {
-      "description": "Fetch active DHCP leases from AdGuard Home. Only available when AdGuard Home's built-in DHCP server is enabled.",
+      "description": "Fetch active (dynamic) DHCP leases from AdGuard Home. Only available when AdGuard Home's built-in DHCP server is enabled.",
       "method": "GET",
       "path": "/control/dhcp/status",
       "response_mapping": {
@@ -111,11 +111,24 @@
       }
     },
     "get_static_dhcp_leases": {
-      "description": "Fetch static DHCP leases \u2014 permanently assigned IP/MAC/hostname mappings.",
+      "description": "Fetch static (permanently assigned) DHCP leases from AdGuard Home.",
       "method": "GET",
       "path": "/control/dhcp/status",
       "response_mapping": {
         "root_path": "static_leases",
+        "fields": {
+          "mac": "mac_address",
+          "ip": "ip_address",
+          "hostname": "hostname"
+        }
+      }
+    },
+    "get_all_dhcp_leases": {
+      "description": "Fetch both active and static DHCP leases in one call. Used for polling.",
+      "method": "GET",
+      "path": "/control/dhcp/status",
+      "response_mapping": {
+        "root_paths": ["leases", "static_leases"],
         "fields": {
           "mac": "mac_address",
           "ip": "ip_address",
@@ -138,24 +151,31 @@
       "method": "GET",
       "path": "/control/dns_info"
     },
+    "get_access_list": {
+      "description": "Fetch the current AdGuard Home access control list (allowed clients, disallowed clients, blocked hosts).",
+      "method": "GET",
+      "path": "/control/access/list"
+    },
     "block_client": {
-      "description": "Block a client by IP address. Posts the IP to AdGuard Home's disallowed_clients access list. Note: this replaces the entire access list — pre-existing manual access rules will be cleared.",
+      "description": "Block a client by appending their IP to AdGuard Home's disallowed_clients list. Reads the current list first so existing entries are preserved.",
+      "depends_on": "get_access_list",
       "method": "POST",
       "path": "/control/access/set",
       "body": {
-        "allowed_clients": [],
-        "disallowed_clients": ["{ip}"],
-        "blocked_hosts": []
+        "allowed_clients":    {"_list_passthrough": "get_access_list.allowed_clients"},
+        "disallowed_clients": {"_list_append": "get_access_list.disallowed_clients", "_value": "{ip}"},
+        "blocked_hosts":      {"_list_passthrough": "get_access_list.blocked_hosts"}
       }
     },
     "unblock_client": {
-      "description": "Remove a client from AdGuard Home's disallowed_clients access list. Note: this clears the entire disallowed list.",
+      "description": "Unblock a client by removing their IP from AdGuard Home's disallowed_clients list. Reads the current list first so other blocked entries are preserved.",
+      "depends_on": "get_access_list",
       "method": "POST",
       "path": "/control/access/set",
       "body": {
-        "allowed_clients": [],
-        "disallowed_clients": [],
-        "blocked_hosts": []
+        "allowed_clients":    {"_list_passthrough": "get_access_list.allowed_clients"},
+        "disallowed_clients": {"_list_remove": "get_access_list.disallowed_clients", "_value": "{ip}"},
+        "blocked_hosts":      {"_list_passthrough": "get_access_list.blocked_hosts"}
       }
     }
   },
@@ -164,7 +184,7 @@
     "tag_fields": []
   },
   "polling": {
-    "action": "get_dhcp_leases",
+    "action": "get_all_dhcp_leases",
     "interval_seconds": 120,
     "run_on_startup": true
   }

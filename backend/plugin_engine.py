@@ -539,10 +539,11 @@ class PluginRunner:
 
         method   = action_def.get("method", "GET").upper()
         body_tpl = action_def.get("body")
-        body     = (
-            json.loads(self._sub(json.dumps(body_tpl), config, sub_ctx))
-            if body_tpl else None
-        )
+        if body_tpl:
+            body = json.loads(self._sub(json.dumps(body_tpl), config, sub_ctx))
+            body = self._apply_list_directives(body, sub_ctx)
+        else:
+            body = None
 
         headers = {
             k: self._sub(str(v), config, sub_ctx)
@@ -591,10 +592,11 @@ class PluginRunner:
                         self._sub(endpoints.get("base_url", ""), config, sub_ctx)
                         + self._sub(action_def.get("path", ""), config, sub_ctx)
                     )
-                    body = (
-                        json.loads(self._sub(json.dumps(body_tpl), config, sub_ctx))
-                        if body_tpl else None
-                    )
+                    if body_tpl:
+                        body = json.loads(self._sub(json.dumps(body_tpl), config, sub_ctx))
+                        body = self._apply_list_directives(body, sub_ctx)
+                    else:
+                        body = None
                     if auth_method == "cookie" and session:
                         cookies = dict(session.cookies)
                     elif auth_method == "bearer" and session and session.bearer_token:
@@ -1024,48 +1026,102 @@ class PluginRunner:
 
     @staticmethod
     def _apply_response_mapping(raw_data, mapping: dict) -> list:
-        root_path = mapping.get("root_path", "")
-        field_map = mapping.get("fields", {})
+        root_path  = mapping.get("root_path", "")
+        root_paths = mapping.get("root_paths")  # array: merge results from multiple paths
+        field_map  = mapping.get("fields", {})
 
-        data = raw_data
-        if root_path:
-            for part in root_path.split("."):
-                if isinstance(data, dict):
-                    data = data.get(part)
-                elif isinstance(data, list):
-                    try:
-                        data = data[int(part)]
-                    except (ValueError, IndexError):
+        # Normalise to a list of paths so the loop below handles both cases uniformly
+        paths = root_paths if root_paths else ([root_path] if root_path else [""])
+
+        seen_macs: set = set()
+        all_devices: list = []
+
+        for rp in paths:
+            data = raw_data
+            if rp:
+                for part in rp.split("."):
+                    if isinstance(data, dict):
+                        data = data.get(part)
+                    elif isinstance(data, list):
+                        try:
+                            data = data[int(part)]
+                        except (ValueError, IndexError):
+                            data = None
+                            break
+                    else:
                         data = None
                         break
-                else:
-                    data = None
-                    break
-            if data is None:
-                return []
-
-        if not isinstance(data, list):
-            data = [data] if data else []
-
-        devices = []
-        for item in data:
-            if not isinstance(item, dict):
-                continue
-            device: dict = {}
-            for plugin_field, inspectre_field in field_map.items():
-                val = item.get(plugin_field)
-                if val is None:
+                if data is None:
                     continue
-                if inspectre_field == "mac_address":
-                    val = _normalise_mac(str(val))
-                    if not val:
+
+            if not isinstance(data, list):
+                data = [data] if data else []
+
+            for item in data:
+                if not isinstance(item, dict):
+                    continue
+                device: dict = {}
+                for plugin_field, inspectre_field in field_map.items():
+                    val = item.get(plugin_field)
+                    if val is None:
                         continue
-                elif inspectre_field == "is_online":
-                    val = bool(val) if not isinstance(val, str) else val.lower() in ("true", "1", "yes", "online", "connected")
-                device[inspectre_field] = val
-            if device.get("mac_address"):
-                devices.append(device)
-        return devices
+                    if inspectre_field == "mac_address":
+                        val = _normalise_mac(str(val))
+                        if not val:
+                            continue
+                    elif inspectre_field == "is_online":
+                        val = bool(val) if not isinstance(val, str) else val.lower() in ("true", "1", "yes", "online", "connected")
+                    device[inspectre_field] = val
+                if device.get("mac_address"):
+                    mac = device["mac_address"]
+                    if mac not in seen_macs:
+                        seen_macs.add(mac)
+                        all_devices.append(device)
+
+        return all_devices
+
+    @staticmethod
+    def _apply_list_directives(body: dict, sub_ctx: dict) -> dict:
+        """Process _list_append / _list_remove / _list_passthrough body directives.
+
+        These allow a manifest action to non-destructively modify a list fetched
+        from a preceding depends_on action (e.g. read-modify-write an access list).
+
+        Directive format (as a value inside the body dict):
+            {"_list_append":      "dep_action.ctx_key", "_value": "{ip}"}
+            {"_list_remove":      "dep_action.ctx_key", "_value": "{ip}"}
+            {"_list_passthrough": "dep_action.ctx_key"}
+        """
+        if not isinstance(body, dict):
+            return body
+        result = {}
+        for key, val in body.items():
+            if isinstance(val, dict) and (
+                "_list_append" in val or "_list_remove" in val or "_list_passthrough" in val
+            ):
+                ctx_key = (
+                    val.get("_list_append")
+                    or val.get("_list_remove")
+                    or val.get("_list_passthrough", "")
+                )
+                raw = sub_ctx.get(ctx_key, "[]")
+                try:
+                    current = json.loads(raw) if isinstance(raw, str) else list(raw)
+                except (json.JSONDecodeError, TypeError):
+                    current = []
+                if not isinstance(current, list):
+                    current = []
+                item = val.get("_value", "")
+                if "_list_append" in val:
+                    if item and item not in current:
+                        current = current + [item]
+                elif "_list_remove" in val:
+                    current = [x for x in current if x != item]
+                # _list_passthrough: use current as-is
+                result[key] = current
+            else:
+                result[key] = val
+        return result
 
     # ── Template substitution ─────────────────────────────────────────────────
 
@@ -1145,29 +1201,48 @@ class PluginScheduler:
                     if not plugin_info.get("enabled"):
                         continue
                     polling  = plugin_info["manifest"].get("polling") or {}
+                    # Support both singular "action" and plural "actions"
                     action   = polling.get("action")
-                    if not action:
+                    actions  = polling.get("actions") or ([action] if action else [])
+                    if not actions:
                         continue
                     interval = float(polling.get("interval_seconds") or 300)
                     pid      = plugin_info["id"]
                     if (now - self._last_poll.get(pid, 0.0)) >= interval:
                         self._last_poll[pid] = now
-                        asyncio.ensure_future(self._poll_plugin(pid, action))
+                        asyncio.ensure_future(self._poll_plugin(pid, actions))
             except Exception as exc:
                 print(f"[plugin-scheduler] {exc}", flush=True)
             await asyncio.sleep(30)
 
-    async def _poll_plugin(self, plugin_id: str, action: str):
-        result = await self._runner.execute_action(plugin_id, action)
+    async def _poll_plugin(self, plugin_id: str, actions: list):
         db = self._db_factory()
         now = datetime.now(timezone.utc)
-        try:
+        plugin_info = self._registry.get(plugin_id)
+        caps = set((plugin_info or {}).get("manifest", {}).get("capabilities", []))
+        has_presence = "presence" in caps
+
+        # Run all polling actions and merge results (last write wins per MAC)
+        all_devices: dict = {}
+        any_ok   = False
+        last_err = None
+
+        for action in actions:
+            result = await self._runner.execute_action(plugin_id, action)
             if result.get("ok"):
-                devices = result.get("devices") or []
-                plugin_info = self._registry.get(plugin_id)
-                caps = set((plugin_info or {}).get("manifest", {}).get("capabilities", []))
+                any_ok = True
+                for dev in (result.get("devices") or []):
+                    mac = dev.get("mac_address")
+                    if mac:
+                        all_devices[mac] = dev
+            else:
+                last_err = result.get("error", "Unknown error")
+                print(f"[plugin-scheduler] {plugin_id}/{action}: poll FAILED — {last_err}", flush=True)
+
+        try:
+            if any_ok:
+                devices = list(all_devices.values())
                 upserted = 0
-                has_presence = "presence" in caps
                 if devices and caps & {"discovery", "presence"}:
                     upserted = self._upsert_devices(db, plugin_id, devices, has_presence)
                 print(
@@ -1185,8 +1260,8 @@ class PluginScheduler:
                 self._registry.set_status(plugin_id, "active")
                 self._registry.set_poll_result(plugin_id, len(devices), now)
             else:
-                err = result.get("error", "Unknown error")
-                print(f"[plugin-scheduler] {plugin_id}: poll FAILED — {err}", flush=True)
+                err = last_err or "Unknown error"
+                print(f"[plugin-scheduler] {plugin_id}: all poll actions FAILED — {err}", flush=True)
                 db.execute(
                     text(
                         "UPDATE plugins SET last_polled = NOW(), status = 'error',"

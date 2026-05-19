@@ -1,7 +1,7 @@
 {
   "id": "pihole",
   "name": "Pi-hole",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "author": "InSpectre Community",
   "description": "Integrates with Pi-hole v6 REST API to pull known clients (device inventory with hostnames), DHCP leases, and recent DNS query logs for traffic enrichment and suspicious domain alerting.",
   "homepage": "https://pi-hole.net",
@@ -61,7 +61,7 @@
       "type": "integer",
       "default": 1,
       "required": false,
-      "help": "Pi-hole group ID to assign blocked clients to. Create a dedicated group in Pi-hole (Settings → Groups) with a blocklist that blocks all traffic, then enter its numeric ID here. Default: 1."
+      "help": "Pi-hole group ID to assign blocked clients to. Create a dedicated group in Pi-hole (Settings \u2192 Groups) with a blocklist that blocks all traffic, then enter its numeric ID here. Default: 1."
     }
   ],
   "endpoints": {
@@ -100,7 +100,7 @@
       }
     },
     "get_dhcp_leases": {
-      "description": "Fetch active DHCP leases from Pi-hole. Only available when Pi-hole's built-in DHCP server is enabled.",
+      "description": "Fetch active DHCP leases from Pi-hole (includes static reservations that have connected). Only available when Pi-hole's built-in DHCP server is enabled.",
       "depends_on": "login",
       "method": "GET",
       "path": "/api/dhcp/leases",
@@ -108,6 +108,20 @@
         "root_path": "leases",
         "fields": {
           "hwaddr": "mac_address",
+          "ip": "ip_address",
+          "hostname": "hostname"
+        }
+      }
+    },
+    "get_static_dhcp_leases": {
+      "description": "Fetch static DHCP host reservations from Pi-hole's DHCP config. These are permanently assigned IP/MAC/hostname mappings configured before the device connects.",
+      "depends_on": "login",
+      "method": "GET",
+      "path": "/api/dhcp/config",
+      "response_mapping": {
+        "root_path": "config.dhcp.hosts",
+        "fields": {
+          "mac": "mac_address",
           "ip": "ip_address",
           "hostname": "hostname"
         }
@@ -151,7 +165,7 @@
     "tag_fields": []
   },
   "polling": {
-    "action": "get_dhcp_leases",
+    "actions": ["get_dhcp_leases", "get_static_dhcp_leases"],
     "interval_seconds": 120,
     "run_on_startup": true
   }
