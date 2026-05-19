@@ -41,6 +41,22 @@ Declare an array of zero or more of these strings. InSpectre uses them to decide
 
 ---
 
+## Overriding a built-in plugin
+
+Uploaded plugins can use the same `id` as a built-in. When InSpectre detects a naming collision at startup (or at upload time), **the uploaded manifest wins** — it shadows the on-disk built-in for the lifetime of that container session. The existing config and enabled/disabled state stored in the database are preserved; only the manifest (actions, endpoints, response mapping, etc.) is replaced.
+
+This lets you ship a patched or extended version of a built-in without modifying the container image. A log line confirms the override:
+
+```
+[plugins] Uploaded plugin 'tplink-omada' overrides builtin — using uploaded manifest.
+```
+
+To restore the original built-in, delete the uploaded plugin via the Plugins UI (or the `DELETE /api/plugins/{id}` endpoint) and restart — InSpectre will re-register the on-disk manifest automatically.
+
+> **Note:** The override only affects the in-memory registry and subsequent plugin execution. The built-in JSON file on disk is never modified.
+
+---
+
 ## Blocking Contract
 
 A plugin that declares `"blocking"` in its `capabilities` array participates in InSpectre's pluggable blocking system. InSpectre's blocking coordinator calls the plugin instead of (or in addition to) the probe's ARP poisoning when the user selects the plugin's method in Settings → Security Responses → Blocking Method.

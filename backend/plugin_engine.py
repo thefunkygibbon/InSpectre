@@ -297,26 +297,24 @@ class PluginRegistry:
             rows = []
         for row in rows:
             try:
-                # Uploaded plugins must never overwrite a builtin — the builtin's manifest
-                # on disk always wins. Only config/enabled/status are taken from the DB row
-                # (already handled in the builtin phase above).
-                existing = self._plugins.get(row.plugin_id)
-                if existing and existing.get("source") == "builtin":
-                    print(
-                        f"[plugins] Uploaded row for '{row.plugin_id}' superseded by builtin"
-                        f" — using builtin manifest, skipping uploaded manifest.",
-                        flush=True,
-                    )
-                    continue
                 manifest = (
                     row.manifest
                     if isinstance(row.manifest, dict)
                     else json.loads(row.manifest)
                 )
                 validate_manifest(manifest)
+                existing = self._plugins.get(row.plugin_id, {})
+                if existing.get("source") == "builtin":
+                    # Uploaded plugin shadows the builtin — uploaded manifest wins,
+                    # but we preserve any config/state already loaded from the DB.
+                    print(
+                        f"[plugins] Uploaded plugin '{row.plugin_id}' overrides builtin"
+                        f" — using uploaded manifest.",
+                        flush=True,
+                    )
                 self._plugins[row.plugin_id] = {
                     "manifest":   manifest,
-                    "config":     row.config or {},
+                    "config":     row.config or existing.get("config") or {},
                     "source":     "uploaded",
                     "enabled":    bool(row.enabled),
                     "status":     row.status or "disabled",
@@ -355,13 +353,20 @@ class PluginRegistry:
             self._plugins[plugin_id]["last_device_count"] = device_count
 
     def add_uploaded(self, manifest: dict) -> str:
+        """Register an uploaded plugin manifest in-memory.
+
+        If the plugin ID matches a built-in, the uploaded manifest takes
+        precedence (overrides the built-in) — allowing power users to ship
+        a patched version without touching the container image.
+        """
         validate_manifest(manifest)
         pid = manifest["id"]
-        if pid in self._plugins and self._plugins[pid]["source"] == "builtin":
-            raise PluginValidationError(
-                f"Plugin ID '{pid}' conflicts with a built-in plugin"
-            )
         existing = self._plugins.get(pid, {})
+        if existing.get("source") == "builtin":
+            print(
+                f"[plugins] add_uploaded: '{pid}' overrides built-in plugin.",
+                flush=True,
+            )
         self._plugins[pid] = {
             "manifest":   manifest,
             "config":     existing.get("config") or {},
