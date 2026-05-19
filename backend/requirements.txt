@@ -11,3 +11,4 @@ python-multipart==0.0.20
 docker==7.1.0
 apprise>=1.9
 paho-mqtt>=1.6
+pysnmp>=5.0

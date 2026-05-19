@@ -27,6 +27,12 @@ import bcrypt as _bcrypt
 from jose import JWTError, jwt
 
 from models import Base, Device, DeviceEvent, FingerprintEntry, Setting, TrafficStat, VulnReport
+from plugin_engine import (
+    PluginRegistry, PluginRunner, PluginEventBus, PluginScheduler,
+    validate_manifest, PluginValidationError,
+    encrypt_field, decrypt_field, get_decrypted_config,
+    verify_webhook_signature,
+)
 
 DATABASE_URL = os.environ.get("DATABASE_URL", "postgresql://admin:password123@db:5432/inspectre")
 # PROBE_API_URL is the name used in docker-compose; PROBE_URL is the legacy fallback.
@@ -171,42 +177,71 @@ class HAMQTTManager:
                           open_ports: int | None = None, vulns: int | None = None,
                           is_new: bool | None = None):
         mid, sp = self._mid(mac), self._sp
-        self.publish(f"{sp}/clients/{mid}/presence", "ON" if is_online else "OFF")
-        if ip         is not None: self.publish(f"{sp}/clients/{mid}/ip",              ip)
-        if open_ports is not None: self.publish(f"{sp}/clients/{mid}/open_ports",  str(open_ports))
-        if vulns      is not None: self.publish(f"{sp}/clients/{mid}/vulnerabilities", str(vulns))
-        if is_new     is not None: self.publish(f"{sp}/clients/{mid}/new",  "ON" if is_new else "OFF")
+        self.publish(f"{sp}/clients/{mid}/presence", "ON" if is_online else "OFF", retain=True)
+        if ip         is not None: self.publish(f"{sp}/clients/{mid}/ip",              ip,           retain=True)
+        if open_ports is not None: self.publish(f"{sp}/clients/{mid}/open_ports",  str(open_ports), retain=True)
+        if vulns      is not None: self.publish(f"{sp}/clients/{mid}/vulnerabilities", str(vulns),  retain=True)
+        if is_new     is not None: self.publish(f"{sp}/clients/{mid}/new",  "ON" if is_new else "OFF", retain=True)
 
     def pub_system_state(self, total_devices: int | None = None, total_vulns: int | None = None,
                           scan_state: str | None = None, last_scan: str | None = None):
         sp = self._sp
-        if total_devices is not None: self.publish(f"{sp}/system/total_devices",         str(total_devices))
-        if total_vulns   is not None: self.publish(f"{sp}/system/total_vulnerabilities",  str(total_vulns))
-        if scan_state    is not None: self.publish(f"{sp}/system/scan_state",             scan_state)
-        if last_scan     is not None: self.publish(f"{sp}/system/last_scan",              last_scan)
+        if total_devices is not None: self.publish(f"{sp}/system/total_devices",         str(total_devices), retain=True)
+        if total_vulns   is not None: self.publish(f"{sp}/system/total_vulnerabilities",  str(total_vulns),  retain=True)
+        if scan_state    is not None: self.publish(f"{sp}/system/scan_state",             scan_state,        retain=True)
+        if last_scan     is not None: self.publish(f"{sp}/system/last_scan",              last_scan,         retain=True)
 
 
 _ha_mqtt = HAMQTTManager()
 
+# ---------------------------------------------------------------------------
+# Plugin engine singletons
+# ---------------------------------------------------------------------------
+_plugin_registry  = PluginRegistry()
+_plugin_runner    = PluginRunner(_plugin_registry, _ha_mqtt)
+_plugin_event_bus = PluginEventBus(_plugin_registry, _plugin_runner)
+_plugin_scheduler = PluginScheduler(_plugin_registry, _plugin_runner, SessionLocal)
+
 
 def _ha_startup_connect(db: "Session"):
-    """Connect HA MQTT on startup and publish initial discovery + state for all devices."""
+    """Connect HA MQTT on startup and publish initial discovery + state for all devices.
+
+    Reads config from the plugin store when available (new path), falls back to the
+    legacy ha_mqtt_* settings keys (upgrade path for existing installs).
+    """
     try:
-        s = {r.key: r.value for r in db.query(Setting).filter(
-            Setting.key.in_(["ha_mqtt_enabled", "ha_mqtt_host", "ha_mqtt_port",
-                              "ha_mqtt_user", "ha_mqtt_password",
-                              "ha_mqtt_discovery_prefix", "ha_mqtt_state_prefix"])
-        ).all()}
-        if s.get("ha_mqtt_enabled") != "true" or not s.get("ha_mqtt_host", "").strip():
-            return
-        _ha_mqtt.connect(
-            host             = s["ha_mqtt_host"].strip(),
-            port             = int(s.get("ha_mqtt_port", "1883") or 1883),
-            user             = s.get("ha_mqtt_user", ""),
-            password         = s.get("ha_mqtt_password", ""),
-            discovery_prefix = s.get("ha_mqtt_discovery_prefix", "homeassistant"),
-            state_prefix     = s.get("ha_mqtt_state_prefix",     "inspectre"),
-        )
+        # ── New path: plugin config store ────────────────────────────────────
+        plugin = _plugin_registry.get("home-assistant")
+        if plugin and plugin.get("enabled") and plugin.get("config", {}).get("host"):
+            cfg = get_decrypted_config(plugin["manifest"], plugin["config"])
+            host = cfg.get("host", "").strip()
+            if not host:
+                return
+            _ha_mqtt.connect(
+                host             = host,
+                port             = int(cfg.get("port") or 1883),
+                user             = cfg.get("user", ""),
+                password         = cfg.get("password", ""),
+                discovery_prefix = cfg.get("discovery_prefix", "homeassistant"),
+                state_prefix     = cfg.get("state_prefix",     "inspectre"),
+            )
+        else:
+            # ── Legacy path: settings table ──────────────────────────────────
+            s = {r.key: r.value for r in db.query(Setting).filter(
+                Setting.key.in_(["ha_mqtt_enabled", "ha_mqtt_host", "ha_mqtt_port",
+                                  "ha_mqtt_user", "ha_mqtt_password",
+                                  "ha_mqtt_discovery_prefix", "ha_mqtt_state_prefix"])
+            ).all()}
+            if s.get("ha_mqtt_enabled") != "true" or not s.get("ha_mqtt_host", "").strip():
+                return
+            _ha_mqtt.connect(
+                host             = s["ha_mqtt_host"].strip(),
+                port             = int(s.get("ha_mqtt_port", "1883") or 1883),
+                user             = s.get("ha_mqtt_user", ""),
+                password         = s.get("ha_mqtt_password", ""),
+                discovery_prefix = s.get("ha_mqtt_discovery_prefix", "homeassistant"),
+                state_prefix     = s.get("ha_mqtt_state_prefix",     "inspectre"),
+            )
         import time; time.sleep(1)  # brief wait for connect callback
         if not _ha_mqtt.connected:
             return
@@ -469,6 +504,30 @@ def _migrate(db: Session):
         )""",
         "CREATE INDEX IF NOT EXISTS ix_npc_profile ON notification_profile_channels(profile_id)",
         "CREATE INDEX IF NOT EXISTS ix_npc_channel ON notification_profile_channels(channel_id)",
+        # Plugin registry table
+        """CREATE TABLE IF NOT EXISTS plugins (
+            plugin_id     TEXT        NOT NULL PRIMARY KEY,
+            display_name  TEXT        NOT NULL,
+            version       TEXT        NOT NULL DEFAULT '1.0.0',
+            enabled       BOOLEAN     NOT NULL DEFAULT false,
+            manifest      JSONB       NOT NULL DEFAULT '{}',
+            config        JSONB       NOT NULL DEFAULT '{}',
+            install_source TEXT       NOT NULL DEFAULT 'builtin',
+            status        TEXT        NOT NULL DEFAULT 'disabled',
+            last_error    TEXT,
+            installed_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            last_polled   TIMESTAMPTZ
+        )""",
+        "CREATE INDEX IF NOT EXISTS ix_plugins_source ON plugins(install_source)",
+        # Per-device enrichment data stored by plugins
+        """CREATE TABLE IF NOT EXISTS plugin_device_data (
+            plugin_id   TEXT        NOT NULL,
+            mac_address TEXT        NOT NULL,
+            data        JSONB       NOT NULL DEFAULT '{}',
+            updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            PRIMARY KEY (plugin_id, mac_address)
+        )""",
+        "CREATE INDEX IF NOT EXISTS ix_plugin_device_data_mac ON plugin_device_data(mac_address)",
     ]
     for sql in migrations:
         try:
@@ -1233,27 +1292,41 @@ async def _notification_loop():
                             dispatches.append(("block.schedule_end", "Block Schedule Ended",
                                                f"Block schedule deactivated for {name}", mac))
 
-                    # ── HA MQTT state push ───────────────────────────────────
-                    if _ha_mqtt.connected:
-                        try:
-                            ports_count = len((scan_results or {}).get("open_ports", []))
-                            sev_map     = {"low": 1, "info": 1, "medium": 2, "high": 3, "critical": 3}
-                            vuln_count  = sev_map.get(vuln_severity or "", 0)
-                            if etype in ("joined", "interface_joined"):
+                    # ── Plugin event bus dispatch ─────────────────────────────
+                    _sev_map     = {"low": 1, "info": 1, "medium": 2, "high": 3, "critical": 3}
+                    _ports_count = len((scan_results or {}).get("open_ports", [])) if scan_results else 0
+                    _vuln_count  = _sev_map.get(vuln_severity or "", 0)
+                    _pe_ctx = {
+                        "mac":   mac,
+                        "name":  name,
+                        "ip":    ip,
+                        "ports": _ports_count,
+                        "vulns": _vuln_count,
+                    }
+                    _pe_type = None
+                    if etype in ("joined", "interface_joined"):
+                        _pe_type = "device.new"
+                    elif etype == "online":
+                        _pe_type = "device.online"
+                    elif etype == "offline":
+                        _pe_type = "device.offline"
+                    elif etype == "port_opened":
+                        _pe_ctx["ports"] = _ports_count
+                        _pe_type = "port.opened"
+                    elif etype == "vuln_scan_complete":
+                        severity_str = d.get("severity", "clean")
+                        if severity_str not in ("clean", "none", ""):
+                            _pe_ctx["vulns"] = d.get("vuln_count", _vuln_count)
+                            _pe_type = "vuln.found"
+                    elif etype == "renamed":
+                        # renamed is not in the standard event hook vocab — call HA directly
+                        if _ha_mqtt.connected:
+                            try:
                                 _ha_mqtt.pub_device_discovery(mac, name, ip)
-                                _ha_mqtt.pub_device_state(mac, True, ip, ports_count, vuln_count, is_new=True)
-                            elif etype == "online":
-                                _ha_mqtt.pub_device_state(mac, True, ip, ports_count, vuln_count)
-                            elif etype == "offline":
-                                _ha_mqtt.pub_device_state(mac, False, ip)
-                            elif etype == "port_opened":
-                                _ha_mqtt.pub_device_state(mac, True, open_ports=ports_count)
-                            elif etype == "vuln_scan_complete":
-                                _ha_mqtt.pub_device_state(mac, True, vulns=d.get("vuln_count", vuln_count))
-                            elif etype == "renamed":
-                                _ha_mqtt.pub_device_discovery(mac, name, ip)
-                        except Exception as _ha_exc:
-                            print(f"[ha-mqtt] Dispatch error: {_ha_exc}", flush=True)
+                            except Exception as _ha_exc:
+                                print(f"[ha-mqtt] Renamed dispatch error: {_ha_exc}", flush=True)
+                    if _pe_type:
+                        asyncio.ensure_future(_plugin_event_bus.notify(_pe_type, _pe_ctx))
 
             finally:
                 db.close()
@@ -1943,6 +2016,51 @@ def _migrate_legacy_notifications(db: Session):
     print(f"[notify] Migrated {len(channels)} legacy notification channel(s)", flush=True)
 
 
+def _migrate_legacy_ha_mqtt(db: Session):
+    """One-time migration: copy ha_mqtt_* settings into the home-assistant plugin config."""
+    try:
+        row = db.execute(
+            text("SELECT config FROM plugins WHERE plugin_id = 'home-assistant'")
+        ).fetchone()
+        if row and isinstance(row.config, dict) and row.config.get("host"):
+            return  # Already migrated
+
+        def _s(key, default=""):
+            r = db.get(Setting, key)
+            return r.value if r else default
+
+        host = _s("ha_mqtt_host").strip()
+        if not host:
+            return  # Nothing to migrate
+
+        password = _s("ha_mqtt_password")
+        config = {
+            "host":             host,
+            "port":             _s("ha_mqtt_port", "1883"),
+            "user":             _s("ha_mqtt_user"),
+            "password":         encrypt_field(password) if password else "",
+            "discovery_prefix": _s("ha_mqtt_discovery_prefix", "homeassistant"),
+            "state_prefix":     _s("ha_mqtt_state_prefix", "inspectre"),
+        }
+        enabled = _s("ha_mqtt_enabled", "false") == "true"
+        new_status = "active" if enabled else "disabled"
+        db.execute(
+            text("""
+                UPDATE plugins
+                SET config  = CAST(:config AS jsonb),
+                    enabled = :enabled,
+                    status  = :status
+                WHERE plugin_id = 'home-assistant'
+            """),
+            {"config": json.dumps(config), "enabled": enabled, "status": new_status},
+        )
+        db.commit()
+        print("[plugins] Migrated ha_mqtt_* settings to home-assistant plugin config", flush=True)
+    except Exception as exc:
+        print(f"[plugins] HA migration (non-fatal): {exc}", flush=True)
+        db.rollback()
+
+
 @app.on_event("startup")
 async def on_startup():
     global _main_loop
@@ -1953,8 +2071,16 @@ async def on_startup():
         _seed_settings(db)
         _seed_default_user(db)
         _migrate_legacy_docker_host(db)
-        _migrate_legacy_notifications(db)
+        try:
+            _migrate_legacy_notifications(db)
+        except Exception as exc:
+            print(f"[startup] notifications migration failed (non-fatal): {exc}", flush=True)
+            db.rollback()
+        _migrate_legacy_ha_mqtt(db)
+        _plugin_registry.load_all(db)
         _ha_startup_connect(db)
+    except Exception as exc:
+        print(f"[startup] CRITICAL startup error: {exc}", flush=True)
     finally:
         db.close()
     asyncio.ensure_future(_scheduled_vuln_scan_loop())
@@ -1965,6 +2091,7 @@ async def on_startup():
     asyncio.ensure_future(_trivy_db_update_loop())
     asyncio.ensure_future(_docker_event_loop())
     asyncio.ensure_future(_fingerbank_loop())
+    asyncio.ensure_future(_plugin_scheduler.run())
 
 
 # ---------------------------------------------------------------------------
@@ -1996,6 +2123,9 @@ class DeviceUpdate(BaseModel):
 
 class SettingUpdate(BaseModel):
     value: str
+
+class PluginConfigSave(BaseModel):
+    config: dict
     
 class IdentityUpdate(BaseModel):
     vendor_override:      Optional[str] = None
@@ -2880,15 +3010,51 @@ def acknowledge_device(mac: str, db: Session = Depends(get_db)):
 
 
 @app.post("/devices/{mac}/resolve-name")
-def resolve_name(mac: str, db: Session = Depends(get_db)):
+async def resolve_name(mac: str, db: Session = Depends(get_db)):
     d = db.get(Device, mac.lower())
     if not d:
         raise HTTPException(404, "Device not found")
-    name = _resolve_hostname(d.ip_address)
-    if name:
+    ip = d.ip_address
+    name = None
+    if ip:
+        try:
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                r = await client.get(f"{PROBE_URL}/resolve/{ip}")
+                if r.status_code == 200:
+                    name = r.json().get("hostname")
+        except Exception:
+            pass
+    if name and not d.custom_name:
         d.hostname = name
         db.commit(); db.refresh(d)
     return {"mac": mac, "resolved": name, "device": _to_dict(d)}
+
+
+@app.post("/devices/resolve-all-names")
+async def resolve_all_names(db: Session = Depends(get_db)):
+    devices = db.query(Device).filter(
+        Device.is_ignored == False,
+        Device.ip_address != None,
+        Device.ip_address != "",
+    ).all()
+    updated = 0
+    failed = 0
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        for d in devices:
+            ip = d.ip_address
+            if not ip:
+                continue
+            try:
+                r = await client.get(f"{PROBE_URL}/resolve/{ip}")
+                if r.status_code == 200:
+                    name = r.json().get("hostname")
+                    if name and not d.custom_name:
+                        d.hostname = name
+                        updated += 1
+            except Exception:
+                failed += 1
+    db.commit()
+    return {"updated": updated, "failed": failed, "total": len(devices)}
 
 
 @app.post("/devices/{mac}/rescan")
@@ -4115,6 +4281,405 @@ def ha_mqtt_disconnect():
     return {"connected": False}
 
 
+# ---------------------------------------------------------------------------
+# Plugin management endpoints
+# ---------------------------------------------------------------------------
+
+def _redact_plugin_config(manifest: dict, config: dict) -> dict:
+    redacted = dict(config)
+    for field in manifest.get("config_schema", []):
+        if field.get("type") == "password" and redacted.get(field["key"]):
+            redacted[field["key"]] = "**redacted**"
+    return redacted
+
+
+async def _plugin_block_hook(mac: str, ip: Optional[str], action: str):
+    """Fire plugin block/unblock actions for any enabled plugin with 'blocking' capability."""
+    for plugin_info in _plugin_registry.list_all():
+        if not plugin_info.get("enabled"):
+            continue
+        caps = plugin_info["manifest"].get("capabilities", [])
+        if "blocking" not in caps:
+            continue
+        pid = plugin_info["id"]
+        actions = plugin_info["manifest"].get("actions") or {}
+        action_name = action if action in actions else None
+        if not action_name:
+            action_name = "block_host" if action == "block" else "unblock_host"
+            if action_name not in actions:
+                continue
+        # Look up any plugin-specific device ID stored in plugin_device_data
+        plugin_id_val = None
+        _db = SessionLocal()
+        try:
+            row = _db.execute(
+                text("SELECT data FROM plugin_device_data WHERE plugin_id = :pid AND mac_address = :mac"),
+                {"pid": pid, "mac": mac},
+            ).fetchone()
+            if row and isinstance(row.data, dict):
+                plugin_id_val = row.data.get("id") or row.data.get("device_id")
+        except Exception:
+            pass
+        finally:
+            _db.close()
+        ctx = {"mac": mac, "ip": ip or "", "plugin_device_id": plugin_id_val or ""}
+        try:
+            result = await _plugin_runner.execute_action(pid, action_name, ctx)
+            if not result.get("ok"):
+                print(f"[plugin-block] {pid}.{action_name} failed: {result.get('error')}", flush=True)
+        except Exception as exc:
+            print(f"[plugin-block] {pid}: {exc}", flush=True)
+
+
+def _plugin_to_dict(plugin_info: dict) -> dict:
+    manifest = plugin_info["manifest"]
+    return {
+        "id":                plugin_info["id"],
+        "name":              manifest.get("name"),
+        "version":           manifest.get("version"),
+        "author":            manifest.get("author"),
+        "description":       manifest.get("description"),
+        "icon":              manifest.get("icon"),
+        "homepage":          manifest.get("homepage"),
+        "capabilities":      manifest.get("capabilities", []),
+        "source":            plugin_info["source"],
+        "enabled":           plugin_info["enabled"],
+        "status":            plugin_info["status"],
+        "last_error":        plugin_info["last_error"],
+        "last_polled":       plugin_info.get("last_polled"),
+        "last_device_count": plugin_info.get("last_device_count"),
+        "config":            _redact_plugin_config(manifest, plugin_info.get("config") or {}),
+        "manifest":          manifest,
+    }
+
+
+@app.get("/plugins")
+def list_plugins(username: str = Depends(get_current_user)):
+    return [_plugin_to_dict(p) for p in _plugin_registry.list_all()]
+
+
+@app.get("/plugins/{plugin_id}")
+def get_plugin(plugin_id: str, username: str = Depends(get_current_user)):
+    plugin = _plugin_registry.get(plugin_id)
+    if not plugin:
+        raise HTTPException(404, "Plugin not found")
+    return _plugin_to_dict({"id": plugin_id, **plugin})
+
+
+@app.post("/plugins/upload", status_code=201)
+async def upload_plugin(
+    file: UploadFile = File(...),
+    username: str = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    content = await file.read()
+    fname   = file.filename or ""
+    try:
+        if fname.endswith((".yaml", ".yml")):
+            try:
+                import yaml as _yaml
+                manifest = _yaml.safe_load(content)
+            except ImportError:
+                raise HTTPException(
+                    400, "YAML support requires pyyaml — upload as JSON instead"
+                )
+        else:
+            manifest = json.loads(content)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(400, f"Could not parse manifest: {exc}")
+
+    try:
+        validate_manifest(manifest)
+    except PluginValidationError as exc:
+        raise HTTPException(400, str(exc))
+
+    pid = manifest["id"]
+    existing = _plugin_registry.get(pid)
+    if existing and existing["source"] == "builtin":
+        raise HTTPException(400, f"Plugin ID '{pid}' conflicts with a built-in plugin")
+
+    try:
+        _plugin_registry.add_uploaded(manifest)
+        db.execute(
+            text("""
+                INSERT INTO plugins
+                    (plugin_id, display_name, version, enabled,
+                     manifest, config, install_source, status)
+                VALUES (:pid, :name, :ver, false,
+                        CAST(:manifest AS jsonb), CAST('{}' AS jsonb), 'uploaded', 'disabled')
+                ON CONFLICT (plugin_id) DO UPDATE
+                    SET manifest = EXCLUDED.manifest,
+                        display_name = EXCLUDED.display_name,
+                        version = EXCLUDED.version
+            """),
+            {
+                "pid":      pid,
+                "name":     manifest.get("name", pid),
+                "ver":      manifest.get("version", "1.0.0"),
+                "manifest": json.dumps(manifest),
+            },
+        )
+        db.commit()
+    except PluginValidationError as exc:
+        raise HTTPException(400, str(exc))
+    except Exception as exc:
+        db.rollback()
+        _plugin_registry.remove(pid)
+        raise HTTPException(500, f"Database error: {exc}")
+
+    return {"id": pid, "name": manifest.get("name"), "status": "disabled"}
+
+
+@app.put("/plugins/{plugin_id}/config")
+def save_plugin_config(
+    plugin_id: str,
+    payload: PluginConfigSave,
+    username: str = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    plugin = _plugin_registry.get(plugin_id)
+    if not plugin:
+        raise HTTPException(404, "Plugin not found")
+
+    manifest      = plugin["manifest"]
+    existing_cfg  = plugin.get("config") or {}
+    password_keys = {
+        f["key"] for f in manifest.get("config_schema", [])
+        if f.get("type") == "password"
+    }
+
+    encrypted = dict(payload.config)
+    for key in password_keys:
+        val = encrypted.get(key, "")
+        if val == "**redacted**":
+            encrypted[key] = existing_cfg.get(key, "")  # keep existing encrypted value
+        elif val:
+            encrypted[key] = encrypt_field(val)
+
+    # For the HA plugin: keep legacy settings table in sync
+    if plugin_id == "home-assistant":
+        ha_mapping = {
+            "host":             "ha_mqtt_host",
+            "port":             "ha_mqtt_port",
+            "user":             "ha_mqtt_user",
+            "password":         "ha_mqtt_password",
+            "discovery_prefix": "ha_mqtt_discovery_prefix",
+            "state_prefix":     "ha_mqtt_state_prefix",
+        }
+        for cfg_key, setting_key in ha_mapping.items():
+            val = encrypted.get(cfg_key, "")
+            if cfg_key == "password" and val:
+                val = decrypt_field(val)  # settings table stores plaintext
+            s = db.get(Setting, setting_key)
+            if s:
+                s.value = str(val)
+            else:
+                db.add(Setting(key=setting_key, value=str(val), description=""))
+
+    try:
+        db.execute(
+            text("UPDATE plugins SET config = CAST(:cfg AS jsonb) WHERE plugin_id = :pid"),
+            {"cfg": json.dumps(encrypted), "pid": plugin_id},
+        )
+        db.commit()
+    except Exception as exc:
+        db.rollback()
+        raise HTTPException(500, f"Failed to save plugin config: {exc}")
+    _plugin_registry.update_config(plugin_id, encrypted)
+    _plugin_runner.clear_session(plugin_id)
+    return {"ok": True}
+
+
+@app.patch("/plugins/{plugin_id}/enable")
+def enable_plugin(
+    plugin_id: str,
+    username: str = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    plugin = _plugin_registry.get(plugin_id)
+    if not plugin:
+        raise HTTPException(404, "Plugin not found")
+
+    db.execute(
+        text("UPDATE plugins SET enabled = true, status = 'active' WHERE plugin_id = :pid"),
+        {"pid": plugin_id},
+    )
+    # For HA plugin: keep legacy enabled setting in sync and start connection
+    if plugin_id == "home-assistant":
+        s = db.get(Setting, "ha_mqtt_enabled")
+        if s:
+            s.value = "true"
+        else:
+            db.add(Setting(key="ha_mqtt_enabled", value="true", description=""))
+    db.commit()
+    _plugin_registry.set_enabled(plugin_id, True, "active")
+
+    if plugin_id == "home-assistant":
+        db2 = SessionLocal()
+        try:
+            _ha_startup_connect(db2)
+        finally:
+            db2.close()
+
+    return {"ok": True, "enabled": True}
+
+
+@app.patch("/plugins/{plugin_id}/disable")
+def disable_plugin(
+    plugin_id: str,
+    username: str = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    plugin = _plugin_registry.get(plugin_id)
+    if not plugin:
+        raise HTTPException(404, "Plugin not found")
+
+    db.execute(
+        text("UPDATE plugins SET enabled = false, status = 'disabled' WHERE plugin_id = :pid"),
+        {"pid": plugin_id},
+    )
+    if plugin_id == "home-assistant":
+        s = db.get(Setting, "ha_mqtt_enabled")
+        if s:
+            s.value = "false"
+        _ha_mqtt.disconnect()
+    db.commit()
+    _plugin_registry.set_enabled(plugin_id, False, "disabled")
+    _plugin_runner.clear_session(plugin_id)
+    return {"ok": True, "enabled": False}
+
+
+@app.delete("/plugins/{plugin_id}")
+def delete_plugin(
+    plugin_id: str,
+    username: str = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    plugin = _plugin_registry.get(plugin_id)
+    if not plugin:
+        raise HTTPException(404, "Plugin not found")
+    if plugin["source"] == "builtin":
+        raise HTTPException(400, "Built-in plugins cannot be deleted — disable them instead")
+
+    db.execute(text("DELETE FROM plugins WHERE plugin_id = :pid"), {"pid": plugin_id})
+    db.execute(text("DELETE FROM plugin_device_data WHERE plugin_id = :pid"), {"pid": plugin_id})
+    db.commit()
+    _plugin_registry.remove(plugin_id)
+    return {"ok": True}
+
+
+@app.post("/plugins/{plugin_id}/test")
+async def test_plugin_connection(
+    plugin_id: str,
+    username: str = Depends(get_current_user),
+):
+    plugin = _plugin_registry.get(plugin_id)
+    if not plugin:
+        raise HTTPException(404, "Plugin not found")
+    result = await _plugin_runner.execute_action(plugin_id, "test_connection")
+    return result
+
+
+@app.post("/plugins/{plugin_id}/poll")
+async def poll_plugin_now(
+    plugin_id: str,
+    username: str = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Manually trigger the plugin's polling action and upsert discovered devices immediately."""
+    plugin = _plugin_registry.get(plugin_id)
+    if not plugin:
+        raise HTTPException(404, "Plugin not found")
+    polling = plugin["manifest"].get("polling") or {}
+    action = polling.get("action")
+    if not action:
+        raise HTTPException(400, "This plugin has no polling action configured")
+    await _plugin_scheduler._poll_plugin(plugin_id, action)
+    updated = _plugin_registry.get(plugin_id)
+    ok = updated.get("status") == "active"
+    return {
+        "ok":                ok,
+        "status":            updated.get("status"),
+        "error":             updated.get("last_error") if not ok else None,
+        "last_device_count": updated.get("last_device_count"),
+    }
+
+
+@app.get("/plugins/{plugin_id}/data")
+def get_plugin_data(
+    plugin_id: str,
+    username: str = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    rows = db.execute(
+        text("""
+            SELECT mac_address, data, updated_at
+            FROM plugin_device_data
+            WHERE plugin_id = :pid
+            ORDER BY updated_at DESC
+        """),
+        {"pid": plugin_id},
+    ).fetchall()
+    return [
+        {
+            "mac":        r.mac_address,
+            "data":       r.data,
+            "updated_at": r.updated_at.isoformat() if r.updated_at else None,
+        }
+        for r in rows
+    ]
+
+
+@app.post("/plugins/{plugin_id}/webhook")
+async def plugin_webhook(plugin_id: str, request: Request, db: Session = Depends(get_db)):
+    plugin = _plugin_registry.get(plugin_id)
+    if not plugin or not plugin.get("enabled"):
+        raise HTTPException(404, "Plugin not found or disabled")
+
+    body_bytes = await request.body()
+
+    # Optional HMAC-SHA256 signature validation
+    cfg = get_decrypted_config(plugin["manifest"], plugin.get("config") or {})
+    secret = cfg.get("webhook_secret", "")
+    if secret:
+        sig_header = request.headers.get("X-Hub-Signature-256", "")
+        if not verify_webhook_signature(body_bytes, secret, sig_header):
+            raise HTTPException(403, "Invalid webhook signature")
+
+    try:
+        payload = json.loads(body_bytes) if body_bytes else {}
+    except Exception:
+        raise HTTPException(400, "Invalid JSON payload")
+
+    # Find the action marked trigger=webhook
+    actions = plugin["manifest"].get("actions") or {}
+    action_def = next(
+        (a for a in actions.values() if a.get("trigger") == "webhook"),
+        None,
+    )
+    if not action_def:
+        raise HTTPException(422, "No webhook-triggered action defined in plugin manifest")
+
+    action_name = next(k for k, v in actions.items() if v is action_def)
+
+    result = await _plugin_runner.execute_action(plugin_id, action_name, payload)
+    if not result.get("ok"):
+        raise HTTPException(502, result.get("error", "Plugin action failed"))
+
+    # Feed discovered devices into the event bus
+    for dev in (result.get("devices") or []):
+        mac = dev.get("mac_address", "")
+        if mac:
+            event = "device.online" if dev.get("is_online", True) else "device.offline"
+            asyncio.ensure_future(_plugin_event_bus.notify(event, {
+                "mac": mac, "ip": dev.get("ip_address", ""), "name": dev.get("hostname", ""),
+            }))
+
+    return {"ok": True, "devices_received": len(result.get("devices") or [])}
+
+
 @app.get("/notifications/channels")
 def list_channels(db: Session = Depends(get_db)):
     rows = db.execute(text("SELECT * FROM notification_channels ORDER BY created_at")).fetchall()
@@ -5079,6 +5644,8 @@ async def block_device(mac: str, db: Session = Depends(get_db)):
     d.is_blocked = True
     _add_event(db, mac.lower(), "blocked", {"ip": d.ip_address})
     db.commit(); db.refresh(d)
+    # Plugin blocking hook (fire-and-forget)
+    asyncio.ensure_future(_plugin_block_hook(mac.lower(), d.ip_address, "block"))
     return _to_dict(d)
 
 
@@ -5098,6 +5665,7 @@ async def unblock_device(mac: str, db: Session = Depends(get_db)):
     d.is_blocked = False
     _add_event(db, mac.lower(), "unblocked", {"ip": d.ip_address})
     db.commit(); db.refresh(d)
+    asyncio.ensure_future(_plugin_block_hook(mac.lower(), d.ip_address, "unblock"))
     return _to_dict(d)
 
 

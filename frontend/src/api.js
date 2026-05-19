@@ -89,6 +89,7 @@ export const api = {
   updateIdentity:  (mac, body)  => request('PATCH', `/devices/${mac}/identity`, body),
   updateMetadata:  (mac, body)  => request('PATCH', `/devices/${mac}/metadata`, body),
   resolveName:      (mac) => request('POST', `/devices/${mac}/resolve-name`),
+  resolveAllNames:  ()    => request('POST', `/devices/resolve-all-names`),
   rescanDevice:     (mac) => request('POST', `/devices/${mac}/rescan`),
   resetBaseline:    (mac) => request('POST', `/devices/${mac}/reset-baseline`),
   fingerbankLookup: (mac) => request('POST', `/devices/${mac}/fingerbank/lookup`),
@@ -136,6 +137,36 @@ export const api = {
   applySettings:   ()           => request('POST', '/settings/apply'),
   restartProbe:    ()           => request('POST', '/settings/restart-probe'),
   restartBackend:  ()           => request('POST', '/settings/restart-backend'),
+
+  // Home Assistant MQTT (legacy — kept for backward compat)
+  haMqttStatus:     ()         => request('GET',  '/ha-mqtt/status'),
+  haMqttReconnect:  ()         => request('POST', '/ha-mqtt/reconnect'),
+  haMqttDisconnect: ()         => request('POST', '/ha-mqtt/disconnect'),
+
+  // Plugins
+  listPlugins:      ()              => request('GET',    '/plugins'),
+  getPlugin:        (id)            => request('GET',    `/plugins/${id}`),
+  savePluginConfig: (id, config)    => request('PUT',    `/plugins/${id}/config`, { config }),
+  enablePlugin:     (id)            => request('PATCH',  `/plugins/${id}/enable`),
+  disablePlugin:    (id)            => request('PATCH',  `/plugins/${id}/disable`),
+  deletePlugin:     (id)            => request('DELETE', `/plugins/${id}`),
+  testPlugin:       (id)            => request('POST',   `/plugins/${id}/test`),
+  pollPlugin:       (id)            => request('POST',   `/plugins/${id}/poll`),
+  getPluginData:    (id)            => request('GET',    `/plugins/${id}/data`),
+  uploadPlugin: (file) => {
+    const form = new FormData()
+    form.append('file', file)
+    const token = getToken()
+    const headers = token ? { Authorization: `Bearer ${token}` } : {}
+    return fetch(`${BASE}/plugins/upload`, { method: 'POST', body: form, headers })
+      .then(async r => {
+        if (!r.ok) {
+          const e = await r.json().catch(() => ({}))
+          throw new Error(e.detail || `Upload failed: ${r.status}`)
+        }
+        return r.json()
+      })
+  },
 
   // Export (include auth header so the global middleware allows through)
   exportDevicesCsv: () => {
@@ -316,10 +347,6 @@ export const api = {
   // Notification event definitions and pending browser queue
   notifEvents:          ()          => request('GET',    '/notifications/events'),
   notifPending:         ()          => request('GET',    '/notifications/pending'),
-  // Home Assistant MQTT integration
-  haMqttStatus:         ()          => request('GET',    '/ha-mqtt/status'),
-  haMqttReconnect:      ()          => request('POST',   '/ha-mqtt/reconnect'),
-  haMqttDisconnect:     ()          => request('POST',   '/ha-mqtt/disconnect'),
 }
 
 export { streamSSE }

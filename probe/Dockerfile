@@ -16,15 +16,17 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     unzip \
     && rm -rf /var/lib/apt/lists/*
 
-# Install Nuclei vulnerability scanner (fetch latest release, fall back to known-good version)
+# Install Nuclei vulnerability scanner (graceful failure — probe handles absence)
+ARG NUCLEI_VERSION=3.5.0
 RUN NUCLEI_VERSION=$(wget -qO- https://api.github.com/repos/projectdiscovery/nuclei/releases/latest \
-        | grep '"tag_name"' | sed 's/.*"v\([^"]*\)".*/\1/' || echo "3.5.0") \
+        | grep '"tag_name"' | sed 's/.*"v\([^"]*\)".*/\1/' || echo "${NUCLEI_VERSION}") \
     && wget -q "https://github.com/projectdiscovery/nuclei/releases/download/v${NUCLEI_VERSION}/nuclei_${NUCLEI_VERSION}_linux_amd64.zip" \
          -O /tmp/nuclei.zip \
     && unzip -q /tmp/nuclei.zip -d /tmp/nuclei_unzip \
     && mv /tmp/nuclei_unzip/nuclei /usr/local/bin/nuclei \
     && chmod +x /usr/local/bin/nuclei \
-    && rm -rf /tmp/nuclei.zip /tmp/nuclei_unzip
+    && rm -rf /tmp/nuclei.zip /tmp/nuclei_unzip \
+    || echo "[WARN] Nuclei download failed — vulnerability scanning will be unavailable"
 
 # Install Nerva service fingerprinting tool (graceful failure — probe handles absence)
 ARG NERVA_VERSION=1.4.0

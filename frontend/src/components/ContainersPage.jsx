@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback, useMemo } from 'react'
+import { useState, useEffect, useCallback, useMemo, useRef } from 'react'
 import { Box, RefreshCw, Search, AlertCircle, Play, Square, Loader2, LayoutGrid, List, ArrowUpDown, ShieldAlert, Network, GitBranch, X, Sparkles } from 'lucide-react'
 import { api } from '../api'
 import { ContainerCard } from './ContainerCard'
@@ -259,12 +259,16 @@ export function ContainersPage({ openContainer, skin }) {
     return () => clearInterval(id)
   }, [load])
 
-  // Open a specific container's drawer on the vuln tab (used from SecurityDashboard)
+  // Open a specific container's drawer on the vuln tab (used from SecurityDashboard).
+  // consumed ref prevents containers auto-refresh from re-opening a drawer the user closed.
+  const openContainerConsumed = useRef(false)
+  useEffect(() => { openContainerConsumed.current = false }, [openContainer])
   useEffect(() => {
-    if (!openContainer) return
+    if (!openContainer || openContainerConsumed.current) return
     const found = containers.find(c => c.name === openContainer)
     if (found) {
       setSelected(found)
+      openContainerConsumed.current = true
     }
   }, [openContainer, containers])
 
