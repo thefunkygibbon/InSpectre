@@ -1,0 +1,135 @@
+{
+  "id": "pfsense",
+  "name": "pfSense",
+  "version": "1.0.0",
+  "author": "InSpectre Community",
+  "description": "Integrates with pfSense via the pfSense-API package (formerly fauxapi). Discovers ARP/DHCP lease data for device inventory and blocks/unblocks devices by managing a dedicated firewall alias. Requires the pfSense-API package to be installed on your pfSense instance (System > Package Manager).",
+  "homepage": "https://github.com/jaredhendrickson13/pfsense-api",
+  "min_inspectre_version": "1.0.0",
+  "icon": null,
+  "capabilities": [
+    "discovery",
+    "enrichment",
+    "blocking",
+    "firewall"
+  ],
+  "config_schema": [
+    {
+      "key": "host",
+      "label": "pfSense Host",
+      "type": "url",
+      "default": "https://192.168.1.1",
+      "required": true,
+      "help": "Base URL of your pfSense web interface, e.g. https://192.168.1.1. Do not include a trailing slash."
+    },
+    {
+      "key": "api_client_id",
+      "label": "API Client ID",
+      "type": "string",
+      "default": "",
+      "required": true,
+      "help": "Client ID (username) for the pfSense-API package. Configure in System > API > Keys."
+    },
+    {
+      "key": "api_client_token",
+      "label": "API Client Token",
+      "type": "password",
+      "default": "",
+      "required": true,
+      "help": "Client token (password/secret) paired with the Client ID above."
+    },
+    {
+      "key": "block_alias",
+      "label": "Block Alias Name",
+      "type": "string",
+      "default": "inspectre_blocked",
+      "required": true,
+      "help": "Name of the pfSense Host alias that InSpectre will add/remove blocked IPs from. Create this alias in Firewall > Aliases (type: Host) and add a LAN block rule sourcing it before enabling blocking."
+    },
+    {
+      "key": "verify_ssl",
+      "label": "Verify SSL Certificate",
+      "type": "boolean",
+      "default": false,
+      "required": false,
+      "help": "Disable if your pfSense instance uses a self-signed certificate (default for most home installs)."
+    }
+  ],
+  "endpoints": {
+    "base_url": "{host}",
+    "auth": "api-key-header",
+    "api_key_header": "Authorization",
+    "api_key_value": "{api_client_id} {api_client_token}",
+    "headers": {
+      "Content-Type": "application/json",
+      "Accept": "application/json"
+    }
+  },
+  "actions": {
+    "get_arp_table": {
+      "description": "Fetch the ARP table via pfSense-API. Returns all known hosts with IP, MAC, and interface.",
+      "method": "GET",
+      "path": "/api/v1/diagnostics/arp",
+      "response_mapping": {
+        "root_path": "data",
+        "fields": {
+          "mac-address": "mac_address",
+          "ip-address": "ip_address",
+          "hostname": "hostname",
+          "interface-name": "vlan"
+        }
+      }
+    },
+    "get_dhcp_leases": {
+      "description": "Fetch active DHCP leases from pfSense for hostname and MAC enrichment.",
+      "method": "GET",
+      "path": "/api/v1/services/dhcpd/lease",
+      "response_mapping": {
+        "root_path": "data",
+        "fields": {
+          "mac": "mac_address",
+          "ip": "ip_address",
+          "hostname": "hostname"
+        }
+      }
+    },
+    "get_alias": {
+      "description": "Fetch the current contents of the block alias to check what is already blocked.",
+      "method": "GET",
+      "path": "/api/v1/firewall/alias?name={block_alias}"
+    },
+    "block_client": {
+      "description": "Add the device IP to the block alias. pfSense-API applies the change to the live pf table immediately.",
+      "method": "POST",
+      "path": "/api/v1/firewall/alias/entry",
+      "body": {
+        "name": "{block_alias}",
+        "address": ["{ip}"]
+      }
+    },
+    "unblock_client": {
+      "description": "Remove the device IP from the block alias.",
+      "method": "DELETE",
+      "path": "/api/v1/firewall/alias/entry",
+      "body": {
+        "name": "{block_alias}",
+        "address": ["{ip}"]
+      }
+    },
+    "test_connection": {
+      "description": "Verify API credentials by fetching pfSense system information.",
+      "method": "GET",
+      "path": "/api/v1/system/version"
+    }
+  },
+  "event_hooks": {},
+  "data_mapping": {
+    "block_id_field": "ip_address",
+    "tag_fields": []
+  },
+  "polling": {
+    "action": "get_arp_table",
+    "interval_seconds": 60,
+    "run_on_startup": true
+  }
+}
