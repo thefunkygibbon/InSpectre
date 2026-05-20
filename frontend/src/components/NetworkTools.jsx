@@ -526,18 +526,11 @@ function EmailTool() {
     if (!domain.trim()) return
     run(() => api.toolsEmail(domain.trim()))
   }
-  function spfStatus(records) {
-    if (!records?.length) return { color: '#f87171', label: 'Missing' }
-    return { color: '#22c55e', label: 'Present' }
-  }
-  function dmarcStatus(records) {
-    if (!records?.length) return { color: '#f87171', label: 'Missing' }
-    const r = records[0] || ''
-    if (r.includes('p=none'))       return { color: '#fbbf24', label: 'None (monitoring only)' }
-    if (r.includes('p=quarantine')) return { color: '#f59e0b', label: 'Quarantine' }
-    if (r.includes('p=reject'))     return { color: '#22c55e', label: 'Reject' }
-    return { color: '#fbbf24', label: 'Present' }
-  }
+
+  const confColor = c => c === 'high' ? '#22c55e' : c === 'medium' ? '#fbbf24' : '#9ca3af'
+  const enfColor  = e => ({ enforced: '#22c55e', quarantine: '#f59e0b', monitoring: '#60a5fa', none: '#f87171' }[e] || '#9ca3af')
+  const enfLabel  = e => ({ enforced: 'Enforced (reject)', quarantine: 'Quarantine', monitoring: 'Monitoring (p=none)', none: 'No DMARC' }[e] || e)
+
   return (
     <ToolCard title="Email Server Analysis">
       <form onSubmit={handleSubmit} className="flex flex-wrap gap-2">
@@ -545,69 +538,171 @@ function EmailTool() {
           value={domain} onChange={e => setDomain(e.target.value)} />
         <SubmitBtn loading={loading}>Analyse</SubmitBtn>
       </form>
+
       {result && (
         <div className="mt-3 space-y-4">
-          {(result.email_provider || (result.security_vendors && result.security_vendors.length > 0)) && (
+
+          {/* Warnings */}
+          {result.warnings?.length > 0 && (
+            <div className="space-y-1">
+              {result.warnings.map((w, i) => (
+                <div key={i} className="px-3 py-2 rounded-lg text-xs"
+                  style={{ background: 'rgba(251,191,36,0.1)', color: '#fbbf24', border: '1px solid rgba(251,191,36,0.2)' }}>
+                  ⚠ {w}
+                </div>
+              ))}
+            </div>
+          )}
+
+          {/* Email Provider */}
+          <div className="p-3 rounded-lg bg-[var(--color-surface-offset)] border border-[var(--color-border)]">
+            <p className="text-[10px] uppercase tracking-wider text-[var(--color-text-muted)] mb-2">Email Provider</p>
+            <div className="flex items-center flex-wrap gap-2 mb-1.5">
+              <span className="px-2 py-1 rounded text-xs font-semibold"
+                style={{ background: 'rgba(59,130,246,0.15)', color: '#60a5fa' }}>
+                📧 {result.email_provider}
+              </span>
+              <span className="px-2 py-1 rounded text-[10px]"
+                style={{ background: 'rgba(0,0,0,0.2)', color: confColor(result.email_provider_confidence) }}>
+                {result.email_provider_confidence} confidence
+              </span>
+            </div>
+            {result.email_provider_detail && (
+              <p className="text-[10px] text-[var(--color-text-muted)] leading-relaxed">{result.email_provider_detail}</p>
+            )}
+          </div>
+
+          {/* SEG / Inline Security / DMARC */}
+          <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
             <div className="p-3 rounded-lg bg-[var(--color-surface-offset)] border border-[var(--color-border)]">
-              <p className="text-[10px] uppercase tracking-wider text-[var(--color-text-muted)] mb-2">Provider Intelligence</p>
-              <div className="flex flex-wrap gap-2">
-                {result.email_provider && (
-                  <span className="px-2 py-1 rounded text-xs font-semibold" style={{background:'rgba(59,130,246,0.15)',color:'#60a5fa'}}>
-                    📧 {result.email_provider}
-                  </span>
-                )}
-                {(result.security_vendors || []).map(v => (
-                  <span key={v} className="px-2 py-1 rounded text-xs font-semibold" style={{background:'rgba(168,85,247,0.15)',color:'#c084fc'}}>
-                    🛡 {v}
+              <p className="text-[10px] uppercase tracking-wider text-[var(--color-text-muted)] mb-1.5">Email Gateway (SEG)</p>
+              {result.seg_provider
+                ? <p className="text-xs font-semibold" style={{ color: '#c084fc' }}>🛡 {result.seg_provider}</p>
+                : <p className="text-xs text-[var(--color-text-muted)]">None detected</p>}
+              {result.seg_detail && (
+                <p className="text-[10px] text-[var(--color-text-muted)] mt-1.5 leading-relaxed">{result.seg_detail}</p>
+              )}
+            </div>
+
+            <div className="p-3 rounded-lg bg-[var(--color-surface-offset)] border border-[var(--color-border)]">
+              <p className="text-[10px] uppercase tracking-wider text-[var(--color-text-muted)] mb-1.5">API / Inline Security</p>
+              {result.inline_security_provider
+                ? <p className="text-xs font-semibold" style={{ color: '#fb923c' }}>🔒 {result.inline_security_provider}</p>
+                : <p className="text-xs text-[var(--color-text-muted)]">None detected</p>}
+              {result.inline_security_evidence?.length > 0 && (
+                <div className="mt-1.5 space-y-0.5">
+                  {result.inline_security_evidence.map((ev, i) => (
+                    <p key={i} className="text-[10px] text-[var(--color-text-muted)] font-mono truncate">{ev}</p>
+                  ))}
+                </div>
+              )}
+              {!result.inline_security_provider && result.inline_security_detail && (
+                <p className="text-[10px] text-[var(--color-text-muted)] mt-1.5 leading-relaxed">{result.inline_security_detail}</p>
+              )}
+            </div>
+
+            <div className="p-3 rounded-lg bg-[var(--color-surface-offset)] border border-[var(--color-border)]">
+              <p className="text-[10px] uppercase tracking-wider text-[var(--color-text-muted)] mb-1.5">DMARC</p>
+              <p className="text-xs font-semibold" style={{ color: enfColor(result.dmarc_enforcement) }}>
+                {enfLabel(result.dmarc_enforcement)}
+              </p>
+              {result.dmarc_provider && (
+                <p className="text-[10px] mt-1" style={{ color: '#a78bfa' }}>📊 {result.dmarc_provider}</p>
+              )}
+              {result.dmarc_detail && (
+                <p className="text-[10px] text-[var(--color-text-muted)] mt-1.5 leading-relaxed">{result.dmarc_detail}</p>
+              )}
+            </div>
+          </div>
+
+          {/* Third-party Sending Services */}
+          {result.sending_services?.length > 0 && (
+            <div>
+              <p className="text-[10px] uppercase tracking-wider text-[var(--color-text-muted)] mb-1.5">Third-party Sending Services</p>
+              <div className="flex flex-wrap gap-1.5">
+                {result.sending_services.map((s, i) => (
+                  <span key={i} className="px-2 py-1 rounded text-[10px] font-medium"
+                    style={{ background: 'rgba(34,197,94,0.1)', color: '#4ade80' }}>
+                    📬 {s.name}
                   </span>
                 ))}
               </div>
-              <p className="text-[10px] text-[var(--color-text-muted)] italic mt-1.5">Estimates based on MX, SPF, DKIM and DMARC signals</p>
             </div>
           )}
-          {!result.email_provider && (!result.security_vendors || result.security_vendors.length === 0) && (
-            <p className="text-xs text-[var(--color-text-muted)] italic">Provider not identified from available signals.</p>
-          )}
-          <div>
-            <p className="text-[10px] uppercase tracking-wider text-[var(--color-text-muted)] mb-1.5">MX Records</p>
-            <RecordList records={result.mx} />
-          </div>
-          <div className="grid grid-cols-2 sm:grid-cols-3 gap-3">
-            {[
-              { name: 'SPF',   ...spfStatus(result.spf) },
-              { name: 'DMARC', ...dmarcStatus(result.dmarc) },
-              { name: 'DKIM',
-                color: Object.keys(result.dkim || {}).length ? '#22c55e' : '#f87171',
-                label: Object.keys(result.dkim || {}).length
-                  ? `Found (${Object.keys(result.dkim).join(', ')})`
-                  : 'Not detected',
-              },
-            ].map(s => (
-              <div key={s.name} className="flex items-center gap-2 px-3 py-2 rounded-lg bg-[var(--color-surface-offset)]">
-                <span className="w-2 h-2 rounded-full shrink-0" style={{ background: s.color }} />
-                <span className="text-xs text-[var(--color-text-muted)] w-14 shrink-0">{s.name}</span>
-                <span className="text-xs font-semibold truncate" style={{ color: s.color }}>{s.label}</span>
+
+          {/* MX Records */}
+          {result.mx_records?.length > 0 && (
+            <div>
+              <p className="text-[10px] uppercase tracking-wider text-[var(--color-text-muted)] mb-1.5">MX Records</p>
+              <div className="space-y-1">
+                {result.mx_records.map((r, i) => (
+                  <div key={i} className="flex items-center gap-2 px-2 py-1.5 rounded bg-[var(--color-surface-offset)] text-xs">
+                    <span className="font-mono text-[var(--color-text-muted)] w-6 text-right shrink-0">{r.priority}</span>
+                    <span className="font-mono flex-1 truncate">{r.exchange}</span>
+                    {r.provider && (
+                      <span className="text-[10px] px-1.5 py-0.5 rounded shrink-0 whitespace-nowrap" style={{
+                        background: r.provider_type === 'seg'    ? 'rgba(168,85,247,0.15)'
+                                  : r.provider_type === 'inline' ? 'rgba(251,146,60,0.15)'
+                                  : 'rgba(59,130,246,0.15)',
+                        color:      r.provider_type === 'seg'    ? '#c084fc'
+                                  : r.provider_type === 'inline' ? '#fb923c'
+                                  : '#60a5fa',
+                      }}>{r.provider}</span>
+                    )}
+                  </div>
+                ))}
               </div>
-            ))}
-          </div>
-          {result.spf?.length > 0 && (
+            </div>
+          )}
+
+          {/* SPF */}
+          {result.spf && (
             <div>
               <p className="text-[10px] uppercase tracking-wider text-[var(--color-text-muted)] mb-1">SPF Record</p>
-              <RecordList records={result.spf} />
+              <RecordList records={[result.spf.raw_record]} />
+              {result.spf.all_mechanism && (
+                <p className="text-[10px] text-[var(--color-text-muted)] mt-1">
+                  All mechanism: <span className="font-mono">{result.spf.all_mechanism}</span>
+                </p>
+              )}
             </div>
           )}
-          {result.dmarc?.length > 0 && (
+
+          {/* DMARC raw */}
+          {result.dmarc && (
             <div>
               <p className="text-[10px] uppercase tracking-wider text-[var(--color-text-muted)] mb-1">DMARC Record</p>
-              <RecordList records={result.dmarc} />
+              <RecordList records={[result.dmarc.raw_record]} />
+              {(result.dmarc.rua?.length > 0 || result.dmarc.ruf?.length > 0) && (
+                <div className="mt-1.5 space-y-0.5">
+                  {result.dmarc.rua?.length > 0 && (
+                    <p className="text-[10px] text-[var(--color-text-muted)]">RUA: {result.dmarc.rua.join(', ')}</p>
+                  )}
+                  {result.dmarc.ruf?.length > 0 && (
+                    <p className="text-[10px] text-[var(--color-text-muted)]">RUF: {result.dmarc.ruf.join(', ')}</p>
+                  )}
+                </div>
+              )}
             </div>
           )}
-          {Object.entries(result.dkim || {}).map(([sel, recs]) => (
-            <div key={sel}>
-              <p className="text-[10px] uppercase tracking-wider text-[var(--color-text-muted)] mb-1">DKIM ({sel})</p>
-              <RecordList records={recs} />
+
+          {/* DKIM selectors confirmed */}
+          {result.dkim_checks?.length > 0 && (
+            <div>
+              <p className="text-[10px] uppercase tracking-wider text-[var(--color-text-muted)] mb-1.5">DKIM Selectors Confirmed</p>
+              <div className="flex flex-wrap gap-1.5">
+                {result.dkim_checks.map((dk, i) => (
+                  <span key={i} className="px-2 py-1 rounded text-[10px] font-medium"
+                    style={{ background: 'rgba(34,197,94,0.1)', color: '#4ade80' }}>
+                    <span className="font-mono">{dk.selector}</span>
+                    {dk.provider !== 'Generic / Multiple' && ` · ${dk.provider}`}
+                  </span>
+                ))}
+              </div>
             </div>
-          ))}
+          )}
+
+          {/* Nameservers */}
           {result.nameservers?.length > 0 && (
             <div>
               <p className="text-[10px] uppercase tracking-wider text-[var(--color-text-muted)] mb-1">Nameservers</p>

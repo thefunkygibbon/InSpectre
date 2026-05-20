@@ -33,6 +33,7 @@ from plugin_engine import (
     encrypt_field, decrypt_field, get_decrypted_config,
     verify_webhook_signature,
 )
+from email_analysis import run_email_analysis
 
 DATABASE_URL = os.environ.get("DATABASE_URL", "postgresql://admin:password123@db:5432/inspectre")
 # PROBE_API_URL is the name used in docker-compose; PROBE_URL is the legacy fallback.
@@ -6027,139 +6028,19 @@ async def tools_whois(host: str = Query(...)):
 
 @app.get("/tools/email")
 async def tools_email(domain: str = Query(...)):
-    import dns.resolver
+    import dns.resolver as _dns_res
     _validate_tool_host(domain)
-
-    def _resolve(name: str, qtype: str) -> list[str]:
+    try:
+        loop = asyncio.get_event_loop()
+        result = await loop.run_in_executor(None, run_email_analysis, domain)
+        data = result.to_dict()
         try:
-            return [str(r) for r in dns.resolver.resolve(name, qtype, lifetime=8)]
+            data["nameservers"] = [str(r) for r in _dns_res.resolve(domain, "NS", lifetime=8)]
         except Exception:
-            return []
-
-    out: dict = {"domain": domain}
-    out["mx"]          = sorted(_resolve(domain, "MX"))
-    out["spf"]         = [r.strip('"') for r in _resolve(domain, "TXT") if "v=spf" in r.lower()]
-    out["dmarc"]       = [r.strip('"') for r in _resolve(f"_dmarc.{domain}", "TXT")]
-    out["nameservers"] = _resolve(domain, "NS")
-
-    dkim: dict = {}
-    for sel in ["default", "google", "mail", "k1", "selector1", "selector2", "dkim"]:
-        recs = _resolve(f"{sel}._domainkey.{domain}", "TXT")
-        if recs:
-            dkim[sel] = [r.strip('"') for r in recs]
-    out["dkim"] = dkim
-
-    # ── Provider & Security Intelligence ────────────────────────────────────
-    # Infer the email hosting provider from MX hostnames (most reliable signal)
-    _MX_PROVIDERS: list[tuple[list[str], str]] = [
-        (["google.com", "googlemail.com", "gmail.com"],         "Google Workspace"),
-        (["outlook.com", "hotmail.com", "microsoft.com",
-          "protection.outlook.com"],                            "Microsoft 365"),
-        (["pphosted.com", "proofpoint.com"],                    "Proofpoint"),
-        (["mimecast.com"],                                      "Mimecast"),
-        (["barracudanetworks.com", "cudamail.com",
-          "ess.barracuda.com"],                                 "Barracuda"),
-        (["messagelabs.com", "symanteccloud.com",
-          "broadcom.com"],                                      "Symantec / Broadcom"),
-        (["hornetsecurity.com"],                                "Hornetsecurity"),
-        (["trendmicro.com", "trendmicro.eu",
-          "imhs.trendmicro"],                                   "Trend Micro"),
-        (["sophos.com", "sophosmail.com"],                      "Sophos"),
-        (["ironport.com", "cisco.com"],                         "Cisco IronPort"),
-        (["spamexperts.com"],                                   "SpamExperts"),
-        (["mailgun.org", "mailgun.net"],                        "Mailgun"),
-        (["sendgrid.net"],                                      "SendGrid"),
-        (["amazonses.com", "amazonaws.com"],                    "Amazon SES"),
-        (["zoho.com"],                                          "Zoho Mail"),
-        (["yandex.net", "yandex.ru"],                          "Yandex Mail"),
-        (["yahoodns.net", "yahoo.com"],                         "Yahoo Mail"),
-        (["fastmail.com", "fastmail.fm"],                       "Fastmail"),
-        (["protonmail.ch", "protonmail.com"],                   "Proton Mail"),
-        (["improvmx.com"],                                      "ImprovMX"),
-        (["forwardemail.net"],                                   "Forward Email"),
-    ]
-
-    # Signals for email security vendors (SPF includes, DKIM selectors, DMARC rua, NS)
-    _SPF_SECURITY: list[tuple[list[str], str]] = [
-        (["pphosted.com", "proofpoint.com"],    "Proofpoint"),
-        (["mimecast.com"],                       "Mimecast"),
-        (["barracudanetworks.com"],              "Barracuda"),
-        (["messagelabs.com", "symanteccloud.com"], "Symantec / Broadcom"),
-        (["hornetsecurity.com"],                 "Hornetsecurity"),
-        (["trendmicro.com"],                     "Trend Micro"),
-        (["sophos.com"],                         "Sophos"),
-        (["ironport.com"],                       "Cisco IronPort"),
-        (["spamexperts.com"],                    "SpamExperts"),
-        (["google.com", "googlemail.com"],       "Google Workspace"),
-        (["outlook.com", "protection.outlook.com", "microsoft.com"], "Microsoft 365"),
-    ]
-
-    _DKIM_SECURITY: list[tuple[list[str], str]] = [
-        (["selector1", "selector2"],             "Microsoft 365"),
-        (["google"],                             "Google Workspace"),
-        (["pphosted", "proofpoint"],             "Proofpoint"),
-        (["mimecast"],                           "Mimecast"),
-        (["barracuda"],                          "Barracuda"),
-    ]
-
-    _DMARC_SECURITY: list[tuple[list[str], str]] = [
-        (["dmarcian.com"],                       "Dmarcian"),
-        (["agari.com"],                          "Agari"),
-        (["valimail.com"],                       "Valimail"),
-        (["easydmarc.com"],                      "EasyDMARC"),
-        (["mailhardener.com"],                   "Mailhardener"),
-        (["dmarc.postmarkapp.com"],              "Postmark"),
-    ]
-
-    _NS_SECURITY: list[tuple[list[str], str]] = [
-        (["pphosted.com", "proofpoint.com"],    "Proofpoint"),
-        (["mimecast.com"],                       "Mimecast"),
-        (["barracudanetworks.com"],              "Barracuda"),
-    ]
-
-    mx_hosts_flat = " ".join(out["mx"]).lower()
-    spf_flat      = " ".join(out["spf"]).lower()
-    dmarc_flat    = " ".join(out["dmarc"]).lower()
-    ns_flat       = " ".join(out["nameservers"]).lower()
-    dkim_sels     = list(dkim.keys())
-
-    # Determine provider
-    email_provider: str | None = None
-    for patterns, name in _MX_PROVIDERS:
-        if any(p in mx_hosts_flat for p in patterns):
-            email_provider = name
-            break
-
-    # Determine security vendors (deduplicated, ordered)
-    security_vendors: list[str] = []
-
-    def _add_vendor(v: str):
-        if v not in security_vendors:
-            security_vendors.append(v)
-
-    for patterns, name in _SPF_SECURITY:
-        if any(p in spf_flat for p in patterns):
-            _add_vendor(name)
-
-    for patterns, name in _DKIM_SECURITY:
-        if any(s in patterns for s in dkim_sels):
-            _add_vendor(name)
-
-    for patterns, name in _DMARC_SECURITY:
-        if any(p in dmarc_flat for p in patterns):
-            _add_vendor(name)
-
-    for patterns, name in _NS_SECURITY:
-        if any(p in ns_flat for p in patterns):
-            _add_vendor(name)
-
-    # If provider == security vendor, remove the duplicate from security list
-    if email_provider and email_provider in security_vendors:
-        security_vendors.remove(email_provider)
-
-    out["email_provider"]    = email_provider
-    out["security_vendors"]  = security_vendors
-    return out
+            data["nameservers"] = []
+        return data
+    except Exception as exc:
+        raise HTTPException(500, str(exc))
 
 
 # ---------------------------------------------------------------------------
