@@ -1,14 +1,15 @@
-import { useState, useEffect, useRef } from 'react'
+import { useState, useEffect, useRef, useCallback } from 'react'
 import {
   Save, RotateCcw, Settings2, X, Download, Upload, FileText,
   Database, Bell, ScanLine, Eye, EyeOff, Send, Globe, User, Key, Box,
-  AlertTriangle, ChevronDown, ChevronRight, Paintbrush, Package,
+  AlertTriangle, ChevronDown, ChevronRight, Paintbrush, Package, RefreshCw,
 } from 'lucide-react'
 import { api } from '../api'
 import { HostsManager } from './HostsManager'
 import { useTheme } from '../hooks/useTheme'
 import { NotificationsTab } from './NotificationsTab'
 import { PluginsTab } from './PluginsTab'
+import { StreamOutput } from './StreamOutput'
 
 // ── Setting definitions ────────────────────────────────────────────────────────
 const SETTING_META = {
@@ -77,8 +78,15 @@ const SETTING_META = {
   docker_enabled:        { tab: 'docker' },
   docker_host:           { tab: 'docker' },
   docker_tls_verify:     { tab: 'docker' },
-  trivy_db_update_hours: { label: 'Trivy DB Update Interval', unit: 'hours', type: 'number', min: 0, max: 168, tab: 'docker',
-    description: 'How often to refresh the Trivy vulnerability database (hours). Set to 0 to disable automatic updates.' },
+  trivy_db_update_frequency: { label: 'Trivy DB Auto-Update', type: 'select', tab: 'docker',
+    options: [
+      { value: 'disabled', label: 'Disabled' },
+      { value: '1d',       label: 'Daily' },
+      { value: '2d',       label: 'Every 2 days' },
+      { value: '7d',       label: 'Weekly' },
+      { value: '30d',      label: 'Monthly' },
+    ],
+    description: 'How often to automatically refresh the Trivy vulnerability database.' },
   docker_scan_on_new:    { label: 'Scan New Containers',     type: 'toggle', tab: 'docker',
     description: 'Automatically run a Trivy vulnerability scan when a new container is created.' },
   docker_scan_on_update: { label: 'Scan Updated Containers', type: 'toggle', tab: 'docker',
@@ -201,6 +209,24 @@ export function SettingsPanel({ onClose, onSettingChange }) {
   const [blockPlugins,      setBlockPlugins]      = useState([])
   const [blockPluginError,  setBlockPluginError]  = useState('')
 
+  const [trivyDbStatus,     setTrivyDbStatus]     = useState(null)
+  const [trivyUpdating,     setTrivyUpdating]     = useState(false)
+  const [trivyLines,        setTrivyLines]        = useState([])
+  const trivyAbortRef = useRef(null)
+
+  const [nucleiStatus,      setNucleiStatus]      = useState(null)
+  const [nucleiUpdating,    setNucleiUpdating]    = useState(false)
+  const [nucleiLines,       setNucleiLines]       = useState([])
+  const nucleiAbortRef = useRef(null)
+
+  const fetchTrivyStatus = useCallback(() => {
+    api.trivyDbStatus().then(setTrivyDbStatus).catch(() => {})
+  }, [])
+
+  const fetchNucleiStatus = useCallback(() => {
+    api.nucleiTemplateStatus().then(setNucleiStatus).catch(() => {})
+  }, [])
+
   useEffect(() => {
     api.getSettings().then(setSettings).catch(() => {})
     api.getFingerprintStats().then(setFpStats).catch(() => {})
@@ -210,7 +236,9 @@ export function SettingsPanel({ onClose, onSettingChange }) {
     api.listPlugins().then(plugins => {
       setBlockPlugins(plugins.filter(p => p.capabilities?.includes('blocking')))
     }).catch(() => {})
-  }, [])
+    fetchTrivyStatus()
+    fetchNucleiStatus()
+  }, [fetchTrivyStatus, fetchNucleiStatus])
 
   function handleChange(key, value) {
     setDirty(d => ({ ...d, [key]: value }))
@@ -442,7 +470,75 @@ export function SettingsPanel({ onClose, onSettingChange }) {
 
               {/* Vulnerability Scanning */}
               <CollapsibleSection label="Vulnerability Scanning" Icon={AlertTriangle} defaultOpen={false}>
-                {settingsByKeys(['vuln_scan_schedule','vuln_scan_targets','vuln_scan_templates','nuclei_template_update_interval','vuln_scan_on_new_device','vuln_scan_on_port_change']).map(s => (
+                {settingsByKeys(['vuln_scan_schedule','vuln_scan_targets','vuln_scan_templates','vuln_scan_on_new_device','vuln_scan_on_port_change']).map(s => (
+                  <SettingRow key={s.key} s={s} dirty={dirty} onchange={handleChange} />
+                ))}
+
+                {/* Nuclei templates management card */}
+                <div className="card p-4 space-y-3 mt-2">
+                  <div className="flex items-center justify-between gap-3">
+                    <div className="min-w-0">
+                      <p className="text-sm font-medium" style={{ color: 'var(--color-text)' }}>
+                        Nuclei Community Templates
+                      </p>
+                      {nucleiStatus == null ? (
+                        <p className="text-xs mt-0.5" style={{ color: 'var(--color-text-faint)' }}>Checking…</p>
+                      ) : nucleiStatus.exists && nucleiStatus.last_updated ? (
+                        <p className="text-xs mt-0.5 font-mono" style={{ color: 'var(--color-text-muted)' }}>
+                          Updated: {new Date(nucleiStatus.last_updated).toLocaleString()}
+                          {nucleiStatus.version ? ` (v${nucleiStatus.version})` : ''}
+                        </p>
+                      ) : nucleiStatus.exists ? (
+                        <p className="text-xs mt-0.5 font-mono" style={{ color: 'var(--color-text-muted)' }}>
+                          Templates present{nucleiStatus.version ? ` (v${nucleiStatus.version})` : ''}
+                        </p>
+                      ) : nucleiStatus.binary_available === false ? (
+                        <p className="text-xs mt-0.5" style={{ color: '#ef4444' }}>Nuclei not available</p>
+                      ) : (
+                        <p className="text-xs mt-0.5" style={{ color: '#f59e0b' }}>Not downloaded yet</p>
+                      )}
+                    </div>
+                    <button
+                      onClick={async () => {
+                        if (nucleiUpdating) return
+                        setNucleiUpdating(true)
+                        setNucleiLines([])
+                        const ctrl = new AbortController()
+                        nucleiAbortRef.current = ctrl
+                        try {
+                          await api.nucleiTemplateUpdate(line => {
+                            if (line === 'NUCLEI_UPDATE_DONE') {
+                              setNucleiUpdating(false)
+                              fetchNucleiStatus()
+                            } else {
+                              setNucleiLines(l => [...l, line])
+                            }
+                          }, ctrl.signal)
+                        } catch {
+                          /* aborted or network error */
+                        } finally {
+                          setNucleiUpdating(false)
+                        }
+                      }}
+                      disabled={nucleiUpdating || nucleiStatus?.binary_available === false}
+                      className="btn-ghost flex items-center gap-1.5 text-xs shrink-0"
+                    >
+                      <RefreshCw size={12} className={nucleiUpdating ? 'animate-spin' : ''} />
+                      {nucleiUpdating ? 'Updating…' : 'Update Now'}
+                    </button>
+                  </div>
+
+                  {(nucleiLines.length > 0 || nucleiUpdating) && (
+                    <StreamOutput
+                      lines={nucleiLines}
+                      running={nucleiUpdating}
+                      onStop={() => { nucleiAbortRef.current?.abort(); setNucleiUpdating(false) }}
+                      mode="generic"
+                    />
+                  )}
+                </div>
+
+                {settingsByKeys(['nuclei_template_update_interval']).map(s => (
                   <SettingRow key={s.key} s={s} dirty={dirty} onchange={handleChange} />
                 ))}
               </CollapsibleSection>
@@ -697,7 +793,64 @@ export function SettingsPanel({ onClose, onSettingChange }) {
               <HostsManager />
 
               <CollapsibleSection label="Vulnerability Scanning" Icon={AlertTriangle} defaultOpen={false}>
-                {settingsByKeys(['trivy_db_update_hours','docker_scan_on_new','docker_scan_on_update']).map(s => (
+                {/* Trivy DB management card */}
+                <div className="card p-4 space-y-3 mb-2">
+                  <div className="flex items-center justify-between gap-3">
+                    <div className="min-w-0">
+                      <p className="text-sm font-medium" style={{ color: 'var(--color-text)' }}>
+                        Trivy Vulnerability DB
+                      </p>
+                      {trivyDbStatus == null ? (
+                        <p className="text-xs mt-0.5" style={{ color: 'var(--color-text-faint)' }}>Checking…</p>
+                      ) : trivyDbStatus.exists && trivyDbStatus.downloaded_at ? (
+                        <p className="text-xs mt-0.5 font-mono" style={{ color: 'var(--color-text-muted)' }}>
+                          Downloaded: {new Date(trivyDbStatus.downloaded_at).toLocaleString()}
+                        </p>
+                      ) : (
+                        <p className="text-xs mt-0.5" style={{ color: '#f59e0b' }}>Not downloaded yet</p>
+                      )}
+                    </div>
+                    <button
+                      onClick={async () => {
+                        if (trivyUpdating) return
+                        setTrivyUpdating(true)
+                        setTrivyLines([])
+                        const ctrl = new AbortController()
+                        trivyAbortRef.current = ctrl
+                        try {
+                          await api.trivyDbUpdate(line => {
+                            if (line === 'TRIVY_DB_DONE') {
+                              setTrivyUpdating(false)
+                              fetchTrivyStatus()
+                            } else {
+                              setTrivyLines(l => [...l, line])
+                            }
+                          }, ctrl.signal)
+                        } catch {
+                          /* aborted or network error */
+                        } finally {
+                          setTrivyUpdating(false)
+                        }
+                      }}
+                      disabled={trivyUpdating}
+                      className="btn-ghost flex items-center gap-1.5 text-xs shrink-0"
+                    >
+                      <RefreshCw size={12} className={trivyUpdating ? 'animate-spin' : ''} />
+                      {trivyUpdating ? 'Updating…' : 'Update Now'}
+                    </button>
+                  </div>
+
+                  {(trivyLines.length > 0 || trivyUpdating) && (
+                    <StreamOutput
+                      lines={trivyLines}
+                      running={trivyUpdating}
+                      onStop={() => { trivyAbortRef.current?.abort(); setTrivyUpdating(false) }}
+                      mode="generic"
+                    />
+                  )}
+                </div>
+
+                {settingsByKeys(['trivy_db_update_frequency','docker_scan_on_new','docker_scan_on_update']).map(s => (
                   <SettingRow key={s.key} s={s} dirty={dirty} onchange={handleChange} />
                 ))}
               </CollapsibleSection>

@@ -17,10 +17,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # Install Nuclei vulnerability scanner (graceful failure — probe handles absence)
-ARG NUCLEI_VERSION=3.5.0
-RUN NUCLEI_VERSION=$(wget -qO- https://api.github.com/repos/projectdiscovery/nuclei/releases/latest \
-        | grep '"tag_name"' | sed 's/.*"v\([^"]*\)".*/\1/' || echo "${NUCLEI_VERSION}") \
-    && wget -q "https://github.com/projectdiscovery/nuclei/releases/download/v${NUCLEI_VERSION}/nuclei_${NUCLEI_VERSION}_linux_amd64.zip" \
+ARG NUCLEI_VERSION=3.3.9
+RUN wget -q "https://github.com/projectdiscovery/nuclei/releases/download/v${NUCLEI_VERSION}/nuclei_${NUCLEI_VERSION}_linux_amd64.zip" \
          -O /tmp/nuclei.zip \
     && unzip -q /tmp/nuclei.zip -d /tmp/nuclei_unzip \
     && mv /tmp/nuclei_unzip/nuclei /usr/local/bin/nuclei \
@@ -37,9 +35,6 @@ RUN wget -q "https://github.com/praetorian-inc/nerva/releases/download/v${NERVA_
     && chmod +x /usr/local/bin/nerva \
     && rm -f /tmp/nerva.tar.gz \
     || echo "[WARN] Nerva download failed — service fingerprinting will be skipped"
-
-# Pre-fetch Nuclei community templates (baked into image; rebuild to refresh)
-RUN nuclei -update-templates -no-color 2>&1 | tail -5 || true
 
 # Install Ookla speedtest CLI via official packagecloud repo
 # Graceful failure: if Ookla's repo is unreachable the probe still starts;

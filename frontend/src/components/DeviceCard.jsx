@@ -101,7 +101,7 @@ export function DeviceCard({ device, onClick, onStarToggle, isVulnScanning, isAc
   const DevIcon  = getDeviceIcon(device)
   const category = getDeviceCategory(device)
   const ports    = openPortCount(device)
-  const scanning     = !device.deep_scanned
+  const scanning     = !device.deep_scanned && device.is_online
   const drift        = baselineDrift(device)
   const isNew        = isNewDevice(device)
   const showNew      = isNew && !isAcknowledged
@@ -122,26 +122,29 @@ export function DeviceCard({ device, onClick, onStarToggle, isVulnScanning, isAc
       )}
 
       {/* Header */}
-      <div className="flex items-start justify-between gap-2 pr-6">
-        <div className="flex items-center gap-2.5 min-w-0">
-          <span className="w-8 h-8 rounded-lg flex items-center justify-center shrink-0 transition-colors duration-200"
-            style={{ background: category.bgColor }}>
-            <DevIcon size={15} style={{ color: category.color }} />
-          </span>
-          <div className="min-w-0">
-            <div className="flex items-center gap-1.5">
-              <OnlineDot online={device.is_online} size="sm" />
-              <span className="font-semibold text-sm truncate" style={{ color: 'var(--color-text)' }}>{name}</span>
-            </div>
-            {showVendorSubtitle && (
-              <span className="text-[11px] truncate block" style={{ color: 'var(--color-text-muted)' }}>{vendor}</span>
-            )}
+      <div className="flex items-start gap-2.5 pr-6">
+        <span className="w-8 h-8 rounded-lg flex items-center justify-center shrink-0 transition-colors duration-200"
+          style={{ background: category.bgColor }}>
+          <DevIcon size={15} style={{ color: category.color }} />
+        </span>
+
+        {/* Name column — takes all remaining width */}
+        <div className="relative min-w-0 flex-1 overflow-hidden">
+          {/* Name line — overflow-hidden here is the critical clip point */}
+          <div className="flex items-center gap-1.5 overflow-hidden">
+            <OnlineDot online={device.is_online} size="sm" />
+            <span
+              className={`font-semibold text-sm truncate min-w-0 flex-1${showNew ? ' pr-14' : ''}`}
+              style={{ color: 'var(--color-text)' }}
+            >{name}</span>
           </div>
-        </div>
-        <div className="flex flex-col gap-1 items-end shrink-0">
+
+          {/* NEW badge — absolutely overlaid on the right of the name line */}
           {showNew && (
-            <span className="flex items-center gap-0.5 text-[10px] font-bold rounded-full px-2 py-0.5"
-              style={{ color: '#10b981', background: 'rgba(16,185,129,0.12)', border: '1px solid rgba(16,185,129,0.35)' }}>
+            <span
+              className="absolute top-0 right-0 flex items-center gap-0.5 text-[10px] font-bold rounded-full px-2 py-0.5"
+              style={{ color: '#10b981', background: 'rgba(16,185,129,0.18)', border: '1px solid rgba(16,185,129,0.4)' }}
+            >
               NEW
               {onAcknowledge && (
                 <button
@@ -155,17 +158,26 @@ export function DeviceCard({ device, onClick, onStarToggle, isVulnScanning, isAc
               )}
             </span>
           )}
-          {scanning && (
-            <span className="text-[10px] font-medium text-amber-400 bg-amber-400/10
-                             border border-amber-400/20 rounded-full px-2 py-0.5">
-              Scanning
-            </span>
+
+          {showVendorSubtitle && (
+            <span className="text-[11px] truncate block mt-0.5" style={{ color: 'var(--color-text-muted)' }}>{vendor}</span>
           )}
-          {isVulnScanning && (
-            <span className="text-[10px] font-medium rounded-full px-2 py-0.5"
-              style={{ color: 'var(--color-brand)', background: 'color-mix(in srgb, var(--color-brand) 12%, transparent)', border: '1px solid color-mix(in srgb, var(--color-brand) 25%, transparent)' }}>
-              Vuln Scan
-            </span>
+
+          {/* Scanning / VulnScan — below the name, never compete for horizontal space */}
+          {(scanning || isVulnScanning) && (
+            <div className="flex items-center gap-1 mt-1 flex-wrap">
+              {scanning && (
+                <span className="text-[10px] font-medium text-amber-400 bg-amber-400/10 border border-amber-400/20 rounded-full px-2 py-0.5">
+                  Scanning
+                </span>
+              )}
+              {isVulnScanning && (
+                <span className="text-[10px] font-medium rounded-full px-2 py-0.5"
+                  style={{ color: 'var(--color-brand)', background: 'color-mix(in srgb, var(--color-brand) 12%, transparent)', border: '1px solid color-mix(in srgb, var(--color-brand) 25%, transparent)' }}>
+                  Vuln Scan
+                </span>
+              )}
+            </div>
           )}
         </div>
       </div>

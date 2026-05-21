@@ -604,7 +604,7 @@ DEFAULT_SETTINGS = {
     "docker_enabled":            ("false", "Enable Docker container monitoring."),
     "docker_host":               ("unix:///var/run/docker.sock", "Docker host — socket path (unix:///var/run/docker.sock) or TCP URL (tcp://host:2375)."),
     "docker_tls_verify":         ("false", "Enable TLS verification for Docker TCP connections."),
-    "trivy_db_update_hours":     ("24",   "How often (hours) to refresh the Trivy vulnerability database. Set to 0 to disable automatic updates."),
+    "trivy_db_update_frequency": ("1d",   "How often to refresh the Trivy vulnerability database. Options: disabled, 1d, 2d, 7d, 30d."),
     "docker_scan_on_new":        ("false", "Automatically run a Trivy vuln scan when a new container is created."),
     "docker_scan_on_update":     ("false", "Automatically run a Trivy vuln scan when a container is recreated with an updated image."),
     # Notification — speed test alert thresholds
@@ -7156,6 +7156,8 @@ async def create_container_host(body: ContainerHostCreate, db: Session = Depends
         "tls": body.tls_verify, "enabled": body.enabled, "node": body.node or "pve",
     }).fetchone()
     db.commit()
+    if body.enabled:
+        _schedule_trivy_db_download_if_missing()
     return _row_to_host(row)
 
 
@@ -7181,6 +7183,8 @@ async def update_container_host(host_id: int, body: ContainerHostUpdate, db: Ses
     fields["id"] = host_id
     updated = db.execute(text(f"UPDATE container_hosts SET {set_clause} WHERE id = :id RETURNING *"), fields).fetchone()
     db.commit()
+    if fields.get("enabled"):
+        _schedule_trivy_db_download_if_missing()
     return _row_to_host(updated)
 
 
@@ -7801,34 +7805,174 @@ async def stream_docker_trivy_scan(container_id: str, db: Session = Depends(get_
 
 
 # ---------------------------------------------------------------------------
+# Trivy DB helpers
+# ---------------------------------------------------------------------------
+_TRIVY_DB_META = "/root/.cache/trivy/db/metadata.json"
+_TRIVY_FREQ_SECONDS = {"1d": 86400, "2d": 172800, "7d": 604800, "30d": 2592000}
+_trivy_db_updating = False
+
+
+def _trivy_db_status() -> dict:
+    """Return metadata from the on-disk Trivy DB, or exists=False if absent."""
+    try:
+        with open(_TRIVY_DB_META) as f:
+            meta = json.load(f)
+        return {
+            "exists": True,
+            "updated_at":    meta.get("UpdatedAt"),
+            "next_update":   meta.get("NextUpdate"),
+            "downloaded_at": meta.get("DownloadedAt"),
+        }
+    except Exception:
+        return {"exists": False, "updated_at": None, "next_update": None, "downloaded_at": None}
+
+
+async def _run_trivy_db_download():
+    """Download/refresh the Trivy DB, streaming output to callers via an asyncio.Queue."""
+    global _trivy_db_updating
+    if _trivy_db_updating or not shutil.which("trivy"):
+        return
+    _trivy_db_updating = True
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "trivy", "image", "--download-db-only",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+        )
+        if proc.stdout:
+            async for raw in proc.stdout:
+                line = raw.decode(errors="replace").rstrip()
+                if line:
+                    print(f"[trivy_db] {line}", flush=True)
+        await proc.wait()
+        if proc.returncode == 0:
+            print("[trivy_db] Vulnerability DB updated.", flush=True)
+        else:
+            print(f"[trivy_db] Update exited with code {proc.returncode}.", flush=True)
+    except Exception as exc:
+        print(f"[trivy_db] Update failed: {exc}", flush=True)
+    finally:
+        _trivy_db_updating = False
+
+
+def _schedule_trivy_db_download_if_missing():
+    """Fire-and-forget: download DB if it doesn't exist yet."""
+    if not _trivy_db_status()["exists"] and shutil.which("trivy"):
+        asyncio.ensure_future(_run_trivy_db_download())
+
+
+# ---------------------------------------------------------------------------
 # Trivy DB update background loop
 # ---------------------------------------------------------------------------
 async def _trivy_db_update_loop():
     """Periodically refreshes the Trivy vulnerability database."""
-    await asyncio.sleep(60)  # startup grace
+    await asyncio.sleep(60)  # startup grace — let the container settle
+    # Immediate download if DB is absent (e.g. fresh volume)
+    if not _trivy_db_status()["exists"] and shutil.which("trivy"):
+        print("[trivy_db] DB not found — downloading now.", flush=True)
+        await _run_trivy_db_download()
     while True:
         db = SessionLocal()
         try:
-            s = db.get(Setting, "trivy_db_update_hours")
-            hours = int(s.value) if s and s.value else 24
+            s = db.get(Setting, "trivy_db_update_frequency")
+            freq = s.value.strip() if s and s.value else "1d"
         except Exception:
-            hours = 24
+            freq = "1d"
         finally:
             db.close()
 
-        if hours > 0 and shutil.which("trivy"):
-            try:
-                proc = await asyncio.create_subprocess_exec(
-                    "trivy", "image", "--download-db-only", "--no-progress",
-                    stdout=asyncio.subprocess.DEVNULL,
-                    stderr=asyncio.subprocess.DEVNULL,
-                )
-                await proc.wait()
-                print("[trivy_db] Vulnerability DB updated.", flush=True)
-            except Exception as e:
-                print(f"[trivy_db] Update failed: {e}", flush=True)
+        interval = _TRIVY_FREQ_SECONDS.get(freq, 0)
+        if interval > 0 and shutil.which("trivy"):
+            await _run_trivy_db_download()
 
-        await asyncio.sleep(max(hours, 1) * 3600 if hours > 0 else 86400)
+        await asyncio.sleep(interval if interval > 0 else 86400)
+
+
+# ---------------------------------------------------------------------------
+# Trivy DB status + force-update endpoints
+# ---------------------------------------------------------------------------
+@app.get("/trivy/db-status")
+async def trivy_db_status_endpoint(_user: str = Depends(get_current_user)):
+    status = _trivy_db_status()
+    status["updating"] = _trivy_db_updating
+    return status
+
+
+@app.get("/trivy/db-update")
+async def trivy_db_update_stream(_user: str = Depends(get_current_user)):
+    """SSE stream that triggers a Trivy DB download and streams its output."""
+    if not shutil.which("trivy"):
+        async def _no_trivy():
+            yield "data: [ERROR] Trivy binary not found in container.\n\n"
+            yield "data: TRIVY_DB_DONE\n\n"
+        return StreamingResponse(_no_trivy(), media_type="text/event-stream",
+                                 headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+    async def _stream():
+        global _trivy_db_updating
+        if _trivy_db_updating:
+            yield "data: [INFO] Update already in progress — please wait.\n\n"
+            yield "data: TRIVY_DB_DONE\n\n"
+            return
+        _trivy_db_updating = True
+        try:
+            yield "data: [INFO] Starting Trivy vulnerability DB download…\n\n"
+            proc = await asyncio.create_subprocess_exec(
+                "trivy", "image", "--download-db-only",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+            )
+            if proc.stdout:
+                async for raw in proc.stdout:
+                    line = raw.decode(errors="replace").rstrip()
+                    if line:
+                        yield f"data: {line}\n\n"
+            await proc.wait()
+            if proc.returncode == 0:
+                yield "data: [INFO] Trivy DB updated successfully.\n\n"
+            else:
+                yield f"data: [ERROR] Update exited with code {proc.returncode}.\n\n"
+        except Exception as exc:
+            yield f"data: [ERROR] {exc}\n\n"
+        finally:
+            _trivy_db_updating = False
+        yield "data: TRIVY_DB_DONE\n\n"
+
+    return StreamingResponse(_stream(), media_type="text/event-stream",
+                             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+
+# ---------------------------------------------------------------------------
+# Nuclei template status + force-update endpoints (proxy to probe)
+# ---------------------------------------------------------------------------
+@app.get("/nuclei/template-status")
+async def nuclei_template_status(_user: str = Depends(get_current_user)):
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            r = await client.get(f"{PROBE_URL}/nuclei/status")
+            return r.json()
+    except Exception:
+        return {"exists": False, "version": None, "last_updated": None, "binary_available": False}
+
+
+@app.get("/nuclei/template-update")
+async def nuclei_template_update_stream(_user: str = Depends(get_current_user)):
+    """SSE proxy: streams Nuclei template update output from the probe."""
+    async def _proxy():
+        try:
+            async with httpx.AsyncClient(timeout=None) as client:
+                async with client.stream("GET", f"{PROBE_URL}/nuclei/update") as r:
+                    async for line in r.aiter_lines():
+                        if line:
+                            yield f"{line}\n"
+                        else:
+                            yield "\n"
+        except Exception as exc:
+            yield f"data: [ERROR] Could not reach probe: {exc}\n\n"
+            yield "data: NUCLEI_UPDATE_DONE\n\n"
+
+    return StreamingResponse(_proxy(), media_type="text/event-stream",
+                             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
 
 # ---------------------------------------------------------------------------

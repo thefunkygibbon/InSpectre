@@ -347,6 +347,14 @@ export const api = {
   // Notification event definitions and pending browser queue
   notifEvents:          ()          => request('GET',    '/notifications/events'),
   notifPending:         ()          => request('GET',    '/notifications/pending'),
+
+  // Trivy vulnerability DB
+  trivyDbStatus:        ()                    => request('GET', '/trivy/db-status'),
+  trivyDbUpdate:        (onLine, signal)      => streamSSE('/trivy/db-update', onLine, signal),
+
+  // Nuclei templates
+  nucleiTemplateStatus: ()                    => request('GET', '/nuclei/template-status'),
+  nucleiTemplateUpdate: (onLine, signal)      => streamSSE('/nuclei/template-update', onLine, signal),
 }
 
 export { streamSSE }

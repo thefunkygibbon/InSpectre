@@ -14,8 +14,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         | grep '"tag_name"' | sed 's/.*"v\([^"]*\)".*/\1/' || echo "0.62.0") \
     && curl -sfL "https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz" \
         | tar -xz -C /usr/local/bin trivy 2>/dev/null || true \
-    && rm -rf /var/lib/apt/lists/* \
-    && trivy image --download-db-only --no-progress --scanners vuln 2>/dev/null || true
+    && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 COPY requirements.txt .
