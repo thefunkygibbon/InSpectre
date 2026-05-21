@@ -5,6 +5,7 @@ import json
 import os
 import queue
 import re
+import shutil
 import signal
 import socket
 import subprocess
@@ -2447,10 +2448,30 @@ def _run_nerva_fingerprint(ip: str, mac: str, open_ports: list[int]) -> None:
 # ---------------------------------------------------------------------------
 # Nuclei template updater
 # ---------------------------------------------------------------------------
+def _nuclei_templates_exist() -> bool:
+    templates_dir = "/root/nuclei-templates"
+    return os.path.isdir(templates_dir) and bool(os.listdir(templates_dir))
+
+
 def _nuclei_template_update_loop() -> None:
     """Background thread that periodically runs nuclei -update-templates."""
     global _last_nuclei_template_update
-    time.sleep(120)  # startup grace period
+    # If templates dir is empty, download immediately without waiting
+    if not _nuclei_templates_exist() and shutil.which("nuclei"):
+        print("[nuclei] Templates directory empty — downloading now.", flush=True)
+        try:
+            result = subprocess.run(
+                ["nuclei", "-update-templates"],
+                capture_output=True, text=True, timeout=600,
+            )
+            if result.returncode == 0:
+                print("[nuclei] Initial template download complete.", flush=True)
+                _last_nuclei_template_update = datetime.now(timezone.utc)
+            else:
+                print(f"[nuclei] Initial download failed (exit {result.returncode})", flush=True)
+        except Exception as exc:
+            print(f"[nuclei] Initial download error: {exc}", flush=True)
+    time.sleep(120)  # startup grace period before periodic loop
     _update_intervals = {"12h": 43200, "24h": 86400, "48h": 172800, "weekly": 604800}
     while True:
         try:
@@ -3182,6 +3203,72 @@ def probe_restart():
         os.kill(os.getpid(), signal.SIGTERM)
     threading.Thread(target=_do, daemon=True).start()
     return {"ok": True, "restarting": True}
+
+
+@probe_api.get("/nuclei/status")
+def nuclei_status():
+    templates_dir = "/root/nuclei-templates"
+    exists = _nuclei_templates_exist()
+    version = None
+    try:
+        with open(os.path.join(templates_dir, ".version")) as f:
+            version = f.read().strip()
+    except Exception:
+        pass
+    return {
+        "exists": exists,
+        "version": version,
+        "last_updated": _last_nuclei_template_update.isoformat() if _last_nuclei_template_update else None,
+        "binary_available": bool(shutil.which("nuclei")),
+    }
+
+
+_nuclei_updating = False
+
+
+@probe_api.get("/nuclei/update")
+async def nuclei_update_stream():
+    """SSE stream that triggers a Nuclei template update."""
+    global _nuclei_updating
+    if not shutil.which("nuclei"):
+        async def _no_bin():
+            yield "data: [ERROR] Nuclei binary not found in container.\n\n"
+            yield "data: NUCLEI_UPDATE_DONE\n\n"
+        return StreamingResponse(_no_bin(), media_type="text/event-stream",
+                                 headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+    async def _stream():
+        global _nuclei_updating, _last_nuclei_template_update
+        if _nuclei_updating:
+            yield "data: [INFO] Update already in progress — please wait.\n\n"
+            yield "data: NUCLEI_UPDATE_DONE\n\n"
+            return
+        _nuclei_updating = True
+        try:
+            yield "data: [INFO] Starting Nuclei template update…\n\n"
+            proc = await asyncio.create_subprocess_exec(
+                "nuclei", "-update-templates",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+            )
+            async for raw in proc.stdout:
+                line = raw.decode(errors="replace").rstrip()
+                if line:
+                    yield f"data: {line}\n\n"
+            await proc.wait()
+            if proc.returncode == 0:
+                _last_nuclei_template_update = datetime.now(timezone.utc)
+                yield "data: [INFO] Templates updated successfully.\n\n"
+            else:
+                yield f"data: [ERROR] nuclei exited with code {proc.returncode}\n\n"
+        except Exception as exc:
+            yield f"data: [ERROR] {exc}\n\n"
+        finally:
+            _nuclei_updating = False
+        yield "data: NUCLEI_UPDATE_DONE\n\n"
+
+    return StreamingResponse(_stream(), media_type="text/event-stream",
+                             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
 
 def start_probe_api() -> None:

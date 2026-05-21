@@ -31,7 +31,7 @@ BUILTIN_DIR = os.path.join(os.path.dirname(__file__), "plugins", "builtin")
 
 VALID_CAPABILITIES = frozenset([
     "discovery", "blocking", "enrichment", "dns",
-    "presence", "traffic", "export", "notification",
+    "presence", "traffic", "export", "notification", "firewall",
 ])
 VALID_FIELD_TYPES = frozenset([
     "string", "password", "integer", "boolean",
@@ -40,6 +40,7 @@ VALID_FIELD_TYPES = frozenset([
 VALID_EVENT_KEYS = frozenset([
     "device.new", "device.online", "device.offline",
     "port.opened", "vuln.found", "vuln.critical", "vuln.high",
+    "device.blocked", "device.unblocked",
 ])
 VALID_AUTH_METHODS = frozenset([
     "none", "basic", "bearer", "cookie",
@@ -296,26 +297,24 @@ class PluginRegistry:
             rows = []
         for row in rows:
             try:
-                # Uploaded plugins must never overwrite a builtin — the builtin's manifest
-                # on disk always wins. Only config/enabled/status are taken from the DB row
-                # (already handled in the builtin phase above).
-                existing = self._plugins.get(row.plugin_id)
-                if existing and existing.get("source") == "builtin":
-                    print(
-                        f"[plugins] Uploaded row for '{row.plugin_id}' superseded by builtin"
-                        f" — using builtin manifest, skipping uploaded manifest.",
-                        flush=True,
-                    )
-                    continue
                 manifest = (
                     row.manifest
                     if isinstance(row.manifest, dict)
                     else json.loads(row.manifest)
                 )
                 validate_manifest(manifest)
+                existing = self._plugins.get(row.plugin_id, {})
+                if existing.get("source") == "builtin":
+                    # Uploaded plugin shadows the builtin — uploaded manifest wins,
+                    # but we preserve any config/state already loaded from the DB.
+                    print(
+                        f"[plugins] Uploaded plugin '{row.plugin_id}' overrides builtin"
+                        f" — using uploaded manifest.",
+                        flush=True,
+                    )
                 self._plugins[row.plugin_id] = {
                     "manifest":   manifest,
-                    "config":     row.config or {},
+                    "config":     row.config or existing.get("config") or {},
                     "source":     "uploaded",
                     "enabled":    bool(row.enabled),
                     "status":     row.status or "disabled",
@@ -354,13 +353,20 @@ class PluginRegistry:
             self._plugins[plugin_id]["last_device_count"] = device_count
 
     def add_uploaded(self, manifest: dict) -> str:
+        """Register an uploaded plugin manifest in-memory.
+
+        If the plugin ID matches a built-in, the uploaded manifest takes
+        precedence (overrides the built-in) — allowing power users to ship
+        a patched version without touching the container image.
+        """
         validate_manifest(manifest)
         pid = manifest["id"]
-        if pid in self._plugins and self._plugins[pid]["source"] == "builtin":
-            raise PluginValidationError(
-                f"Plugin ID '{pid}' conflicts with a built-in plugin"
-            )
         existing = self._plugins.get(pid, {})
+        if existing.get("source") == "builtin":
+            print(
+                f"[plugins] add_uploaded: '{pid}' overrides built-in plugin.",
+                flush=True,
+            )
         self._plugins[pid] = {
             "manifest":   manifest,
             "config":     existing.get("config") or {},
@@ -538,10 +544,11 @@ class PluginRunner:
 
         method   = action_def.get("method", "GET").upper()
         body_tpl = action_def.get("body")
-        body     = (
-            json.loads(self._sub(json.dumps(body_tpl), config, sub_ctx))
-            if body_tpl else None
-        )
+        if body_tpl:
+            body = json.loads(self._sub(json.dumps(body_tpl), config, sub_ctx))
+            body = self._apply_list_directives(body, sub_ctx)
+        else:
+            body = None
 
         headers = {
             k: self._sub(str(v), config, sub_ctx)
@@ -590,10 +597,11 @@ class PluginRunner:
                         self._sub(endpoints.get("base_url", ""), config, sub_ctx)
                         + self._sub(action_def.get("path", ""), config, sub_ctx)
                     )
-                    body = (
-                        json.loads(self._sub(json.dumps(body_tpl), config, sub_ctx))
-                        if body_tpl else None
-                    )
+                    if body_tpl:
+                        body = json.loads(self._sub(json.dumps(body_tpl), config, sub_ctx))
+                        body = self._apply_list_directives(body, sub_ctx)
+                    else:
+                        body = None
                     if auth_method == "cookie" and session:
                         cookies = dict(session.cookies)
                     elif auth_method == "bearer" and session and session.bearer_token:
@@ -1023,48 +1031,102 @@ class PluginRunner:
 
     @staticmethod
     def _apply_response_mapping(raw_data, mapping: dict) -> list:
-        root_path = mapping.get("root_path", "")
-        field_map = mapping.get("fields", {})
+        root_path  = mapping.get("root_path", "")
+        root_paths = mapping.get("root_paths")  # array: merge results from multiple paths
+        field_map  = mapping.get("fields", {})
 
-        data = raw_data
-        if root_path:
-            for part in root_path.split("."):
-                if isinstance(data, dict):
-                    data = data.get(part)
-                elif isinstance(data, list):
-                    try:
-                        data = data[int(part)]
-                    except (ValueError, IndexError):
+        # Normalise to a list of paths so the loop below handles both cases uniformly
+        paths = root_paths if root_paths else ([root_path] if root_path else [""])
+
+        seen_macs: set = set()
+        all_devices: list = []
+
+        for rp in paths:
+            data = raw_data
+            if rp:
+                for part in rp.split("."):
+                    if isinstance(data, dict):
+                        data = data.get(part)
+                    elif isinstance(data, list):
+                        try:
+                            data = data[int(part)]
+                        except (ValueError, IndexError):
+                            data = None
+                            break
+                    else:
                         data = None
                         break
-                else:
-                    data = None
-                    break
-            if data is None:
-                return []
-
-        if not isinstance(data, list):
-            data = [data] if data else []
-
-        devices = []
-        for item in data:
-            if not isinstance(item, dict):
-                continue
-            device: dict = {}
-            for plugin_field, inspectre_field in field_map.items():
-                val = item.get(plugin_field)
-                if val is None:
+                if data is None:
                     continue
-                if inspectre_field == "mac_address":
-                    val = _normalise_mac(str(val))
-                    if not val:
+
+            if not isinstance(data, list):
+                data = [data] if data else []
+
+            for item in data:
+                if not isinstance(item, dict):
+                    continue
+                device: dict = {}
+                for plugin_field, inspectre_field in field_map.items():
+                    val = item.get(plugin_field)
+                    if val is None:
                         continue
-                elif inspectre_field == "is_online":
-                    val = bool(val) if not isinstance(val, str) else val.lower() in ("true", "1", "yes", "online", "connected")
-                device[inspectre_field] = val
-            if device.get("mac_address"):
-                devices.append(device)
-        return devices
+                    if inspectre_field == "mac_address":
+                        val = _normalise_mac(str(val))
+                        if not val:
+                            continue
+                    elif inspectre_field == "is_online":
+                        val = bool(val) if not isinstance(val, str) else val.lower() in ("true", "1", "yes", "online", "connected")
+                    device[inspectre_field] = val
+                if device.get("mac_address"):
+                    mac = device["mac_address"]
+                    if mac not in seen_macs:
+                        seen_macs.add(mac)
+                        all_devices.append(device)
+
+        return all_devices
+
+    @staticmethod
+    def _apply_list_directives(body: dict, sub_ctx: dict) -> dict:
+        """Process _list_append / _list_remove / _list_passthrough body directives.
+
+        These allow a manifest action to non-destructively modify a list fetched
+        from a preceding depends_on action (e.g. read-modify-write an access list).
+
+        Directive format (as a value inside the body dict):
+            {"_list_append":      "dep_action.ctx_key", "_value": "{ip}"}
+            {"_list_remove":      "dep_action.ctx_key", "_value": "{ip}"}
+            {"_list_passthrough": "dep_action.ctx_key"}
+        """
+        if not isinstance(body, dict):
+            return body
+        result = {}
+        for key, val in body.items():
+            if isinstance(val, dict) and (
+                "_list_append" in val or "_list_remove" in val or "_list_passthrough" in val
+            ):
+                ctx_key = (
+                    val.get("_list_append")
+                    or val.get("_list_remove")
+                    or val.get("_list_passthrough", "")
+                )
+                raw = sub_ctx.get(ctx_key, "[]")
+                try:
+                    current = json.loads(raw) if isinstance(raw, str) else list(raw)
+                except (json.JSONDecodeError, TypeError):
+                    current = []
+                if not isinstance(current, list):
+                    current = []
+                item = val.get("_value", "")
+                if "_list_append" in val:
+                    if item and item not in current:
+                        current = current + [item]
+                elif "_list_remove" in val:
+                    current = [x for x in current if x != item]
+                # _list_passthrough: use current as-is
+                result[key] = current
+            else:
+                result[key] = val
+        return result
 
     # ── Template substitution ─────────────────────────────────────────────────
 
@@ -1144,30 +1206,50 @@ class PluginScheduler:
                     if not plugin_info.get("enabled"):
                         continue
                     polling  = plugin_info["manifest"].get("polling") or {}
+                    # Support both singular "action" and plural "actions"
                     action   = polling.get("action")
-                    if not action:
+                    actions  = polling.get("actions") or ([action] if action else [])
+                    if not actions:
                         continue
                     interval = float(polling.get("interval_seconds") or 300)
                     pid      = plugin_info["id"]
                     if (now - self._last_poll.get(pid, 0.0)) >= interval:
                         self._last_poll[pid] = now
-                        asyncio.ensure_future(self._poll_plugin(pid, action))
+                        asyncio.ensure_future(self._poll_plugin(pid, actions))
             except Exception as exc:
                 print(f"[plugin-scheduler] {exc}", flush=True)
             await asyncio.sleep(30)
 
-    async def _poll_plugin(self, plugin_id: str, action: str):
-        result = await self._runner.execute_action(plugin_id, action)
+    async def _poll_plugin(self, plugin_id: str, actions: list):
         db = self._db_factory()
         now = datetime.now(timezone.utc)
-        try:
+        plugin_info = self._registry.get(plugin_id)
+        caps = set((plugin_info or {}).get("manifest", {}).get("capabilities", []))
+        has_presence = "presence" in caps
+
+        # Run all polling actions and merge results (last write wins per MAC)
+        all_devices: dict = {}
+        any_ok   = False
+        last_err = None
+
+        for action in actions:
+            result = await self._runner.execute_action(plugin_id, action)
             if result.get("ok"):
-                devices = result.get("devices") or []
-                plugin_info = self._registry.get(plugin_id)
-                caps = set((plugin_info or {}).get("manifest", {}).get("capabilities", []))
+                any_ok = True
+                for dev in (result.get("devices") or []):
+                    mac = dev.get("mac_address")
+                    if mac:
+                        all_devices[mac] = dev
+            else:
+                last_err = result.get("error", "Unknown error")
+                print(f"[plugin-scheduler] {plugin_id}/{action}: poll FAILED — {last_err}", flush=True)
+
+        try:
+            if any_ok:
+                devices = list(all_devices.values())
                 upserted = 0
                 if devices and caps & {"discovery", "presence"}:
-                    upserted = self._upsert_devices(db, plugin_id, devices)
+                    upserted = self._upsert_devices(db, plugin_id, devices, has_presence)
                 print(
                     f"[plugin-scheduler] {plugin_id}: poll OK — {len(devices)} device(s) returned,"
                     f" {upserted} upserted",
@@ -1183,8 +1265,8 @@ class PluginScheduler:
                 self._registry.set_status(plugin_id, "active")
                 self._registry.set_poll_result(plugin_id, len(devices), now)
             else:
-                err = result.get("error", "Unknown error")
-                print(f"[plugin-scheduler] {plugin_id}: poll FAILED — {err}", flush=True)
+                err = last_err or "Unknown error"
+                print(f"[plugin-scheduler] {plugin_id}: all poll actions FAILED — {err}", flush=True)
                 db.execute(
                     text(
                         "UPDATE plugins SET last_polled = NOW(), status = 'error',"
@@ -1201,7 +1283,7 @@ class PluginScheduler:
         finally:
             db.close()
 
-    def _upsert_devices(self, db: Session, plugin_id: str, devices: list) -> int:
+    def _upsert_devices(self, db: Session, plugin_id: str, devices: list, has_presence: bool = True) -> int:
         count = 0
         for dev in devices:
             # Strip all non-hex characters so both colon and dash separated MACs normalise correctly
@@ -1218,24 +1300,43 @@ class PluginScheduler:
                 #   1. User custom_name set → never touch hostname
                 #   2. Device already has a hostname (from probe/ARP/DNS) → keep it
                 #   3. No hostname yet → accept plugin-provided name as fallback only
-                db.execute(text("""
-                    INSERT INTO devices (mac_address, ip_address, hostname, is_online, first_seen, last_seen)
-                    VALUES (:mac, :ip, :hostname, :online, NOW(), NOW())
-                    ON CONFLICT (mac_address) DO UPDATE SET
-                        ip_address = COALESCE(EXCLUDED.ip_address, devices.ip_address),
-                        hostname   = CASE
-                                        WHEN devices.custom_name IS NOT NULL THEN devices.hostname
-                                        WHEN devices.hostname IS NOT NULL AND devices.hostname != '' THEN devices.hostname
-                                        ELSE EXCLUDED.hostname
-                                     END,
-                        is_online  = EXCLUDED.is_online,
-                        last_seen  = NOW()
-                """), {
-                    "mac":      mac_fmt,
-                    "ip":       dev.get("ip_address"),
-                    "hostname": dev.get("hostname"),
-                    "online":   bool(dev.get("is_online", True)),
-                })
+                online_val = bool(dev.get("is_online")) if has_presence else False
+                if has_presence:
+                    db.execute(text("""
+                        INSERT INTO devices (mac_address, ip_address, hostname, is_online, first_seen, last_seen)
+                        VALUES (:mac, :ip, :hostname, :online, NOW(), NOW())
+                        ON CONFLICT (mac_address) DO UPDATE SET
+                            ip_address = COALESCE(EXCLUDED.ip_address, devices.ip_address),
+                            hostname   = CASE
+                                            WHEN devices.custom_name IS NOT NULL THEN devices.hostname
+                                            WHEN devices.hostname IS NOT NULL AND devices.hostname != '' THEN devices.hostname
+                                            ELSE EXCLUDED.hostname
+                                         END,
+                            is_online  = EXCLUDED.is_online,
+                            last_seen  = NOW()
+                    """), {
+                        "mac":      mac_fmt,
+                        "ip":       dev.get("ip_address"),
+                        "hostname": dev.get("hostname"),
+                        "online":   online_val,
+                    })
+                else:
+                    db.execute(text("""
+                        INSERT INTO devices (mac_address, ip_address, hostname, is_online, first_seen, last_seen)
+                        VALUES (:mac, :ip, :hostname, false, NOW(), NOW())
+                        ON CONFLICT (mac_address) DO UPDATE SET
+                            ip_address = COALESCE(EXCLUDED.ip_address, devices.ip_address),
+                            hostname   = CASE
+                                            WHEN devices.custom_name IS NOT NULL THEN devices.hostname
+                                            WHEN devices.hostname IS NOT NULL AND devices.hostname != '' THEN devices.hostname
+                                            ELSE EXCLUDED.hostname
+                                         END,
+                            last_seen  = NOW()
+                    """), {
+                        "mac":      mac_fmt,
+                        "ip":       dev.get("ip_address"),
+                        "hostname": dev.get("hostname"),
+                    })
 
                 # Store full enrichment payload in plugin_device_data
                 enrichment = {k: v for k, v in dev.items() if k not in INSPECTRE_DEVICE_FIELDS}

@@ -1,14 +1,15 @@
-import { useState, useEffect, useRef } from 'react'
+import { useState, useEffect, useRef, useCallback } from 'react'
 import {
   Save, RotateCcw, Settings2, X, Download, Upload, FileText,
   Database, Bell, ScanLine, Eye, EyeOff, Send, Globe, User, Key, Box,
-  AlertTriangle, ChevronDown, ChevronRight, Paintbrush, Package,
+  AlertTriangle, ChevronDown, ChevronRight, Paintbrush, Package, RefreshCw,
 } from 'lucide-react'
 import { api } from '../api'
 import { HostsManager } from './HostsManager'
 import { useTheme } from '../hooks/useTheme'
 import { NotificationsTab } from './NotificationsTab'
 import { PluginsTab } from './PluginsTab'
+import { StreamOutput } from './StreamOutput'
 
 // ── Setting definitions ────────────────────────────────────────────────────────
 const SETTING_META = {
@@ -77,8 +78,15 @@ const SETTING_META = {
   docker_enabled:        { tab: 'docker' },
   docker_host:           { tab: 'docker' },
   docker_tls_verify:     { tab: 'docker' },
-  trivy_db_update_hours: { label: 'Trivy DB Update Interval', unit: 'hours', type: 'number', min: 0, max: 168, tab: 'docker',
-    description: 'How often to refresh the Trivy vulnerability database (hours). Set to 0 to disable automatic updates.' },
+  trivy_db_update_frequency: { label: 'Trivy DB Auto-Update', type: 'select', tab: 'docker',
+    options: [
+      { value: 'disabled', label: 'Disabled' },
+      { value: '1d',       label: 'Daily' },
+      { value: '2d',       label: 'Every 2 days' },
+      { value: '7d',       label: 'Weekly' },
+      { value: '30d',      label: 'Monthly' },
+    ],
+    description: 'How often to automatically refresh the Trivy vulnerability database.' },
   docker_scan_on_new:    { label: 'Scan New Containers',     type: 'toggle', tab: 'docker',
     description: 'Automatically run a Trivy vulnerability scan when a new container is created.' },
   docker_scan_on_update: { label: 'Scan Updated Containers', type: 'toggle', tab: 'docker',
@@ -105,7 +113,7 @@ const SETTING_META = {
 
   // Scanner tab — auto-block security responses
   auto_block_new_devices:   { label: 'Auto-Block New Devices', type: 'toggle', tab: 'scanner',
-    description: 'Automatically ARP-block any newly discovered device until it is manually approved.' },
+    description: 'Automatically block any newly discovered device until it is manually approved. Uses the active block method below.' },
   auto_block_vuln_severity: { label: 'Auto-Block on Vulnerability', type: 'select', tab: 'scanner',
     options: [
       { value: 'none',     label: 'Disabled' },
@@ -113,7 +121,10 @@ const SETTING_META = {
       { value: 'high',     label: 'High and above' },
       { value: 'critical', label: 'Critical only' },
     ],
-    description: 'Automatically ARP-block a device when a vulnerability scan finds issues at or above the selected severity.' },
+    description: 'Automatically block a device when a vulnerability scan finds issues at or above the selected severity. Uses the active block method below.' },
+  // Blocking method (custom UI renders these)
+  block_method:    { tab: 'scanner' },
+  block_plugin_id: { tab: 'scanner' },
 
   // Phase 9 — device grouping
   auto_group_by_hostname: { label: 'Auto-group by Hostname', type: 'toggle', tab: 'scanner',
@@ -195,6 +206,26 @@ export function SettingsPanel({ onClose, onSettingChange }) {
   const [recheckNames,  setRecheckNames]  = useState({ running: false, result: null })
   const fileInputRef = useRef(null)
   const [detectedInterface, setDetectedInterface] = useState('')
+  const [blockPlugins,      setBlockPlugins]      = useState([])
+  const [blockPluginError,  setBlockPluginError]  = useState('')
+
+  const [trivyDbStatus,     setTrivyDbStatus]     = useState(null)
+  const [trivyUpdating,     setTrivyUpdating]     = useState(false)
+  const [trivyLines,        setTrivyLines]        = useState([])
+  const trivyAbortRef = useRef(null)
+
+  const [nucleiStatus,      setNucleiStatus]      = useState(null)
+  const [nucleiUpdating,    setNucleiUpdating]    = useState(false)
+  const [nucleiLines,       setNucleiLines]       = useState([])
+  const nucleiAbortRef = useRef(null)
+
+  const fetchTrivyStatus = useCallback(() => {
+    api.trivyDbStatus().then(setTrivyDbStatus).catch(() => {})
+  }, [])
+
+  const fetchNucleiStatus = useCallback(() => {
+    api.nucleiTemplateStatus().then(setNucleiStatus).catch(() => {})
+  }, [])
 
   useEffect(() => {
     api.getSettings().then(setSettings).catch(() => {})
@@ -202,7 +233,12 @@ export function SettingsPanel({ onClose, onSettingChange }) {
     api.setupNetworkInfo().then(info => {
       if (info?.interface) setDetectedInterface(info.interface)
     }).catch(() => {})
-  }, [])
+    api.listPlugins().then(plugins => {
+      setBlockPlugins(plugins.filter(p => p.capabilities?.includes('blocking')))
+    }).catch(() => {})
+    fetchTrivyStatus()
+    fetchNucleiStatus()
+  }, [fetchTrivyStatus, fetchNucleiStatus])
 
   function handleChange(key, value) {
     setDirty(d => ({ ...d, [key]: value }))
@@ -211,9 +247,19 @@ export function SettingsPanel({ onClose, onSettingChange }) {
 
   async function handleSave() {
     setSaving(true)
-    await Promise.all(
-      Object.entries(dirty).map(([key, value]) => api.updateSetting(key, value))
-    )
+    setBlockPluginError('')
+    try {
+      await Promise.all(
+        Object.entries(dirty).map(([key, value]) => api.updateSetting(key, value))
+      )
+    } catch (e) {
+      const msg = e?.message || String(e)
+      if (msg.includes('block_plugin') || dirty.block_plugin_id !== undefined) {
+        setBlockPluginError(msg.replace(/^.*\d+\s*/, ''))
+      }
+      setSaving(false)
+      return
+    }
     // Push scanner settings to the probe immediately (no need to wait for next scan cycle)
     if (activeTab === 'scanner') {
       api.applySettings().catch(() => {})
@@ -424,7 +470,75 @@ export function SettingsPanel({ onClose, onSettingChange }) {
 
               {/* Vulnerability Scanning */}
               <CollapsibleSection label="Vulnerability Scanning" Icon={AlertTriangle} defaultOpen={false}>
-                {settingsByKeys(['vuln_scan_schedule','vuln_scan_targets','vuln_scan_templates','nuclei_template_update_interval','vuln_scan_on_new_device','vuln_scan_on_port_change']).map(s => (
+                {settingsByKeys(['vuln_scan_schedule','vuln_scan_targets','vuln_scan_templates','vuln_scan_on_new_device','vuln_scan_on_port_change']).map(s => (
+                  <SettingRow key={s.key} s={s} dirty={dirty} onchange={handleChange} />
+                ))}
+
+                {/* Nuclei templates management card */}
+                <div className="card p-4 space-y-3 mt-2">
+                  <div className="flex items-center justify-between gap-3">
+                    <div className="min-w-0">
+                      <p className="text-sm font-medium" style={{ color: 'var(--color-text)' }}>
+                        Nuclei Community Templates
+                      </p>
+                      {nucleiStatus == null ? (
+                        <p className="text-xs mt-0.5" style={{ color: 'var(--color-text-faint)' }}>Checking…</p>
+                      ) : nucleiStatus.exists && nucleiStatus.last_updated ? (
+                        <p className="text-xs mt-0.5 font-mono" style={{ color: 'var(--color-text-muted)' }}>
+                          Updated: {new Date(nucleiStatus.last_updated).toLocaleString()}
+                          {nucleiStatus.version ? ` (v${nucleiStatus.version})` : ''}
+                        </p>
+                      ) : nucleiStatus.exists ? (
+                        <p className="text-xs mt-0.5 font-mono" style={{ color: 'var(--color-text-muted)' }}>
+                          Templates present{nucleiStatus.version ? ` (v${nucleiStatus.version})` : ''}
+                        </p>
+                      ) : nucleiStatus.binary_available === false ? (
+                        <p className="text-xs mt-0.5" style={{ color: '#ef4444' }}>Nuclei not available</p>
+                      ) : (
+                        <p className="text-xs mt-0.5" style={{ color: '#f59e0b' }}>Not downloaded yet</p>
+                      )}
+                    </div>
+                    <button
+                      onClick={async () => {
+                        if (nucleiUpdating) return
+                        setNucleiUpdating(true)
+                        setNucleiLines([])
+                        const ctrl = new AbortController()
+                        nucleiAbortRef.current = ctrl
+                        try {
+                          await api.nucleiTemplateUpdate(line => {
+                            if (line === 'NUCLEI_UPDATE_DONE') {
+                              setNucleiUpdating(false)
+                              fetchNucleiStatus()
+                            } else {
+                              setNucleiLines(l => [...l, line])
+                            }
+                          }, ctrl.signal)
+                        } catch {
+                          /* aborted or network error */
+                        } finally {
+                          setNucleiUpdating(false)
+                        }
+                      }}
+                      disabled={nucleiUpdating || nucleiStatus?.binary_available === false}
+                      className="btn-ghost flex items-center gap-1.5 text-xs shrink-0"
+                    >
+                      <RefreshCw size={12} className={nucleiUpdating ? 'animate-spin' : ''} />
+                      {nucleiUpdating ? 'Updating…' : 'Update Now'}
+                    </button>
+                  </div>
+
+                  {(nucleiLines.length > 0 || nucleiUpdating) && (
+                    <StreamOutput
+                      lines={nucleiLines}
+                      running={nucleiUpdating}
+                      onStop={() => { nucleiAbortRef.current?.abort(); setNucleiUpdating(false) }}
+                      mode="generic"
+                    />
+                  )}
+                </div>
+
+                {settingsByKeys(['nuclei_template_update_interval']).map(s => (
                   <SettingRow key={s.key} s={s} dirty={dirty} onchange={handleChange} />
                 ))}
               </CollapsibleSection>
@@ -441,6 +555,100 @@ export function SettingsPanel({ onClose, onSettingChange }) {
                 {settingsByKeys(['auto_block_new_devices','auto_block_vuln_severity']).map(s => (
                   <SettingRow key={s.key} s={s} dirty={dirty} onchange={handleChange} />
                 ))}
+
+                {/* Blocking Method — custom UI */}
+                {(() => {
+                  const currentMethod   = val('block_method') || 'arp'
+                  const currentPluginId = val('block_plugin_id') || ''
+
+                  // Derive which methods have a qualifying plugin
+                  const dnsPlugins   = blockPlugins.filter(p => p.capabilities?.includes('dns'))
+                  const fwPlugins    = blockPlugins.filter(p => p.capabilities?.includes('firewall'))
+                  const infraPlugins = blockPlugins.filter(p =>
+                    !p.capabilities?.includes('dns') && !p.capabilities?.includes('firewall')
+                  )
+
+                  const methodOptions = [
+                    { value: 'arp',            label: 'ARP Poisoning (probe-native)',           always: true  },
+                    { value: 'dns',            label: 'DNS Block (AdGuard Home / Pi-hole)',      always: false, plugins: dnsPlugins   },
+                    { value: 'firewall',       label: 'Firewall Rule (OPNsense / pfSense)',      always: false, plugins: fwPlugins    },
+                    { value: 'infrastructure', label: 'Infrastructure (TP-Link Omada / UniFi)', always: false, plugins: infraPlugins },
+                  ].filter(o => o.always || o.plugins.length > 0)
+
+                  const pluginsForMethod = currentMethod === 'arp' ? [] :
+                    methodOptions.find(o => o.value === currentMethod)?.plugins ?? []
+
+                  const selectedPlugin = blockPlugins.find(p => p.id === currentPluginId)
+                  const pluginUnhealthy = selectedPlugin && selectedPlugin.status === 'error'
+
+                  return (
+                    <div className="space-y-2 pt-1">
+                      <p className="text-xs font-semibold pt-1" style={{ color: 'var(--color-text-muted)' }}>Blocking Method</p>
+
+                      {/* Method selector */}
+                      <div className="space-y-1">
+                        <label className="text-xs" style={{ color: 'var(--color-text-muted)' }}>Method</label>
+                        <select
+                          className="w-full rounded-lg px-3 py-2 text-sm"
+                          style={{ background: 'var(--color-surface-offset)', border: '1px solid var(--color-border)', color: 'var(--color-text)' }}
+                          value={currentMethod}
+                          onChange={e => {
+                            handleChange('block_method', e.target.value)
+                            handleChange('block_plugin_id', '')
+                            setBlockPluginError('')
+                          }}
+                        >
+                          {methodOptions.map(o => (
+                            <option key={o.value} value={o.value}>{o.label}</option>
+                          ))}
+                        </select>
+                        <p className="text-xs" style={{ color: 'var(--color-text-faint)' }}>
+                          {currentMethod === 'arp'
+                            ? 'The probe uses ARP poisoning to redirect traffic. No plugin required.'
+                            : 'Only methods with an enabled, configured blocking plugin are shown.'}
+                        </p>
+                      </div>
+
+                      {/* Plugin selector (hidden for ARP) */}
+                      {currentMethod !== 'arp' && (
+                        <div className="space-y-1">
+                          <label className="text-xs" style={{ color: 'var(--color-text-muted)' }}>Blocking Plugin</label>
+                          {pluginsForMethod.length === 0 ? (
+                            <p className="text-xs rounded-lg px-3 py-2"
+                              style={{ background: 'rgba(245,158,11,0.08)', border: '1px solid rgba(245,158,11,0.3)', color: '#d97706' }}>
+                              No enabled plugin found for the selected method. Enable and configure a qualifying plugin in the Plugins tab first.
+                            </p>
+                          ) : (
+                            <select
+                              className="w-full rounded-lg px-3 py-2 text-sm"
+                              style={{ background: 'var(--color-surface-offset)', border: '1px solid var(--color-border)', color: 'var(--color-text)' }}
+                              value={currentPluginId}
+                              onChange={e => { handleChange('block_plugin_id', e.target.value); setBlockPluginError('') }}
+                            >
+                              <option value="">— select plugin —</option>
+                              {pluginsForMethod.map(p => (
+                                <option key={p.id} value={p.id}>{p.name} ({p.status})</option>
+                              ))}
+                            </select>
+                          )}
+                          {blockPluginError && (
+                            <p className="text-xs rounded-lg px-3 py-2"
+                              style={{ background: 'rgba(239,68,68,0.08)', border: '1px solid rgba(239,68,68,0.3)', color: '#ef4444' }}>
+                              {blockPluginError}
+                            </p>
+                          )}
+                          {pluginUnhealthy && (
+                            <p className="text-xs rounded-lg px-3 py-2"
+                              style={{ background: 'rgba(245,158,11,0.08)', border: '1px solid rgba(245,158,11,0.3)', color: '#d97706' }}>
+                              Warning: {selectedPlugin.name} last poll failed — blocks may not execute until the plugin recovers.
+                              {selectedPlugin.last_error && <span> Error: {selectedPlugin.last_error}</span>}
+                            </p>
+                          )}
+                        </div>
+                      )}
+                    </div>
+                  )
+                })()}
               </CollapsibleSection>
 
               {/* ── Here Be Dragons ─────────────────────────────────────── */}
@@ -585,7 +793,64 @@ export function SettingsPanel({ onClose, onSettingChange }) {
               <HostsManager />
 
               <CollapsibleSection label="Vulnerability Scanning" Icon={AlertTriangle} defaultOpen={false}>
-                {settingsByKeys(['trivy_db_update_hours','docker_scan_on_new','docker_scan_on_update']).map(s => (
+                {/* Trivy DB management card */}
+                <div className="card p-4 space-y-3 mb-2">
+                  <div className="flex items-center justify-between gap-3">
+                    <div className="min-w-0">
+                      <p className="text-sm font-medium" style={{ color: 'var(--color-text)' }}>
+                        Trivy Vulnerability DB
+                      </p>
+                      {trivyDbStatus == null ? (
+                        <p className="text-xs mt-0.5" style={{ color: 'var(--color-text-faint)' }}>Checking…</p>
+                      ) : trivyDbStatus.exists && trivyDbStatus.downloaded_at ? (
+                        <p className="text-xs mt-0.5 font-mono" style={{ color: 'var(--color-text-muted)' }}>
+                          Downloaded: {new Date(trivyDbStatus.downloaded_at).toLocaleString()}
+                        </p>
+                      ) : (
+                        <p className="text-xs mt-0.5" style={{ color: '#f59e0b' }}>Not downloaded yet</p>
+                      )}
+                    </div>
+                    <button
+                      onClick={async () => {
+                        if (trivyUpdating) return
+                        setTrivyUpdating(true)
+                        setTrivyLines([])
+                        const ctrl = new AbortController()
+                        trivyAbortRef.current = ctrl
+                        try {
+                          await api.trivyDbUpdate(line => {
+                            if (line === 'TRIVY_DB_DONE') {
+                              setTrivyUpdating(false)
+                              fetchTrivyStatus()
+                            } else {
+                              setTrivyLines(l => [...l, line])
+                            }
+                          }, ctrl.signal)
+                        } catch {
+                          /* aborted or network error */
+                        } finally {
+                          setTrivyUpdating(false)
+                        }
+                      }}
+                      disabled={trivyUpdating}
+                      className="btn-ghost flex items-center gap-1.5 text-xs shrink-0"
+                    >
+                      <RefreshCw size={12} className={trivyUpdating ? 'animate-spin' : ''} />
+                      {trivyUpdating ? 'Updating…' : 'Update Now'}
+                    </button>
+                  </div>
+
+                  {(trivyLines.length > 0 || trivyUpdating) && (
+                    <StreamOutput
+                      lines={trivyLines}
+                      running={trivyUpdating}
+                      onStop={() => { trivyAbortRef.current?.abort(); setTrivyUpdating(false) }}
+                      mode="generic"
+                    />
+                  )}
+                </div>
+
+                {settingsByKeys(['trivy_db_update_frequency','docker_scan_on_new','docker_scan_on_update']).map(s => (
                   <SettingRow key={s.key} s={s} dirty={dirty} onchange={handleChange} />
                 ))}
               </CollapsibleSection>

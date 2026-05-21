@@ -1,0 +1,191 @@
+{
+  "id": "adguard-home",
+  "name": "AdGuard Home",
+  "version": "1.1.0",
+  "author": "InSpectre Community",
+  "description": "Integrates with AdGuard Home REST API to pull known clients (device inventory with hostname resolution), DHCP leases, and DNS query logs for traffic analysis and suspicious domain alerting.",
+  "homepage": "https://github.com/AdguardTeam/AdGuardHome",
+  "min_inspectre_version": "1.0.0",
+  "icon": null,
+  "capabilities": [
+    "discovery",
+    "enrichment",
+    "dns",
+    "traffic",
+    "blocking"
+  ],
+  "config_schema": [
+    {
+      "key": "host",
+      "label": "AdGuard Home Host",
+      "type": "url",
+      "default": "http://192.168.0.2:3000",
+      "required": true,
+      "help": "Base URL of your AdGuard Home web interface including port, e.g. http://192.168.0.2:3000. Do not include a trailing slash."
+    },
+    {
+      "key": "user",
+      "label": "Username",
+      "type": "string",
+      "default": "admin",
+      "required": true,
+      "help": "AdGuard Home administrator username."
+    },
+    {
+      "key": "password",
+      "label": "Password",
+      "type": "password",
+      "default": "",
+      "required": true,
+      "help": "AdGuard Home administrator password."
+    },
+    {
+      "key": "query_log_limit",
+      "label": "Query Log Entries per Poll",
+      "type": "integer",
+      "default": 500,
+      "required": false,
+      "help": "How many recent DNS query log entries to fetch each poll cycle. Recommended: 200\u20131000."
+    },
+    {
+      "key": "suspicious_domains",
+      "label": "Suspicious Domain Keywords",
+      "type": "multiline",
+      "default": "malware\nphishing\ntracker\nbotnet\ncnc\nc2\nexploit\ndynamic-dns\nno-ip\nduckdns\nddns",
+      "required": false,
+      "help": "One keyword per line. Any DNS query whose domain contains one of these strings will trigger a vuln.found event alert tagged 'suspicious-dns'. Case-insensitive substring match."
+    },
+    {
+      "key": "verify_ssl",
+      "label": "Verify SSL Certificate",
+      "type": "boolean",
+      "default": true,
+      "required": false,
+      "help": "Disable if your AdGuard Home instance uses a self-signed HTTPS certificate."
+    }
+  ],
+  "endpoints": {
+    "base_url": "{host}",
+    "auth": "basic",
+    "headers": {
+      "Content-Type": "application/json",
+      "Accept": "application/json"
+    }
+  },
+  "actions": {
+    "get_clients": {
+      "description": "Fetch all manually configured clients for device inventory and hostname resolution.",
+      "method": "GET",
+      "path": "/control/clients",
+      "response_mapping": {
+        "root_path": "clients",
+        "fields": {
+          "ids.0": "ip_address",
+          "name": "hostname"
+        }
+      }
+    },
+    "get_auto_clients": {
+      "description": "Fetch auto-discovered clients (from rDNS and /etc/hosts) not yet manually configured.",
+      "method": "GET",
+      "path": "/control/clients",
+      "response_mapping": {
+        "root_path": "auto_clients",
+        "fields": {
+          "ip": "ip_address",
+          "name": "hostname"
+        }
+      }
+    },
+    "get_dhcp_leases": {
+      "description": "Fetch active (dynamic) DHCP leases from AdGuard Home. Only available when AdGuard Home's built-in DHCP server is enabled.",
+      "method": "GET",
+      "path": "/control/dhcp/status",
+      "response_mapping": {
+        "root_path": "leases",
+        "fields": {
+          "mac": "mac_address",
+          "ip": "ip_address",
+          "hostname": "hostname"
+        }
+      }
+    },
+    "get_static_dhcp_leases": {
+      "description": "Fetch static (permanently assigned) DHCP leases from AdGuard Home.",
+      "method": "GET",
+      "path": "/control/dhcp/status",
+      "response_mapping": {
+        "root_path": "static_leases",
+        "fields": {
+          "mac": "mac_address",
+          "ip": "ip_address",
+          "hostname": "hostname"
+        }
+      }
+    },
+    "get_all_dhcp_leases": {
+      "description": "Fetch both active and static DHCP leases in one call. Used for polling.",
+      "method": "GET",
+      "path": "/control/dhcp/status",
+      "response_mapping": {
+        "root_paths": ["leases", "static_leases"],
+        "fields": {
+          "mac": "mac_address",
+          "ip": "ip_address",
+          "hostname": "hostname"
+        }
+      }
+    },
+    "get_query_log": {
+      "description": "Fetch recent DNS query log for traffic analysis and suspicious domain detection.",
+      "method": "GET",
+      "path": "/control/querylog?limit={query_log_limit}"
+    },
+    "get_stats": {
+      "description": "Fetch aggregate DNS statistics including top queried domains and top clients.",
+      "method": "GET",
+      "path": "/control/stats"
+    },
+    "test_connection": {
+      "description": "Verify connectivity and credentials by fetching DNS general settings.",
+      "method": "GET",
+      "path": "/control/dns_info"
+    },
+    "get_access_list": {
+      "description": "Fetch the current AdGuard Home access control list (allowed clients, disallowed clients, blocked hosts).",
+      "method": "GET",
+      "path": "/control/access/list"
+    },
+    "block_client": {
+      "description": "Block a client by appending their IP to AdGuard Home's disallowed_clients list. Reads the current list first so existing entries are preserved.",
+      "depends_on": "get_access_list",
+      "method": "POST",
+      "path": "/control/access/set",
+      "body": {
+        "allowed_clients":    {"_list_passthrough": "get_access_list.allowed_clients"},
+        "disallowed_clients": {"_list_append": "get_access_list.disallowed_clients", "_value": "{ip}"},
+        "blocked_hosts":      {"_list_passthrough": "get_access_list.blocked_hosts"}
+      }
+    },
+    "unblock_client": {
+      "description": "Unblock a client by removing their IP from AdGuard Home's disallowed_clients list. Reads the current list first so other blocked entries are preserved.",
+      "depends_on": "get_access_list",
+      "method": "POST",
+      "path": "/control/access/set",
+      "body": {
+        "allowed_clients":    {"_list_passthrough": "get_access_list.allowed_clients"},
+        "disallowed_clients": {"_list_remove": "get_access_list.disallowed_clients", "_value": "{ip}"},
+        "blocked_hosts":      {"_list_passthrough": "get_access_list.blocked_hosts"}
+      }
+    }
+  },
+  "event_hooks": {},
+  "data_mapping": {
+    "tag_fields": []
+  },
+  "polling": {
+    "action": "get_all_dhcp_leases",
+    "interval_seconds": 120,
+    "run_on_startup": true
+  }
+}

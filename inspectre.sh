@@ -16,9 +16,10 @@ Usage:
 
 Commands:
   rebuild         Full rebuild from the current folder — wipes containers, images,
-                  build cache, AND the postgres_data/ folder (all device history).
+                  build cache, AND the data/db/ folder (all device history).
+                  Vuln scanner data (data/vuln/) is always preserved.
   rebuild keep-data
-                  Full rebuild but leaves postgres_data/ intact (devices, history, settings
+                  Full rebuild but leaves data/db/ intact (devices, history, settings
                   are preserved across the rebuild).
   up              Start the stack normally.
   down            Stop the stack.
@@ -27,8 +28,10 @@ Commands:
 Notes:
   - This script does NOT run any git commands.
   - It rebuilds from the files currently present in this working directory.
-  - Database data lives in ./postgres_data/ (a bind mount, not a named volume).
-    "rebuild" deletes that folder; "rebuild keep-data" leaves it untouched.
+  - Data layout:
+      data/db/         — PostgreSQL data (wiped by "rebuild", kept by "rebuild keep-data")
+      data/vuln/trivy  — Trivy vulnerability DB (never wiped)
+      data/vuln/nuclei — Nuclei templates (never wiped)
 EOF
 }
 
@@ -66,13 +69,14 @@ full_rebuild() {
   log "No git fetch/pull/reset will be performed."
 
   if [[ "$keep_data" == "true" ]]; then
-    log "Database contents (postgres_data/) will be preserved."
+    log "Database contents (data/db/) will be preserved."
     if ! confirm "Proceed with full rebuild keeping existing data?"; then
       log "Aborted."
       exit 1
     fi
   else
-    log "This will delete containers, images, build cache, AND the postgres_data/ folder (all device history)."
+    log "This will delete containers, images, build cache, AND the data/db/ folder (all device history)."
+    log "Vuln scanner data (data/vuln/) will be preserved."
     if ! confirm "Are you sure you want to wipe everything?"; then
       log "Aborted."
       exit 1
@@ -80,12 +84,12 @@ full_rebuild() {
   fi
 
   log "Stopping existing stack..."
-  "${COMPOSE_CMD[@]}" down --volumes --remove-orphans || true
+  "${COMPOSE_CMD[@]}" down --remove-orphans || true
 
   if [[ "$keep_data" == "false" ]]; then
-    if [[ -d "$SCRIPT_DIR/postgres_data" ]]; then
-      log "Wiping postgres_data bind mount..."
-      rm -rf "$SCRIPT_DIR/postgres_data"
+    if [[ -d "$SCRIPT_DIR/data/db" ]]; then
+      log "Wiping data/db bind mount..."
+      rm -rf "$SCRIPT_DIR/data/db"
     fi
   fi
 

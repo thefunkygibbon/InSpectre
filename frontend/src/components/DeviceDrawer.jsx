@@ -608,7 +608,7 @@ export function DeviceDrawer({ device, onClose, onRename, onResolveName, onRefre
       if (onRefresh) onRefresh()
       setStaticLines([
         action === 'block'
-          ? `[OK] Device ${updated.ip_address} is now blocked from the internet via ARP spoofing.`
+          ? `[OK] Device ${updated.ip_address} is now blocked from the internet.`
           : `[OK] Device ${updated.ip_address} has been unblocked — internet access restored.`,
       ])
     } catch (e) {
@@ -1144,26 +1144,54 @@ export function DeviceDrawer({ device, onClose, onRename, onResolveName, onRefre
 }
 
 function GroupManager({ mac, device, onChanged }) {
-  const [group,      setGroup]      = useState(null)
-  const [loading,    setLoading]    = useState(false)
-  const [addMac,     setAddMac]     = useState('')
-  const [addErr,     setAddErr]     = useState(null)
-  const [busy,       setBusy]       = useState(false)
+  const [group,        setGroup]        = useState(null)
+  const [addErr,       setAddErr]       = useState(null)
+  const [busy,         setBusy]         = useState(false)
+  const [query,        setQuery]        = useState('')
+  const [selectedMac,  setSelectedMac]  = useState(null)
+  const [allDevices,   setAllDevices]   = useState([])
+  const [showDrop,     setShowDrop]     = useState(false)
+  const wrapRef = useRef(null)
 
   useEffect(() => {
     api.getDeviceGroup(mac).then(setGroup).catch(() => {})
+    api.getDevices().then(r => setAllDevices(Array.isArray(r) ? r : (r?.devices ?? []))).catch(() => {})
   }, [mac])
+
+  // Close dropdown on outside click
+  useEffect(() => {
+    const handler = e => { if (wrapRef.current && !wrapRef.current.contains(e.target)) setShowDrop(false) }
+    document.addEventListener('mousedown', handler)
+    return () => document.removeEventListener('mousedown', handler)
+  }, [])
 
   const reload = () => api.getDeviceGroup(mac).then(setGroup).catch(() => {})
 
+  const groupedMacs = new Set((group?.members || []).map(m => m.mac_address))
+  const suggestions = query.trim().length > 0
+    ? allDevices.filter(d => {
+        if (d.mac_address === mac || groupedMacs.has(d.mac_address)) return false
+        const q = query.toLowerCase()
+        const name = (d.custom_name || d.hostname || d.ip_address || d.mac_address || '').toLowerCase()
+        return name.includes(q) || d.mac_address.toLowerCase().includes(q) || (d.ip_address || '').toLowerCase().includes(q)
+      }).slice(0, 8)
+    : []
+
+  const handleSelect = d => {
+    setQuery(d.custom_name || d.hostname || d.ip_address || d.mac_address)
+    setSelectedMac(d.mac_address)
+    setShowDrop(false)
+  }
+
   const handleAdd = async () => {
-    const target = addMac.trim().toLowerCase()
+    const target = (selectedMac || query.trim()).toLowerCase()
     if (!target) return
     setAddErr(null)
     setBusy(true)
     try {
       await api.addToGroup(mac, target)
-      setAddMac('')
+      setQuery('')
+      setSelectedMac(null)
       await reload()
       onChanged()
     } catch (e) {
@@ -1173,7 +1201,7 @@ function GroupManager({ mac, device, onChanged }) {
     }
   }
 
-  const handleRemove = async (targetMac) => {
+  const handleRemove = async targetMac => {
     setBusy(true)
     try {
       await api.removeFromGroup(targetMac)
@@ -1181,12 +1209,10 @@ function GroupManager({ mac, device, onChanged }) {
       onChanged()
     } catch (e) {
       alert('Error: ' + e.message)
-    } finally {
-      setBusy(false)
-    }
+    } finally { setBusy(false) }
   }
 
-  const handleSetPrimary = async (targetMac) => {
+  const handleSetPrimary = async targetMac => {
     setBusy(true)
     try {
       await api.setGroupPrimary(targetMac)
@@ -1194,9 +1220,7 @@ function GroupManager({ mac, device, onChanged }) {
       onChanged()
     } catch (e) {
       alert('Error: ' + e.message)
-    } finally {
-      setBusy(false)
-    }
+    } finally { setBusy(false) }
   }
 
   const members = group?.members || []
@@ -1220,30 +1244,21 @@ function GroupManager({ mac, device, onChanged }) {
               className="flex items-center gap-2 px-2 py-1.5 rounded-lg text-xs"
               style={{ background: 'var(--color-surface-offset)' }}>
               <span className={`w-1.5 h-1.5 rounded-full shrink-0 ${m.is_online ? 'bg-green-400' : 'bg-gray-500'}`} />
-              <span className="flex-1 font-mono truncate" style={{ color: 'var(--color-text)' }}>
-                {m.display_name}
-              </span>
-              <span className="font-mono text-[10px]" style={{ color: 'var(--color-text-faint)' }}>
-                {m.mac_address}
-              </span>
-              {m.group_primary && (
+              <span className="flex-1 truncate" style={{ color: 'var(--color-text)' }}>{m.display_name}</span>
+              <span className="font-mono text-[10px]" style={{ color: 'var(--color-text-faint)' }}>{m.mac_address}</span>
+              {m.group_primary ? (
                 <span className="text-[10px] px-1 rounded" style={{ background: 'var(--color-brand-alpha)', color: 'var(--color-brand)' }}>
                   primary
                 </span>
-              )}
-              {!m.group_primary && (
-                <button
-                  disabled={busy}
-                  onClick={() => handleSetPrimary(m.mac_address)}
+              ) : (
+                <button disabled={busy} onClick={() => handleSetPrimary(m.mac_address)}
                   className="text-[10px] px-1.5 py-0.5 rounded border transition-colors"
                   style={{ borderColor: 'var(--color-border)', color: 'var(--color-text-faint)' }}
                   title="Set as group primary">
                   set primary
                 </button>
               )}
-              <button
-                disabled={busy}
-                onClick={() => handleRemove(m.mac_address)}
+              <button disabled={busy} onClick={() => handleRemove(m.mac_address)}
                 className="ml-1 p-0.5 rounded hover:bg-red-500/20 text-red-400 transition-colors"
                 title="Remove from group">
                 <Trash2 size={11} />
@@ -1253,24 +1268,50 @@ function GroupManager({ mac, device, onChanged }) {
         </div>
       )}
 
-      <div className="flex gap-2">
-        <input
-          value={addMac}
-          onChange={e => setAddMac(e.target.value)}
-          onKeyDown={e => e.key === 'Enter' && handleAdd()}
-          placeholder="MAC address to group with…"
-          className="flex-1 px-2 py-1.5 rounded-lg border text-xs font-mono"
-          style={{ background: 'var(--color-surface-offset)', borderColor: 'var(--color-border)', color: 'var(--color-text)' }}
-        />
-        <button
-          disabled={busy || !addMac.trim()}
-          onClick={handleAdd}
-          className="flex items-center gap-1 px-3 py-1.5 rounded-lg border text-xs font-medium transition-colors disabled:opacity-50"
-          style={{ borderColor: 'var(--color-brand)', color: 'var(--color-brand)', background: 'var(--color-brand-alpha)' }}>
-          <Plus size={12} />
-          Group
-        </button>
+      {/* Device name autocomplete input */}
+      <div ref={wrapRef} className="relative">
+        <div className="flex gap-2">
+          <input
+            value={query}
+            onChange={e => { setQuery(e.target.value); setSelectedMac(null); setShowDrop(true) }}
+            onFocus={() => query.trim() && setShowDrop(true)}
+            onKeyDown={e => {
+              if (e.key === 'Enter') { setShowDrop(false); handleAdd() }
+              if (e.key === 'Escape') setShowDrop(false)
+            }}
+            placeholder="Search by device name, IP or MAC…"
+            className="flex-1 px-2 py-1.5 rounded-lg border text-xs"
+            style={{ background: 'var(--color-surface-offset)', borderColor: 'var(--color-border)', color: 'var(--color-text)' }}
+          />
+          <button
+            disabled={busy || !query.trim()}
+            onClick={handleAdd}
+            className="flex items-center gap-1 px-3 py-1.5 rounded-lg border text-xs font-medium transition-colors disabled:opacity-50"
+            style={{ borderColor: 'var(--color-brand)', color: 'var(--color-brand)', background: 'var(--color-brand-alpha)' }}>
+            <Plus size={12} /> Group
+          </button>
+        </div>
+
+        {showDrop && suggestions.length > 0 && (
+          <div className="absolute z-50 top-full mt-1 left-0 right-0 rounded-lg border overflow-hidden shadow-lg"
+            style={{ background: 'var(--color-surface)', borderColor: 'var(--color-border)' }}>
+            {suggestions.map(d => {
+              const name = d.custom_name || d.hostname || d.ip_address || d.mac_address
+              return (
+                <button key={d.mac_address}
+                  onMouseDown={e => { e.preventDefault(); handleSelect(d) }}
+                  className="w-full flex items-center gap-2 px-3 py-2 text-xs text-left hover:bg-[var(--color-surface-offset)] transition-colors">
+                  <span className={`w-1.5 h-1.5 rounded-full shrink-0 ${d.is_online ? 'bg-green-400' : 'bg-gray-500'}`} />
+                  <span className="flex-1 truncate font-medium" style={{ color: 'var(--color-text)' }}>{name}</span>
+                  {d.ip_address && <span className="font-mono shrink-0" style={{ color: 'var(--color-text-faint)' }}>{d.ip_address}</span>}
+                  <span className="font-mono text-[10px] shrink-0" style={{ color: 'var(--color-text-faint)' }}>{d.mac_address}</span>
+                </button>
+              )
+            })}
+          </div>
+        )}
       </div>
+
       {addErr && <p className="text-xs text-red-400">{addErr}</p>}
     </div>
   )

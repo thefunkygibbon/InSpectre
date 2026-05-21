@@ -1,0 +1,149 @@
+{
+  "id": "opnsense",
+  "name": "OPNsense",
+  "version": "1.0.0",
+  "author": "InSpectre Community",
+  "description": "Integrates with OPNsense firewall via its built-in REST API. Discovers ARP table entries for device inventory, and blocks/unblocks devices by managing a dedicated firewall alias (inspectre_blocked) that feeds a LAN block rule.",
+  "homepage": "https://opnsense.org",
+  "min_inspectre_version": "1.0.0",
+  "icon": null,
+  "capabilities": [
+    "discovery",
+    "enrichment",
+    "blocking",
+    "firewall"
+  ],
+  "config_schema": [
+    {
+      "key": "host",
+      "label": "OPNsense Host",
+      "type": "url",
+      "default": "https://192.168.1.1",
+      "required": true,
+      "help": "Base URL of your OPNsense web interface, e.g. https://192.168.1.1. Do not include a trailing slash."
+    },
+    {
+      "key": "api_key",
+      "label": "API Key",
+      "type": "string",
+      "default": "",
+      "required": true,
+      "help": "API key generated in System > Access > Users > your user > API keys. The key acts as the HTTP Basic auth username."
+    },
+    {
+      "key": "api_secret",
+      "label": "API Secret",
+      "type": "password",
+      "default": "",
+      "required": true,
+      "help": "API secret paired with the API key above. Acts as the HTTP Basic auth password."
+    },
+    {
+      "key": "block_alias",
+      "label": "Block Alias Name",
+      "type": "string",
+      "default": "inspectre_blocked",
+      "required": true,
+      "help": "Name of the OPNsense Host alias that InSpectre will add/remove blocked IPs from. Create this alias in Firewall > Aliases (type: Host) and add a LAN block rule sourcing it before enabling blocking."
+    },
+    {
+      "key": "verify_ssl",
+      "label": "Verify SSL Certificate",
+      "type": "boolean",
+      "default": false,
+      "required": false,
+      "help": "Disable if your OPNsense instance uses a self-signed certificate (default for most home installs)."
+    }
+  ],
+  "endpoints": {
+    "base_url": "{host}",
+    "auth": "basic",
+    "username_field": "api_key",
+    "password_field": "api_secret",
+    "headers": {
+      "Content-Type": "application/json",
+      "Accept": "application/json"
+    }
+  },
+  "actions": {
+    "get_arp_table": {
+      "description": "Fetch the ARP table from OPNsense diagnostics. Returns all known LAN hosts with IP and MAC.",
+      "method": "GET",
+      "path": "/api/diagnostics/interface/getArp",
+      "response_mapping": {
+        "root_path": "",
+        "fields": {
+          "mac": "mac_address",
+          "ip": "ip_address",
+          "hostname": "hostname",
+          "manufacturer": "vendor",
+          "intf_description": "vlan"
+        }
+      }
+    },
+    "get_dhcp_leases": {
+      "description": "Fetch active DHCPv4 leases from OPNsense for richer hostname and MAC data.",
+      "method": "GET",
+      "path": "/api/dhcpv4/leases/searchLease",
+      "response_mapping": {
+        "root_path": "rows",
+        "fields": {
+          "mac": "mac_address",
+          "address": "ip_address",
+          "hostname": "hostname"
+        }
+      }
+    },
+    "get_alias_uuid": {
+      "description": "Resolve the UUID for the configured block alias by name. Required before adding/removing IPs.",
+      "method": "GET",
+      "path": "/api/firewall/alias/getAliasUUID/{block_alias}",
+      "session_extract": {
+        "from": "response_body",
+        "json_path": "uuid",
+        "store_as": "alias_uuid"
+      }
+    },
+    "block_client": {
+      "description": "Add the device IP to the block alias using alias_util, then apply the alias to the live pf tables immediately (no full rule reload needed).",
+      "method": "POST",
+      "path": "/api/firewall/alias_util/add/{block_alias}",
+      "body": {
+        "address": "{ip}"
+      }
+    },
+    "unblock_client": {
+      "description": "Remove the device IP from the block alias using alias_util. Takes effect immediately in the live pf table.",
+      "method": "POST",
+      "path": "/api/firewall/alias_util/delete/{block_alias}",
+      "body": {
+        "address": "{ip}"
+      }
+    },
+    "get_blocked_list": {
+      "description": "List all IPs currently in the block alias.",
+      "method": "GET",
+      "path": "/api/firewall/alias_util/list/{block_alias}"
+    },
+    "flush_blocked": {
+      "description": "Flush (clear) all IPs from the block alias. Use with caution — unblocks everything.",
+      "method": "POST",
+      "path": "/api/firewall/alias_util/flush/{block_alias}"
+    },
+    "test_connection": {
+      "description": "Verify API credentials by fetching firmware version info.",
+      "method": "GET",
+      "path": "/api/core/firmware/status"
+    }
+  },
+  "event_hooks": {},
+  "data_mapping": {
+    "block_id_field": "ip_address",
+    "tag_fields": []
+  },
+  "polling": {
+    "action": "get_arp_table",
+    "interval_seconds": 60,
+    "run_on_startup": true
+  }
+}

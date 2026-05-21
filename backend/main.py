@@ -33,6 +33,7 @@ from plugin_engine import (
     encrypt_field, decrypt_field, get_decrypted_config,
     verify_webhook_signature,
 )
+from email_analysis import run_email_analysis
 
 DATABASE_URL = os.environ.get("DATABASE_URL", "postgresql://admin:password123@db:5432/inspectre")
 # PROBE_API_URL is the name used in docker-compose; PROBE_URL is the legacy fallback.
@@ -583,8 +584,11 @@ DEFAULT_SETTINGS = {
     # Phase 8 — speed test
     "speedtest_schedule":      ("disabled", "Scheduled speed test interval. Options: disabled, 30m, 1h, 6h, 24h."),
     # Phase 8 — auto-block
-    "auto_block_new_devices":    ("false", "Automatically ARP-block newly discovered devices until manually approved."),
+    "auto_block_new_devices":    ("false", "Automatically block newly discovered devices until manually approved."),
     "auto_block_vuln_severity":  ("none",  "Minimum vuln severity to trigger auto-block. Options: none, medium, high, critical."),
+    # Blocking method
+    "block_method":    ("arp",  "Active blocking method: arp (probe ARP poisoning), dns (AdGuard Home / Pi-hole), infrastructure (TP-Link Omada / UniFi)."),
+    "block_plugin_id": ("",    "Plugin ID used for blocking when block_method is not arp. Must be an enabled plugin with blocking capability and block_client/unblock_client actions defined."),
     # Phase 9 — device grouping
     "auto_group_by_hostname":    ("true",  "Automatically group devices with the same hostname as the same physical device on a different interface (e.g. laptop switching between WiFi and Ethernet). When disabled, a suggestion event is written instead."),
     # Network / probe identity
@@ -600,7 +604,7 @@ DEFAULT_SETTINGS = {
     "docker_enabled":            ("false", "Enable Docker container monitoring."),
     "docker_host":               ("unix:///var/run/docker.sock", "Docker host — socket path (unix:///var/run/docker.sock) or TCP URL (tcp://host:2375)."),
     "docker_tls_verify":         ("false", "Enable TLS verification for Docker TCP connections."),
-    "trivy_db_update_hours":     ("24",   "How often (hours) to refresh the Trivy vulnerability database. Set to 0 to disable automatic updates."),
+    "trivy_db_update_frequency": ("1d",   "How often to refresh the Trivy vulnerability database. Options: disabled, 1d, 2d, 7d, 30d."),
     "docker_scan_on_new":        ("false", "Automatically run a Trivy vuln scan when a new container is created."),
     "docker_scan_on_update":     ("false", "Automatically run a Trivy vuln scan when a container is recreated with an updated image."),
     # Notification — speed test alert thresholds
@@ -1217,7 +1221,7 @@ async def _notification_loop():
                         dispatches.append(("device.new", "New Device",
                                            f"{name} ({ip}) appeared on the network", mac))
                         if auto_block_new:
-                            devices_to_block.append(mac)
+                            devices_to_block.append((mac, ip))
                         if vuln_on_new and ip:
                             scripts_s = db.get(Setting, "vuln_scan_templates")
                             vuln_scans.append((mac, ip, (scripts_s.value or "").strip() if scripts_s else ""))
@@ -1262,7 +1266,7 @@ async def _notification_loop():
                         if auto_block_sev != "none":
                             try:
                                 if SEV_ORDER.index(severity) >= SEV_ORDER.index(auto_block_sev):
-                                    devices_to_block.append(mac)
+                                    devices_to_block.append((mac, ip))
                             except ValueError:
                                 pass
 
@@ -1357,17 +1361,17 @@ async def _notification_loop():
             for mac, ip, scripts in vuln_scans:
                 asyncio.ensure_future(_run_single_vuln_scan(mac, ip, scripts))
 
-            for mac in devices_to_block:
+            for mac, ip in devices_to_block:
                 try:
-                    async with httpx.AsyncClient(timeout=10) as c:
-                        await c.post(f"{PROBE_URL}/block/{mac}")
+                    await _execute_block_bg(mac, ip, "block")
                     db2 = SessionLocal()
                     try:
                         db2.execute(text("UPDATE devices SET is_blocked=true WHERE mac_address=:mac"), {"mac": mac})
-                        _add_event(db2, mac, "blocked", {"reason": "auto"})
+                        _add_event(db2, mac, "blocked", {"reason": "auto", "ip": ip})
                         db2.commit()
                     finally:
                         db2.close()
+                    asyncio.ensure_future(_plugin_event_bus.notify("device.blocked", {"mac": mac, "ip": ip or ""}))
                     print(f"[notify] Auto-blocked {mac}", flush=True)
                 except Exception as exc:
                     print(f"[notify] Auto-block {mac}: {exc}", flush=True)
@@ -4139,6 +4143,18 @@ def update_setting(key: str, payload: SettingUpdate, db: Session = Depends(get_d
     s = db.get(Setting, key)
     if not s:
         raise HTTPException(404, "Setting not found")
+    if key == "block_plugin_id" and payload.value:
+        plugin = _plugin_registry.get(payload.value)
+        if not plugin:
+            raise HTTPException(400, f"Plugin '{payload.value}' not found")
+        if not plugin.get("enabled"):
+            raise HTTPException(400, f"Plugin '{payload.value}' is not enabled")
+        caps = plugin["manifest"].get("capabilities", [])
+        if "blocking" not in caps:
+            raise HTTPException(400, f"Plugin '{payload.value}' does not declare the 'blocking' capability")
+        actions = plugin["manifest"].get("actions") or {}
+        if "block_client" not in actions or "unblock_client" not in actions:
+            raise HTTPException(400, f"Plugin '{payload.value}' must define both block_client and unblock_client actions")
     s.value = payload.value
     db.commit()
     return {"key": key, "value": s.value}
@@ -4293,42 +4309,94 @@ def _redact_plugin_config(manifest: dict, config: dict) -> dict:
     return redacted
 
 
-async def _plugin_block_hook(mac: str, ip: Optional[str], action: str):
-    """Fire plugin block/unblock actions for any enabled plugin with 'blocking' capability."""
-    for plugin_info in _plugin_registry.list_all():
-        if not plugin_info.get("enabled"):
-            continue
-        caps = plugin_info["manifest"].get("capabilities", [])
-        if "blocking" not in caps:
-            continue
-        pid = plugin_info["id"]
-        actions = plugin_info["manifest"].get("actions") or {}
-        action_name = action if action in actions else None
-        if not action_name:
-            action_name = "block_host" if action == "block" else "unblock_host"
-            if action_name not in actions:
-                continue
-        # Look up any plugin-specific device ID stored in plugin_device_data
-        plugin_id_val = None
-        _db = SessionLocal()
+def _get_block_method_settings(db: Session) -> tuple[str, str]:
+    method_row    = db.get(Setting, "block_method")
+    plugin_id_row = db.get(Setting, "block_plugin_id")
+    method    = (method_row.value    if method_row    else None) or "arp"
+    plugin_id = (plugin_id_row.value if plugin_id_row else None) or ""
+    return method, plugin_id
+
+
+async def _execute_block(mac: str, ip: Optional[str], db: Session, action: str) -> None:
+    """
+    Unified blocking coordinator (synchronous path, raises HTTPException on failure).
+    action: "block" or "unblock"
+    """
+    method, plugin_id = _get_block_method_settings(db)
+
+    if method == "arp":
         try:
-            row = _db.execute(
-                text("SELECT data FROM plugin_device_data WHERE plugin_id = :pid AND mac_address = :mac"),
-                {"pid": pid, "mac": mac},
-            ).fetchone()
-            if row and isinstance(row.data, dict):
-                plugin_id_val = row.data.get("id") or row.data.get("device_id")
-        except Exception:
-            pass
-        finally:
-            _db.close()
-        ctx = {"mac": mac, "ip": ip or "", "plugin_device_id": plugin_id_val or ""}
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                if action == "block":
+                    resp = await client.post(f"{PROBE_URL}/block/{mac.lower()}")
+                else:
+                    resp = await client.delete(f"{PROBE_URL}/block/{mac.lower()}")
+                if resp.status_code >= 400:
+                    raise HTTPException(502, f"Probe error: {resp.text[:200]}")
+        except httpx.ConnectError:
+            raise HTTPException(502, f"Cannot reach probe at {PROBE_URL}")
+    else:
+        if not plugin_id:
+            raise HTTPException(400, "block_plugin_id is not configured")
+        plugin = _plugin_registry.get(plugin_id)
+        if not plugin or not plugin.get("enabled"):
+            raise HTTPException(400, f"Blocking plugin '{plugin_id}' is not enabled")
+        action_name = "block_client" if action == "block" else "unblock_client"
+        if action_name not in (plugin["manifest"].get("actions") or {}):
+            raise HTTPException(400, f"Plugin '{plugin_id}' has no '{action_name}' action")
+        mac_lower = mac.lower()
+        mac_dash  = mac_lower.replace(":", "-").upper()
+        print(f"[block-coord] {action} via plugin '{plugin_id}': mac={mac_lower} mac_dash={mac_dash} ip={ip}", flush=True)
+        result = await _plugin_runner.execute_action(
+            plugin_id, action_name, {"mac": mac_lower, "mac_dash": mac_dash, "ip": ip or ""}
+        )
+        print(f"[block-coord] {action} result: ok={result.get('ok')} error={result.get('error')} status={result.get('status_code')} api_code={result.get('api_error_code')}", flush=True)
+        if not result.get("ok"):
+            raise HTTPException(502, f"Plugin block failed: {result.get('error', 'unknown error')}")
+
+
+async def _execute_block_bg(mac: str, ip: Optional[str], action: str) -> None:
+    """
+    Blocking coordinator for background loops — logs failures instead of raising.
+    action: "block" or "unblock"
+    """
+    db = SessionLocal()
+    try:
+        method, plugin_id = _get_block_method_settings(db)
+    finally:
+        db.close()
+
+    if method == "arp":
         try:
-            result = await _plugin_runner.execute_action(pid, action_name, ctx)
-            if not result.get("ok"):
-                print(f"[plugin-block] {pid}.{action_name} failed: {result.get('error')}", flush=True)
+            async with httpx.AsyncClient(timeout=10) as c:
+                if action == "block":
+                    await c.post(f"{PROBE_URL}/block/{mac.lower()}")
+                else:
+                    await c.delete(f"{PROBE_URL}/block/{mac.lower()}")
         except Exception as exc:
-            print(f"[plugin-block] {pid}: {exc}", flush=True)
+            print(f"[block-coord] ARP {action} {mac}: {exc}", flush=True)
+    else:
+        if not plugin_id:
+            print(f"[block-coord] block_plugin_id not configured — skipping {action} for {mac}", flush=True)
+            return
+        plugin = _plugin_registry.get(plugin_id)
+        if not plugin or not plugin.get("enabled"):
+            print(f"[block-coord] Plugin '{plugin_id}' not enabled — skipping {action} for {mac}", flush=True)
+            return
+        action_name = "block_client" if action == "block" else "unblock_client"
+        if action_name not in (plugin["manifest"].get("actions") or {}):
+            print(f"[block-coord] Plugin '{plugin_id}' has no '{action_name}' action — skipping {mac}", flush=True)
+            return
+        mac_lower = mac.lower()
+        mac_dash  = mac_lower.replace(":", "-").upper()
+        try:
+            result = await _plugin_runner.execute_action(
+                plugin_id, action_name, {"mac": mac_lower, "mac_dash": mac_dash, "ip": ip or ""}
+            )
+            if not result.get("ok"):
+                print(f"[block-coord] Plugin {action} {mac}: {result.get('error')}", flush=True)
+        except Exception as exc:
+            print(f"[block-coord] Plugin {action} {mac}: {exc}", flush=True)
 
 
 def _plugin_to_dict(plugin_info: dict) -> dict:
@@ -5633,19 +5701,11 @@ async def block_device(mac: str, db: Session = Depends(get_db)):
     d = db.get(Device, mac.lower())
     if not d:
         raise HTTPException(404, "Device not found")
-    try:
-        async with httpx.AsyncClient(timeout=15.0) as client:
-            resp = await client.post(f"{PROBE_URL}/block/{mac.lower()}")
-            if resp.status_code >= 400:
-                body = resp.text
-                raise HTTPException(502, f"Probe error: {body[:200]}")
-    except httpx.ConnectError:
-        raise HTTPException(502, f"Cannot reach probe at {PROBE_URL}")
+    await _execute_block(mac, d.ip_address, db, "block")
     d.is_blocked = True
     _add_event(db, mac.lower(), "blocked", {"ip": d.ip_address})
     db.commit(); db.refresh(d)
-    # Plugin blocking hook (fire-and-forget)
-    asyncio.ensure_future(_plugin_block_hook(mac.lower(), d.ip_address, "block"))
+    asyncio.ensure_future(_plugin_event_bus.notify("device.blocked", {"mac": mac.lower(), "ip": d.ip_address or ""}))
     return _to_dict(d)
 
 
@@ -5654,18 +5714,11 @@ async def unblock_device(mac: str, db: Session = Depends(get_db)):
     d = db.get(Device, mac.lower())
     if not d:
         raise HTTPException(404, "Device not found")
-    try:
-        async with httpx.AsyncClient(timeout=15.0) as client:
-            resp = await client.delete(f"{PROBE_URL}/block/{mac.lower()}")
-            if resp.status_code >= 400:
-                body = resp.text
-                raise HTTPException(502, f"Probe error: {body[:200]}")
-    except httpx.ConnectError:
-        raise HTTPException(502, f"Cannot reach probe at {PROBE_URL}")
+    await _execute_block(mac, d.ip_address, db, "unblock")
     d.is_blocked = False
     _add_event(db, mac.lower(), "unblocked", {"ip": d.ip_address})
     db.commit(); db.refresh(d)
-    asyncio.ensure_future(_plugin_block_hook(mac.lower(), d.ip_address, "unblock"))
+    asyncio.ensure_future(_plugin_event_bus.notify("device.unblocked", {"mac": mac.lower(), "ip": d.ip_address or ""}))
     return _to_dict(d)
 
 
@@ -5975,28 +6028,19 @@ async def tools_whois(host: str = Query(...)):
 
 @app.get("/tools/email")
 async def tools_email(domain: str = Query(...)):
-    import dns.resolver
+    import dns.resolver as _dns_res
     _validate_tool_host(domain)
-
-    def _resolve(name: str, qtype: str) -> list[str]:
+    try:
+        loop = asyncio.get_event_loop()
+        result = await loop.run_in_executor(None, run_email_analysis, domain)
+        data = result.to_dict()
         try:
-            return [str(r) for r in dns.resolver.resolve(name, qtype, lifetime=8)]
+            data["nameservers"] = [str(r) for r in _dns_res.resolve(domain, "NS", lifetime=8)]
         except Exception:
-            return []
-
-    out: dict = {"domain": domain}
-    out["mx"]          = sorted(_resolve(domain, "MX"))
-    out["spf"]         = [r.strip('"') for r in _resolve(domain, "TXT") if "v=spf" in r.lower()]
-    out["dmarc"]       = [r.strip('"') for r in _resolve(f"_dmarc.{domain}", "TXT")]
-    out["nameservers"] = _resolve(domain, "NS")
-
-    dkim: dict = {}
-    for sel in ["default", "google", "mail", "k1", "selector1", "selector2", "dkim"]:
-        recs = _resolve(f"{sel}._domainkey.{domain}", "TXT")
-        if recs:
-            dkim[sel] = [r.strip('"') for r in recs]
-    out["dkim"] = dkim
-    return out
+            data["nameservers"] = []
+        return data
+    except Exception as exc:
+        raise HTTPException(500, str(exc))
 
 
 # ---------------------------------------------------------------------------
@@ -6847,27 +6891,21 @@ async def _block_schedule_loop():
 
                     if should_block and not is_sched_blocked:
                         # Need to block
-                        try:
-                            async with httpx.AsyncClient(timeout=8.0) as client:
-                                await client.post(f"{PROBE_URL}/block/{mac.lower()}")
-                        except Exception:
-                            pass
+                        await _execute_block_bg(mac, ip, "block")
                         db.execute(text(
                             "UPDATE devices SET is_blocked = TRUE, is_schedule_blocked = TRUE WHERE mac_address = :mac"
                         ), {"mac": mac})
                         _add_event(db, mac, "blocked", {"ip": ip, "reason": "schedule"})
+                        asyncio.ensure_future(_plugin_event_bus.notify("device.blocked", {"mac": mac, "ip": ip or ""}))
 
                     elif not should_block and is_sched_blocked:
                         # Schedule says unblock (only if blocked by schedule, not manually)
-                        try:
-                            async with httpx.AsyncClient(timeout=8.0) as client:
-                                await client.delete(f"{PROBE_URL}/block/{mac.lower()}")
-                        except Exception:
-                            pass
+                        await _execute_block_bg(mac, ip, "unblock")
                         db.execute(text(
                             "UPDATE devices SET is_blocked = FALSE, is_schedule_blocked = FALSE WHERE mac_address = :mac"
                         ), {"mac": mac})
                         _add_event(db, mac, "unblocked", {"ip": ip, "reason": "schedule_end"})
+                        asyncio.ensure_future(_plugin_event_bus.notify("device.unblocked", {"mac": mac, "ip": ip or ""}))
 
                 db.commit()
             finally:
@@ -7118,6 +7156,8 @@ async def create_container_host(body: ContainerHostCreate, db: Session = Depends
         "tls": body.tls_verify, "enabled": body.enabled, "node": body.node or "pve",
     }).fetchone()
     db.commit()
+    if body.enabled:
+        _schedule_trivy_db_download_if_missing()
     return _row_to_host(row)
 
 
@@ -7143,6 +7183,8 @@ async def update_container_host(host_id: int, body: ContainerHostUpdate, db: Ses
     fields["id"] = host_id
     updated = db.execute(text(f"UPDATE container_hosts SET {set_clause} WHERE id = :id RETURNING *"), fields).fetchone()
     db.commit()
+    if fields.get("enabled"):
+        _schedule_trivy_db_download_if_missing()
     return _row_to_host(updated)
 
 
@@ -7763,34 +7805,174 @@ async def stream_docker_trivy_scan(container_id: str, db: Session = Depends(get_
 
 
 # ---------------------------------------------------------------------------
+# Trivy DB helpers
+# ---------------------------------------------------------------------------
+_TRIVY_DB_META = "/root/.cache/trivy/db/metadata.json"
+_TRIVY_FREQ_SECONDS = {"1d": 86400, "2d": 172800, "7d": 604800, "30d": 2592000}
+_trivy_db_updating = False
+
+
+def _trivy_db_status() -> dict:
+    """Return metadata from the on-disk Trivy DB, or exists=False if absent."""
+    try:
+        with open(_TRIVY_DB_META) as f:
+            meta = json.load(f)
+        return {
+            "exists": True,
+            "updated_at":    meta.get("UpdatedAt"),
+            "next_update":   meta.get("NextUpdate"),
+            "downloaded_at": meta.get("DownloadedAt"),
+        }
+    except Exception:
+        return {"exists": False, "updated_at": None, "next_update": None, "downloaded_at": None}
+
+
+async def _run_trivy_db_download():
+    """Download/refresh the Trivy DB, streaming output to callers via an asyncio.Queue."""
+    global _trivy_db_updating
+    if _trivy_db_updating or not shutil.which("trivy"):
+        return
+    _trivy_db_updating = True
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "trivy", "image", "--download-db-only",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+        )
+        if proc.stdout:
+            async for raw in proc.stdout:
+                line = raw.decode(errors="replace").rstrip()
+                if line:
+                    print(f"[trivy_db] {line}", flush=True)
+        await proc.wait()
+        if proc.returncode == 0:
+            print("[trivy_db] Vulnerability DB updated.", flush=True)
+        else:
+            print(f"[trivy_db] Update exited with code {proc.returncode}.", flush=True)
+    except Exception as exc:
+        print(f"[trivy_db] Update failed: {exc}", flush=True)
+    finally:
+        _trivy_db_updating = False
+
+
+def _schedule_trivy_db_download_if_missing():
+    """Fire-and-forget: download DB if it doesn't exist yet."""
+    if not _trivy_db_status()["exists"] and shutil.which("trivy"):
+        asyncio.ensure_future(_run_trivy_db_download())
+
+
+# ---------------------------------------------------------------------------
 # Trivy DB update background loop
 # ---------------------------------------------------------------------------
 async def _trivy_db_update_loop():
     """Periodically refreshes the Trivy vulnerability database."""
-    await asyncio.sleep(60)  # startup grace
+    await asyncio.sleep(60)  # startup grace — let the container settle
+    # Immediate download if DB is absent (e.g. fresh volume)
+    if not _trivy_db_status()["exists"] and shutil.which("trivy"):
+        print("[trivy_db] DB not found — downloading now.", flush=True)
+        await _run_trivy_db_download()
     while True:
         db = SessionLocal()
         try:
-            s = db.get(Setting, "trivy_db_update_hours")
-            hours = int(s.value) if s and s.value else 24
+            s = db.get(Setting, "trivy_db_update_frequency")
+            freq = s.value.strip() if s and s.value else "1d"
         except Exception:
-            hours = 24
+            freq = "1d"
         finally:
             db.close()
 
-        if hours > 0 and shutil.which("trivy"):
-            try:
-                proc = await asyncio.create_subprocess_exec(
-                    "trivy", "image", "--download-db-only", "--no-progress",
-                    stdout=asyncio.subprocess.DEVNULL,
-                    stderr=asyncio.subprocess.DEVNULL,
-                )
-                await proc.wait()
-                print("[trivy_db] Vulnerability DB updated.", flush=True)
-            except Exception as e:
-                print(f"[trivy_db] Update failed: {e}", flush=True)
+        interval = _TRIVY_FREQ_SECONDS.get(freq, 0)
+        if interval > 0 and shutil.which("trivy"):
+            await _run_trivy_db_download()
 
-        await asyncio.sleep(max(hours, 1) * 3600 if hours > 0 else 86400)
+        await asyncio.sleep(interval if interval > 0 else 86400)
+
+
+# ---------------------------------------------------------------------------
+# Trivy DB status + force-update endpoints
+# ---------------------------------------------------------------------------
+@app.get("/trivy/db-status")
+async def trivy_db_status_endpoint(_user: str = Depends(get_current_user)):
+    status = _trivy_db_status()
+    status["updating"] = _trivy_db_updating
+    return status
+
+
+@app.get("/trivy/db-update")
+async def trivy_db_update_stream(_user: str = Depends(get_current_user)):
+    """SSE stream that triggers a Trivy DB download and streams its output."""
+    if not shutil.which("trivy"):
+        async def _no_trivy():
+            yield "data: [ERROR] Trivy binary not found in container.\n\n"
+            yield "data: TRIVY_DB_DONE\n\n"
+        return StreamingResponse(_no_trivy(), media_type="text/event-stream",
+                                 headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+    async def _stream():
+        global _trivy_db_updating
+        if _trivy_db_updating:
+            yield "data: [INFO] Update already in progress — please wait.\n\n"
+            yield "data: TRIVY_DB_DONE\n\n"
+            return
+        _trivy_db_updating = True
+        try:
+            yield "data: [INFO] Starting Trivy vulnerability DB download…\n\n"
+            proc = await asyncio.create_subprocess_exec(
+                "trivy", "image", "--download-db-only",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+            )
+            if proc.stdout:
+                async for raw in proc.stdout:
+                    line = raw.decode(errors="replace").rstrip()
+                    if line:
+                        yield f"data: {line}\n\n"
+            await proc.wait()
+            if proc.returncode == 0:
+                yield "data: [INFO] Trivy DB updated successfully.\n\n"
+            else:
+                yield f"data: [ERROR] Update exited with code {proc.returncode}.\n\n"
+        except Exception as exc:
+            yield f"data: [ERROR] {exc}\n\n"
+        finally:
+            _trivy_db_updating = False
+        yield "data: TRIVY_DB_DONE\n\n"
+
+    return StreamingResponse(_stream(), media_type="text/event-stream",
+                             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+
+# ---------------------------------------------------------------------------
+# Nuclei template status + force-update endpoints (proxy to probe)
+# ---------------------------------------------------------------------------
+@app.get("/nuclei/template-status")
+async def nuclei_template_status(_user: str = Depends(get_current_user)):
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            r = await client.get(f"{PROBE_URL}/nuclei/status")
+            return r.json()
+    except Exception:
+        return {"exists": False, "version": None, "last_updated": None, "binary_available": False}
+
+
+@app.get("/nuclei/template-update")
+async def nuclei_template_update_stream(_user: str = Depends(get_current_user)):
+    """SSE proxy: streams Nuclei template update output from the probe."""
+    async def _proxy():
+        try:
+            async with httpx.AsyncClient(timeout=None) as client:
+                async with client.stream("GET", f"{PROBE_URL}/nuclei/update") as r:
+                    async for line in r.aiter_lines():
+                        if line:
+                            yield f"{line}\n"
+                        else:
+                            yield "\n"
+        except Exception as exc:
+            yield f"data: [ERROR] Could not reach probe: {exc}\n\n"
+            yield "data: NUCLEI_UPDATE_DONE\n\n"
+
+    return StreamingResponse(_proxy(), media_type="text/event-stream",
+                             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
 
 # ---------------------------------------------------------------------------

@@ -118,6 +118,13 @@ export const SMART_FILTERS = [
       },
     ],
   },
+  {
+    id:          'grouped',
+    label:       'Grouped',
+    icon:        'GitMerge',
+    description: 'Devices that are part of a multi-interface group',
+    fn:          d => Boolean(d.group_id),
+  },
 ]
 
 const SAVED_VIEWS_KEY = 'inspectre_saved_views'

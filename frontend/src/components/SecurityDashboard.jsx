@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useRef } from 'react'
 import {
   ShieldAlert, ShieldCheck, RefreshCw, ScanLine,
   AlertTriangle, Info, Clock, ChevronDown, ChevronRight,
@@ -6,6 +6,7 @@ import {
 } from 'lucide-react'
 import { api } from '../api'
 import { exportDashboardVulnPDF } from '../utils/vulnPdfExport'
+import { StreamOutput } from './StreamOutput'
 
 // ---------------------------------------------------------------------------
 // Vuln scan settings panel
@@ -52,9 +53,15 @@ const VULN_SETTING_META = {
     description: 'Comma-separated tags (e.g. cve,exposure,misconfig,default-login,network).',
   },
   // ── Container image scanning (Trivy) ──────────────────────────────────────
-  trivy_db_update_hours: {
-    label: 'Trivy DB Update Interval', type: 'number', min: 0, unit: 'hours',
-    description: 'How often to refresh the Trivy CVE database. Set to 0 to disable.',
+  trivy_db_update_frequency: {
+    label: 'Trivy DB Update Frequency', type: 'select',
+    options: [
+      { value: 'disabled', label: 'Disabled' },
+      { value: '1d',       label: 'Daily' },
+      { value: '2d',       label: 'Every 2 days' },
+      { value: '7d',       label: 'Weekly' },
+      { value: '30d',      label: 'Monthly' },
+    ],
   },
   docker_scan_on_new: {
     label: 'Scan New Containers', type: 'toggle',
@@ -67,7 +74,7 @@ const VULN_SETTING_META = {
 }
 
 const NETWORK_VULN_KEYS    = ['vuln_scan_schedule','vuln_scan_targets','vuln_scan_on_new_device','vuln_scan_on_port_change','nuclei_template_update_interval','vuln_scan_templates']
-const CONTAINER_VULN_KEYS  = ['trivy_db_update_hours','docker_scan_on_new','docker_scan_on_update']
+const CONTAINER_VULN_KEYS  = ['trivy_db_update_frequency','docker_scan_on_new','docker_scan_on_update']
 const VULN_KEYS = Object.keys(VULN_SETTING_META)
 
 function VulnSettingsPanel({ onClose }) {
@@ -75,6 +82,14 @@ function VulnSettingsPanel({ onClose }) {
   const [dirty,  setDirty]  = useState({})
   const [saving, setSaving] = useState(false)
   const [saved,  setSaved]  = useState(false)
+
+  const [trivyUpdating, setTrivyUpdating] = useState(false)
+  const [trivyLines,    setTrivyLines]    = useState([])
+  const trivyAbortRef = useRef(null)
+
+  const [nucleiUpdating, setNucleiUpdating] = useState(false)
+  const [nucleiLines,    setNucleiLines]    = useState([])
+  const nucleiAbortRef = useRef(null)
 
   useEffect(() => {
     api.getSettings().then(all => {
@@ -96,6 +111,34 @@ function VulnSettingsPanel({ onClose }) {
     setSaving(false)
     setSaved(true)
     setTimeout(() => setSaved(false), 2000)
+  }
+
+  async function runTrivyUpdate() {
+    if (trivyUpdating) return
+    setTrivyUpdating(true)
+    setTrivyLines([])
+    const ctrl = new AbortController()
+    trivyAbortRef.current = ctrl
+    try {
+      await api.trivyDbUpdate(line => {
+        if (line === 'TRIVY_DB_DONE') setTrivyUpdating(false)
+        else setTrivyLines(l => [...l, line])
+      }, ctrl.signal)
+    } catch { /* aborted */ } finally { setTrivyUpdating(false) }
+  }
+
+  async function runNucleiUpdate() {
+    if (nucleiUpdating) return
+    setNucleiUpdating(true)
+    setNucleiLines([])
+    const ctrl = new AbortController()
+    nucleiAbortRef.current = ctrl
+    try {
+      await api.nucleiTemplateUpdate(line => {
+        if (line === 'NUCLEI_UPDATE_DONE') setNucleiUpdating(false)
+        else setNucleiLines(l => [...l, line])
+      }, ctrl.signal)
+    } catch { /* aborted */ } finally { setNucleiUpdating(false) }
   }
 
   const hasDirty = Object.keys(dirty).length > 0
@@ -153,22 +196,6 @@ function VulnSettingsPanel({ onClose }) {
                 </select>
               </div>
             )
-          } else if (meta.type === 'number') {
-            element = (
-              <div key={key} className="space-y-1">
-                <label className="text-xs font-medium" style={{ color: 'var(--color-text)' }}>{meta.label}</label>
-                <div className="flex items-center gap-2">
-                  <input type="number" min={meta.min} className="input text-xs w-24" style={dirtyStyle} value={v}
-                    onChange={e => handleChange(key, e.target.value)} />
-                  {meta.unit && (
-                    <span className="text-xs" style={{ color: 'var(--color-text-faint)' }}>{meta.unit}</span>
-                  )}
-                </div>
-                {meta.description && (
-                  <p className="text-[10px]" style={{ color: 'var(--color-text-faint)' }}>{meta.description}</p>
-                )}
-              </div>
-            )
           } else {
             element = (
               <div key={key} className="space-y-1 sm:col-span-2">
@@ -182,21 +209,56 @@ function VulnSettingsPanel({ onClose }) {
             )
           }
 
+          if (key === NETWORK_VULN_KEYS[0]) {
+            return [
+              <div key="network-update-btn" className="sm:col-span-2 flex justify-end">
+                <button onClick={runNucleiUpdate} disabled={nucleiUpdating}
+                  className="btn-ghost flex items-center gap-1.5 text-xs">
+                  <RefreshCw size={11} className={nucleiUpdating ? 'animate-spin' : ''} />
+                  {nucleiUpdating ? 'Updating templates…' : 'Update Nuclei Templates'}
+                </button>
+              </div>,
+              element,
+            ]
+          }
+
           if (key === CONTAINER_VULN_KEYS[0]) {
             return [
-              <div key="container-divider" className="sm:col-span-2 pt-2 border-t flex items-center gap-2"
+              <div key="container-divider" className="sm:col-span-2 pt-2 border-t flex items-center justify-between gap-2"
                 style={{ borderColor: 'var(--color-border)' }}>
-                <Box size={11} style={{ color: 'var(--color-text-faint)' }} />
-                <span className="text-[10px] font-semibold uppercase tracking-wider"
-                  style={{ color: 'var(--color-text-faint)' }}>
-                  Container Image Scanning (Trivy)
-                </span>
+                <div className="flex items-center gap-2">
+                  <Box size={11} style={{ color: 'var(--color-text-faint)' }} />
+                  <span className="text-[10px] font-semibold uppercase tracking-wider"
+                    style={{ color: 'var(--color-text-faint)' }}>
+                    Container Image Scanning (Trivy)
+                  </span>
+                </div>
+                <button onClick={runTrivyUpdate} disabled={trivyUpdating}
+                  className="btn-ghost flex items-center gap-1.5 text-xs">
+                  <RefreshCw size={11} className={trivyUpdating ? 'animate-spin' : ''} />
+                  {trivyUpdating ? 'Updating DB…' : 'Update Trivy DB'}
+                </button>
               </div>,
               element,
             ]
           }
           return [element]
         })}
+
+        {(trivyLines.length > 0 || trivyUpdating) && (
+          <div className="sm:col-span-2">
+            <StreamOutput lines={trivyLines} running={trivyUpdating}
+              onStop={() => { trivyAbortRef.current?.abort(); setTrivyUpdating(false) }}
+              mode="generic" />
+          </div>
+        )}
+        {(nucleiLines.length > 0 || nucleiUpdating) && (
+          <div className="sm:col-span-2">
+            <StreamOutput lines={nucleiLines} running={nucleiUpdating}
+              onStop={() => { nucleiAbortRef.current?.abort(); setNucleiUpdating(false) }}
+              mode="generic" />
+          </div>
+        )}
       </div>
       {hasDirty && (
         <div className="px-4 pb-4">
