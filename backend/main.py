@@ -4661,10 +4661,11 @@ async def poll_plugin_now(
     if not plugin:
         raise HTTPException(404, "Plugin not found")
     polling = plugin["manifest"].get("polling") or {}
-    action = polling.get("action")
-    if not action:
+    action  = polling.get("action")
+    actions = polling.get("actions") or ([action] if action else [])
+    if not actions:
         raise HTTPException(400, "This plugin has no polling action configured")
-    await _plugin_scheduler._poll_plugin(plugin_id, action)
+    await _plugin_scheduler._poll_plugin(plugin_id, actions)
     updated = _plugin_registry.get(plugin_id)
     ok = updated.get("status") == "active"
     return {
