@@ -9,6 +9,7 @@ bcrypt==4.2.1
 python-jose[cryptography]==3.3.0
 python-multipart==0.0.20
 docker==7.1.0
+pyyaml>=6.0
 apprise>=1.9
 paho-mqtt>=1.6
 pysnmp>=5.0

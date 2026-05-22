@@ -368,7 +368,7 @@ function PluginConfigPanel({ plugin, config, onChange, onSave, onTest, onPoll, o
             {testing ? 'Testing…' : 'Test Connection'}
           </button>
         )}
-        {manifest.polling?.action && plugin.enabled && (
+        {(manifest.polling?.action || manifest.polling?.actions?.length > 0) && plugin.enabled && (
           <button onClick={onPoll} disabled={polling}
             className="btn-secondary flex items-center gap-2 text-sm"
             style={{ opacity: polling ? 0.5 : 1 }}
