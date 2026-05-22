@@ -3,6 +3,7 @@ import {
   X, Box, Play, Square, RotateCcw, ChevronDown, ChevronRight,
   Network, HardDrive, Tag, Terminal, ShieldAlert, ShieldCheck,
   Settings2, Clock, ExternalLink, Eye, EyeOff, Loader2, FileText, Download, FileDown,
+  Copy, Check, GitMerge, Info,
 } from 'lucide-react'
 import { api } from '../api'
 import { exportContainerVulnPDF } from '../utils/vulnPdfExport'
@@ -53,6 +54,7 @@ function maskEnvValue(env) {
 
 const TABS = [
   { id: 'overview', label: 'Overview'  },
+  { id: 'compose',  label: 'Compose'   },
   { id: 'logs',     label: 'Logs'      },
   { id: 'vuln',     label: 'Vuln Scan' },
   { id: 'admin',    label: 'Admin'     },
@@ -468,12 +470,111 @@ function VulnTab({ container, trivyScan, updateTrivyScan }) {
 }
 
 // ---------------------------------------------------------------------------
+// Compose tab
+// ---------------------------------------------------------------------------
+function ComposeTab({ containerId, containerName, labels }) {
+  const [data,     setData]     = useState(null)
+  const [loading,  setLoading]  = useState(false)
+  const [error,    setError]    = useState(null)
+  const [copied,   setCopied]   = useState(false)
+
+  useEffect(() => {
+    setLoading(true)
+    api.dockerCompose(containerId)
+      .then(r => { setData(r); setError(null) })
+      .catch(e => setError(e.message || 'Failed to generate compose file'))
+      .finally(() => setLoading(false))
+  }, [containerId])
+
+  function handleCopy() {
+    if (!data?.yaml) return
+    navigator.clipboard.writeText(data.yaml).then(() => {
+      setCopied(true)
+      setTimeout(() => setCopied(false), 2000)
+    })
+  }
+
+  function handleDownload() {
+    if (!data?.yaml) return
+    const blob = new Blob([data.yaml], { type: 'text/yaml' })
+    const url  = URL.createObjectURL(blob)
+    const a    = document.createElement('a')
+    a.href     = url
+    a.download = `${containerName || 'container'}-compose.yml`
+    a.click()
+    URL.revokeObjectURL(url)
+  }
+
+  if (loading) return (
+    <div className="flex items-center gap-2 py-6 justify-center text-sm" style={{ color: 'var(--color-text-muted)' }}>
+      <Loader2 size={14} className="animate-spin" /> Generating…
+    </div>
+  )
+
+  if (error) return (
+    <div className="rounded-lg px-4 py-3 text-xs" style={{ background: 'rgba(239,68,68,0.1)', color: '#ef4444', border: '1px solid rgba(239,68,68,0.25)' }}>
+      {error}
+    </div>
+  )
+
+  if (!data) return null
+
+  return (
+    <div className="space-y-3">
+      {/* Origin notice */}
+      {data.compose_managed ? (
+        <div className="flex items-start gap-2 rounded-lg px-3 py-2.5 text-xs"
+          style={{ background: 'color-mix(in srgb, var(--color-brand) 10%, transparent)', border: '1px solid color-mix(in srgb, var(--color-brand) 25%, transparent)', color: 'var(--color-brand)' }}>
+          <GitMerge size={12} className="mt-0.5 shrink-0" />
+          <span>
+            Compose-managed — project <strong>{data.project}</strong>, service <strong>{data.service}</strong>.
+            The YAML below is generated from the running container config (the original file may differ).
+          </span>
+        </div>
+      ) : (
+        <div className="flex items-start gap-2 rounded-lg px-3 py-2.5 text-xs"
+          style={{ background: 'rgba(245,158,11,0.08)', border: '1px solid rgba(245,158,11,0.25)', color: '#f59e0b' }}>
+          <Info size={12} className="mt-0.5 shrink-0" />
+          <span>Generated from the live container configuration — not started via Compose.</span>
+        </div>
+      )}
+
+      {/* Toolbar */}
+      <div className="flex items-center justify-between">
+        <span className="text-[11px] font-semibold uppercase tracking-wider" style={{ color: 'var(--color-text-faint)' }}>
+          docker-compose.yml
+        </span>
+        <div className="flex items-center gap-2">
+          <button onClick={handleCopy}
+            className="flex items-center gap-1 text-xs px-2.5 py-1 rounded-lg border transition-colors"
+            style={{ borderColor: 'var(--color-border)', color: 'var(--color-text-muted)' }}>
+            {copied ? <Check size={11} /> : <Copy size={11} />}
+            {copied ? 'Copied!' : 'Copy'}
+          </button>
+          <button onClick={handleDownload}
+            className="flex items-center gap-1 text-xs px-2.5 py-1 rounded-lg border transition-colors"
+            style={{ borderColor: 'var(--color-border)', color: 'var(--color-text-muted)' }}>
+            <FileDown size={11} /> Download
+          </button>
+        </div>
+      </div>
+
+      {/* YAML block */}
+      <pre className="rounded-lg p-4 text-[11px] font-mono overflow-x-auto leading-relaxed"
+        style={{ background: 'var(--color-surface-offset)', color: 'var(--color-text)', border: '1px solid var(--color-border)', whiteSpace: 'pre', maxHeight: '60vh', overflowY: 'auto' }}>
+        {data.yaml}
+      </pre>
+    </div>
+  )
+}
+
+// ---------------------------------------------------------------------------
 // Main drawer
 // ---------------------------------------------------------------------------
 export function ContainerDrawer({ container: initialContainer, trivyScan, updateTrivyScan, initialTab, onClose, onContainerUpdate }) {
   const [container,   setContainer]   = useState(initialContainer)
   const isProxmox   = container.host_type === 'proxmox'
-  const visibleTabs = isProxmox ? TABS.filter(t => t.id !== 'logs' && t.id !== 'vuln') : TABS
+  const visibleTabs = isProxmox ? TABS.filter(t => t.id !== 'logs' && t.id !== 'vuln' && t.id !== 'compose') : TABS
   const startTab    = initialTab || 'overview'
   const [activeTab,   setActiveTab]   = useState(
     isProxmox && (startTab === 'logs' || startTab === 'vuln') ? 'overview' : startTab
@@ -692,6 +793,15 @@ export function ContainerDrawer({ container: initialContainer, trivyScan, update
                 </Collapsible>
               )}
             </>
+          )}
+
+          {/* ── Compose tab ── */}
+          {activeTab === 'compose' && (
+            <ComposeTab
+              containerId={container.id}
+              containerName={container.name}
+              labels={container.labels}
+            />
           )}
 
           {/* ── Logs tab ── */}

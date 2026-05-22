@@ -22,6 +22,7 @@ import threading
 from datetime import datetime, timezone, timedelta
 from urllib.parse import urlparse, quote as _urlencode
 
+import yaml as _yaml
 import httpx
 import bcrypt as _bcrypt
 from jose import JWTError, jwt
@@ -7713,6 +7714,247 @@ def _parse_trivy_json(data: dict) -> list:
                 "target":    target,
             })
     return vulns
+
+
+# ---------------------------------------------------------------------------
+# Compose file generation
+# ---------------------------------------------------------------------------
+
+def _generate_compose_yaml(c) -> tuple[str, dict]:
+    """Return (yaml_string, meta) for a container object.
+
+    meta contains:
+      compose_managed: bool — whether container was started via docker compose
+      project:         str | None
+      service:         str | None
+    """
+    attrs    = c.attrs or {}
+    cfg      = attrs.get("Config", {})
+    hcfg     = attrs.get("HostConfig", {})
+    net_sets = attrs.get("NetworkSettings", {})
+    name     = c.name.lstrip("/")
+    labels   = cfg.get("Labels") or {}
+
+    compose_managed = bool(labels.get("com.docker.compose.project"))
+    meta = {
+        "compose_managed": compose_managed,
+        "project":  labels.get("com.docker.compose.project"),
+        "service":  labels.get("com.docker.compose.service"),
+    }
+
+    svc: dict = {}
+
+    # image
+    svc["image"] = cfg.get("Image") or ""
+
+    # container_name
+    svc["container_name"] = name
+
+    # restart
+    rp      = hcfg.get("RestartPolicy") or {}
+    rp_name = rp.get("Name", "no") or "no"
+    if rp_name not in ("no", ""):
+        if rp_name == "on-failure":
+            max_r = rp.get("MaximumRetryCount") or 0
+            svc["restart"] = f"on-failure:{max_r}" if max_r else "on-failure"
+        else:
+            svc["restart"] = rp_name
+
+    # ports
+    ports = []
+    for cport, bindings in (net_sets.get("Ports") or {}).items():
+        if bindings:
+            for b in bindings:
+                hip   = b.get("HostIp", "") or ""
+                hport = b.get("HostPort", "") or ""
+                if hip and hip not in ("0.0.0.0", "::", ""):
+                    ports.append(f"{hip}:{hport}:{cport}" if hport else cport)
+                else:
+                    ports.append(f"{hport}:{cport}" if hport else cport)
+        else:
+            # exposed but not published
+            ports.append(cport)
+    if ports:
+        svc["ports"] = ports
+
+    # volumes / bind mounts
+    volumes  = []
+    tmpfs    = []
+    top_vols = {}
+    for m in (attrs.get("Mounts") or []):
+        mtype = m.get("Type", "bind")
+        src   = m.get("Source", "") or ""
+        dst   = m.get("Destination", "") or ""
+        mode  = m.get("Mode", "") or ""
+        if mtype == "tmpfs":
+            tmpfs.append(dst)
+        elif mtype == "volume":
+            vol_name = m.get("Name") or src
+            v = f"{vol_name}:{dst}"
+            if mode and mode not in ("", "rw"):
+                v += f":{mode}"
+            volumes.append(v)
+            if vol_name:
+                top_vols[vol_name] = None  # mark for top-level volumes block
+        else:  # bind
+            v = f"{src}:{dst}"
+            if mode and mode not in ("", "rw", "z"):
+                v += f":{mode}"
+            volumes.append(v)
+    if volumes:
+        svc["volumes"] = volumes
+    if tmpfs:
+        svc["tmpfs"] = tmpfs
+
+    # environment (skip empty, mask nothing — user can see their own config)
+    env = [e for e in (cfg.get("Env") or []) if e and "=" in e]
+    if env:
+        svc["environment"] = env
+
+    # entrypoint
+    ep = cfg.get("Entrypoint")
+    if ep:
+        svc["entrypoint"] = ep[0] if len(ep) == 1 else ep
+
+    # command (skip if identical to entrypoint)
+    cmd = cfg.get("Cmd")
+    if cmd and cmd != ep:
+        svc["command"] = cmd[0] if len(cmd) == 1 else cmd
+
+    # hostname (skip docker-assigned default = first 12 chars of ID)
+    hn = cfg.get("Hostname") or ""
+    cid = attrs.get("Id", "") or ""
+    if hn and hn != cid[:12]:
+        svc["hostname"] = hn
+
+    # working dir
+    wd = cfg.get("WorkingDir") or ""
+    if wd:
+        svc["working_dir"] = wd
+
+    # user
+    user = cfg.get("User") or ""
+    if user:
+        svc["user"] = user
+
+    # network_mode / networks
+    networks    = net_sets.get("Networks") or {}
+    net_names   = list(networks.keys())
+    _std_nets   = {"bridge", "host", "none"}
+    custom_nets = [n for n in net_names if n not in _std_nets]
+    if "host" in net_names:
+        svc["network_mode"] = "host"
+    elif custom_nets:
+        net_block = {}
+        for n in custom_nets:
+            aliases = (networks.get(n) or {}).get("Aliases") or []
+            # strip docker-assigned aliases (container name + short ID)
+            real_aliases = [a for a in aliases if a not in (name, cid[:12])]
+            net_block[n] = {"aliases": real_aliases} if real_aliases else {}
+        svc["networks"] = net_block
+
+    # extra_hosts
+    extra_hosts = [h for h in (hcfg.get("ExtraHosts") or []) if h]
+    if extra_hosts:
+        svc["extra_hosts"] = extra_hosts
+
+    # capabilities
+    cap_add  = hcfg.get("CapAdd")  or []
+    cap_drop = hcfg.get("CapDrop") or []
+    if cap_add:
+        svc["cap_add"]  = cap_add
+    if cap_drop:
+        svc["cap_drop"] = cap_drop
+
+    if hcfg.get("Privileged"):
+        svc["privileged"] = True
+
+    # devices
+    devs = [
+        f"{d['PathOnHost']}:{d['PathInContainer']}"
+        for d in (hcfg.get("Devices") or [])
+        if d.get("PathOnHost")
+    ]
+    if devs:
+        svc["devices"] = devs
+
+    # dns
+    dns = [d for d in (hcfg.get("Dns") or []) if d]
+    if dns:
+        svc["dns"] = dns
+
+    # resource limits
+    mem = hcfg.get("Memory") or 0
+    if mem:
+        if mem >= 1024 ** 3:
+            svc["mem_limit"] = f"{mem // 1024**3}g"
+        elif mem >= 1024 ** 2:
+            svc["mem_limit"] = f"{mem // 1024**2}m"
+        else:
+            svc["mem_limit"] = f"{mem // 1024}k"
+
+    nano = hcfg.get("NanoCpus") or 0
+    if nano:
+        svc["cpus"] = round(nano / 1e9, 4)
+
+    # sysctls
+    sysctls = hcfg.get("Sysctls") or {}
+    if sysctls:
+        svc["sysctls"] = sysctls
+
+    # logging
+    log_cfg = hcfg.get("LogConfig") or {}
+    log_driver = log_cfg.get("Type") or ""
+    if log_driver and log_driver not in ("json-file", ""):
+        log_block: dict = {"driver": log_driver}
+        log_opts = log_cfg.get("Config") or {}
+        if log_opts:
+            log_block["options"] = log_opts
+        svc["logging"] = log_block
+
+    # build compose document
+    compose: dict = {"services": {name: svc}}
+
+    if top_vols:
+        compose["volumes"] = {v: None for v in top_vols}
+
+    if custom_nets and "network_mode" not in svc:
+        compose["networks"] = {n: {"external": True} for n in custom_nets}
+
+    yaml_str = _yaml.dump(compose, default_flow_style=False, sort_keys=False, allow_unicode=True)
+    return yaml_str, meta
+
+
+@app.get("/docker/containers/{container_id}/compose")
+async def get_container_compose(container_id: str, db: Session = Depends(get_db)):
+    """Return a docker-compose.yml snippet generated from the container's live config."""
+    if container_id.startswith("px-"):
+        raise HTTPException(400, "Compose generation is not available for Proxmox containers.")
+    if not _docker_enabled(db):
+        raise HTTPException(503, "No container hosts configured.")
+
+    hosts      = _get_enabled_hosts(db)
+    docker_h   = [h for h in hosts if h["type"] != "proxmox"]
+    if not docker_h:
+        raise HTTPException(503, "No Docker hosts configured.")
+    host_url   = docker_h[0]["url"] or "unix:///var/run/docker.sock"
+
+    def _do():
+        client = _make_docker_client(host_url)
+        try:
+            c = client.containers.get(container_id)
+            return _generate_compose_yaml(c)
+        finally:
+            client.close()
+
+    try:
+        yaml_str, meta = await asyncio.to_thread(_do)
+        return {"yaml": yaml_str, **meta}
+    except HTTPException:
+        raise
+    except Exception as e:
+        code = 404 if "404" in str(e) or "Not Found" in str(e) else 503
+        raise HTTPException(code, str(e))
 
 
 @app.get("/docker/containers/{container_id}/trivy-scan")

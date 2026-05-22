@@ -306,6 +306,7 @@ export const api = {
   dockerRestart:          (id)            => request('POST', `/docker/containers/${id}/restart`),
   dockerLogs:             (id, tail, onLine, signal) => streamSSE(`/docker/containers/${id}/logs${tail ? `?tail=${tail}` : ''}`, onLine, signal),
   dockerTrivyScan:        (id, onLine, signal)       => streamSSE(`/docker/containers/${id}/trivy-scan`, onLine, signal),
+  dockerCompose:          (id)                       => request('GET',  `/docker/containers/${id}/compose`),
   dockerAutoScanResult:   (name)      => request('GET',  `/docker/auto-scan/${encodeURIComponent(name)}`),
   dockerVulnSummary:      ()          => request('GET',  '/docker/vuln-summary'),
   dockerScanAll:          ()          => request('POST', '/docker/scan-all'),
