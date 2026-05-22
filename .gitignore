@@ -15,3 +15,4 @@ var/
 postgres_data/
 postgres_dataold/
 postgres_dataold2/
+.vscode
