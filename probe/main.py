@@ -1340,8 +1340,11 @@ def _tcp_connect_sweep(ip: str, workers: int | None = None) -> list[int]:
     import concurrent.futures
     import socket as _socket
 
-    w       = workers if workers is not None else PORT_SCAN_WORKERS
-    TIMEOUT = 1.0
+    w         = workers if workers is not None else PORT_SCAN_WORKERS
+    TIMEOUT   = 1.0
+    # Hard cap: theoretical max is ceil(65535/w)*1.0s. Add generous margin then bail out
+    # to avoid an indefinitely hung scan blocking the semaphore for hours.
+    MAX_SWEEP_S = max(660, int((65535 / max(w, 1)) * 1.5 + 60))
 
     def _check(port: int) -> int | None:
         try:
@@ -1352,18 +1355,28 @@ def _tcp_connect_sweep(ip: str, workers: int | None = None) -> list[int]:
             return None
 
     open_ports: list[int] = []
+    ex = concurrent.futures.ThreadPoolExecutor(max_workers=w)
     try:
-        with concurrent.futures.ThreadPoolExecutor(max_workers=w) as ex:
-            futs = {ex.submit(_check, p): p for p in range(1, 65536)}
-            for fut in concurrent.futures.as_completed(futs):
+        futs = {ex.submit(_check, p): p for p in range(1, 65536)}
+        try:
+            for fut in concurrent.futures.as_completed(futs, timeout=MAX_SWEEP_S):
                 try:
                     r = fut.result()
                     if r is not None:
                         open_ports.append(r)
                 except Exception:
                     pass
+        except concurrent.futures.TimeoutError:
+            print(
+                f"[scan] TCP sweep exceeded {MAX_SWEEP_S}s for {ip} — "
+                f"returning partial results ({len(open_ports)} ports found so far)",
+                flush=True,
+            )
     except Exception as exc:
         print(f"[scan] TCP sweep error for {ip}: {exc}", flush=True)
+    finally:
+        # Don't wait for hung threads — they will finish on their own via socket timeout
+        ex.shutdown(wait=False, cancel_futures=True)
     return sorted(open_ports)
 
 
@@ -1854,6 +1867,19 @@ def upsert_seen_device(mac: str, ip: str, source: str) -> None:
             print(f"[DB] Offline-return rescan error {mac}: {e}", flush=True)
         finally:
             sess_or.close()
+
+    # Proactively trigger scan for any device returning from offline that still needs scanning.
+    # Avoids waiting a full sweep cycle for the unscanned-retry loop to pick it up.
+    if was_online is False and not is_new:
+        _sr = Session()
+        try:
+            _dev_r = _sr.get(Device, mac)
+            if _dev_r and not _dev_r.deep_scanned:
+                trigger_deep_scan(_dev_r.primary_ip or ip, mac)
+        except Exception:
+            pass
+        finally:
+            _sr.close()
 
     # seen_while_online = True when the device was already online at a different IP
     # (multi-homed / dual-stack), vs DHCP rotation where device was offline.
