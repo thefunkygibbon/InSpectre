@@ -3,7 +3,7 @@ import {
   X, Box, Play, Square, RotateCcw, ChevronDown, ChevronRight,
   Network, HardDrive, Tag, Terminal, ShieldAlert, ShieldCheck,
   Settings2, Clock, ExternalLink, Eye, EyeOff, Loader2, FileText, Download, FileDown,
-  Copy, Check, GitMerge, Info,
+  Copy, Check, GitMerge, Info, Trash2, RotateCw, AlertTriangle,
 } from 'lucide-react'
 import { api } from '../api'
 import { exportContainerVulnPDF } from '../utils/vulnPdfExport'
@@ -23,12 +23,12 @@ function fmt(iso) {
 }
 
 function hostIpFromUrl(url) {
-  if (!url || url.startsWith('unix://')) return 'localhost'
+  if (!url || url.startsWith('unix://')) return window.location.hostname
   try {
     const m = url.match(/^(?:tcp|http|https):\/\/([^:/]+)/)
     if (m) return m[1]
   } catch (_) {}
-  return 'localhost'
+  return window.location.hostname
 }
 
 function fmtSize(bytes) {
@@ -583,13 +583,14 @@ export function ContainerDrawer({ container: initialContainer, trivyScan, update
   const [actionMsg,   setActionMsg]   = useState('')
   const [showAllEnv,  setShowAllEnv]  = useState(false)
   const [masked,      setMasked]      = useState(true)
+  const [confirmDialog, setConfirmDialog] = useState(null) // null, 'delete', or 'update'
 
   useEffect(() => { setContainer(initialContainer) }, [initialContainer])
 
   const cfg       = STATUS_CONFIG[container.status] || STATUS_CONFIG.exited
   const isRunning = container.status === 'running'
   const isStopped = STOPPED_STATES.includes(container.status)
-  const hostIp    = hostIpFromUrl(container.host_url)
+  const hostIp    = container.host_local_ip || hostIpFromUrl(container.host_url)
 
   async function doAction(action) {
     setActioning(action)
@@ -599,15 +600,33 @@ export function ContainerDrawer({ container: initialContainer, trivyScan, update
       if (action === 'start')   updated = await api.dockerStart(container.id)
       if (action === 'stop')    updated = await api.dockerStop(container.id)
       if (action === 'restart') updated = await api.dockerRestart(container.id)
-      if (updated) {
+      if (action === 'delete') {
+        updated = await api.dockerDelete(container.id)
+        if (updated) {
+          setActionMsg(`[OK] Container deleted successfully.`)
+          setTimeout(() => onClose(), 1500)
+        }
+      }
+      if (action === 'update') {
+        updated = await api.dockerUpdate(container.id)
+        if (updated) {
+          setContainer(updated)
+          if (onContainerUpdate) onContainerUpdate(updated)
+          setActionMsg(`[OK] Container updated successfully.`)
+        }
+      }
+      if (updated && action !== 'delete') {
         setContainer(updated)
         if (onContainerUpdate) onContainerUpdate(updated)
-        setActionMsg(`[OK] Container ${action}ed successfully.`)
+        if (action !== 'delete' && action !== 'update') {
+          setActionMsg(`[OK] Container ${action}ed successfully.`)
+        }
       }
     } catch (e) {
       setActionMsg(`[ERROR] ${e.message}`)
     } finally {
       setActioning(null)
+      setConfirmDialog(null)
     }
   }
 
@@ -880,9 +899,114 @@ export function ContainerDrawer({ container: initialContainer, trivyScan, update
                   <span className="font-mono text-[10px] text-text break-all">{container.image_id?.replace('sha256:','').slice(0,32) || '--'}</span>
                 </Row>
               </Collapsible>
+
+              {!isProxmox && (
+                <Collapsible title="Destructive Actions" icon={AlertTriangle} defaultOpen={false}>
+                  <div className="space-y-2 pt-1">
+                    <button
+                      onClick={() => setConfirmDialog('update')}
+                      disabled={!!actioning}
+                      className="w-full flex items-center justify-center gap-2 px-3 py-2 rounded-lg border text-xs font-medium
+                                 transition-colors border-blue-500/40 bg-blue-500/10 text-blue-400
+                                 hover:bg-blue-500/20 disabled:opacity-40 disabled:cursor-not-allowed">
+                      {actioning === 'update' ? <Loader2 size={12} className="animate-spin" /> : <RotateCw size={12} />}
+                      {actioning === 'update' ? 'Updating…' : 'Update Image'}
+                    </button>
+
+                    <button
+                      onClick={() => setConfirmDialog('delete')}
+                      disabled={!!actioning}
+                      className="w-full flex items-center justify-center gap-2 px-3 py-2 rounded-lg border text-xs font-medium
+                                 transition-colors border-red-600/40 bg-red-600/10 text-red-500
+                                 hover:bg-red-600/20 disabled:opacity-40 disabled:cursor-not-allowed">
+                      {actioning === 'delete' ? <Loader2 size={12} className="animate-spin" /> : <Trash2 size={12} />}
+                      {actioning === 'delete' ? 'Deleting…' : 'Delete Container'}
+                    </button>
+                  </div>
+                </Collapsible>
+              )}
             </div>
           )}
         </div>
+
+        {/* Confirmation Modals */}
+        {confirmDialog === 'delete' && (
+          <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm">
+            <div className="bg-surface rounded-xl shadow-2xl border border-border max-w-sm mx-4 overflow-hidden">
+              <div className="px-6 py-4 border-b border-border">
+                <div className="flex items-center gap-3">
+                  <AlertTriangle size={20} style={{ color: '#ef4444' }} />
+                  <h3 className="text-lg font-semibold" style={{ color: 'var(--color-text)' }}>Delete Container?</h3>
+                </div>
+              </div>
+              <div className="px-6 py-4 space-y-3">
+                <p style={{ color: 'var(--color-text-muted)' }} className="text-sm">
+                  This will permanently delete the container <strong>{container.name}</strong>. This action cannot be undone.
+                </p>
+                <p style={{ color: '#f59e0b' }} className="text-xs flex items-center gap-2">
+                  <AlertTriangle size={14} /> The container data will be lost.
+                </p>
+              </div>
+              <div className="px-6 py-4 border-t border-border flex items-center gap-2">
+                <button
+                  onClick={() => setConfirmDialog(null)}
+                  disabled={!!actioning}
+                  className="flex-1 px-4 py-2 rounded-lg border transition-colors text-sm font-medium"
+                  style={{ borderColor: 'var(--color-border)', color: 'var(--color-text-muted)' }}>
+                  Cancel
+                </button>
+                <button
+                  onClick={() => doAction('delete')}
+                  disabled={!!actioning}
+                  className="flex-1 flex items-center justify-center gap-2 px-4 py-2 rounded-lg border text-sm font-medium
+                             transition-colors border-red-600/40 bg-red-600/10 text-red-500
+                             hover:bg-red-600/20 disabled:opacity-40 disabled:cursor-not-allowed">
+                  {actioning === 'delete' ? <Loader2 size={14} className="animate-spin" /> : <Trash2 size={14} />}
+                  {actioning === 'delete' ? 'Deleting…' : 'Delete'}
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {confirmDialog === 'update' && (
+          <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm">
+            <div className="bg-surface rounded-xl shadow-2xl border border-border max-w-sm mx-4 overflow-hidden">
+              <div className="px-6 py-4 border-b border-border">
+                <div className="flex items-center gap-3">
+                  <RotateCw size={20} style={{ color: '#3b82f6' }} />
+                  <h3 className="text-lg font-semibold" style={{ color: 'var(--color-text)' }}>Update Container?</h3>
+                </div>
+              </div>
+              <div className="px-6 py-4 space-y-3">
+                <p style={{ color: 'var(--color-text-muted)' }} className="text-sm">
+                  This will pull the latest image and recreate the container <strong>{container.name}</strong>. Running container will be stopped.
+                </p>
+                <p style={{ color: '#3b82f6' }} className="text-xs flex items-center gap-2">
+                  <RotateCw size={14} /> The container will be restarted with the new image and same configuration.
+                </p>
+              </div>
+              <div className="px-6 py-4 border-t border-border flex items-center gap-2">
+                <button
+                  onClick={() => setConfirmDialog(null)}
+                  disabled={!!actioning}
+                  className="flex-1 px-4 py-2 rounded-lg border transition-colors text-sm font-medium"
+                  style={{ borderColor: 'var(--color-border)', color: 'var(--color-text-muted)' }}>
+                  Cancel
+                </button>
+                <button
+                  onClick={() => doAction('update')}
+                  disabled={!!actioning}
+                  className="flex-1 flex items-center justify-center gap-2 px-4 py-2 rounded-lg border text-sm font-medium
+                             transition-colors border-blue-500/40 bg-blue-500/10 text-blue-400
+                             hover:bg-blue-500/20 disabled:opacity-40 disabled:cursor-not-allowed">
+                  {actioning === 'update' ? <Loader2 size={14} className="animate-spin" /> : <RotateCw size={14} />}
+                  {actioning === 'update' ? 'Updating…' : 'Update'}
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
       </aside>
     </>
   )

@@ -304,6 +304,8 @@ export const api = {
   dockerStart:            (id)            => request('POST', `/docker/containers/${id}/start`),
   dockerStop:             (id)            => request('POST', `/docker/containers/${id}/stop`),
   dockerRestart:          (id)            => request('POST', `/docker/containers/${id}/restart`),
+  dockerDelete:           (id)            => request('DELETE', `/docker/containers/${id}`),
+  dockerUpdate:           (id)            => request('POST', `/docker/containers/${id}/update`),
   dockerLogs:             (id, tail, onLine, signal) => streamSSE(`/docker/containers/${id}/logs${tail ? `?tail=${tail}` : ''}`, onLine, signal),
   dockerTrivyScan:        (id, onLine, signal)       => streamSSE(`/docker/containers/${id}/trivy-scan`, onLine, signal),
   dockerCompose:          (id)                       => request('GET',  `/docker/containers/${id}/compose`),

@@ -38,6 +38,7 @@ function HostForm({ initial, onSave, onCancel, saving }) {
   const [authToken, setAuthToken] = useState('')  // never pre-fill token
   const [tlsVerify, setTlsVerify] = useState(initial?.tls_verify || false)
   const [node,      setNode]      = useState(initial?.node      || 'pve')
+  const [localIp,   setLocalIp]   = useState(initial?.local_ip  || '')
   const [error,     setError]     = useState('')
 
   function handleTypeChange(t) {
@@ -55,6 +56,7 @@ function HostForm({ initial, onSave, onCancel, saving }) {
       name: name.trim(), type, url: url.trim() || null,
       auth_user: authUser.trim() || null,
       tls_verify: tlsVerify, node: node.trim() || 'pve', enabled: true,
+      local_ip: localIp.trim() || null,
     }
     if (authToken) body.auth_token = authToken
     onSave(body)
@@ -71,6 +73,15 @@ function HostForm({ initial, onSave, onCancel, saving }) {
       <div className="space-y-1">
         <label className="text-xs font-medium" style={{ color: 'var(--color-text-muted)' }}>Display Name</label>
         <input className="input w-full" placeholder="e.g. Home Server" value={name} onChange={e => setName(e.target.value)} />
+      </div>
+
+      {/* Local IP */}
+      <div className="space-y-1">
+        <label className="text-xs font-medium" style={{ color: 'var(--color-text-muted)' }}>Local IP Address</label>
+        <input className="input w-full font-mono text-sm" placeholder="e.g. 192.168.1.10" value={localIp} onChange={e => setLocalIp(e.target.value)} />
+        <p className="text-[11px]" style={{ color: 'var(--color-text-faint)' }}>
+          Internal IP of the Docker/Proxmox host. Used for port links in the dashboard.
+        </p>
       </div>
 
       {/* Type */}
