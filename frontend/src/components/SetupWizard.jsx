@@ -547,8 +547,18 @@ function StepContainers({ onNext }) {
   const [authToken, setAuthToken] = useState('')
   const [tlsVerify, setTlsVerify] = useState(false)
   const [node,      setNode]      = useState('pve')
+  const [localIp,   setLocalIp]   = useState('')
   const [adding,    setAdding]    = useState(false)
   const [error,     setError]     = useState('')
+
+  // Auto-detect local IP from probe on mount
+  useEffect(() => {
+    api.setupNetworkInfo().then(info => {
+      if (info.ip_address) {
+        setLocalIp(info.ip_address)
+      }
+    }).catch(() => {})
+  }, [])
 
   function autoName(t) {
     return t === 'proxmox' ? 'Proxmox 1' : 'Docker 1'
@@ -572,6 +582,7 @@ function StepContainers({ onNext }) {
       name: name.trim(), type, url: url.trim() || null,
       auth_user: authUser.trim() || null,
       tls_verify: tlsVerify, node: node.trim() || 'pve', enabled: true,
+      local_ip: localIp.trim() || null,
     }
     if (authToken) body.auth_token = authToken
     setAdding(true)
@@ -581,6 +592,7 @@ function StepContainers({ onNext }) {
       setName(autoName(type)); setAuthUser(''); setAuthToken('')
       setTlsVerify(false); setNode('pve')
       setUrl(wizardDefaultUrl(type))
+      setLocalIp('')
     } catch (e) {
       setError(`Failed to add host: ${e.message}`)
     } finally {
@@ -631,6 +643,15 @@ function StepContainers({ onNext }) {
           <label className="text-xs font-medium" style={{ color: 'var(--color-text-muted)' }}>Display Name</label>
           <input className="input w-full text-sm" placeholder="e.g. Home Server"
             value={name} onChange={e => setName(e.target.value)} />
+        </div>
+
+        <div className="space-y-1">
+          <label className="text-xs font-medium" style={{ color: 'var(--color-text-muted)' }}>Local IP Address</label>
+          <input className="input w-full font-mono text-sm" placeholder="e.g. 192.168.1.10"
+            value={localIp} onChange={e => setLocalIp(e.target.value)} />
+          <p className="text-[11px]" style={{ color: 'var(--color-text-faint)' }}>
+            Internal IP of the Docker/Proxmox host. Used for port links in the dashboard.
+          </p>
         </div>
 
         {type === 'docker_local' && (

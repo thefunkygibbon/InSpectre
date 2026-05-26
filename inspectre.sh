@@ -59,6 +59,9 @@ log() {
 remove_project_images() {
   log "Removing local project images if present..."
   docker image rm "${PROJECT_NAME}-probe" "${PROJECT_NAME}-web" "${PROJECT_NAME}-backend" 2>/dev/null || true
+
+  log "Pruning dangling images (old build layers)..."
+  docker image prune -f || true
 }
 
 full_rebuild() {

@@ -458,8 +458,10 @@ def _migrate(db: Session):
             tls_verify BOOLEAN NOT NULL DEFAULT false,
             enabled    BOOLEAN NOT NULL DEFAULT true,
             node       TEXT NOT NULL DEFAULT 'pve',
+            local_ip   TEXT,
             created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
         )""",
+        "ALTER TABLE container_hosts ADD COLUMN IF NOT EXISTS local_ip TEXT",
         # Persistent Trivy scan results (survives backend restarts)
         """CREATE TABLE IF NOT EXISTS container_vuln_results (
             name       TEXT NOT NULL PRIMARY KEY,
@@ -2111,6 +2113,7 @@ class ContainerHostCreate(BaseModel):
     tls_verify: bool = False
     enabled:    bool = True
     node:       str  = "pve"
+    local_ip:   Optional[str] = None
 
 class ContainerHostUpdate(BaseModel):
     name:       Optional[str]  = None
@@ -2121,6 +2124,7 @@ class ContainerHostUpdate(BaseModel):
     tls_verify: Optional[bool] = None
     enabled:    Optional[bool] = None
     node:       Optional[str]  = None
+    local_ip:   Optional[str]  = None
 
 class DeviceUpdate(BaseModel):
     custom_name: Optional[str] = None
@@ -7136,6 +7140,7 @@ def _row_to_host(row) -> dict:
         "tls_verify": row.tls_verify,
         "enabled":    row.enabled,
         "node":       row.node,
+        "local_ip":   row.local_ip,
         "created_at": row.created_at.isoformat() if row.created_at else None,
     }
 
@@ -7149,13 +7154,14 @@ async def list_container_hosts(db: Session = Depends(get_db)):
 @app.post("/container-hosts", status_code=201)
 async def create_container_host(body: ContainerHostCreate, db: Session = Depends(get_db)):
     row = db.execute(text("""
-        INSERT INTO container_hosts (name, type, url, auth_user, auth_token, tls_verify, enabled, node)
-        VALUES (:name, :type, :url, :au, :at, :tls, :enabled, :node)
+        INSERT INTO container_hosts (name, type, url, auth_user, auth_token, tls_verify, enabled, node, local_ip)
+        VALUES (:name, :type, :url, :au, :at, :tls, :enabled, :node, :local_ip)
         RETURNING *
     """), {
         "name": body.name, "type": body.type, "url": body.url or None,
         "au": body.auth_user or None, "at": body.auth_token or None,
         "tls": body.tls_verify, "enabled": body.enabled, "node": body.node or "pve",
+        "local_ip": body.local_ip or None,
     }).fetchone()
     db.commit()
     if body.enabled:
@@ -7176,6 +7182,7 @@ async def update_container_host(host_id: int, body: ContainerHostUpdate, db: Ses
     if body.tls_verify is not None: fields["tls_verify"] = body.tls_verify
     if body.enabled    is not None: fields["enabled"]    = body.enabled
     if body.node       is not None: fields["node"]       = body.node or "pve"
+    if body.local_ip   is not None: fields["local_ip"]   = body.local_ip or None
     # Only update auth_token if explicitly supplied and not masked
     if body.auth_token is not None and body.auth_token != "***":
         fields["auth_token"] = body.auth_token or None
@@ -7227,7 +7234,7 @@ def _get_enabled_hosts(db: Session) -> list:
         {
             "id":         r.id, "name": r.name, "type": r.type,
             "url":        r.url, "auth_user": r.auth_user, "auth_token": r.auth_token,
-            "tls_verify": r.tls_verify, "node": r.node,
+            "tls_verify": r.tls_verify, "node": r.node, "local_ip": r.local_ip,
         }
         for r in rows
     ]
@@ -7340,12 +7347,7 @@ def _fetch_containers_for_host(host: dict) -> list:
     try:
         result = []
         for c in client.containers.list(all=True):
-            d = _fmt_container(c)
-            d["host_id"]   = host["id"]
-            d["host_name"] = host["name"]
-            d["host_type"] = htype
-            d["host_url"]  = host_url
-            result.append(d)
+            result.append(_add_docker_host_meta(_fmt_container(c), host, host_url))
         return result
     finally:
         client.close()
@@ -7425,6 +7427,15 @@ def _fmt_container(c) -> dict:
         "hostname":       config.get("Hostname",""),
         "working_dir":    config.get("WorkingDir",""),
     }
+
+
+def _add_docker_host_meta(container: dict, host: dict, host_url: str) -> dict:
+    container["host_id"] = host["id"]
+    container["host_name"] = host["name"]
+    container["host_type"] = host["type"]
+    container["host_url"] = host_url
+    container["host_local_ip"] = host.get("local_ip")  # Store local_ip for port links
+    return container
 
 
 @app.get("/docker/stats")
@@ -7533,9 +7544,7 @@ async def get_docker_container(container_id: str, db: Session = Depends(get_db))
         client = _make_docker_client(host_url)
         try:
             c = client.containers.get(container_id)
-            d = _fmt_container(c)
-            d["host_id"] = docker_hosts[0]["id"]; d["host_name"] = docker_hosts[0]["name"]
-            return d
+            return _add_docker_host_meta(_fmt_container(c), docker_hosts[0], host_url)
         finally:
             client.close()
 
@@ -7570,7 +7579,7 @@ async def docker_start(container_id: str, db: Session = Depends(get_db)):
         try:
             c = client.containers.get(container_id)
             c.start(); c.reload()
-            return _fmt_container(c)
+            return _add_docker_host_meta(_fmt_container(c), docker_hosts[0], host_url)
         finally:
             client.close()
 
@@ -7604,7 +7613,7 @@ async def docker_stop(container_id: str, db: Session = Depends(get_db)):
         try:
             c = client.containers.get(container_id)
             c.stop(timeout=10); c.reload()
-            return _fmt_container(c)
+            return _add_docker_host_meta(_fmt_container(c), docker_hosts[0], host_url)
         finally:
             client.close()
 
@@ -7638,7 +7647,129 @@ async def docker_restart(container_id: str, db: Session = Depends(get_db)):
         try:
             c = client.containers.get(container_id)
             c.restart(timeout=10); c.reload()
-            return _fmt_container(c)
+            return _add_docker_host_meta(_fmt_container(c), docker_hosts[0], host_url)
+        finally:
+            client.close()
+
+    try:
+        return await asyncio.to_thread(_do)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(400, str(e))
+
+
+@app.delete("/docker/containers/{container_id}")
+async def docker_delete(container_id: str, db: Session = Depends(get_db)):
+    """Delete (remove) a container."""
+    px = _parse_proxmox_id(container_id)
+    if px:
+        host_id, node, vmid = px
+        host = _get_host_row(db, host_id)
+        try:
+            # Delete Proxmox LXC
+            _proxmox_request(host, "DELETE", f"/api2/json/nodes/{node}/lxc/{vmid}")
+            return {"status": "deleted"}
+        except Exception as e:
+            raise HTTPException(400, str(e))
+
+    hosts = _get_enabled_hosts(db)
+    docker_hosts = [h for h in hosts if h["type"] != "proxmox"]
+    if not docker_hosts:
+        raise HTTPException(503, "No Docker hosts.")
+    host_url = docker_hosts[0]["url"] or "unix:///var/run/docker.sock"
+
+    def _do():
+        client = _make_docker_client(host_url)
+        try:
+            c = client.containers.get(container_id)
+            # Stop if running
+            if c.status != "exited":
+                c.stop(timeout=10)
+            # Remove container
+            c.remove(force=True)
+            return {"status": "deleted", "container_id": container_id}
+        finally:
+            client.close()
+
+    try:
+        return await asyncio.to_thread(_do)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(400, str(e))
+
+
+@app.post("/docker/containers/{container_id}/update")
+async def docker_update(container_id: str, db: Session = Depends(get_db)):
+    """Update container by pulling latest image and recreating it (Watchtower-like)."""
+    px = _parse_proxmox_id(container_id)
+    if px:
+        raise HTTPException(400, "Update is not supported for Proxmox containers.")
+
+    hosts = _get_enabled_hosts(db)
+    docker_hosts = [h for h in hosts if h["type"] != "proxmox"]
+    if not docker_hosts:
+        raise HTTPException(503, "No Docker hosts.")
+    host_url = docker_hosts[0]["url"] or "unix:///var/run/docker.sock"
+
+    def _do():
+        client = _make_docker_client(host_url)
+        try:
+            c = client.containers.get(container_id)
+            # Store current container config before deletion
+            image_name = c.image.tags[0] if c.image.tags else str(c.image.id)
+            
+            # Pull latest image
+            try:
+                client.images.pull(image_name)
+            except Exception as pull_err:
+                # If pull fails, continue anyway - might use cached image
+                pass
+            
+            # Get current container config
+            attrs = c.attrs or {}
+            config = attrs.get("Config", {})
+            host_cfg = attrs.get("HostConfig", {})
+            
+            # Stop container
+            if c.status != "exited":
+                c.stop(timeout=10)
+            
+            # Remove old container
+            c.remove(force=True)
+            
+            # Create new container with same config
+            new_c = client.containers.create(
+                image=image_name,
+                command=config.get("Cmd"),
+                environment=config.get("Env"),
+                labels=config.get("Labels"),
+                hostname=config.get("Hostname"),
+                working_dir=config.get("WorkingDir"),
+                name=c.name.lstrip("/"),
+                ports=None,  # Will be handled by port bindings in host_config
+                volumes=None,  # Will be handled by binds in host_config
+                restart_policy={"Name": host_cfg.get("RestartPolicy", {}).get("Name", "no")},
+                host_config=client.api.create_host_config(
+                    port_bindings={
+                        p.split("/")[0]: int(b.get("HostPort", 0)) 
+                        for p, bindings in (attrs.get("NetworkSettings", {}).get("Ports") or {}).items()
+                        if bindings
+                        for b in bindings
+                    },
+                    binds={
+                        m.get("Source", ""): {"bind": m.get("Destination", ""), "mode": m.get("Mode", "rw")}
+                        for m in (attrs.get("Mounts") or [])
+                        if m.get("Type") == "bind"
+                    },
+                ),
+            )
+            
+            # Start new container
+            new_c.start()
+            new_c.reload()
+            return _add_docker_host_meta(_fmt_container(new_c), docker_hosts[0], host_url)
         finally:
             client.close()
 
