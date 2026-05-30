@@ -861,7 +861,7 @@ export function PersonPresencePage({ devices }) {
     // Also refresh when the tab regains focus
     function onVisible() { if (document.visibilityState === 'visible') doRefresh() }
     document.addEventListener('visibilitychange', onVisible)
-    const id = setInterval(doRefresh, 30000)
+    const id = setInterval(doRefresh, 10000)
     return () => { clearInterval(id); document.removeEventListener('visibilitychange', onVisible) }
   }, [load, loadTimeline, days])
 
@@ -961,7 +961,7 @@ export function PersonPresencePage({ devices }) {
         <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-3 mb-8">
           {persons.map(person => (
             <PersonCard key={person.id} person={person} allDevices={allDevices}
-              onUpdated={() => { load(); loadTimeline(days) }}
+              onUpdated={() => load()}
               onDeleted={() => { load(); loadTimeline(days) }} />
           ))}
         </div>

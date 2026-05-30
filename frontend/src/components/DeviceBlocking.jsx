@@ -474,7 +474,7 @@ export function DeviceBlocking({ devices, onDeviceClick }) {
     }
     function onVisible() { if (document.visibilityState === 'visible') doRefresh() }
     document.addEventListener('visibilitychange', onVisible)
-    const id = setInterval(doRefresh, 30000)
+    const id = setInterval(doRefresh, 10000)
     return () => { clearInterval(id); document.removeEventListener('visibilitychange', onVisible) }
   }, [load])
 

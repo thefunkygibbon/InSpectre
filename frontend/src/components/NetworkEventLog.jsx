@@ -76,11 +76,11 @@ export function NetworkEventLog({ onDeviceClick }) {
     return () => { alive = false }
   }, [limit])
 
-  // Auto-refresh every 30s
+  // Auto-refresh every 10s
   useEffect(() => {
     const id = setInterval(() => {
       api.getStatusEvents(limit).then(rows => setEvents(rows)).catch(() => {})
-    }, 30000)
+    }, 10000)
     return () => clearInterval(id)
   }, [limit])
 
