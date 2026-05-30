@@ -288,6 +288,9 @@ export const api = {
   deletePerson:         (id)                 => request('DELETE', `/persons/${id}`),
   addPersonDevice:      (id, body)           => request('POST',   `/persons/${id}/devices`, body),
   removePersonDevice:   (id, mac)            => request('DELETE', `/persons/${id}/devices/${mac}`),
+  getPersonsTimeline:   (days)               => request('GET',    `/persons/timeline${days ? `?days=${days}` : ''}`),
+  blockPerson:          (id, body)           => request('POST',   `/persons/${id}/block`, body),
+  unblockPerson:        (id)                 => request('POST',   `/persons/${id}/unblock`),
 
   // Network pause / resume
   getNetworkStatus: ()  => request('GET',  '/network/status'),

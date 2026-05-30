@@ -12,8 +12,8 @@ export function useTheme() {
     return 'dark'  })
 
   const [skin, setSkinState] = useState(() => {
-    try { return localStorage.getItem('inspectre-skin') || 'spectre' } catch (_) {}
-    return localStorage.getItem('inspectre-skin') || 'phantom'
+    try { return localStorage.getItem('inspectre-skin') || 'phantom' } catch (_) {}
+    return 'phantom'
   })
 
   useEffect(() => {

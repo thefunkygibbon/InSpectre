@@ -205,6 +205,9 @@ _plugin_runner    = PluginRunner(_plugin_registry, _ha_mqtt)
 _plugin_event_bus = PluginEventBus(_plugin_registry, _plugin_runner)
 _plugin_scheduler = PluginScheduler(_plugin_registry, _plugin_runner, SessionLocal)
 
+# In-memory dict: person_id -> asyncio.Task for timed auto-unblock
+_person_timed_blocks: dict = {}
+
 
 def _ha_startup_connect(db: "Session"):
     """Connect HA MQTT on startup and publish initial discovery + state for all devices.
@@ -551,6 +554,7 @@ def _migrate(db: Session):
         )""",
         "CREATE INDEX IF NOT EXISTS ix_person_devices_mac ON person_devices(mac_address)",
         "ALTER TABLE block_schedules ADD COLUMN IF NOT EXISTS person_id UUID REFERENCES persons(id) ON DELETE SET NULL",
+        "ALTER TABLE block_schedules ADD COLUMN IF NOT EXISTS person_ids TEXT[] DEFAULT '{}'",
         "ALTER TABLE devices ADD COLUMN IF NOT EXISTS person_id UUID REFERENCES persons(id) ON DELETE SET NULL",
         "CREATE INDEX IF NOT EXISTS ix_devices_person_id ON devices(person_id)",
     ]
@@ -890,6 +894,10 @@ NOTIFICATION_EVENT_DEFS = [
     ("container.crashed",           "Container Crashed",        "Containers",      "A container exited with a non-zero exit code"),
     ("traffic.unusual_port",        "Unusual Port Traffic",     "Traffic",         "A device communicated on an unusual port"),
     ("traffic.suspicious_country",  "Suspicious Country Traffic","Traffic",        "A device communicated with a flagged country"),
+    ("person.home",                 "Person Arrived Home",      "Person Presence", "A tracked person's device came online (person is home)"),
+    ("person.away",                 "Person Left Home",         "Person Presence", "A tracked person's device went offline (person is away)"),
+    ("person.blocked",              "Person Blocked",           "Person Presence", "All of a person's devices were manually blocked"),
+    ("person.unblocked",            "Person Unblocked",         "Person Presence", "A person's devices were unblocked"),
 ]
 
 _last_alert_event_id: int = 0
@@ -1270,6 +1278,23 @@ async def _notification_loop():
                             if days_absent >= returned_days:
                                 dispatches.append(("device.returned", "Device Returned",
                                                    f"{name} ({ip}) reappeared after {days_absent} days", mac))
+                        # person.home: check if this mac belongs to a person now home
+                        person_row = db.execute(text("""
+                            SELECT p.id::text, p.name FROM persons p
+                            JOIN person_devices pd ON pd.person_id = p.id
+                            WHERE pd.mac_address = :mac LIMIT 1
+                        """), {"mac": mac}).fetchone()
+                        if person_row:
+                            pid, pname = person_row
+                            # Person is home if at least one of their devices is online
+                            any_online = db.execute(text("""
+                                SELECT 1 FROM person_devices pd
+                                JOIN devices d ON d.mac_address = pd.mac_address
+                                WHERE pd.person_id = :pid AND d.is_online = true LIMIT 1
+                            """), {"pid": pid}).fetchone()
+                            if any_online:
+                                dispatches.append(("person.home", "Person Arrived Home",
+                                                   f"{pname} is now home", None))
 
                     elif etype == "offline":
                         dispatches.append(("device.offline.all", "Device Offline",
@@ -1277,6 +1302,23 @@ async def _notification_loop():
                         if is_important:
                             dispatches.append(("device.offline.watched", "Watched Device Offline",
                                                f"{name} ({ip}) went offline", mac))
+                        # person.away: check if this mac belongs to a person now away
+                        person_row = db.execute(text("""
+                            SELECT p.id::text, p.name FROM persons p
+                            JOIN person_devices pd ON pd.person_id = p.id
+                            WHERE pd.mac_address = :mac LIMIT 1
+                        """), {"mac": mac}).fetchone()
+                        if person_row:
+                            pid, pname = person_row
+                            # Person is away if none of their devices are online
+                            any_online = db.execute(text("""
+                                SELECT 1 FROM person_devices pd
+                                JOIN devices d ON d.mac_address = pd.mac_address
+                                WHERE pd.person_id = :pid AND d.is_online = true LIMIT 1
+                            """), {"pid": pid}).fetchone()
+                            if not any_online:
+                                dispatches.append(("person.away", "Person Left Home",
+                                                   f"{pname} is away (all devices offline)", None))
 
                     elif etype == "vuln_scan_complete":
                         severity = d.get("severity", "clean")
@@ -2187,6 +2229,7 @@ class BlockScheduleCreate(BaseModel):
     end_time:      str
     enabled:       bool               = True
     person_id:     Optional[str]      = None
+    person_ids:    List[str]          = []
 
 class BlockScheduleUpdate(BaseModel):
     label:         Optional[str]       = None
@@ -2197,6 +2240,7 @@ class BlockScheduleUpdate(BaseModel):
     mac_addresses: Optional[List[str]] = None
     tags:          Optional[str]       = None
     person_id:     Optional[str]       = None   # UUID string or empty string to clear
+    person_ids:    Optional[List[str]] = None
 
 class LoginRequest(BaseModel):
     username: str
@@ -6594,13 +6638,14 @@ def _schedule_row_to_dict(row) -> dict:
         "mac_addresses": list(row[8]) if row[8] else [],
         "tags":          row[9] or "",
         "person_id":     str(row[10]) if len(row) > 10 and row[10] else None,
+        "person_ids":    list(row[11]) if len(row) > 11 and row[11] else [],
     }
 
 
 @app.get("/block-schedules")
 def list_block_schedules(db: Session = Depends(get_db)):
     rows = db.execute(text(
-        "SELECT id, mac_address, label, days_of_week, start_time, end_time, enabled, created_at, mac_addresses, tags, person_id "
+        "SELECT id, mac_address, label, days_of_week, start_time, end_time, enabled, created_at, mac_addresses, tags, person_id, person_ids "
         "FROM block_schedules ORDER BY created_at DESC"
     )).fetchall()
     return [_schedule_row_to_dict(r) for r in rows]
@@ -6610,21 +6655,29 @@ def list_block_schedules(db: Session = Depends(get_db)):
 def create_block_schedule(payload: BlockScheduleCreate, db: Session = Depends(get_db)):
     if not payload.start_time or not payload.end_time:
         raise HTTPException(400, "start_time and end_time are required")
-    person_id = payload.person_id or None
+    person_id  = payload.person_id or None
+    # Merge single person_id into person_ids for backward compat
+    person_ids = list(set(payload.person_ids or []))
+    if person_id and person_id not in person_ids:
+        person_ids.append(person_id)
+    # If any person_ids, set person_id to first one for backward compat display
+    if person_ids and not person_id:
+        person_id = person_ids[0]
     row = db.execute(text(
-        "INSERT INTO block_schedules (mac_address, label, days_of_week, start_time, end_time, enabled, mac_addresses, tags, person_id) "
-        "VALUES (:mac, :label, :days, :start, :end, :enabled, :mac_addresses, :tags, :person_id) "
-        "RETURNING id, mac_address, label, days_of_week, start_time, end_time, enabled, created_at, mac_addresses, tags, person_id"
+        "INSERT INTO block_schedules (mac_address, label, days_of_week, start_time, end_time, enabled, mac_addresses, tags, person_id, person_ids) "
+        "VALUES (:mac, :label, :days, :start, :end, :enabled, :mac_addresses, :tags, :person_id, :person_ids) "
+        "RETURNING id, mac_address, label, days_of_week, start_time, end_time, enabled, created_at, mac_addresses, tags, person_id, person_ids"
     ), {
-        "mac":          payload.mac_address,
-        "label":        payload.label or "",
-        "days":         payload.days_of_week,
-        "start":        payload.start_time,
-        "end":          payload.end_time,
-        "enabled":      payload.enabled,
+        "mac":           payload.mac_address,
+        "label":         payload.label or "",
+        "days":          payload.days_of_week,
+        "start":         payload.start_time,
+        "end":           payload.end_time,
+        "enabled":       payload.enabled,
         "mac_addresses": payload.mac_addresses or [],
-        "tags":         payload.tags or "",
-        "person_id":    person_id,
+        "tags":          payload.tags or "",
+        "person_id":     person_id,
+        "person_ids":    person_ids,
     }).fetchone()
     db.commit()
     return _schedule_row_to_dict(row)
@@ -6638,21 +6691,29 @@ def update_block_schedule(schedule_id: int, payload: BlockScheduleUpdate, db: Se
     if not existing:
         raise HTTPException(404, "Schedule not found")
     updates = {}
-    if payload.label        is not None: updates["label"]        = payload.label
-    if payload.days_of_week is not None: updates["days_of_week"] = payload.days_of_week
-    if payload.start_time   is not None: updates["start_time"]   = payload.start_time
-    if payload.end_time     is not None: updates["end_time"]     = payload.end_time
-    if payload.enabled      is not None: updates["enabled"]      = payload.enabled
+    if payload.label         is not None: updates["label"]         = payload.label
+    if payload.days_of_week  is not None: updates["days_of_week"]  = payload.days_of_week
+    if payload.start_time    is not None: updates["start_time"]    = payload.start_time
+    if payload.end_time      is not None: updates["end_time"]      = payload.end_time
+    if payload.enabled       is not None: updates["enabled"]       = payload.enabled
     if payload.mac_addresses is not None: updates["mac_addresses"] = payload.mac_addresses
     if payload.tags          is not None: updates["tags"]          = payload.tags
     if payload.person_id     is not None: updates["person_id"]     = payload.person_id or None
+    if payload.person_ids    is not None:
+        pids = list(set(payload.person_ids))
+        updates["person_ids"] = pids
+        # keep person_id in sync with first entry
+        if pids and payload.person_id is None:
+            updates["person_id"] = pids[0]
+        elif not pids:
+            updates["person_id"] = None
     if updates:
         set_clause = ", ".join(f"{k} = :{k}" for k in updates)
         updates["id"] = schedule_id
         db.execute(text(f"UPDATE block_schedules SET {set_clause} WHERE id = :id"), updates)
         db.commit()
     row = db.execute(text(
-        "SELECT id, mac_address, label, days_of_week, start_time, end_time, enabled, created_at, mac_addresses, tags, person_id "
+        "SELECT id, mac_address, label, days_of_week, start_time, end_time, enabled, created_at, mac_addresses, tags, person_id, person_ids "
         "FROM block_schedules WHERE id = :id"
     ), {"id": schedule_id}).fetchone()
     return _schedule_row_to_dict(row)
@@ -6678,17 +6739,24 @@ def _person_row_to_dict(row, devices=None, schedules=None) -> dict:
         is_home = any(d["mac_address"] == primary_mac and d.get("is_online") for d in devs)
     elif devs:
         is_home = any(d.get("is_online") for d in devs)
+    is_blocked = bool(devs) and all(d.get("is_blocked", False) for d in devs)
+    timed_block_remaining = None
+    task = _person_timed_blocks.get(pid)
+    if task and not task.done():
+        timed_block_remaining = True  # active timed block
     return {
-        "id":          pid,
-        "name":        row[1],
-        "primary_mac": primary_mac,
-        "photo":       row[3],
-        "notes":       row[4],
-        "created_at":  row[5].isoformat() if row[5] else None,
-        "updated_at":  row[6].isoformat() if row[6] else None,
-        "is_home":     is_home,
-        "devices":     devs,
-        "schedules":   schedules or [],
+        "id":                   pid,
+        "name":                 row[1],
+        "primary_mac":          primary_mac,
+        "photo":                row[3],
+        "notes":                row[4],
+        "created_at":           row[5].isoformat() if row[5] else None,
+        "updated_at":           row[6].isoformat() if row[6] else None,
+        "is_home":              is_home,
+        "is_blocked":           is_blocked,
+        "has_timed_block":      timed_block_remaining is not None,
+        "devices":              devs,
+        "schedules":            schedules or [],
     }
 
 
@@ -6701,7 +6769,7 @@ def list_persons(db: Session = Depends(get_db)):
     dev_rows = db.execute(text("""
         SELECT pd.person_id::text, d.mac_address, d.is_online,
                COALESCE(d.custom_name, d.hostname, d.ip_address) AS display_name,
-               d.ip_address, d.device_type_override, d.vendor
+               d.ip_address, d.device_type_override, d.vendor, d.is_blocked
         FROM person_devices pd
         JOIN devices d ON d.mac_address = pd.mac_address
     """)).fetchall()
@@ -6709,22 +6777,29 @@ def list_persons(db: Session = Depends(get_db)):
     for r in dev_rows:
         devs_by_person.setdefault(r[0], []).append({
             "mac_address":  r[1], "is_online": r[2], "display_name": r[3],
-            "ip_address":   r[4], "device_type": r[5], "vendor": r[6],
+            "ip_address":   r[4], "device_type": r[5], "vendor": r[6], "is_blocked": bool(r[7]),
         })
-    # Fetch person-targeted schedules
+    # Fetch person-targeted schedules (both person_id and person_ids)
     try:
         sched_rows = db.execute(text(
-            "SELECT id, person_id::text, label, days_of_week, start_time, end_time, enabled "
-            "FROM block_schedules WHERE person_id IS NOT NULL"
+            "SELECT id, person_id::text, label, days_of_week, start_time, end_time, enabled, person_ids "
+            "FROM block_schedules WHERE person_id IS NOT NULL OR array_length(person_ids, 1) > 0"
         )).fetchall()
     except Exception:
         sched_rows = []
     scheds_by_person: dict = {}
     for r in sched_rows:
-        scheds_by_person.setdefault(r[1], []).append({
+        sched = {
             "id": r[0], "label": r[2], "days_of_week": r[3],
             "start_time": r[4], "end_time": r[5], "enabled": r[6],
-        })
+            "person_ids": list(r[7]) if r[7] else [],
+        }
+        # Add to each targeted person's list
+        effective_pids = list(r[7]) if r[7] else []
+        if r[1] and r[1] not in effective_pids:
+            effective_pids.append(r[1])
+        for pid in effective_pids:
+            scheds_by_person.setdefault(pid, []).append(sched)
     return [
         _person_row_to_dict(p, devs_by_person.get(str(p[0]), []), scheds_by_person.get(str(p[0]), []))
         for p in persons
@@ -6763,6 +6838,109 @@ def create_person(payload: PersonCreate, db: Session = Depends(get_db)):
     return _person_row_to_dict(row)
 
 
+@app.get("/persons/timeline")
+def get_persons_timeline(days: int = Query(7, ge=1, le=365), db: Session = Depends(get_db)):
+    now = datetime.now(timezone.utc)
+    window_start = now - timedelta(days=days)
+
+    persons = db.execute(text(
+        "SELECT id::text, name, primary_mac, photo FROM persons ORDER BY name"
+    )).fetchall()
+
+    if not persons:
+        return {"window_start": window_start.isoformat(), "window_end": now.isoformat(),
+                "days": days, "persons": []}
+
+    # Resolve which MAC to track for each person (primary_mac or first assigned device)
+    person_macs: dict = {}
+    for p in persons:
+        pid = p[0]
+        if p[2]:
+            person_macs[pid] = p[2]
+        else:
+            row = db.execute(text(
+                "SELECT mac_address FROM person_devices WHERE person_id = :pid LIMIT 1"
+            ), {"pid": pid}).fetchone()
+            if row:
+                person_macs[pid] = row[0]
+
+    all_macs = list(set(person_macs.values()))
+    events_by_mac: dict = {}
+    prior_by_mac:  dict = {}
+
+    if all_macs:
+        mac_params = {f"mac{i}": m for i, m in enumerate(all_macs)}
+        mac_in     = ", ".join(f":mac{i}" for i in range(len(all_macs)))
+
+        for r in db.execute(text(f"""
+            SELECT mac_address, type, created_at FROM device_events
+            WHERE mac_address IN ({mac_in})
+              AND type IN ('online', 'offline', 'joined')
+              AND created_at >= :window_start
+            ORDER BY mac_address, created_at ASC
+        """), {"window_start": window_start, **mac_params}).fetchall():
+            events_by_mac.setdefault(r[0], []).append({"type": r[1], "ts": r[2]})
+
+        for r in db.execute(text(f"""
+            SELECT DISTINCT ON (mac_address) mac_address, type
+            FROM device_events
+            WHERE mac_address IN ({mac_in})
+              AND type IN ('online', 'offline', 'joined')
+              AND created_at < :window_start
+            ORDER BY mac_address, created_at DESC
+        """), {"window_start": window_start, **mac_params}).fetchall():
+            prior_by_mac[r[0]] = "online" if r[1] in ("online", "joined") else "offline"
+
+    def build_segments(mac):
+        evts    = events_by_mac.get(mac, [])
+        initial = prior_by_mac.get(mac, "unknown")
+        segs    = []
+        ss      = window_start
+        st      = initial
+        home_ms = 0.0
+
+        for ev in evts:
+            se = ev["ts"]
+            if se > ss:
+                segs.append({"from": ss.isoformat(), "to": se.isoformat(), "status": st})
+                if st == "online":
+                    home_ms += (se - ss).total_seconds() * 1000
+            ss = se
+            st = "online" if ev["type"] in ("online", "joined") else "offline"
+
+        segs.append({"from": ss.isoformat(), "to": now.isoformat(), "status": st})
+        if st == "online":
+            home_ms += (now - ss).total_seconds() * 1000
+
+        total_ms   = (now - window_start).total_seconds() * 1000
+        home_pct   = round((home_ms / total_ms) * 100) if total_ms > 0 else 0
+        return segs, home_pct
+
+    result = []
+    for p in persons:
+        pid = p[0]
+        mac = person_macs.get(pid)
+        if mac:
+            segs, pct = build_segments(mac)
+        else:
+            segs, pct = [], 0
+        result.append({
+            "id":          pid,
+            "name":        p[1],
+            "photo":       p[3],
+            "primary_mac": p[2],
+            "segments":    segs,
+            "at_home_pct": pct,
+        })
+
+    return {
+        "window_start": window_start.isoformat(),
+        "window_end":   now.isoformat(),
+        "days":         days,
+        "persons":      result,
+    }
+
+
 @app.get("/persons/{person_id}")
 def get_person(person_id: str, db: Session = Depends(get_db)):
     row = db.execute(text(
@@ -6774,20 +6952,21 @@ def get_person(person_id: str, db: Session = Depends(get_db)):
     dev_rows = db.execute(text("""
         SELECT pd.person_id::text, d.mac_address, d.is_online,
                COALESCE(d.custom_name, d.hostname, d.ip_address) AS display_name,
-               d.ip_address, d.device_type_override, d.vendor
+               d.ip_address, d.device_type_override, d.vendor, d.is_blocked
         FROM person_devices pd
         JOIN devices d ON d.mac_address = pd.mac_address
         WHERE pd.person_id = :pid
     """), {"pid": person_id}).fetchall()
     devs = [{"mac_address": r[1], "is_online": r[2], "display_name": r[3],
-             "ip_address": r[4], "device_type": r[5], "vendor": r[6]} for r in dev_rows]
+             "ip_address": r[4], "device_type": r[5], "vendor": r[6], "is_blocked": bool(r[7])} for r in dev_rows]
     try:
         sched_rows = db.execute(text(
-            "SELECT id, person_id::text, label, days_of_week, start_time, end_time, enabled "
-            "FROM block_schedules WHERE person_id = :pid"
+            "SELECT id, person_id::text, label, days_of_week, start_time, end_time, enabled, person_ids "
+            "FROM block_schedules WHERE person_id = :pid OR :pid = ANY(person_ids::text[])"
         ), {"pid": person_id}).fetchall()
         scheds = [{"id": r[0], "label": r[2], "days_of_week": r[3],
-                   "start_time": r[4], "end_time": r[5], "enabled": r[6]} for r in sched_rows]
+                   "start_time": r[4], "end_time": r[5], "enabled": r[6],
+                   "person_ids": list(r[7]) if r[7] else []} for r in sched_rows]
     except Exception:
         scheds = []
     return _person_row_to_dict(row, devs, scheds)
@@ -6863,6 +7042,89 @@ def remove_person_device(person_id: str, mac: str, db: Session = Depends(get_db)
         "UPDATE persons SET primary_mac = NULL, updated_at = NOW() WHERE id = :pid AND primary_mac = :mac"
     ), {"pid": person_id, "mac": mac})
     db.commit()
+
+
+class PersonBlockRequest(BaseModel):
+    duration_minutes: Optional[int] = None  # None = indefinite; 30, 60, 360, 1440 for timed
+
+
+@app.post("/persons/{person_id}/block")
+async def block_person(person_id: str, payload: PersonBlockRequest = PersonBlockRequest(), db: Session = Depends(get_db)):
+    # Fetch person name for notification
+    prow = db.execute(text("SELECT name FROM persons WHERE id = :pid"), {"pid": person_id}).fetchone()
+    person_name = prow[0] if prow else "Person"
+    rows = db.execute(text(
+        "SELECT d.mac_address, d.ip_address FROM person_devices pd "
+        "JOIN devices d ON d.mac_address = pd.mac_address WHERE pd.person_id = :pid"
+    ), {"pid": person_id}).fetchall()
+    if not rows:
+        raise HTTPException(404, "Person not found or has no devices")
+    for r in rows:
+        mac, ip = r[0], r[1]
+        d = db.get(Device, mac)
+        if d and not d.is_blocked:
+            await _execute_block(mac, ip, db, "block")
+            d.is_blocked = True
+            _add_event(db, mac, "blocked", {"ip": ip, "reason": "person_block"})
+    db.commit()
+    asyncio.ensure_future(_notification_dispatch(
+        "person.blocked", "Person Blocked",
+        f"{person_name}'s devices have been blocked"
+    ))
+    # Cancel any existing timed block and start a new one if duration given
+    existing = _person_timed_blocks.pop(person_id, None)
+    if existing and not existing.done():
+        existing.cancel()
+    if payload.duration_minutes:
+        macs = [r[0] for r in rows]
+        async def _auto_unblock(pid: str, mac_list: list, delay_s: int, pn: str):
+            await asyncio.sleep(delay_s)
+            _db = SessionLocal()
+            try:
+                for mac in mac_list:
+                    dd = _db.get(Device, mac)
+                    if dd and dd.is_blocked:
+                        await _execute_block(mac, dd.ip_address, _db, "unblock")
+                        dd.is_blocked = False
+                        _add_event(_db, mac, "unblocked", {"ip": dd.ip_address, "reason": "person_timed_unblock"})
+                _db.commit()
+            finally:
+                _db.close()
+            _person_timed_blocks.pop(pid, None)
+            asyncio.ensure_future(_notification_dispatch(
+                "person.unblocked", "Person Unblocked",
+                f"{pn}'s devices have been automatically unblocked"
+            ))
+        _person_timed_blocks[person_id] = asyncio.ensure_future(
+            _auto_unblock(person_id, macs, payload.duration_minutes * 60, person_name)
+        )
+    return {"ok": True, "macs": [r[0] for r in rows], "duration_minutes": payload.duration_minutes}
+
+
+@app.post("/persons/{person_id}/unblock")
+async def unblock_person(person_id: str, db: Session = Depends(get_db)):
+    prow = db.execute(text("SELECT name FROM persons WHERE id = :pid"), {"pid": person_id}).fetchone()
+    person_name = prow[0] if prow else "Person"
+    existing = _person_timed_blocks.pop(person_id, None)
+    if existing and not existing.done():
+        existing.cancel()
+    rows = db.execute(text(
+        "SELECT d.mac_address, d.ip_address FROM person_devices pd "
+        "JOIN devices d ON d.mac_address = pd.mac_address WHERE pd.person_id = :pid"
+    ), {"pid": person_id}).fetchall()
+    for r in rows:
+        mac, ip = r[0], r[1]
+        d = db.get(Device, mac)
+        if d and d.is_blocked:
+            await _execute_block(mac, ip, db, "unblock")
+            d.is_blocked = False
+            _add_event(db, mac, "unblocked", {"ip": ip, "reason": "person_unblock"})
+    db.commit()
+    asyncio.ensure_future(_notification_dispatch(
+        "person.unblocked", "Person Unblocked",
+        f"{person_name}'s devices have been unblocked"
+    ))
+    return {"ok": True, "macs": [r[0] for r in rows]}
 
 
 # ---------------------------------------------------------------------------
@@ -7112,7 +7374,7 @@ async def _block_schedule_loop():
             db = SessionLocal()
             try:
                 schedules = db.execute(text(
-                    "SELECT id, mac_address, days_of_week, start_time, end_time, mac_addresses, tags, person_id "
+                    "SELECT id, mac_address, days_of_week, start_time, end_time, mac_addresses, tags, person_id, person_ids "
                     "FROM block_schedules WHERE enabled = TRUE"
                 )).fetchall()
 
@@ -7121,17 +7383,26 @@ async def _block_schedule_loop():
                 device_should_block: dict = {}  # mac -> bool (True = schedule says block)
 
                 for sched in schedules:
-                    _, mac, days, start, end, mac_addresses, sched_tags, person_id = sched
+                    _, mac, days, start, end, mac_addresses, sched_tags, person_id, person_ids = sched
                     active = _schedule_active_now(days, start, end)
 
                     # Determine target MACs
                     target_macs = None  # None = network-wide
-                    if person_id:
-                        # Person schedule: expand to all devices assigned to this person
-                        person_macs = db.execute(text(
-                            "SELECT mac_address FROM person_devices WHERE person_id = :pid"
-                        ), {"pid": str(person_id)}).scalars().all()
-                        target_macs = list(person_macs)
+
+                    # Build effective person_ids list (union of person_ids array + legacy person_id)
+                    effective_pids = list(person_ids) if person_ids else []
+                    if person_id and str(person_id) not in effective_pids:
+                        effective_pids.append(str(person_id))
+
+                    if effective_pids:
+                        # Expand all persons to their devices
+                        target_macs = []
+                        for pid in effective_pids:
+                            person_macs = db.execute(text(
+                                "SELECT mac_address FROM person_devices WHERE person_id = :pid"
+                            ), {"pid": pid}).scalars().all()
+                            target_macs.extend(person_macs)
+                        target_macs = list(set(target_macs))
                     elif mac_addresses:
                         target_macs = list(mac_addresses)
                     elif sched_tags:

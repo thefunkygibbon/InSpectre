@@ -318,10 +318,10 @@ function MainApp({ onLogout }) {
   const clock = useClock()
   const { activeFilters, toggleFilter, clearFilters, applyFilters, savedViews, saveView, loadView, deleteView } = useSmartFilters()
 
-  const [search,        setSearch]        = useState('')
-  const [filter,        setFilter]        = useState('all')
-  const [sort,          setSort]          = useState('last_seen_desc')
-  const [layout,        setLayout]        = useState('grid')
+  const [search,        setSearch]        = useState(() => { try { return JSON.parse(localStorage.getItem('inspectre-prefs') || '{}').search  ?? '' } catch { return '' } })
+  const [filter,        setFilter]        = useState(() => { try { return JSON.parse(localStorage.getItem('inspectre-prefs') || '{}').filter  ?? 'all' } catch { return 'all' } })
+  const [sort,          setSort]          = useState(() => { try { return JSON.parse(localStorage.getItem('inspectre-prefs') || '{}').sort    ?? 'last_seen_desc' } catch { return 'last_seen_desc' } })
+  const [layout,        setLayout]        = useState(() => { try { return JSON.parse(localStorage.getItem('inspectre-prefs') || '{}').layout  ?? 'grid' } catch { return 'grid' } })
   const [selected,         setSelected]         = useState(null)
   const [drawerInitialTab, setDrawerInitialTab] = useState('overview')
   const [showSettings,     setShowSettings]     = useState(false)
@@ -336,6 +336,14 @@ function MainApp({ onLogout }) {
     window.addEventListener('resize', onResize)
     return () => window.removeEventListener('resize', onResize)
   }, [])
+
+  // Persist filter/sort/view preferences
+  useEffect(() => {
+    try {
+      const prefs = { search, filter, sort, layout }
+      localStorage.setItem('inspectre-prefs', JSON.stringify(prefs))
+    } catch {}
+  }, [search, filter, sort, layout])
 
   useEffect(() => {
     if (activePage !== 'containers') setContainerToOpen(null)

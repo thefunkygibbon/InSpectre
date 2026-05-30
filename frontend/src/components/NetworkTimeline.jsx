@@ -415,7 +415,11 @@ export function NetworkTimeline({ onDeviceClick }) {
 
   useEffect(() => { load(days) }, [days, load])
 
-  function handlePeriodChange(d) {
+  // Auto-refresh every 30s
+  useEffect(() => {
+    const id = setInterval(() => load(days), 30000)
+    return () => clearInterval(id)
+  }, [days, load])
     setDays(d)
   }
 

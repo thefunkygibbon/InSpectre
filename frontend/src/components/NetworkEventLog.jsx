@@ -76,6 +76,14 @@ export function NetworkEventLog({ onDeviceClick }) {
     return () => { alive = false }
   }, [limit])
 
+  // Auto-refresh every 30s
+  useEffect(() => {
+    const id = setInterval(() => {
+      api.getStatusEvents(limit).then(rows => setEvents(rows)).catch(() => {})
+    }, 30000)
+    return () => clearInterval(id)
+  }, [limit])
+
   const filtered = useMemo(() => {
     if (!events) return []
     if (!search.trim()) return events
