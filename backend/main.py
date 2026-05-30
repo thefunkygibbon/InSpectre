@@ -534,6 +534,25 @@ def _migrate(db: Session):
             PRIMARY KEY (plugin_id, mac_address)
         )""",
         "CREATE INDEX IF NOT EXISTS ix_plugin_device_data_mac ON plugin_device_data(mac_address)",
+        # Person presence
+        """CREATE TABLE IF NOT EXISTS persons (
+            id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+            name        VARCHAR(100) NOT NULL,
+            photo       TEXT,
+            primary_mac VARCHAR(17),
+            notes       TEXT,
+            created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )""",
+        """CREATE TABLE IF NOT EXISTS person_devices (
+            person_id   UUID NOT NULL REFERENCES persons(id) ON DELETE CASCADE,
+            mac_address VARCHAR(17) NOT NULL REFERENCES devices(mac_address) ON DELETE CASCADE,
+            PRIMARY KEY (person_id, mac_address)
+        )""",
+        "CREATE INDEX IF NOT EXISTS ix_person_devices_mac ON person_devices(mac_address)",
+        "ALTER TABLE block_schedules ADD COLUMN IF NOT EXISTS person_id UUID REFERENCES persons(id) ON DELETE SET NULL",
+        "ALTER TABLE devices ADD COLUMN IF NOT EXISTS person_id UUID REFERENCES persons(id) ON DELETE SET NULL",
+        "CREATE INDEX IF NOT EXISTS ix_devices_person_id ON devices(person_id)",
     ]
     for sql in migrations:
         try:
@@ -2152,6 +2171,7 @@ class MetadataUpdate(BaseModel):
     zone:         Optional[str]  = None
     is_ignored:   Optional[bool] = None
     suppress_presence_events: Optional[bool] = None
+    person_id:    Optional[str]  = None   # UUID string or empty string to unassign
 
 
 class PrimaryIPUpdate(BaseModel):
@@ -2166,6 +2186,7 @@ class BlockScheduleCreate(BaseModel):
     start_time:    str
     end_time:      str
     enabled:       bool               = True
+    person_id:     Optional[str]      = None
 
 class BlockScheduleUpdate(BaseModel):
     label:         Optional[str]       = None
@@ -2175,6 +2196,7 @@ class BlockScheduleUpdate(BaseModel):
     enabled:       Optional[bool]      = None
     mac_addresses: Optional[List[str]] = None
     tags:          Optional[str]       = None
+    person_id:     Optional[str]       = None   # UUID string or empty string to clear
 
 class LoginRequest(BaseModel):
     username: str
@@ -2419,6 +2441,8 @@ def _to_dict(d: Device) -> dict:
         "group_size":              1,
         "is_group_representative": False,
         "is_acknowledged":         bool(getattr(d, "is_acknowledged", False)),
+        "person_id":               str(getattr(d, "person_id", None)) if getattr(d, "person_id", None) else None,
+        "person_name":             None,  # populated by list_devices
     }
 
 
@@ -2887,6 +2911,13 @@ def list_devices(
         if m.mac_address != group_representative.get(gid_str)
     }
 
+    # Build person name lookup
+    try:
+        person_rows = db.execute(text("SELECT id::text, name FROM persons")).fetchall()
+        person_name_map = {r[0]: r[1] for r in person_rows}
+    except Exception:
+        person_name_map = {}
+
     result = []
     for d in devices:
         if d.mac_address in hidden_macs:
@@ -2916,6 +2947,9 @@ def list_devices(
             ]
             dct["group_size"]              = len(members)
             dct["is_group_representative"] = True
+        pid = dct.get("person_id")
+        if pid:
+            dct["person_name"] = person_name_map.get(pid)
         result.append(dct)
     return result
 
@@ -3009,6 +3043,8 @@ def update_metadata(mac: str, payload: MetadataUpdate, db: Session = Depends(get
         d.is_ignored = payload.is_ignored
     if payload.suppress_presence_events is not None:
         d.suppress_presence_events = payload.suppress_presence_events
+    if payload.person_id is not None:
+        d.person_id = payload.person_id or None  # empty string → unassign
     db.commit(); db.refresh(d)
     return _to_dict(d)
 
@@ -6557,13 +6593,14 @@ def _schedule_row_to_dict(row) -> dict:
         "created_at":    row[7].isoformat() if row[7] else None,
         "mac_addresses": list(row[8]) if row[8] else [],
         "tags":          row[9] or "",
+        "person_id":     str(row[10]) if len(row) > 10 and row[10] else None,
     }
 
 
 @app.get("/block-schedules")
 def list_block_schedules(db: Session = Depends(get_db)):
     rows = db.execute(text(
-        "SELECT id, mac_address, label, days_of_week, start_time, end_time, enabled, created_at, mac_addresses, tags "
+        "SELECT id, mac_address, label, days_of_week, start_time, end_time, enabled, created_at, mac_addresses, tags, person_id "
         "FROM block_schedules ORDER BY created_at DESC"
     )).fetchall()
     return [_schedule_row_to_dict(r) for r in rows]
@@ -6573,10 +6610,11 @@ def list_block_schedules(db: Session = Depends(get_db)):
 def create_block_schedule(payload: BlockScheduleCreate, db: Session = Depends(get_db)):
     if not payload.start_time or not payload.end_time:
         raise HTTPException(400, "start_time and end_time are required")
+    person_id = payload.person_id or None
     row = db.execute(text(
-        "INSERT INTO block_schedules (mac_address, label, days_of_week, start_time, end_time, enabled, mac_addresses, tags) "
-        "VALUES (:mac, :label, :days, :start, :end, :enabled, :mac_addresses, :tags) "
-        "RETURNING id, mac_address, label, days_of_week, start_time, end_time, enabled, created_at, mac_addresses, tags"
+        "INSERT INTO block_schedules (mac_address, label, days_of_week, start_time, end_time, enabled, mac_addresses, tags, person_id) "
+        "VALUES (:mac, :label, :days, :start, :end, :enabled, :mac_addresses, :tags, :person_id) "
+        "RETURNING id, mac_address, label, days_of_week, start_time, end_time, enabled, created_at, mac_addresses, tags, person_id"
     ), {
         "mac":          payload.mac_address,
         "label":        payload.label or "",
@@ -6586,6 +6624,7 @@ def create_block_schedule(payload: BlockScheduleCreate, db: Session = Depends(ge
         "enabled":      payload.enabled,
         "mac_addresses": payload.mac_addresses or [],
         "tags":         payload.tags or "",
+        "person_id":    person_id,
     }).fetchone()
     db.commit()
     return _schedule_row_to_dict(row)
@@ -6606,13 +6645,14 @@ def update_block_schedule(schedule_id: int, payload: BlockScheduleUpdate, db: Se
     if payload.enabled      is not None: updates["enabled"]      = payload.enabled
     if payload.mac_addresses is not None: updates["mac_addresses"] = payload.mac_addresses
     if payload.tags          is not None: updates["tags"]          = payload.tags
+    if payload.person_id     is not None: updates["person_id"]     = payload.person_id or None
     if updates:
         set_clause = ", ".join(f"{k} = :{k}" for k in updates)
         updates["id"] = schedule_id
         db.execute(text(f"UPDATE block_schedules SET {set_clause} WHERE id = :id"), updates)
         db.commit()
     row = db.execute(text(
-        "SELECT id, mac_address, label, days_of_week, start_time, end_time, enabled, created_at, mac_addresses, tags "
+        "SELECT id, mac_address, label, days_of_week, start_time, end_time, enabled, created_at, mac_addresses, tags, person_id "
         "FROM block_schedules WHERE id = :id"
     ), {"id": schedule_id}).fetchone()
     return _schedule_row_to_dict(row)
@@ -6621,6 +6661,207 @@ def update_block_schedule(schedule_id: int, payload: BlockScheduleUpdate, db: Se
 @app.delete("/block-schedules/{schedule_id}", status_code=204)
 def delete_block_schedule(schedule_id: int, db: Session = Depends(get_db)):
     db.execute(text("DELETE FROM block_schedules WHERE id = :id"), {"id": schedule_id})
+    db.commit()
+
+
+# ---------------------------------------------------------------------------
+# Person Presence API
+# ---------------------------------------------------------------------------
+
+def _person_row_to_dict(row, devices=None, schedules=None) -> dict:
+    """Convert a persons row to a dict. devices and schedules are pre-fetched lists."""
+    pid = str(row[0])
+    primary_mac = row[2]
+    devs = devices or []
+    is_home = False
+    if primary_mac:
+        is_home = any(d["mac_address"] == primary_mac and d.get("is_online") for d in devs)
+    elif devs:
+        is_home = any(d.get("is_online") for d in devs)
+    return {
+        "id":          pid,
+        "name":        row[1],
+        "primary_mac": primary_mac,
+        "photo":       row[3],
+        "notes":       row[4],
+        "created_at":  row[5].isoformat() if row[5] else None,
+        "updated_at":  row[6].isoformat() if row[6] else None,
+        "is_home":     is_home,
+        "devices":     devs,
+        "schedules":   schedules or [],
+    }
+
+
+@app.get("/persons")
+def list_persons(db: Session = Depends(get_db)):
+    persons = db.execute(text(
+        "SELECT id::text, name, primary_mac, photo, notes, created_at, updated_at FROM persons ORDER BY name"
+    )).fetchall()
+    # Fetch all devices assigned to any person in one query
+    dev_rows = db.execute(text("""
+        SELECT pd.person_id::text, d.mac_address, d.is_online,
+               COALESCE(d.custom_name, d.hostname, d.ip_address) AS display_name,
+               d.ip_address, d.device_type_override, d.vendor
+        FROM person_devices pd
+        JOIN devices d ON d.mac_address = pd.mac_address
+    """)).fetchall()
+    devs_by_person: dict = {}
+    for r in dev_rows:
+        devs_by_person.setdefault(r[0], []).append({
+            "mac_address":  r[1], "is_online": r[2], "display_name": r[3],
+            "ip_address":   r[4], "device_type": r[5], "vendor": r[6],
+        })
+    # Fetch person-targeted schedules
+    try:
+        sched_rows = db.execute(text(
+            "SELECT id, person_id::text, label, days_of_week, start_time, end_time, enabled "
+            "FROM block_schedules WHERE person_id IS NOT NULL"
+        )).fetchall()
+    except Exception:
+        sched_rows = []
+    scheds_by_person: dict = {}
+    for r in sched_rows:
+        scheds_by_person.setdefault(r[1], []).append({
+            "id": r[0], "label": r[2], "days_of_week": r[3],
+            "start_time": r[4], "end_time": r[5], "enabled": r[6],
+        })
+    return [
+        _person_row_to_dict(p, devs_by_person.get(str(p[0]), []), scheds_by_person.get(str(p[0]), []))
+        for p in persons
+    ]
+
+
+class PersonCreate(BaseModel):
+    name:        str
+    primary_mac: Optional[str] = None
+    photo:       Optional[str] = None   # base64 data URI
+    notes:       Optional[str] = None
+
+
+class PersonUpdate(BaseModel):
+    name:        Optional[str] = None
+    primary_mac: Optional[str] = None  # empty string to clear
+    photo:       Optional[str] = None  # empty string to clear
+    notes:       Optional[str] = None
+
+
+@app.post("/persons", status_code=201)
+def create_person(payload: PersonCreate, db: Session = Depends(get_db)):
+    if not payload.name.strip():
+        raise HTTPException(400, "name is required")
+    row = db.execute(text(
+        "INSERT INTO persons (name, primary_mac, photo, notes) "
+        "VALUES (:name, :primary_mac, :photo, :notes) "
+        "RETURNING id::text, name, primary_mac, photo, notes, created_at, updated_at"
+    ), {
+        "name":        payload.name.strip(),
+        "primary_mac": payload.primary_mac or None,
+        "photo":       payload.photo or None,
+        "notes":       payload.notes or None,
+    }).fetchone()
+    db.commit()
+    return _person_row_to_dict(row)
+
+
+@app.get("/persons/{person_id}")
+def get_person(person_id: str, db: Session = Depends(get_db)):
+    row = db.execute(text(
+        "SELECT id::text, name, primary_mac, photo, notes, created_at, updated_at "
+        "FROM persons WHERE id = :id"
+    ), {"id": person_id}).fetchone()
+    if not row:
+        raise HTTPException(404, "Person not found")
+    dev_rows = db.execute(text("""
+        SELECT pd.person_id::text, d.mac_address, d.is_online,
+               COALESCE(d.custom_name, d.hostname, d.ip_address) AS display_name,
+               d.ip_address, d.device_type_override, d.vendor
+        FROM person_devices pd
+        JOIN devices d ON d.mac_address = pd.mac_address
+        WHERE pd.person_id = :pid
+    """), {"pid": person_id}).fetchall()
+    devs = [{"mac_address": r[1], "is_online": r[2], "display_name": r[3],
+             "ip_address": r[4], "device_type": r[5], "vendor": r[6]} for r in dev_rows]
+    try:
+        sched_rows = db.execute(text(
+            "SELECT id, person_id::text, label, days_of_week, start_time, end_time, enabled "
+            "FROM block_schedules WHERE person_id = :pid"
+        ), {"pid": person_id}).fetchall()
+        scheds = [{"id": r[0], "label": r[2], "days_of_week": r[3],
+                   "start_time": r[4], "end_time": r[5], "enabled": r[6]} for r in sched_rows]
+    except Exception:
+        scheds = []
+    return _person_row_to_dict(row, devs, scheds)
+
+
+@app.patch("/persons/{person_id}")
+def update_person(person_id: str, payload: PersonUpdate, db: Session = Depends(get_db)):
+    existing = db.execute(text("SELECT id FROM persons WHERE id = :id"), {"id": person_id}).fetchone()
+    if not existing:
+        raise HTTPException(404, "Person not found")
+    updates: dict = {"updated_at": "NOW()"}
+    if payload.name        is not None: updates["name"]        = payload.name.strip()
+    if payload.primary_mac is not None: updates["primary_mac"] = payload.primary_mac or None
+    if payload.photo       is not None: updates["photo"]       = payload.photo or None
+    if payload.notes       is not None: updates["notes"]       = payload.notes or None
+    set_parts = []
+    params: dict = {"id": person_id}
+    for k, v in updates.items():
+        if k == "updated_at":
+            set_parts.append("updated_at = NOW()")
+        else:
+            set_parts.append(f"{k} = :{k}")
+            params[k] = v
+    db.execute(text(f"UPDATE persons SET {', '.join(set_parts)} WHERE id = :id"), params)
+    db.commit()
+    return get_person(person_id, db)
+
+
+@app.delete("/persons/{person_id}", status_code=204)
+def delete_person(person_id: str, db: Session = Depends(get_db)):
+    # Unassign all devices belonging to this person
+    db.execute(text("UPDATE devices SET person_id = NULL WHERE person_id = :id"), {"id": person_id})
+    db.execute(text("DELETE FROM persons WHERE id = :id"), {"id": person_id})
+    db.commit()
+
+
+class PersonDeviceAdd(BaseModel):
+    mac_address:  str
+    set_primary:  bool = False
+
+
+@app.post("/persons/{person_id}/devices", status_code=201)
+def add_person_device(person_id: str, payload: PersonDeviceAdd, db: Session = Depends(get_db)):
+    mac = payload.mac_address.lower()
+    existing_person = db.execute(text("SELECT id FROM persons WHERE id = :id"), {"id": person_id}).fetchone()
+    if not existing_person:
+        raise HTTPException(404, "Person not found")
+    existing_device = db.execute(text("SELECT mac_address FROM devices WHERE mac_address = :mac"), {"mac": mac}).fetchone()
+    if not existing_device:
+        raise HTTPException(404, "Device not found")
+    db.execute(text(
+        "INSERT INTO person_devices (person_id, mac_address) VALUES (:pid, :mac) ON CONFLICT DO NOTHING"
+    ), {"pid": person_id, "mac": mac})
+    # Update devices.person_id for quick lookup
+    db.execute(text("UPDATE devices SET person_id = :pid WHERE mac_address = :mac"), {"pid": person_id, "mac": mac})
+    if payload.set_primary:
+        db.execute(text("UPDATE persons SET primary_mac = :mac, updated_at = NOW() WHERE id = :pid"), {"mac": mac, "pid": person_id})
+    db.commit()
+    return get_person(person_id, db)
+
+
+@app.delete("/persons/{person_id}/devices/{mac}", status_code=204)
+def remove_person_device(person_id: str, mac: str, db: Session = Depends(get_db)):
+    mac = mac.lower()
+    db.execute(text(
+        "DELETE FROM person_devices WHERE person_id = :pid AND mac_address = :mac"
+    ), {"pid": person_id, "mac": mac})
+    db.execute(text(
+        "UPDATE devices SET person_id = NULL WHERE mac_address = :mac AND person_id = :pid"
+    ), {"mac": mac, "pid": person_id})
+    # If this was the primary device, clear it
+    db.execute(text(
+        "UPDATE persons SET primary_mac = NULL, updated_at = NOW() WHERE id = :pid AND primary_mac = :mac"
+    ), {"pid": person_id, "mac": mac})
     db.commit()
 
 
@@ -6871,7 +7112,7 @@ async def _block_schedule_loop():
             db = SessionLocal()
             try:
                 schedules = db.execute(text(
-                    "SELECT id, mac_address, days_of_week, start_time, end_time, mac_addresses, tags "
+                    "SELECT id, mac_address, days_of_week, start_time, end_time, mac_addresses, tags, person_id "
                     "FROM block_schedules WHERE enabled = TRUE"
                 )).fetchall()
 
@@ -6880,12 +7121,18 @@ async def _block_schedule_loop():
                 device_should_block: dict = {}  # mac -> bool (True = schedule says block)
 
                 for sched in schedules:
-                    _, mac, days, start, end, mac_addresses, sched_tags = sched
+                    _, mac, days, start, end, mac_addresses, sched_tags, person_id = sched
                     active = _schedule_active_now(days, start, end)
 
                     # Determine target MACs
                     target_macs = None  # None = network-wide
-                    if mac_addresses:
+                    if person_id:
+                        # Person schedule: expand to all devices assigned to this person
+                        person_macs = db.execute(text(
+                            "SELECT mac_address FROM person_devices WHERE person_id = :pid"
+                        ), {"pid": str(person_id)}).scalars().all()
+                        target_macs = list(person_macs)
+                    elif mac_addresses:
                         target_macs = list(mac_addresses)
                     elif sched_tags:
                         tag_list = [t.strip().lower() for t in sched_tags.split(',') if t.strip()]

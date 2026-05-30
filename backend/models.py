@@ -38,6 +38,7 @@ class Device(Base):
     zone                 = Column(String, nullable=True)
     is_ignored           = Column(Boolean, server_default='false', nullable=False)
     suppress_presence_events = Column(Boolean, server_default='false', nullable=False)
+    person_id            = Column(String, nullable=True)
 
     # Tracks when is_online last changed (online↔offline transitions)
     status_changed_at        = Column(DateTime(timezone=True), nullable=True)

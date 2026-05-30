@@ -18,6 +18,7 @@ import { StreamOutput }   from './StreamOutput'
 import { api }            from '../api'
 import { useStreamAction }  from '../hooks/useStreamAction'
 import { CATEGORIES, OVERRIDE_OPTIONS } from '../deviceCategories'
+import { PersonAutocomplete } from './PersonPresencePage'
 
 function fmt(iso) {
   if (!iso) return '--'
@@ -826,35 +827,36 @@ export function DeviceDrawer({ device, onClose, onRename, onResolveName, onRefre
                     ? (localDevice.is_blocked ? 'Unblocking…' : 'Blocking…')
                     : (localDevice.is_blocked ? 'Unblock device' : 'Block internet access')}
                 </button>
-                <button
-                  onClick={handleIgnoreToggle}
-                  disabled={ignoring}
-                  className={`mt-2 w-full flex items-center justify-center gap-2 py-2 rounded-lg
-                             border text-xs font-medium transition-colors duration-150
-                             ${localDevice.is_ignored
-                               ? 'border-brand/40 bg-brand/10 text-brand hover:bg-brand/20'
-                               : 'border-border bg-surface-offset text-text-muted hover:text-text hover:border-border'
-                             }
-                             ${ignoring ? 'opacity-60 cursor-wait' : ''}`}>
-                  {localDevice.is_ignored
-                    ? <><Eye size={12} /> Un-ignore device</>
-                    : <><EyeOff size={12} /> Ignore device</>}
-                </button>
-                <button
-                  onClick={handleSuppressPresenceToggle}
-                  disabled={suppressingPresence}
-                  className={`mt-2 w-full flex items-center justify-center gap-2 py-2 rounded-lg
-                             border text-xs font-medium transition-colors duration-150
-                             ${localDevice.suppress_presence_events
-                               ? 'border-yellow-500/40 bg-yellow-500/10 text-yellow-400 hover:bg-yellow-500/20'
-                               : 'border-border bg-surface-offset text-text-muted hover:text-text hover:border-border'
-                             }
-                             ${suppressingPresence ? 'opacity-60 cursor-wait' : ''}`}>
-                  <BellOff size={12} className={suppressingPresence ? 'animate-pulse' : ''} />
-                  {localDevice.suppress_presence_events
-                    ? 'Resume presence events'
-                    : 'Suppress presence events'}
-                </button>
+                <div className="mt-2 grid grid-cols-2 gap-1">
+                  <button
+                    onClick={handleIgnoreToggle}
+                    disabled={ignoring}
+                    title={localDevice.is_ignored ? 'Un-ignore device' : 'Ignore device'}
+                    className={`flex items-center justify-center gap-1.5 py-1 rounded-lg
+                               border text-xs font-medium transition-colors duration-150
+                               ${localDevice.is_ignored
+                                 ? 'border-brand/40 bg-brand/10 text-brand hover:bg-brand/20'
+                                 : 'border-border bg-surface-offset text-text-muted hover:text-text hover:border-border'
+                               }
+                               ${ignoring ? 'opacity-60 cursor-wait' : ''}`}>
+                    {localDevice.is_ignored ? <Eye size={11} /> : <EyeOff size={11} />}
+                    <span className="truncate">{localDevice.is_ignored ? 'Un-ignore' : 'Ignore'}</span>
+                  </button>
+                  <button
+                    onClick={handleSuppressPresenceToggle}
+                    disabled={suppressingPresence}
+                    title={localDevice.suppress_presence_events ? 'Resume presence events' : 'Suppress presence events'}
+                    className={`flex items-center justify-center gap-1.5 py-1 rounded-lg
+                               border text-xs font-medium transition-colors duration-150
+                               ${localDevice.suppress_presence_events
+                                 ? 'border-yellow-500/40 bg-yellow-500/10 text-yellow-400 hover:bg-yellow-500/20'
+                                 : 'border-border bg-surface-offset text-text-muted hover:text-text hover:border-border'
+                               }
+                               ${suppressingPresence ? 'opacity-60 cursor-wait' : ''}`}>
+                    <BellOff size={11} className={suppressingPresence ? 'animate-pulse' : ''} />
+                    <span className="truncate">{localDevice.suppress_presence_events ? 'Resume' : 'Suppress'}</span>
+                  </button>
+                </div>
                 <StreamOutput
                   lines={termLines}
                   running={termRunning}
@@ -913,6 +915,16 @@ export function DeviceDrawer({ device, onClose, onRename, onResolveName, onRefre
                   setLocalDevice(prev => ({ ...prev, zone }))
                   if (onZoneChange) onZoneChange(zone)
                 }} />
+                <PersonAssigner
+                  mac={mac}
+                  currentPersonId={localDevice.person_id || null}
+                  currentPersonName={localDevice.person_name || null}
+                  onChanged={person => setLocalDevice(prev => ({
+                    ...prev,
+                    person_id:   person ? person.id   : null,
+                    person_name: person ? person.name : null,
+                  }))}
+                />
                 {localDevice.miss_count  !== undefined && <Row label="Miss count" value={localDevice.miss_count} />}
               </Collapsible>
 
@@ -1493,6 +1505,106 @@ function ZoneEditor({ mac, currentZone, onChanged }) {
         </form>
       </div>
       {saveError && <p className="text-[10px] text-red-400 text-right">{saveError}</p>}
+    </div>
+  )
+}
+
+// ---------------------------------------------------------------------------
+// PersonAssigner — shows assigned person + inline edit with autocomplete
+// ---------------------------------------------------------------------------
+
+function PersonAssigner({ mac, currentPersonId, currentPersonName, onChanged }) {
+  const [editing,  setEditing]  = useState(false)
+  const [persons,  setPersons]  = useState([])
+  const [saving,   setSaving]   = useState(false)
+
+  useEffect(() => {
+    if (editing) api.getPersons().then(setPersons).catch(() => {})
+  }, [editing])
+
+  async function handleSelect(person) {
+    setSaving(true)
+    try {
+      await api.updateMetadata(mac, { person_id: person.id })
+      onChanged(person)
+    } finally {
+      setSaving(false)
+      setEditing(false)
+    }
+  }
+
+  async function handleClear() {
+    setSaving(true)
+    try {
+      await api.updateMetadata(mac, { person_id: '' })
+      onChanged(null)
+    } finally {
+      setSaving(false)
+      setEditing(false)
+    }
+  }
+
+  function initials(name) {
+    if (!name) return '?'
+    return name.split(' ').map(w => w[0]).join('').toUpperCase().slice(0, 2)
+  }
+
+  if (!editing) {
+    return (
+      <div className="flex items-center justify-between gap-2 py-1 px-1">
+        <span className="text-xs shrink-0" style={{ color: 'var(--color-text-muted)' }}>Assigned to</span>
+        <div className="flex items-center gap-1.5 flex-1 justify-end min-w-0">
+          {currentPersonName
+            ? (
+              <span className="flex items-center gap-1.5 px-2 py-0.5 rounded-full text-xs"
+                style={{
+                  background: 'rgba(var(--color-brand-rgb,0,255,65),0.1)',
+                  border: '1px solid rgba(var(--color-brand-rgb,0,255,65),0.25)',
+                  color: 'var(--color-brand)',
+                }}>
+                <span className="w-4 h-4 rounded-full flex items-center justify-center text-[8px] font-bold bg-brand text-black flex-shrink-0"
+                  style={{ background: 'var(--color-brand)', color: 'black' }}>
+                  {initials(currentPersonName)}
+                </span>
+                <span className="truncate max-w-[120px]">{currentPersonName}</span>
+              </span>
+            )
+            : <span className="text-xs italic" style={{ color: 'var(--color-text-faint)' }}>Unassigned</span>
+          }
+          <button onClick={() => setEditing(true)}
+            className="text-brand opacity-60 hover:opacity-100 transition-opacity ml-1" title="Edit assignment">
+            <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+              <path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/>
+              <path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/>
+            </svg>
+          </button>
+        </div>
+      </div>
+    )
+  }
+
+  return (
+    <div className="py-1 px-1 space-y-1.5">
+      <div className="flex items-center justify-between">
+        <span className="text-xs shrink-0" style={{ color: 'var(--color-text-muted)' }}>Assigned to</span>
+        <button onClick={() => setEditing(false)}
+          className="opacity-50 hover:opacity-100 transition-opacity">
+          <X size={11} style={{ color: 'var(--color-text-faint)' }} />
+        </button>
+      </div>
+      <PersonAutocomplete
+        persons={persons}
+        onSelect={handleSelect}
+        currentPersonId={currentPersonId}
+        placeholder="Search people…"
+      />
+      {currentPersonName && (
+        <button onClick={handleClear}
+          className="text-[10px] text-text-muted hover:text-red-400 transition-colors">
+          Remove assignment
+        </button>
+      )}
+      {saving && <span className="text-[10px] text-text-faint">Saving…</span>}
     </div>
   )
 }

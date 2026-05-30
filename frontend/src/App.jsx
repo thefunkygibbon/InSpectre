@@ -5,6 +5,7 @@ import {
   LayoutGrid, List, Sun, Moon, ChevronDown,
   Bell, X, Layers, Star, ShieldAlert, Wrench, Ban, BarChart2, Clock,
   ArrowLeft, SlidersHorizontal, LogOut, Eye, EyeOff, Box, Download, Sparkles,
+  Users,
 } from 'lucide-react'
 import { TrafficPage } from './components/TrafficPage'
 import { ContainersPage } from './components/ContainersPage'
@@ -28,6 +29,7 @@ import { SmartFilterBar }      from './components/SmartFilterBar'
 import { LoginPage }           from './components/LoginPage'
 import { SetupWizard }         from './components/SetupWizard'
 import { StatusButton }        from './components/StatusButton'
+import { PersonPresencePage }  from './components/PersonPresencePage'
 
 const APP_VERSION = '1.1.0'
 
@@ -50,6 +52,7 @@ const PAGES = [
   { id: 'tools',      label: 'Network Tools',        Icon: Wrench,      title: 'Network Tools' },
   { id: 'security',   label: 'Vulnerability Report', Icon: ShieldAlert, title: 'Vulnerability Report' },
   { id: 'blocking',   label: 'Device Blocking',      Icon: Ban,         title: 'Device Blocking' },
+  { id: 'people',     label: 'Person Presence',      Icon: Users,       title: 'Person Presence' },
   { id: 'presence',   label: 'Device Presence',      Icon: BarChart2,   title: 'Device Presence' },
   { id: 'events',     label: 'Network Events',       Icon: Clock,       title: 'Network Events' },
   { id: 'traffic',    label: 'Traffic Monitor',      Icon: Activity,    title: 'Traffic Monitor' },
@@ -521,6 +524,10 @@ function MainApp({ onLogout }) {
           setActivePage(null)
           openDevice(typeof dev === 'object' ? dev : devices.find(d => d.mac_address === dev))
         }} />
+      )}
+
+      {activePage === 'people' && (
+        <PersonPresencePage devices={devices} />
       )}
 
       {activePage === 'presence' && (

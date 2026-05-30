@@ -281,6 +281,14 @@ export const api = {
   updateBlockSchedule:  (id, body)  => request('PATCH',  `/block-schedules/${id}`, body),
   deleteBlockSchedule:  (id)        => request('DELETE', `/block-schedules/${id}`),
 
+  // Person Presence
+  getPersons:           ()                    => request('GET',    '/persons'),
+  createPerson:         (body)               => request('POST',   '/persons', body),
+  updatePerson:         (id, body)           => request('PATCH',  `/persons/${id}`, body),
+  deletePerson:         (id)                 => request('DELETE', `/persons/${id}`),
+  addPersonDevice:      (id, body)           => request('POST',   `/persons/${id}/devices`, body),
+  removePersonDevice:   (id, mac)            => request('DELETE', `/persons/${id}/devices/${mac}`),
+
   // Network pause / resume
   getNetworkStatus: ()  => request('GET',  '/network/status'),
   networkPause:     ()  => request('POST', '/network/pause'),
