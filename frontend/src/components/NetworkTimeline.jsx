@@ -420,6 +420,8 @@ export function NetworkTimeline({ onDeviceClick }) {
     const id = setInterval(() => load(days), 30000)
     return () => clearInterval(id)
   }, [days, load])
+
+  function changeDays(d) {
     setDays(d)
   }
 
