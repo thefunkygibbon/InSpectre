@@ -345,6 +345,7 @@ class Device(Base):
     miss_count   = Column(Integer, default=0)
     is_important = Column(Boolean, default=False, nullable=False)
     is_ignored   = Column(Boolean, default=False, nullable=False)
+    suppress_presence_events = Column(Boolean, default=False, nullable=False)
     device_type_override    = Column(String,  nullable=True)
     hostname_last_attempted = Column(DateTime(timezone=True), nullable=True)
     deep_scan_last_run      = Column(DateTime(timezone=True), nullable=True)
@@ -377,6 +378,13 @@ _upsert_locks_lock = threading.Lock()
 # window, so we don't falsely increment miss counts for devices the sniffer saw.
 _sniffer_seen_this_interval: set[str] = set()
 _sniffer_seen_lock = threading.Lock()
+
+# Track MACs for which an "offline" event has already been written and which
+# have not come back online since. Used to suppress duplicate offline events for
+# devices that are continuously offline (e.g. plugin-controlled standby devices).
+# Intentionally in-memory only — resets on probe restart.
+_confirmed_offline_macs: set[str] = set()
+_confirmed_offline_lock = threading.Lock()
 
 def _get_mac_lock(mac: str) -> threading.Lock:
     with _upsert_locks_lock:
@@ -423,6 +431,7 @@ def init_db() -> None:
             conn.execute(text("ALTER TABLE devices ADD COLUMN IF NOT EXISTS baseline_ports JSONB"))
             conn.execute(text("ALTER TABLE devices ADD COLUMN IF NOT EXISTS baseline_scan_count INTEGER NOT NULL DEFAULT 0"))
             conn.execute(text("ALTER TABLE devices ADD COLUMN IF NOT EXISTS primary_ip_locked BOOLEAN NOT NULL DEFAULT FALSE"))
+            conn.execute(text("ALTER TABLE devices ADD COLUMN IF NOT EXISTS suppress_presence_events BOOLEAN NOT NULL DEFAULT FALSE"))
             conn.commit()
         except Exception as e:
             print(f"[DB] Column migration note: {e}", flush=True)
@@ -1811,7 +1820,13 @@ def upsert_seen_device(mac: str, ip: str, source: str) -> None:
             else:
                 if not was_online:
                     print(f"[~] Back online via {source}: {ip} ({mac})", flush=True)
-                    _write_event(mac, "online", {"ip": ip})
+                    # A device coming back online clears its "confirmed offline" state
+                    # so a future genuine offline transition will be recorded.
+                    with _confirmed_offline_lock:
+                        _confirmed_offline_macs.discard(mac)
+                    # Suppressed devices: keep status accurate but don't log the event.
+                    if not getattr(existing, "suppress_presence_events", False):
+                        _write_event(mac, "online", {"ip": ip, "source": source})
                 if ip_changed:
                     primary = existing.primary_ip or old_ip
                     if ip == primary or not was_online:
@@ -2186,6 +2201,8 @@ def update_presence_from_sweep(session, active_macs: set) -> None:
             dev.miss_count = 0
             continue
 
+        suppressed = getattr(dev, "suppress_presence_events", False)
+
         dev.miss_count = (dev.miss_count or 0) + 1
 
         if not dev.is_online:
@@ -2207,7 +2224,25 @@ def update_presence_from_sweep(session, active_macs: set) -> None:
             f"after {dev.miss_count} missed sweeps + ping confirm",
             flush=True,
         )
-        _write_event(dev.mac_address, "offline", {"ip": confirm_ip or dev.ip_address})
+
+        # Suppressed devices: is_online is updated above for accurate status display
+        # but no event is written and the confirmed-offline set is not touched.
+        if suppressed:
+            continue
+
+        # Only write an offline event if the device has come online since the
+        # last offline event was written. This suppresses repeated offline
+        # events for devices that are continuously offline (e.g. a plugin keeps
+        # resetting is_online=True between sweeps).
+        with _confirmed_offline_lock:
+            already_offline = dev.mac_address in _confirmed_offline_macs
+            _confirmed_offline_macs.add(dev.mac_address)
+        if not already_offline:
+            _write_event(dev.mac_address, "offline", {
+                "ip": confirm_ip or dev.ip_address,
+                "source": "sweep",
+                "confirmation": "icmp" if confirm_ip else None,
+            })
 
 # ---------------------------------------------------------------------------
 # ARP blocking (internet cut-off via ARP spoofing)
