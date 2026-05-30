@@ -7373,101 +7373,120 @@ async def _block_schedule_loop():
         try:
             db = SessionLocal()
             try:
-                schedules = db.execute(text(
-                    "SELECT id, mac_address, days_of_week, start_time, end_time, mac_addresses, tags, person_id, person_ids "
-                    "FROM block_schedules WHERE enabled = TRUE"
-                )).fetchall()
+                # Try to select with person_ids; fall back if column missing
+                try:
+                    schedules = db.execute(text(
+                        "SELECT id, mac_address, days_of_week, start_time, end_time, mac_addresses, tags, person_id, person_ids "
+                        "FROM block_schedules WHERE enabled = TRUE"
+                    )).fetchall()
+                    has_person_ids_col = True
+                except Exception:
+                    schedules = db.execute(text(
+                        "SELECT id, mac_address, days_of_week, start_time, end_time, mac_addresses, tags, person_id "
+                        "FROM block_schedules WHERE enabled = TRUE"
+                    )).fetchall()
+                    has_person_ids_col = False
 
                 # Build set of (mac_or_None, should_be_blocked) from all schedules
-                # mac_address=None means network-wide
                 device_should_block: dict = {}  # mac -> bool (True = schedule says block)
 
                 for sched in schedules:
-                    _, mac, days, start, end, mac_addresses, sched_tags, person_id, person_ids = sched
-                    active = _schedule_active_now(days, start, end)
+                    try:
+                        if has_person_ids_col:
+                            sched_id, mac, days, start, end, mac_addresses, sched_tags, person_id, person_ids = sched
+                        else:
+                            sched_id, mac, days, start, end, mac_addresses, sched_tags, person_id = sched
+                            person_ids = []
+                        active = _schedule_active_now(days, start, end)
 
-                    # Determine target MACs
-                    target_macs = None  # None = network-wide
+                        # Determine target MACs
+                        target_macs = None  # None = network-wide
 
-                    # Build effective person_ids list (union of person_ids array + legacy person_id)
-                    effective_pids = list(person_ids) if person_ids else []
-                    if person_id and str(person_id) not in effective_pids:
-                        effective_pids.append(str(person_id))
+                        # Build effective person_ids list
+                        effective_pids = [str(p) for p in (person_ids or [])] if person_ids else []
+                        if person_id and str(person_id) not in effective_pids:
+                            effective_pids.append(str(person_id))
 
-                    if effective_pids:
-                        # Expand all persons to their devices
-                        target_macs = []
-                        for pid in effective_pids:
-                            person_macs = db.execute(text(
-                                "SELECT mac_address FROM person_devices WHERE person_id = :pid"
-                            ), {"pid": pid}).scalars().all()
-                            target_macs.extend(person_macs)
-                        target_macs = list(set(target_macs))
-                    elif mac_addresses:
-                        target_macs = list(mac_addresses)
-                    elif sched_tags:
-                        tag_list = [t.strip().lower() for t in sched_tags.split(',') if t.strip()]
-                        all_devices = db.execute(text(
-                            "SELECT mac_address, tags FROM devices WHERE is_ignored = FALSE AND tags IS NOT NULL"
-                        )).fetchall()
-                        target_macs = []
-                        for dev_mac, dev_tags in all_devices:
-                            if dev_tags:
-                                dev_tag_list = [t.strip().lower() for t in dev_tags.split(',') if t.strip()]
-                                if any(t in dev_tag_list for t in tag_list):
-                                    target_macs.append(dev_mac)
-                    elif mac:
-                        target_macs = [mac]
+                        if effective_pids:
+                            # Expand all persons to their devices (cast to text for safety)
+                            target_macs = []
+                            for pid in effective_pids:
+                                person_macs = db.execute(text(
+                                    "SELECT mac_address FROM person_devices WHERE person_id::text = :pid"
+                                ), {"pid": pid}).scalars().all()
+                                target_macs.extend(person_macs)
+                            target_macs = list(set(target_macs))
+                            print(f"[sched] id={sched_id} persons={effective_pids} active={active} macs={target_macs}", flush=True)
+                        elif mac_addresses:
+                            target_macs = list(mac_addresses)
+                        elif sched_tags:
+                            tag_list = [t.strip().lower() for t in sched_tags.split(',') if t.strip()]
+                            all_devices = db.execute(text(
+                                "SELECT mac_address, tags FROM devices WHERE is_ignored = FALSE AND tags IS NOT NULL"
+                            )).fetchall()
+                            target_macs = []
+                            for dev_mac, dev_tags in all_devices:
+                                if dev_tags:
+                                    dev_tag_list = [t.strip().lower() for t in dev_tags.split(',') if t.strip()]
+                                    if any(t in dev_tag_list for t in tag_list):
+                                        target_macs.append(dev_mac)
+                        elif mac:
+                            target_macs = [mac]
 
-                    if target_macs is not None:
-                        for m in target_macs:
-                            if m not in device_should_block:
-                                device_should_block[m] = False
-                            if active:
-                                device_should_block[m] = True
-                    else:
-                        # Network-wide: apply to all non-ignored devices
-                        all_macs = db.execute(text(
-                            "SELECT mac_address FROM devices WHERE is_ignored = FALSE"
-                        )).scalars().all()
-                        for m in all_macs:
-                            if m not in device_should_block:
-                                device_should_block[m] = False
-                            if active:
-                                device_should_block[m] = True
+                        if target_macs is not None:
+                            for m in target_macs:
+                                if m not in device_should_block:
+                                    device_should_block[m] = False
+                                if active:
+                                    device_should_block[m] = True
+                        else:
+                            # Network-wide: apply to all non-ignored devices
+                            all_macs = db.execute(text(
+                                "SELECT mac_address FROM devices WHERE is_ignored = FALSE"
+                            )).scalars().all()
+                            for m in all_macs:
+                                if m not in device_should_block:
+                                    device_should_block[m] = False
+                                if active:
+                                    device_should_block[m] = True
+                    except Exception as sched_exc:
+                        print(f"[block_schedule_loop] schedule error id={sched[0] if sched else '?'}: {sched_exc}", flush=True)
 
                 # Apply changes
                 for mac, should_block in device_should_block.items():
-                    dev = db.execute(text(
-                        "SELECT is_blocked, is_schedule_blocked, ip_address FROM devices WHERE mac_address = :mac"
-                    ), {"mac": mac}).fetchone()
-                    if not dev:
-                        continue
-                    is_blocked, is_sched_blocked, ip = dev
+                    try:
+                        dev = db.execute(text(
+                            "SELECT is_blocked, is_schedule_blocked, ip_address FROM devices WHERE mac_address = :mac"
+                        ), {"mac": mac}).fetchone()
+                        if not dev:
+                            continue
+                        is_blocked, is_sched_blocked, ip = dev
 
-                    if should_block and not is_sched_blocked:
-                        # Need to block
-                        await _execute_block_bg(mac, ip, "block")
-                        db.execute(text(
-                            "UPDATE devices SET is_blocked = TRUE, is_schedule_blocked = TRUE WHERE mac_address = :mac"
-                        ), {"mac": mac})
-                        _add_event(db, mac, "blocked", {"ip": ip, "reason": "schedule"})
-                        asyncio.ensure_future(_plugin_event_bus.notify("device.blocked", {"mac": mac, "ip": ip or ""}))
+                        if should_block and not is_sched_blocked:
+                            print(f"[sched] blocking {mac} ({ip}) via schedule", flush=True)
+                            await _execute_block_bg(mac, ip, "block")
+                            db.execute(text(
+                                "UPDATE devices SET is_blocked = TRUE, is_schedule_blocked = TRUE WHERE mac_address = :mac"
+                            ), {"mac": mac})
+                            _add_event(db, mac, "blocked", {"ip": ip, "reason": "schedule"})
+                            asyncio.ensure_future(_plugin_event_bus.notify("device.blocked", {"mac": mac, "ip": ip or ""}))
 
-                    elif not should_block and is_sched_blocked:
-                        # Schedule says unblock (only if blocked by schedule, not manually)
-                        await _execute_block_bg(mac, ip, "unblock")
-                        db.execute(text(
-                            "UPDATE devices SET is_blocked = FALSE, is_schedule_blocked = FALSE WHERE mac_address = :mac"
-                        ), {"mac": mac})
-                        _add_event(db, mac, "unblocked", {"ip": ip, "reason": "schedule_end"})
-                        asyncio.ensure_future(_plugin_event_bus.notify("device.unblocked", {"mac": mac, "ip": ip or ""}))
+                        elif not should_block and is_sched_blocked:
+                            print(f"[sched] unblocking {mac} ({ip}) schedule ended", flush=True)
+                            await _execute_block_bg(mac, ip, "unblock")
+                            db.execute(text(
+                                "UPDATE devices SET is_blocked = FALSE, is_schedule_blocked = FALSE WHERE mac_address = :mac"
+                            ), {"mac": mac})
+                            _add_event(db, mac, "unblocked", {"ip": ip, "reason": "schedule_end"})
+                            asyncio.ensure_future(_plugin_event_bus.notify("device.unblocked", {"mac": mac, "ip": ip or ""}))
+                    except Exception as mac_exc:
+                        print(f"[block_schedule_loop] apply error {mac}: {mac_exc}", flush=True)
 
                 db.commit()
             finally:
                 db.close()
         except Exception as exc:
-            print(f"[block_schedule_loop] error: {exc}", flush=True)
+            print(f"[block_schedule_loop] outer error: {exc}", flush=True)
 
         await asyncio.sleep(60)
 

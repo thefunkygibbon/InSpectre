@@ -2,7 +2,7 @@ import { useState, useEffect, useRef, useCallback, useMemo } from 'react'
 import {
   UserPlus, User, Edit2, Trash2, X, Check,
   Smartphone, Plus, Shield, Camera, ShieldOff, ShieldCheck, ChevronDown,
-  AlertTriangle, Star, Loader, ToggleRight, ToggleLeft,
+  AlertTriangle, Star, Loader, ToggleRight, ToggleLeft, Home, MapPin,
 } from 'lucide-react'
 import { api } from '../api'
 
@@ -71,12 +71,14 @@ function Avatar({ photo, name, size = 48, className = '' }) {
 
 function OnlineBadge({ online }) {
   return (
-    <span className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-xs font-semibold ${
+    <span className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-bold tracking-wide ${
       online
-        ? 'bg-green-500/15 text-green-400 border border-green-500/30'
-        : 'bg-surface-offset text-text-muted border border-border'
+        ? 'bg-green-500/20 text-green-400 border border-green-500/40'
+        : 'bg-slate-500/10 text-slate-400 border border-slate-500/25'
     }`}>
-      <span className={`inline-block w-1.5 h-1.5 rounded-full ${online ? 'bg-green-400 animate-pulse' : 'bg-text-muted'}`} />
+      {online
+        ? <Home size={11} className="shrink-0" />
+        : <MapPin size={11} className="shrink-0" />}
       {online ? 'At Home' : 'Away'}
     </span>
   )
@@ -729,7 +731,26 @@ function PersonCard({ person, allDevices, onUpdated, onDeleted }) {
 
   return (
     <div className="rounded-xl border overflow-hidden"
-      style={{ borderColor: person.is_blocked ? 'rgba(239,68,68,0.4)' : 'var(--color-border)', background: person.is_blocked ? 'rgba(239,68,68,0.04)' : 'var(--color-surface)' }}>
+      style={{
+        borderColor: person.is_blocked
+          ? 'rgba(239,68,68,0.4)'
+          : person.is_home
+            ? 'rgba(74,222,128,0.35)'
+            : 'var(--color-border)',
+        background: person.is_blocked
+          ? 'rgba(239,68,68,0.04)'
+          : person.is_home
+            ? 'rgba(74,222,128,0.04)'
+            : 'var(--color-surface)',
+      }}>
+      {/* Colour accent bar at top of card */}
+      <div className="h-1.5 w-full" style={{
+        background: person.is_blocked
+          ? 'linear-gradient(90deg, rgba(239,68,68,0.8), rgba(239,68,68,0.3))'
+          : person.is_home
+            ? 'linear-gradient(90deg, rgba(74,222,128,0.8), rgba(74,222,128,0.3))'
+            : 'linear-gradient(90deg, rgba(148,163,184,0.35), rgba(148,163,184,0.1))',
+      }} />
       <div className="p-4">
         {/* Header row — avatar + name/notes only; edit button pinned top-right */}
         <div className="flex items-start gap-3">
@@ -830,10 +851,18 @@ export function PersonPresencePage({ devices }) {
   useEffect(() => { load() }, [load])
   useEffect(() => { if (!loading) loadTimeline(days) }, [days, loading, loadTimeline])
 
-  // Auto-refresh every 30s
+  // Smart refresh: poll every 30s but skip if the user has an input focused
   useEffect(() => {
-    const id = setInterval(() => { load(); loadTimeline(days) }, 30000)
-    return () => clearInterval(id)
+    function doRefresh() {
+      const el = document.activeElement
+      const busy = el && (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA' || el.tagName === 'SELECT')
+      if (!busy) { load(); loadTimeline(days) }
+    }
+    // Also refresh when the tab regains focus
+    function onVisible() { if (document.visibilityState === 'visible') doRefresh() }
+    document.addEventListener('visibilitychange', onVisible)
+    const id = setInterval(doRefresh, 30000)
+    return () => { clearInterval(id); document.removeEventListener('visibilitychange', onVisible) }
   }, [load, loadTimeline, days])
 
   async function handleCreate({ name, notes, photo, primary_mac, devices: devs }) {

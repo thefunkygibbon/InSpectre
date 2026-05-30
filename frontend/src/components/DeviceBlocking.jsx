@@ -465,10 +465,17 @@ export function DeviceBlocking({ devices, onDeviceClick }) {
 
   useEffect(() => { load() }, [load])
 
-  // Auto-refresh every 30s
+  // Smart refresh: skip when user has a form input focused
   useEffect(() => {
-    const id = setInterval(() => load(), 30000)
-    return () => clearInterval(id)
+    function doRefresh() {
+      const el = document.activeElement
+      const busy = el && (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA' || el.tagName === 'SELECT')
+      if (!busy) load()
+    }
+    function onVisible() { if (document.visibilityState === 'visible') doRefresh() }
+    document.addEventListener('visibilitychange', onVisible)
+    const id = setInterval(doRefresh, 30000)
+    return () => { clearInterval(id); document.removeEventListener('visibilitychange', onVisible) }
   }, [load])
 
   async function handleNetworkToggle() {
