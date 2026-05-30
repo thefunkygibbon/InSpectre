@@ -3,7 +3,7 @@ import {
   Wifi, WifiOff, Monitor, Settings,
   Search, AlertCircle, Activity,
   LayoutGrid, List, Sun, Moon, ChevronDown,
-  Bell, X, Layers, Star, ShieldAlert, Wrench, Ban, BarChart2,
+  Bell, X, Layers, Star, ShieldAlert, Wrench, Ban, BarChart2, Clock,
   ArrowLeft, SlidersHorizontal, LogOut, Eye, EyeOff, Box, Download, Sparkles,
 } from 'lucide-react'
 import { TrafficPage } from './components/TrafficPage'
@@ -22,6 +22,7 @@ import { SecurityDashboard }   from './components/SecurityDashboard'
 import { NetworkTools }        from './components/NetworkTools'
 import { DeviceBlocking }      from './components/DeviceBlocking'
 import { NetworkTimeline }     from './components/NetworkTimeline'
+import { NetworkEventLog }     from './components/NetworkEventLog'
 import { CategoryView }        from './components/CategoryView'
 import { SmartFilterBar }      from './components/SmartFilterBar'
 import { LoginPage }           from './components/LoginPage'
@@ -46,10 +47,11 @@ const TOAST_DURATION = 2500
 
 // Page definitions for the nav
 const PAGES = [
-  { id: 'tools',      label: 'Network Tools',       Icon: Wrench,      title: 'Network Tools' },
+  { id: 'tools',      label: 'Network Tools',        Icon: Wrench,      title: 'Network Tools' },
   { id: 'security',   label: 'Vulnerability Report', Icon: ShieldAlert, title: 'Vulnerability Report' },
   { id: 'blocking',   label: 'Device Blocking',      Icon: Ban,         title: 'Device Blocking' },
-  { id: 'timeline',   label: 'Device Timeline',      Icon: BarChart2,   title: 'Device Timeline' },
+  { id: 'presence',   label: 'Device Presence',      Icon: BarChart2,   title: 'Device Presence' },
+  { id: 'events',     label: 'Network Events',       Icon: Clock,       title: 'Network Events' },
   { id: 'traffic',    label: 'Traffic Monitor',      Icon: Activity,    title: 'Traffic Monitor' },
   { id: 'containers', label: 'Docker Containers',    Icon: Box,         title: 'Docker Containers' },
 ]
@@ -521,8 +523,16 @@ function MainApp({ onLogout }) {
         }} />
       )}
 
-      {activePage === 'timeline' && (
+      {activePage === 'presence' && (
         <NetworkTimeline onDeviceClick={mac => {
+          setActivePage(null)
+          const dev = devices.find(d => d.mac_address === mac)
+          if (dev) openDevice(dev)
+        }} />
+      )}
+
+      {activePage === 'events' && (
+        <NetworkEventLog onDeviceClick={mac => {
           setActivePage(null)
           const dev = devices.find(d => d.mac_address === mac)
           if (dev) openDevice(dev)

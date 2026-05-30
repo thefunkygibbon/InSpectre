@@ -49,7 +49,8 @@ PROBE_URL    = (
 # ---------------------------------------------------------------------------
 SECRET_KEY   = os.environ.get("SECRET_KEY", "CHANGE_ME_IN_PRODUCTION_use_a_long_random_string")
 ALGORITHM    = "HS256"
-TOKEN_EXPIRE = 60 * 24  # minutes — 24 hours
+TOKEN_EXPIRE_DEFAULT  = 60 * 24       # minutes — 24 hours
+TOKEN_EXPIRE_REMEMBER = 60 * 24 * 30  # minutes — 30 days
 bearer_scheme = HTTPBearer(auto_error=False)
 
 engine       = create_engine(DATABASE_URL, pool_pre_ping=True)
@@ -328,6 +329,7 @@ def _migrate(db: Session):
         "ALTER TABLE devices ALTER COLUMN is_blocked SET DEFAULT FALSE",
         "ALTER TABLE devices ADD COLUMN IF NOT EXISTS zone VARCHAR",
         "ALTER TABLE devices ADD COLUMN IF NOT EXISTS is_ignored BOOLEAN NOT NULL DEFAULT FALSE",
+        "ALTER TABLE devices ADD COLUMN IF NOT EXISTS suppress_presence_events BOOLEAN NOT NULL DEFAULT FALSE",
         # Nuclei migration: add scan_args column (replaces nmap_args semantically)
         "ALTER TABLE vuln_reports ADD COLUMN IF NOT EXISTS scan_args VARCHAR",
         # Ensure nmap_args always includes -p- (full port scan); only updates if
@@ -1686,8 +1688,9 @@ def _hash_password(password: str) -> str:
 def _verify_password(plain: str, hashed: str) -> bool:
     return _bcrypt.checkpw(plain.encode(), hashed.encode())
 
-def _create_token(username: str) -> str:
-    expire = datetime.now(timezone.utc) + timedelta(minutes=TOKEN_EXPIRE)
+def _create_token(username: str, expire_minutes: int | None = None) -> str:
+    minutes = expire_minutes or TOKEN_EXPIRE_DEFAULT
+    expire = datetime.now(timezone.utc) + timedelta(minutes=minutes)
     return jwt.encode({"sub": username, "exp": expire}, SECRET_KEY, algorithm=ALGORITHM)
 
 def _decode_token(token: str) -> str | None:
@@ -2148,6 +2151,7 @@ class MetadataUpdate(BaseModel):
     is_important: Optional[bool] = None
     zone:         Optional[str]  = None
     is_ignored:   Optional[bool] = None
+    suppress_presence_events: Optional[bool] = None
 
 
 class PrimaryIPUpdate(BaseModel):
@@ -2175,6 +2179,7 @@ class BlockScheduleUpdate(BaseModel):
 class LoginRequest(BaseModel):
     username: str
     password: str
+    remember_me: bool = False
 
 class ChangePasswordRequest(BaseModel):
     current_password: str
@@ -2398,6 +2403,7 @@ def _to_dict(d: Device) -> dict:
         "is_blocked":            bool(getattr(d, 'is_blocked', False)),
         "zone":                  getattr(d, 'zone', None),
         "is_ignored":            bool(getattr(d, 'is_ignored', False)),
+        "suppress_presence_events": bool(getattr(d, 'suppress_presence_events', False)),
         "primary_ip_locked":     bool(getattr(d, 'primary_ip_locked', False)),
         "dhcp_hostname":         getattr(d, 'dhcp_hostname', None),
         "dhcp_vendor_class":     getattr(d, 'dhcp_vendor_class', None),
@@ -2575,7 +2581,10 @@ def login(payload: LoginRequest, db: Session = Depends(get_db)):
         {"u": payload.username}
     )
     db.commit()
-    token = _create_token(payload.username)
+    token = _create_token(
+        payload.username,
+        TOKEN_EXPIRE_REMEMBER if payload.remember_me else TOKEN_EXPIRE_DEFAULT,
+    )
     return {"token": token, "username": payload.username, "must_change_password": bool(row[2])}
 
 
@@ -2998,6 +3007,8 @@ def update_metadata(mac: str, payload: MetadataUpdate, db: Session = Depends(get
         _add_event(db, mac.lower(), 'tagged', {'tags': payload.tags})
     if payload.is_ignored is not None:
         d.is_ignored = payload.is_ignored
+    if payload.suppress_presence_events is not None:
+        d.suppress_presence_events = payload.suppress_presence_events
     db.commit(); db.refresh(d)
     return _to_dict(d)
 
@@ -4039,6 +4050,26 @@ def get_all_events(limit: int = Query(100, ge=1, le=1000), event_type: Optional[
             ORDER BY de.created_at DESC
             LIMIT :limit
         """), params).fetchall()
+        return [{"id": r[0], "mac_address": r[1], "type": r[2], "detail": r[3],
+                 "created_at": r[4].isoformat() if r[4] else None, "display_name": r[5],
+                 "ip_address": r[6], "vendor": r[7]} for r in rows]
+    except Exception:
+        return []
+
+
+@app.get("/events/status")
+def get_status_events(limit: int = Query(100, ge=1, le=1000), db: Session = Depends(get_db)):
+    try:
+        rows = db.execute(text("""
+            SELECT de.id, de.mac_address, de.type, de.detail, de.created_at,
+                   COALESCE(d.custom_name, d.hostname, d.ip_address, de.mac_address) AS display_name,
+                   d.ip_address, d.vendor
+            FROM device_events de
+            JOIN devices d ON d.mac_address = de.mac_address
+            WHERE de.type IN ('online', 'offline')
+            ORDER BY de.created_at DESC
+            LIMIT :limit
+        """), {"limit": limit}).fetchall()
         return [{"id": r[0], "mac_address": r[1], "type": r[2], "detail": r[3],
                  "created_at": r[4].isoformat() if r[4] else None, "display_name": r[5],
                  "ip_address": r[6], "vendor": r[7]} for r in rows]
@@ -5399,6 +5430,7 @@ def _do_restore(payload: dict, db: Session) -> dict:
             is_blocked=bool(d.get("is_blocked", False)),
             zone=d.get("zone"),
             is_ignored=bool(d.get("is_ignored", False)),
+            suppress_presence_events=bool(d.get("suppress_presence_events", False)),
             deep_scan_last_run=_dt(d.get("deep_scan_last_run")),
             baseline_ports=d.get("baseline_ports"),
             baseline_scan_count=int(d.get("baseline_scan_count") or 0),

@@ -529,9 +529,10 @@ export function DeviceDrawer({ device, onClose, onRename, onResolveName, onRefre
   const [activeAction, setActiveAction] = useState(null)  // 'ping' | 'traceroute' | 'rescan'
   const [staticLines,  setStaticLines]  = useState([])
   const [activeTab,    setActiveTab]    = useState(initialTab || 'overview')
-  const [blocking,     setBlocking]     = useState(false)
-  const [ignoring,     setIgnoring]     = useState(false)
-  const [deleting,     setDeleting]     = useState(false)
+  const [blocking,            setBlocking]            = useState(false)
+  const [ignoring,            setIgnoring]            = useState(false)
+  const [suppressingPresence, setSuppressingPresence] = useState(false)
+  const [deleting,            setDeleting]            = useState(false)
   const [waking,       setWaking]       = useState(false)
 
   // Vuln scan state is owned by the parent (App.jsx) so it survives drawer close/reopen.
@@ -635,6 +636,21 @@ export function DeviceDrawer({ device, onClose, onRename, onResolveName, onRefre
       setLocalDevice(prev => ({ ...prev, is_ignored: !newVal }))
     } finally {
       setIgnoring(false)
+    }
+  }
+
+  async function handleSuppressPresenceToggle() {
+    setSuppressingPresence(true)
+    const newVal = !localDevice.suppress_presence_events
+    setLocalDevice(prev => ({ ...prev, suppress_presence_events: newVal }))
+    try {
+      const updated = await api.updateMetadata(mac, { suppress_presence_events: newVal })
+      setLocalDevice(updated)
+      if (onRefresh) onRefresh()
+    } catch {
+      setLocalDevice(prev => ({ ...prev, suppress_presence_events: !newVal }))
+    } finally {
+      setSuppressingPresence(false)
     }
   }
 
@@ -823,6 +839,21 @@ export function DeviceDrawer({ device, onClose, onRename, onResolveName, onRefre
                   {localDevice.is_ignored
                     ? <><Eye size={12} /> Un-ignore device</>
                     : <><EyeOff size={12} /> Ignore device</>}
+                </button>
+                <button
+                  onClick={handleSuppressPresenceToggle}
+                  disabled={suppressingPresence}
+                  className={`mt-2 w-full flex items-center justify-center gap-2 py-2 rounded-lg
+                             border text-xs font-medium transition-colors duration-150
+                             ${localDevice.suppress_presence_events
+                               ? 'border-yellow-500/40 bg-yellow-500/10 text-yellow-400 hover:bg-yellow-500/20'
+                               : 'border-border bg-surface-offset text-text-muted hover:text-text hover:border-border'
+                             }
+                             ${suppressingPresence ? 'opacity-60 cursor-wait' : ''}`}>
+                  <BellOff size={12} className={suppressingPresence ? 'animate-pulse' : ''} />
+                  {localDevice.suppress_presence_events
+                    ? 'Resume presence events'
+                    : 'Suppress presence events'}
                 </button>
                 <StreamOutput
                   lines={termLines}

@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback, useMemo } from 'react'
-import { Loader, Wifi, WifiOff, Clock, Search, Box } from 'lucide-react'
+import { Loader, Wifi, WifiOff, Clock, Search, Box, History } from 'lucide-react'
 import { api } from '../api'
 
 const PERIODS = [
@@ -18,6 +18,40 @@ function fmtDateTime(iso) {
   return new Date(iso).toLocaleString()
 }
 
+function relativeTime(iso) {
+  if (!iso) return ''
+  const diff = Date.now() - new Date(iso).getTime()
+  const mins = Math.floor(diff / 60000)
+  if (mins < 1)  return 'just now'
+  if (mins < 60) return `${mins}m ago`
+  const hrs = Math.floor(mins / 60)
+  if (hrs < 24)  return `${hrs}h ago`
+  const days = Math.floor(hrs / 24)
+  if (days < 7)  return `${days}d ago`
+  return new Date(iso).toLocaleDateString(undefined, { month: 'short', day: 'numeric' })
+}
+
+const SOURCE_LABELS = {
+  sweep: 'ARP sweep',
+  sniffer: 'Passive sniffer',
+}
+
+function formatSource(source) {
+  if (!source) return null
+  if (SOURCE_LABELS[source]) return SOURCE_LABELS[source]
+  if (source.startsWith('plugin:')) return `Plugin: ${source.slice(7)}`
+  return source
+}
+
+function statusDetail(detail) {
+  if (!detail) return null
+  const parts = []
+  const source = formatSource(detail.source)
+  if (source) parts.push(`Source: ${source}`)
+  if (detail.confirmation === 'icmp') parts.push('Ping confirm')
+  return parts.length ? parts.join(' · ') : null
+}
+
 function StatusDot({ status }) {
   const colors = { online: '#10b981', offline: '#ef4444', unknown: '#6b7280' }
   return (
@@ -26,11 +60,10 @@ function StatusDot({ status }) {
   )
 }
 
-function TimelineBar({ segments, windowStart, windowEnd, deviceName }) {
-  const winStart = new Date(windowStart)
-  const winEnd   = new Date(windowEnd)
-  const totalMs  = winEnd - winStart
-  if (totalMs <= 0) return null
+function TimelineBar({ segments, deviceName }) {
+  if (!segments?.length) {
+    return <div className="flex-1 h-6 rounded overflow-hidden" style={{ background: 'var(--color-surface-offset)' }} />
+  }
 
   const STATUS_COLORS = {
     online:  '#10b981',
@@ -41,20 +74,14 @@ function TimelineBar({ segments, windowStart, windowEnd, deviceName }) {
   return (
     <div className="flex-1 h-6 rounded overflow-hidden relative" style={{ background: 'var(--color-surface-offset)' }}>
       {segments.map((seg, i) => {
-        // Clamp each segment to the window so out-of-range data can't overflow
-        const segStart = Math.max(new Date(seg.from), winStart)
-        const segEnd   = Math.min(new Date(seg.to),   winEnd)
-        if (segEnd <= segStart) return null
-        const leftPct  = ((segStart - winStart) / totalMs) * 100
-        const widthPct = ((segEnd   - segStart) / totalMs) * 100
         const color    = STATUS_COLORS[seg.status] || STATUS_COLORS.unknown
         return (
           <div key={i}
             title={`${deviceName}: ${seg.status} from ${fmtDateTime(seg.from)} to ${fmtDateTime(seg.to)}`}
             className="absolute top-0 bottom-0 transition-opacity hover:opacity-80 cursor-default"
             style={{
-              left:    `${leftPct}%`,
-              width:   `${widthPct}%`,
+              left:    `${seg.leftPct}%`,
+              width:   `${seg.widthPct}%`,
               minWidth: '2px',
               background: color,
               opacity: seg.status === 'unknown' ? 0.3 : 0.85,
@@ -91,16 +118,8 @@ function XAxisLabels({ windowStart, windowEnd, days }) {
   )
 }
 
-function DeviceRow({ device, windowStart, windowEnd, days, onDeviceClick }) {
-  const onlinePct = useMemo(() => {
-    const totalMs = new Date(windowEnd) - new Date(windowStart)
-    if (totalMs <= 0) return 0
-    const onlineMs = device.segments
-      .filter(s => s.status === 'online')
-      .reduce((sum, s) => sum + (new Date(s.to) - new Date(s.from)), 0)
-    return Math.round((onlineMs / totalMs) * 100)
-  }, [device.segments, windowStart, windowEnd])
-
+function DeviceRow({ device, onDeviceClick }) {
+  const onlinePct = device.onlinePct ?? 0
   return (
     <div className="flex items-center gap-3 py-1.5">
       <div className="w-[160px] sm:w-[200px] flex items-center gap-2 shrink-0 min-w-0">
@@ -120,12 +139,7 @@ function DeviceRow({ device, windowStart, windowEnd, days, onDeviceClick }) {
         </button>
       </div>
 
-      <TimelineBar
-        segments={device.segments}
-        windowStart={windowStart}
-        windowEnd={windowEnd}
-        deviceName={device.name}
-      />
+      <TimelineBar segments={device.renderSegments} deviceName={device.name} />
 
       <div className="w-[70px] sm:w-[80px] text-right shrink-0">
         <span className="text-[10px] font-mono tabular-nums"
@@ -295,6 +309,89 @@ function ContainerTimeline({ days }) {
   )
 }
 
+const STATUS_EVENT_CONFIG = {
+  online:  { icon: Wifi,    color: '#10b981', label: 'Came online' },
+  offline: { icon: WifiOff, color: '#ef4444', label: 'Went offline' },
+}
+
+function RecentStatusHistory({ onDeviceClick, limit = 120 }) {
+  const [events, setEvents] = useState(null)
+  const [error, setError] = useState(null)
+
+  useEffect(() => {
+    let alive = true
+    api.getStatusEvents(limit)
+      .then(rows => { if (alive) setEvents(rows) })
+      .catch(e => { if (alive) { setError(e.message); setEvents([]) } })
+    return () => { alive = false }
+  }, [limit])
+
+  return (
+    <div className="card p-4">
+      <div className="flex items-center gap-2 mb-3">
+        <History size={14} style={{ color: 'var(--color-brand)' }} />
+        <h3 className="text-sm font-semibold" style={{ color: 'var(--color-text)' }}>
+          Recent status history
+        </h3>
+      </div>
+
+      {events === null ? (
+        <div className="space-y-2">
+          {[...Array(3)].map((_, i) => <div key={i} className="skeleton h-8 rounded-lg" />)}
+        </div>
+      ) : error ? (
+        <p className="text-xs text-red-400">{error}</p>
+      ) : events.length === 0 ? (
+        <p className="text-xs text-text-muted italic">No online/offline events yet.</p>
+      ) : (
+        <div className="space-y-3">
+          {events.map(event => {
+            const cfg = STATUS_EVENT_CONFIG[event.type] || STATUS_EVENT_CONFIG.offline
+            const Icon = cfg.icon
+            const detail = statusDetail(event.detail)
+            return (
+              <div key={event.id} className="flex gap-3 items-start">
+                <div
+                  className="w-6 h-6 rounded-full flex items-center justify-center shrink-0"
+                  style={{ background: `${cfg.color}20`, border: `1px solid ${cfg.color}40` }}
+                >
+                  <Icon size={11} style={{ color: cfg.color }} />
+                </div>
+                <div className="flex-1 min-w-0">
+                  <div className="flex items-baseline justify-between gap-2">
+                    <span className="text-xs font-medium" style={{ color: 'var(--color-text)' }}>
+                      {cfg.label}
+                    </span>
+                    <span className="text-[10px] shrink-0" style={{ color: 'var(--color-text-muted)' }}>
+                      {relativeTime(event.created_at)}
+                    </span>
+                  </div>
+                  <button
+                    type="button"
+                    disabled={!onDeviceClick}
+                    onClick={() => onDeviceClick && onDeviceClick(event.mac_address)}
+                    className="text-[11px] font-mono truncate text-left hover:underline"
+                    style={{ color: onDeviceClick ? 'var(--color-brand)' : 'var(--color-text)' }}
+                    title={event.display_name || event.mac_address}
+                  >
+                    {event.display_name || event.mac_address}
+                    {event.ip_address ? ` · ${event.ip_address}` : ''}
+                  </button>
+                  {detail && (
+                    <p className="text-[11px] mt-0.5 font-mono" style={{ color: 'var(--color-text-muted)' }}>
+                      {detail}
+                    </p>
+                  )}
+                </div>
+              </div>
+            )
+          })}
+        </div>
+      )}
+    </div>
+  )
+}
+
 export function NetworkTimeline({ onDeviceClick }) {
   const [days,    setDays]    = useState(7)
   const [data,    setData]    = useState(null)
@@ -322,32 +419,53 @@ export function NetworkTimeline({ onDeviceClick }) {
     setDays(d)
   }
 
-  const filtered = useMemo(() => {
+  const preparedDevices = useMemo(() => {
     if (!data?.devices) return []
+    const windowStartMs = new Date(data.window_start).getTime()
+    const windowEndMs = new Date(data.window_end).getTime()
+    const totalMs = windowEndMs - windowStartMs
+    if (totalMs <= 0) {
+      return data.devices.map(d => ({ ...d, renderSegments: [], onlinePct: 0 }))
+    }
+    return data.devices.map(d => {
+      let onlineMs = 0
+      const renderSegments = (d.segments || []).map(seg => {
+        const rawStart = new Date(seg.from).getTime()
+        const rawEnd = new Date(seg.to).getTime()
+        const segStart = Math.max(rawStart, windowStartMs)
+        const segEnd = Math.min(rawEnd, windowEndMs)
+        if (segEnd <= segStart) return null
+        if (seg.status === 'online') onlineMs += (segEnd - segStart)
+        return {
+          status: seg.status,
+          from: seg.from,
+          to: seg.to,
+          leftPct: ((segStart - windowStartMs) / totalMs) * 100,
+          widthPct: ((segEnd - segStart) / totalMs) * 100,
+        }
+      }).filter(Boolean)
+      const onlinePct = Math.round((onlineMs / totalMs) * 100)
+      return { ...d, renderSegments, onlinePct }
+    })
+  }, [data])
+
+  const filtered = useMemo(() => {
+    if (!preparedDevices.length) return []
     const q = search.toLowerCase()
-    if (!q) return data.devices
-    return data.devices.filter(d =>
+    if (!q) return preparedDevices
+    return preparedDevices.filter(d =>
       (d.name || '').toLowerCase().includes(q) ||
       (d.ip || '').includes(q) ||
       (d.mac || '').toLowerCase().includes(q)
     )
-  }, [data, search])
+  }, [preparedDevices, search])
 
   const stats = useMemo(() => {
-    if (!filtered.length || !data) return null
+    if (!filtered.length) return null
     const total = filtered.length
-    const avgUptime = Math.round(
-      filtered.reduce((sum, d) => {
-        const totalMs = new Date(data.window_end) - new Date(data.window_start)
-        if (totalMs <= 0) return sum
-        const onlineMs = d.segments
-          .filter(s => s.status === 'online')
-          .reduce((s2, s) => s2 + (new Date(s.to) - new Date(s.from)), 0)
-        return sum + (onlineMs / totalMs) * 100
-      }, 0) / total
-    )
+    const avgUptime = Math.round(filtered.reduce((sum, d) => sum + (d.onlinePct || 0), 0) / total)
     return { total, avgUptime }
-  }, [filtered, data])
+  }, [filtered])
 
   return (
     <div className="max-w-5xl mx-auto">
@@ -444,26 +562,25 @@ export function NetworkTimeline({ onDeviceClick }) {
           </p>
         </div>
       ) : (
-        <div className="card overflow-hidden">
-          {/* X axis */}
-          <div className="px-4 pt-3 pb-1">
-            <XAxisLabels windowStart={data.window_start} windowEnd={data.window_end} days={days} />
-          </div>
+        <>
+          <div className="card overflow-hidden">
+            {/* X axis */}
+            <div className="px-4 pt-3 pb-1">
+              <XAxisLabels windowStart={data.window_start} windowEnd={data.window_end} days={days} />
+            </div>
 
-          {/* Device rows */}
-          <div className="px-4 pb-4 divide-y" style={{ divideColor: 'var(--color-border)' }}>
-            {filtered.map(device => (
-              <DeviceRow
-                key={device.mac}
-                device={device}
-                windowStart={data.window_start}
-                windowEnd={data.window_end}
-                days={days}
-                onDeviceClick={onDeviceClick}
-              />
-            ))}
+            {/* Device rows */}
+            <div className="px-4 pb-4 divide-y" style={{ divideColor: 'var(--color-border)' }}>
+              {filtered.map(device => (
+                <DeviceRow
+                  key={device.mac}
+                  device={device}
+                  onDeviceClick={onDeviceClick}
+                />
+              ))}
+            </div>
           </div>
-        </div>
+        </>
       )}
 
       </>}

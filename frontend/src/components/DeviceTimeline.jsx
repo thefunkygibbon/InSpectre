@@ -39,6 +39,18 @@ function relativeTime(iso) {
   return new Date(iso).toLocaleDateString(undefined, { month: 'short', day: 'numeric' })
 }
 
+const SOURCE_LABELS = {
+  sweep: 'ARP sweep',
+  sniffer: 'Passive sniffer',
+}
+
+function formatSource(source) {
+  if (!source) return null
+  if (SOURCE_LABELS[source]) return SOURCE_LABELS[source]
+  if (source.startsWith('plugin:')) return `Plugin: ${source.slice(7)}`
+  return source
+}
+
 function eventDetail(event) {
   const d = event.detail
   if (!d) return null
@@ -59,6 +71,15 @@ function eventDetail(event) {
     case 'port_opened':      return d.port != null ? `Port ${d.port}${d.severity ? ` [${d.severity}]` : ''}` : null
     case 'port_closed':      return d.port != null ? `Port ${d.port} closed` : null
     case 'interface_joined': return d?.ip ? `${d.ip} · ${d.vendor || ''}`.replace(/ · $/, '') : null
+    case 'online':
+    case 'offline': {
+      const parts = []
+      const source = formatSource(d.source)
+      if (source) parts.push(`Source: ${source}`)
+      if (d.confirmation === 'icmp') parts.push('Ping confirm')
+      if (d.ip) parts.push(`IP ${d.ip}`)
+      return parts.length ? parts.join(' · ') : null
+    }
     default:                 return null
   }
 }
@@ -188,7 +209,7 @@ export function DeviceTimeline({ mac }) {
                   <span className="text-xs font-medium" style={{ color: 'var(--color-text)' }}>
                     {cfg.label}
                   </span>
-                  <span className="text-[10px] shrink-0" style={{ color: 'var(--color-text-faint)' }}>
+                  <span className="text-[10px] shrink-0" style={{ color: 'var(--color-text-muted)' }}>
                     {relativeTime(event.created_at)}
                   </span>
                 </div>

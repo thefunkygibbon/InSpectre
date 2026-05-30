@@ -66,7 +66,11 @@ export const api = {
   },
 
   // Auth
-  login:          (username, password) => request('POST', '/auth/login', { username, password }),
+  login:          (username, password, rememberMe = false) => request('POST', '/auth/login', {
+    username,
+    password,
+    remember_me: !!rememberMe,
+  }),
   authMe:         ()                   => request('GET',  '/auth/me'),
   changePassword: (current, next)      => request('POST', '/auth/change-password', { current_password: current, new_password: next }),
 
@@ -120,6 +124,11 @@ export const api = {
     if (limit) p.set('limit', limit)
     if (type)  p.set('event_type', type)
     return request('GET', `/events${p.toString() ? '?' + p : ''}`)
+  },
+  getStatusEvents: (limit) => {
+    const p = new URLSearchParams()
+    if (limit) p.set('limit', limit)
+    return request('GET', `/events/status${p.toString() ? '?' + p : ''}`)
   },
 
   // Vendor list for autocomplete

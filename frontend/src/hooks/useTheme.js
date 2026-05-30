@@ -9,12 +9,11 @@ export function useTheme() {
       const stored = localStorage.getItem('inspectre-theme')
       if (stored) return stored
     } catch (_) {}
-    return window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light'
-  })
+    return 'dark'  })
 
   const [skin, setSkinState] = useState(() => {
     try { return localStorage.getItem('inspectre-skin') || 'spectre' } catch (_) {}
-    return 'spectre'
+    return localStorage.getItem('inspectre-skin') || 'phantom'
   })
 
   useEffect(() => {

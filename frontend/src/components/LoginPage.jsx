@@ -7,6 +7,7 @@ export function LoginPage({ onLogin }) {
   const [username, setUsername] = useState('')
   const [password, setPassword] = useState('')
   const [showPw,   setShowPw]   = useState(false)
+  const [rememberMe, setRememberMe] = useState(false)
   const [error,    setError]    = useState('')
   const [loading,  setLoading]  = useState(false)
 
@@ -16,7 +17,7 @@ export function LoginPage({ onLogin }) {
     setError('')
     setLoading(true)
     try {
-      const data = await api.login(username.trim().toLowerCase(), password)
+      const data = await api.login(username.trim().toLowerCase(), password, rememberMe)
       setToken(data.token)
       onLogin(data.must_change_password ?? false)
     } catch (err) {
@@ -90,6 +91,16 @@ export function LoginPage({ onLogin }) {
             {error && (
               <p className="text-xs px-1" style={{ color: '#ef4444' }}>{error}</p>
             )}
+
+            <label className="flex items-center gap-2 text-xs" style={{ color: 'var(--color-text-muted)' }}>
+              <input
+                type="checkbox"
+                checked={rememberMe}
+                onChange={e => setRememberMe(e.target.checked)}
+                disabled={loading}
+              />
+              Remember me
+            </label>
 
             <button
               type="submit"

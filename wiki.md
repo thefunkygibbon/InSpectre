@@ -27,6 +27,8 @@
    - 3.12 [DHCP Fingerprinting & Fingerbank](#312-dhcp-fingerprinting--fingerbank)
    - 3.13 [Device Grouping](#313-device-grouping)
    - 3.14 [Acknowledging New Devices](#314-acknowledging-new-devices)
+   - 3.15 [Device Presence Page](#315-device-presence-page)
+   - 3.16 [Network Events Page](#316-network-events-page)
 4. [Network Scanning](#4-network-scanning)
    - 4.1 [Port Scanning](#41-port-scanning)
    - 4.2 [OS Detection](#42-os-detection)
@@ -176,7 +178,7 @@ You can also choose **Restore from backup** at the start of the wizard to import
 
 **Logging in:**
 
-After setup, every visit requires logging in with the credentials you created. Sessions are JWT-based and stored in the browser. If you are inactive for a while, you may be asked to log in again.
+After setup, every visit requires logging in with the credentials you created. Sessions are JWT-based and stored in the browser. If you are inactive for a while, you may be asked to log in again. Use **Remember me** on the login form to extend the session duration (30 days instead of the default 24 hours).
 
 **Changing your password:**
 
@@ -233,6 +235,10 @@ The main dashboard offers three layout views, selectable from the toolbar:
 | **Category** | Devices grouped by automatically detected device type (Router, Phone, Laptop, NAS, Smart TV, IoT, Unknown, etc.). Useful for an at-a-glance network composition view. |
 
 Switch views using the grid/list/category icons in the top toolbar. Your preference is remembered across sessions.
+
+The **Device Presence** page (left nav) shows a multi-device uptime timeline with visual presence bars over 7 days, 1 month, or 1 year. Each bar represents a device's online/offline status over time, with green segments for online and red for offline.
+
+The **Network Events** page (left nav) shows a chronological log of all online/offline transitions across all devices, with source attribution (ARP sweep, passive sniffer, or plugin detection).
 
 ### 3.2 Search and Filtering
 
@@ -344,6 +350,8 @@ The **Timeline** tab provides two views of a device's history:
 | `marked_important` | Device was starred/watched |
 | `vuln_scan_complete` | Vulnerability scan finished |
 | `interface_joined` | A new MAC was discovered sharing the same hostname — automatically grouped with this device as a new interface |
+
+Online/offline events show the **detection method** (ARP sweep, passive sniffer, or plugin source) so you can see how presence was determined.
 
 ### 3.8 Device Drawer — Admin Tab
 
@@ -479,12 +487,39 @@ To remove a device from a group, click the **Remove** button next to that MAC in
 
 When InSpectre sees a device for the first time, it is marked as **new**. By default, new devices float to the top of the device list and are highlighted to draw your attention.
 
-Once you have reviewed a new device and are happy it belongs on your network, click **Acknowledge** on the device card or in the device drawer. This:
+Once you have reviewed a new device and are happy it belongs on your network, click the **NEW** badge (anywhere on the badge) or **Acknowledge** in the device drawer. This:
 - Removes the "new" highlight and stops it floating to the top
 - Flips the MQTT `new` binary sensor to OFF (if Home Assistant MQTT is configured)
 - Persists server-side — acknowledged status survives browser sessions and won't reset if you clear localStorage or open a different browser
 
 To control whether new devices float to the top, see **Settings → Scanner → Float New Devices to Top**.
+
+### 3.15 Device Presence Page
+
+Access the **Device Presence** page from the left navigation menu. This page shows a visual timeline for all devices on your network:
+
+**Features:**
+- **Time periods** — switch between 7-day, 1-month, or 1-year views
+- **Presence bars** — each device gets a horizontal bar showing online (green), offline (red), and unknown (grey) segments
+- **Uptime percentage** — displayed on the right of each bar
+- **Device/Container toggle** — switch between network device presence and Docker container uptime
+- **Search** — filter the list by device name, IP, or MAC address
+
+Each segment of the presence bar is clickable to see the exact timestamp range.
+
+### 3.16 Network Events Page
+
+Access the **Network Events** page from the left navigation menu. This page shows a chronological log of all online/offline status changes across your entire network:
+
+**Features:**
+- **Event log** — lists every device coming online or going offline, newest first
+- **Source attribution** — each event shows how it was detected (ARP sweep, passive sniffer, or plugin)
+- **Device links** — click any device name to open its drawer
+- **Search** — filter events by device name, IP, or MAC address
+- **Event limits** — choose to view 50, 120, 300, or 1000 recent events
+- **Event stats** — shows total events and counts of online vs offline transitions
+
+This is useful for troubleshooting intermittent connectivity issues or tracking when specific devices were last active.
 
 ---
 

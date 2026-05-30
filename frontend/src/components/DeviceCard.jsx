@@ -141,22 +141,26 @@ export function DeviceCard({ device, onClick, onStarToggle, isVulnScanning, isAc
 
           {/* NEW badge — absolutely overlaid on the right of the name line */}
           {showNew && (
-            <span
-              className="absolute top-0 right-0 flex items-center gap-0.5 text-[10px] font-bold rounded-full px-2 py-0.5"
-              style={{ color: '#10b981', background: 'rgba(16,185,129,0.18)', border: '1px solid rgba(16,185,129,0.4)' }}
-            >
-              NEW
-              {onAcknowledge && (
-                <button
-                  onClick={e => { e.stopPropagation(); onAcknowledge(device.mac_address) }}
-                  className="opacity-60 hover:opacity-100 transition-opacity ml-0.5"
-                  title="Acknowledge — stop surfacing to top"
-                  aria-label="Acknowledge new device"
-                >
-                  <X size={8} />
-                </button>
-              )}
-            </span>
+            onAcknowledge ? (
+              <button
+                type="button"
+                onClick={e => { e.stopPropagation(); onAcknowledge(device.mac_address) }}
+                className="absolute top-0 right-0 flex items-center gap-0.5 text-[10px] font-bold rounded-full px-2 py-0.5 transition-opacity hover:opacity-90"
+                style={{ color: '#10b981', background: 'rgba(16,185,129,0.18)', border: '1px solid rgba(16,185,129,0.4)' }}
+                title="Acknowledge — stop surfacing to top"
+                aria-label="Acknowledge new device"
+              >
+                NEW
+                <X size={8} className="opacity-60" />
+              </button>
+            ) : (
+              <span
+                className="absolute top-0 right-0 flex items-center gap-0.5 text-[10px] font-bold rounded-full px-2 py-0.5"
+                style={{ color: '#10b981', background: 'rgba(16,185,129,0.18)', border: '1px solid rgba(16,185,129,0.4)' }}
+              >
+                NEW
+              </span>
+            )
           )}
 
           {showVendorSubtitle && (

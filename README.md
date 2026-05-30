@@ -11,7 +11,8 @@ InSpectre is a self-hosted home network monitor and security scanner that automa
 Check the [Wiki](https://github.com/thefunkygibbon/InSpectre/wiki) for full admin guide. 
 ---
 
-> **Screenshot placeholder** — _add a screenshot of the main dashboard here_
+<img width="1891" height="832" alt="image" src="https://github.com/user-attachments/assets/1e751db9-1639-4e3f-a912-00999b8d056b" />
+
 
 ---
 
@@ -19,7 +20,8 @@ Check the [Wiki](https://github.com/thefunkygibbon/InSpectre/wiki) for full admi
 
 ### Discovery & Monitoring
 - **Automatic device discovery** — active ARP sweeps + passive packet sniffer detect devices within seconds of them joining the network
-- **Network timeline** — visual online/offline history bar for all devices (7-day, 1-month, 1-year views)
+- **Device Presence** — visual online/offline history bars for all devices showing uptime patterns over 7-day, 1-month, or 1-year periods
+- **Network Events** — global online/offline event log across all devices with source attribution (ARP sweep, passive sniffer, or plugin)
 - **Per-device uptime bar** — 7-day presence history visible at a glance in every device drawer
 - **IP history** — every IP address a device has ever held, with timestamps
 
@@ -81,10 +83,11 @@ Check the [Wiki](https://github.com/thefunkygibbon/InSpectre/wiki) for full admi
 - **Fingerbank cloud lookup** — optionally send DHCP fingerprint data to [Fingerbank](https://fingerbank.org/) (free tier, 600 lookups/hour) for deeper device identification; results include device name, hierarchy, and a confidence score
 - **Port pattern matching** — classify device type from open port signature
 - **Manual + community + auto fingerprints** — all stored locally, importable/exportable
-- **New device acknowledgement** — newly discovered devices float to the top of the device list and are marked as new until acknowledged; clicking Acknowledge on the device card or in the drawer marks the device as known, removing the badge and the float; the acknowledged state is stored server-side and also drives the MQTT `new` binary sensor
+- **New device acknowledgement** — newly discovered devices float to the top of the device list and are marked as new until acknowledged; clicking the **NEW** badge on the device card or **Acknowledge** in the drawer marks the device as known, removing the badge and the float; the acknowledged state is stored server-side and also drives the MQTT `new` binary sensor
 
 ### Authentication & Setup
 - **Built-in authentication** — username and password login with JWT session tokens
+- **Remember me** — optional extended session duration (30 days) from the login screen
 - **First-run setup wizard** — guided 7-step configuration of network settings, vulnerability scanning, notifications, container hosts, and Fingerbank device identification on first launch
 - **Backup/restore** — full JSON backup covering all devices, events, vuln reports, speed test history, settings, users, fingerprints, block schedules, and saved views. Optional AES-256-GCM encryption with a user-supplied password. Restorable from the setup wizard or settings panel; encrypted backups are supported in both locations.
 
