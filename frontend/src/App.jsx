@@ -284,7 +284,7 @@ function MainApp({ onLogout }) {
     dismissNewDevice, dismissOffline,
     dismissAllNew, dismissAllOffline,
     optimisticUpdate,
-  } = useDevices(10000, { onAlert: handleAlert })
+  } = useDevices(45000, { onAlert: handleAlert })
 
   const [vulnScansByMac, setVulnScansByMac] = useState({})
   function updateVulnScan(mac, patchOrFn) {

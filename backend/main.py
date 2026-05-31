@@ -487,6 +487,7 @@ def _migrate(db: Session):
         # Phase 9 — device grouping (same physical device, different interface)
         "ALTER TABLE devices ADD COLUMN IF NOT EXISTS group_id      UUID",
         "ALTER TABLE devices ADD COLUMN IF NOT EXISTS group_primary BOOLEAN NOT NULL DEFAULT FALSE",
+        "ALTER TABLE devices ADD COLUMN IF NOT EXISTS group_manual  BOOLEAN NOT NULL DEFAULT FALSE",
         "CREATE INDEX IF NOT EXISTS ix_devices_group_id ON devices(group_id)",
         # Phase 10 — device acknowledgement
         "ALTER TABLE devices ADD COLUMN IF NOT EXISTS is_acknowledged BOOLEAN NOT NULL DEFAULT FALSE",
@@ -905,6 +906,89 @@ _last_network_paused: str = ""
 _pending_browser_notifications: list = []
 _traffic_notif_cooldowns: dict = {}   # (mac, event_type) → datetime of last notification
 _main_loop: asyncio.AbstractEventLoop | None = None
+
+
+# ---------------------------------------------------------------------------
+# Live updates (Server-Sent Events)
+# ---------------------------------------------------------------------------
+# A lightweight pub/sub fan-out so the frontend can react to changes the moment
+# they happen instead of polling every few seconds.  Any code path (sync request
+# handler running in a threadpool, async task, or the DB watcher loop) can call
+# _sse_publish(); subscribers each hold an asyncio.Queue drained by the
+# /events/stream endpoint.
+_sse_clients: "set[asyncio.Queue]" = set()
+_last_sse_event_id: int = 0
+
+
+def _sse_publish(event: str, data: dict | None = None) -> None:
+    """
+    Broadcast an SSE message to every connected client.  Thread-safe: callable
+    from sync endpoints (threadpool) as well as the event loop.  `event` is the
+    SSE event name (e.g. 'devices', 'schedules', 'persons'); `data` is a small
+    JSON-serialisable hint payload.
+    """
+    if not _sse_clients or _main_loop is None or _main_loop.is_closed():
+        return
+    payload = {"event": event, "data": data or {}}
+
+    def _fan_out():
+        for q in list(_sse_clients):
+            try:
+                q.put_nowait(payload)
+            except Exception:
+                pass
+
+    try:
+        _main_loop.call_soon_threadsafe(_fan_out)
+    except RuntimeError:
+        pass
+
+
+async def _sse_event_watcher() -> None:
+    """
+    Single background loop that turns new `device_events` rows into SSE
+    broadcasts.  Covers everything the probe writes (presence, blocks, scans,
+    IP changes, etc.) without each client polling the API.  Backend-originated
+    mutations (schedules, persons, groups) publish directly via _sse_publish().
+    """
+    global _last_sse_event_id
+    await asyncio.sleep(5)  # startup grace
+    db = SessionLocal()
+    try:
+        row = db.execute(text("SELECT COALESCE(MAX(id), 0) FROM device_events")).scalar()
+        _last_sse_event_id = int(row or 0)
+    except Exception:
+        _last_sse_event_id = 0
+    finally:
+        db.close()
+
+    while True:
+        try:
+            if _sse_clients:
+                db = SessionLocal()
+                try:
+                    rows = db.execute(text("""
+                        SELECT id, mac_address, type
+                        FROM device_events
+                        WHERE id > :last_id
+                        ORDER BY id ASC
+                        LIMIT 200
+                    """), {"last_id": _last_sse_event_id}).fetchall()
+                finally:
+                    db.close()
+                if rows:
+                    types = set()
+                    for eid, mac, etype in rows:
+                        _last_sse_event_id = max(_last_sse_event_id, int(eid))
+                        types.add(etype)
+                    _sse_publish("devices", {"types": sorted(types)})
+                    # Presence / block changes also affect the Person Presence page.
+                    if types & {"online", "offline", "joined", "interface_joined",
+                                "blocked", "unblocked", "ip_change"}:
+                        _sse_publish("persons", {"types": sorted(types)})
+        except Exception:
+            pass
+        await asyncio.sleep(2)
 
 
 def _build_apprise_url(service: str, config: dict) -> str | None:
@@ -1487,15 +1571,48 @@ async def _auth_middleware(request: Request, call_next):
         return await call_next(request)
 
     auth_header = request.headers.get("Authorization", "")
-    if not auth_header.startswith("Bearer "):
+    token = auth_header[7:] if auth_header.startswith("Bearer ") else ""
+    # EventSource (used for /events/stream) cannot set custom headers, so allow
+    # the bearer token to be supplied as a query parameter as a fallback.
+    if not token:
+        token = request.query_params.get("token", "")
+    if not token:
         return JSONResponse({"detail": "Not authenticated"}, status_code=401)
 
     # _decode_token is defined later in this file — valid at call time
-    username = _decode_token(auth_header[7:])
+    username = _decode_token(token)
     if not username:
         return JSONResponse({"detail": "Invalid or expired token"}, status_code=401)
 
     return await call_next(request)
+
+
+@app.middleware("http")
+async def _sse_mutation_notifier(request: Request, call_next):
+    """
+    After any successful mutating request, broadcast a hint on the SSE stream so
+    connected clients refresh the affected view immediately.  Covers
+    schedules / persons / device groups; device presence & block state are
+    already streamed by _sse_event_watcher from device_events.
+    """
+    response = await call_next(request)
+    try:
+        if (request.method in ("POST", "PUT", "PATCH", "DELETE")
+                and 200 <= response.status_code < 300):
+            path = request.url.path
+            if "/block-schedules" in path:
+                _sse_publish("schedules", {})
+                _sse_publish("devices", {})
+            elif "/persons" in path:
+                _sse_publish("persons", {})
+                _sse_publish("devices", {})
+            elif "/group" in path:
+                _sse_publish("devices", {})
+            elif "/metadata" in path or path.startswith("/devices/"):
+                _sse_publish("devices", {})
+    except Exception:
+        pass
+    return response
 
 
 # ---------------------------------------------------------------------------
@@ -2156,6 +2273,7 @@ async def on_startup():
         db.close()
     asyncio.ensure_future(_scheduled_vuln_scan_loop())
     asyncio.ensure_future(_notification_loop())
+    asyncio.ensure_future(_sse_event_watcher())
     asyncio.ensure_future(_block_schedule_loop())
     asyncio.ensure_future(_traffic_flush_loop())
     asyncio.ensure_future(_speedtest_schedule_loop())
@@ -2163,6 +2281,50 @@ async def on_startup():
     asyncio.ensure_future(_docker_event_loop())
     asyncio.ensure_future(_fingerbank_loop())
     asyncio.ensure_future(_plugin_scheduler.run())
+
+
+@app.get("/events/stream")
+async def events_stream(request: Request):
+    """
+    Server-Sent Events stream for live UI updates.  The browser opens one
+    EventSource per tab; the backend pushes named events ('devices', 'persons',
+    'schedules', 'persons'…) whenever the underlying data changes, so pages
+    refresh on real changes instead of polling on a timer.  A periodic heartbeat
+    keeps the connection (and any proxies) alive.
+    """
+    queue: asyncio.Queue = asyncio.Queue(maxsize=100)
+    _sse_clients.add(queue)
+
+    async def _gen():
+        try:
+            # Tell the client we're live so it can do an initial load.
+            yield "event: ready\ndata: {}\n\n"
+            while True:
+                if await request.is_disconnected():
+                    break
+                try:
+                    msg = await asyncio.wait_for(queue.get(), timeout=15.0)
+                except asyncio.TimeoutError:
+                    # Heartbeat comment — ignored by EventSource, keeps proxy open.
+                    yield ": ping\n\n"
+                    continue
+                try:
+                    data = json.dumps(msg.get("data", {}))
+                except Exception:
+                    data = "{}"
+                yield f"event: {msg.get('event', 'message')}\ndata: {data}\n\n"
+        finally:
+            _sse_clients.discard(queue)
+
+    return StreamingResponse(
+        _gen(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -3442,6 +3604,12 @@ def add_to_group(mac: str, body: GroupAddRequest, db: Session = Depends(get_db))
             text("UPDATE devices SET group_primary = true WHERE mac_address = :mac"),
             {"mac": mac1},
         )
+    # Mark the whole group as manually curated so auto-grouping cleanup never
+    # dissolves it (manual groups may legitimately span different DNS hostnames).
+    db.execute(
+        text("UPDATE devices SET group_manual = true WHERE group_id = :gid"),
+        {"gid": new_gid},
+    )
     db.commit()
     return {"ok": True, "group_id": new_gid}
 
@@ -3456,7 +3624,7 @@ def remove_from_group(mac: str, db: Session = Depends(get_db)):
     if not group_id:
         return {"ok": True}
     db.execute(
-        text("UPDATE devices SET group_id = NULL, group_primary = FALSE WHERE mac_address = :mac"),
+        text("UPDATE devices SET group_id = NULL, group_primary = FALSE, group_manual = FALSE WHERE mac_address = :mac"),
         {"mac": mac_lower},
     )
     # If only one member remains, dissolve the group
@@ -3466,7 +3634,7 @@ def remove_from_group(mac: str, db: Session = Depends(get_db)):
     ).scalar() or 0
     if remaining <= 1:
         db.execute(
-            text("UPDATE devices SET group_id = NULL, group_primary = FALSE WHERE group_id = :gid"),
+            text("UPDATE devices SET group_id = NULL, group_primary = FALSE, group_manual = FALSE WHERE group_id = :gid"),
             {"gid": group_id},
         )
     db.commit()
@@ -3489,6 +3657,10 @@ def set_group_primary(mac: str, db: Session = Depends(get_db)):
     db.execute(
         text("UPDATE devices SET group_primary = TRUE WHERE mac_address = :mac"),
         {"mac": mac_lower},
+    )
+    db.execute(
+        text("UPDATE devices SET group_manual = TRUE WHERE group_id = :gid"),
+        {"gid": group_id},
     )
     db.commit()
     return {"ok": True}

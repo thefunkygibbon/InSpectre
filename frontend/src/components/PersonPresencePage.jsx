@@ -5,6 +5,7 @@ import {
   AlertTriangle, Star, Loader, ToggleRight, ToggleLeft, Home, MapPin,
 } from 'lucide-react'
 import { api } from '../api'
+import { subscribeLive } from '../lib/liveEvents'
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -855,18 +856,24 @@ export function PersonPresencePage({ devices, onDeviceClick }) {
   useEffect(() => { load() }, [load])
   useEffect(() => { if (!loading) loadTimeline(days) }, [days, loading, loadTimeline])
 
-  // Smart refresh: poll every 30s but skip if the user has an input focused
+  // Live refresh: update on real changes (presence, blocks, schedules) instead
+  // of polling.  Skip while the user has an input focused so in-progress form
+  // edits aren't clobbered; a slow fallback poll covers any missed events.
   useEffect(() => {
     function doRefresh() {
       const el = document.activeElement
       const busy = el && (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA' || el.tagName === 'SELECT')
       if (!busy) { load(); loadTimeline(days) }
     }
-    // Also refresh when the tab regains focus
     function onVisible() { if (document.visibilityState === 'visible') doRefresh() }
     document.addEventListener('visibilitychange', onVisible)
-    const id = setInterval(doRefresh, 10000)
-    return () => { clearInterval(id); document.removeEventListener('visibilitychange', onVisible) }
+    const unsub = subscribeLive(['persons', 'schedules'], doRefresh)
+    const id = setInterval(doRefresh, 60000)
+    return () => {
+      clearInterval(id)
+      document.removeEventListener('visibilitychange', onVisible)
+      unsub()
+    }
   }, [load, loadTimeline, days])
 
   async function handleCreate({ name, notes, photo, primary_mac, devices: devs }) {

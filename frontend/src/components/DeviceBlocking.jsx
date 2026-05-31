@@ -4,6 +4,7 @@ import {
   Loader, AlertTriangle, Clock, Wifi, WifiOff, Calendar, Pencil, Tag, User, Settings2,
 } from 'lucide-react'
 import { api } from '../api'
+import { subscribeLive } from '../lib/liveEvents'
 
 const DAYS = [
   { key: 'mon', label: 'Mon' },
@@ -465,7 +466,8 @@ export function DeviceBlocking({ devices, onDeviceClick }) {
 
   useEffect(() => { load() }, [load])
 
-  // Smart refresh: skip when user has a form input focused
+  // Live refresh: react to schedule/block changes immediately; skip while an
+  // input is focused; slow fallback poll as a safety net.
   useEffect(() => {
     function doRefresh() {
       const el = document.activeElement
@@ -474,8 +476,13 @@ export function DeviceBlocking({ devices, onDeviceClick }) {
     }
     function onVisible() { if (document.visibilityState === 'visible') doRefresh() }
     document.addEventListener('visibilitychange', onVisible)
-    const id = setInterval(doRefresh, 10000)
-    return () => { clearInterval(id); document.removeEventListener('visibilitychange', onVisible) }
+    const unsub = subscribeLive(['devices', 'schedules'], doRefresh)
+    const id = setInterval(doRefresh, 60000)
+    return () => {
+      clearInterval(id)
+      document.removeEventListener('visibilitychange', onVisible)
+      unsub()
+    }
   }, [load])
 
   async function handleNetworkToggle() {

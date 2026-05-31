@@ -444,6 +444,7 @@ def init_db() -> None:
             conn.execute(text("ALTER TABLE devices ADD COLUMN IF NOT EXISTS baseline_scan_count INTEGER NOT NULL DEFAULT 0"))
             conn.execute(text("ALTER TABLE devices ADD COLUMN IF NOT EXISTS primary_ip_locked BOOLEAN NOT NULL DEFAULT FALSE"))
             conn.execute(text("ALTER TABLE devices ADD COLUMN IF NOT EXISTS suppress_presence_events BOOLEAN NOT NULL DEFAULT FALSE"))
+            conn.execute(text("ALTER TABLE devices ADD COLUMN IF NOT EXISTS group_manual BOOLEAN NOT NULL DEFAULT FALSE"))
             conn.commit()
         except Exception as e:
             print(f"[DB] Column migration note: {e}", flush=True)
@@ -1618,7 +1619,7 @@ def _try_auto_group_by_hostname(mac: str, hostname: str) -> bool:
         # peer can never trigger a merge via DHCP-hostname coincidence).
         row = sess.execute(
             text("""
-                SELECT mac_address, group_id FROM devices
+                SELECT mac_address, group_id, group_manual FROM devices
                 WHERE hostname IS NOT NULL AND hostname != ''
                   AND LOWER(SPLIT_PART(hostname, '.', 1)) = :base
                   AND mac_address != :mac
@@ -1629,7 +1630,17 @@ def _try_auto_group_by_hostname(mac: str, hostname: str) -> bool:
         ).fetchone()
         if not row:
             return False
-        peer_mac, peer_gid = row[0], row[1]
+        peer_mac, peer_gid, peer_manual = row[0], row[1], row[2]
+
+        # Don't auto-merge into (or disturb) a user-curated manual group.
+        if peer_manual:
+            return False
+        cur_manual = sess.execute(
+            text("SELECT group_manual FROM devices WHERE mac_address = :m"),
+            {"m": mac},
+        ).scalar()
+        if cur_manual:
+            return False
 
         if not AUTO_GROUP_BY_HOSTNAME:
             _write_event(mac, "group_suggestion", {
@@ -3464,7 +3475,7 @@ def _backfill_hostname_groups() -> None:
     sess = Session()
     try:
         rows = sess.execute(text("""
-            SELECT mac_address, hostname, dhcp_hostname, group_id, group_primary, is_online, last_seen
+            SELECT mac_address, hostname, dhcp_hostname, group_id, group_primary, is_online, last_seen, group_manual
             FROM devices
             WHERE hostname IS NOT NULL AND hostname != ''
         """)).fetchall()
@@ -3472,7 +3483,10 @@ def _backfill_hostname_groups() -> None:
         # base_hostname -> list of device dicts
         base_map: dict[str, list] = {}
         for row in rows:
-            mac, hn, dhcp_hn, gid, gprimary, online, last_seen = row
+            mac, hn, dhcp_hn, gid, gprimary, online, last_seen, gmanual = row
+            # Leave user-curated (manual) groups untouched.
+            if gmanual:
+                continue
             base = _hostname_base(hn or '')
             if not base or _is_generic_hostname(base):
                 continue
@@ -3541,18 +3555,26 @@ def _cleanup_bad_hostname_groups() -> None:
     sess = Session()
     try:
         rows = sess.execute(text("""
-            SELECT mac_address, hostname, group_id
+            SELECT mac_address, hostname, group_id, group_manual
             FROM devices
             WHERE group_id IS NOT NULL
         """)).fetchall()
 
         groups: dict[str, list] = {}
-        for mac, hn, gid in rows:
-            groups.setdefault(str(gid), []).append({"mac": mac, "hostname": hn})
+        group_is_manual: dict[str, bool] = {}
+        for mac, hn, gid, gmanual in rows:
+            key = str(gid)
+            groups.setdefault(key, []).append({"mac": mac, "hostname": hn})
+            if gmanual:
+                group_is_manual[key] = True
 
         repaired = 0
         for gid, members in groups.items():
             if len(members) < 2:
+                continue
+            # Never touch user-curated (manual) groups — they may legitimately
+            # span different DNS hostnames.
+            if group_is_manual.get(gid):
                 continue
             # Distinct, non-generic DNS hostname bases present in this group
             bases = {}

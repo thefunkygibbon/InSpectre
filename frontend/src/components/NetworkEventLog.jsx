@@ -1,6 +1,7 @@
 import { useState, useEffect, useMemo } from 'react'
 import { Loader, Wifi, WifiOff, History, Search, X, Clock } from 'lucide-react'
 import { api } from '../api'
+import { subscribeLive } from '../lib/liveEvents'
 
 function relativeTime(iso) {
   if (!iso) return ''
@@ -76,12 +77,12 @@ export function NetworkEventLog({ onDeviceClick }) {
     return () => { alive = false }
   }, [limit])
 
-  // Auto-refresh every 10s
+  // Live refresh on device events, with a slow fallback poll.
   useEffect(() => {
-    const id = setInterval(() => {
-      api.getStatusEvents(limit).then(rows => setEvents(rows)).catch(() => {})
-    }, 10000)
-    return () => clearInterval(id)
+    const refresh = () => api.getStatusEvents(limit).then(rows => setEvents(rows)).catch(() => {})
+    const unsub = subscribeLive('devices', refresh)
+    const id = setInterval(refresh, 60000)
+    return () => { clearInterval(id); unsub() }
   }, [limit])
 
   const filtered = useMemo(() => {

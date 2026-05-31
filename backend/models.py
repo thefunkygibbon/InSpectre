@@ -66,6 +66,9 @@ class Device(Base):
     # Phase 9 — device grouping (migration adds columns; model exposes them to ORM)
     group_id      = Column(String, nullable=True)
     group_primary = Column(Boolean, server_default='false', nullable=False)
+    # True when the group was created/edited by the user (manual grouping).
+    # Auto-grouping by hostname leaves this False; cleanup never touches manual groups.
+    group_manual  = Column(Boolean, server_default='false', nullable=False)
 
     # Phase 10 — device acknowledgement
     is_acknowledged = Column(Boolean, server_default='false', nullable=False)

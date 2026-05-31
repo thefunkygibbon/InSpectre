@@ -1,5 +1,6 @@
 import { useState, useEffect, useRef, useCallback } from 'react'
 import { api } from '../api'
+import { useLiveRefresh } from './useLiveRefresh'
 
 function enrich(d) {
   return {
@@ -84,9 +85,14 @@ export function useDevices(intervalMs = 10000, { onAlert } = {}) {
 
   useEffect(() => {
     fetchData()
+    // Slow fallback poll — SSE drives near-instant updates; this is just a
+    // safety net in case the live stream drops.
     const id = setInterval(fetchData, intervalMs)
     return () => clearInterval(id)
   }, [fetchData, intervalMs])
+
+  // Live updates: refresh the moment the backend reports a device change.
+  useLiveRefresh('devices', fetchData)
 
   function optimisticUpdate(mac, patch) {
     setDevices(prev =>
