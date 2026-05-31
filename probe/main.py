@@ -94,6 +94,18 @@ PROBE_API_PORT          = int(os.environ.get("PROBE_API_PORT",         8001))
 LAN_DNS_SERVER_ENV      = os.environ.get("LAN_DNS_SERVER", "").strip()
 MDNS_INTERVAL_MINUTES   = int(os.environ.get("MDNS_INTERVAL_MINUTES", 120))  # default: 2 hours
 
+# The probe's own interface MAC — ARP packets originating from this MAC are
+# our own (e.g. ARP restore packets sent after unblocking a device). The sniffer
+# must ignore them to prevent falsely marking target devices as "online".
+def _get_own_mac(iface: str) -> str | None:
+    try:
+        from scapy.arch import get_if_hwaddr
+        return get_if_hwaddr(iface).lower()
+    except Exception:
+        return None
+
+_PROBE_OWN_MAC: str | None = _get_own_mac(INTERFACE)
+
 # Scan scheduling globals (overridden by DB settings at each cycle)
 NIGHTLY_SCAN_START      = int(os.environ.get("NIGHTLY_SCAN_START", 2))
 NIGHTLY_SCAN_END        = int(os.environ.get("NIGHTLY_SCAN_END",   4))
@@ -1997,6 +2009,13 @@ def process_arp_packet(packet) -> None:
         return
     if not packet.haslayer(ARP):
         return
+    # Ignore ARP packets that the probe itself sent (e.g. ARP restore packets
+    # sent after unblocking a device, which carry hwsrc=target_mac and would
+    # falsely mark that device as "seen this interval").
+    if packet.haslayer(Ether):
+        ether_src = (packet[Ether].src or "").lower().strip()
+        if _PROBE_OWN_MAC and ether_src == _PROBE_OWN_MAC:
+            return
     arp = packet[ARP]
     mac = (arp.hwsrc or "").lower().strip()
     ip  = (arp.psrc  or "").strip()

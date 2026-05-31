@@ -535,7 +535,10 @@ function MainApp({ onLogout }) {
       )}
 
       {activePage === 'people' && (
-        <PersonPresencePage devices={devices} />
+        <PersonPresencePage devices={devices} onDeviceClick={mac => {
+          const dev = devices.find(d => d.mac_address === mac)
+          if (dev) openDevice(dev)
+        }} />
       )}
 
       {activePage === 'presence' && (

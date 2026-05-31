@@ -84,9 +84,9 @@ function OnlineBadge({ online }) {
   )
 }
 
-function DeviceChip({ device, onRemove, isPrimary, onSetPrimary }) {
-  return (
-    <div className="flex items-center gap-1.5 px-2 py-1 rounded-lg border text-xs"
+function DeviceChip({ device, onRemove, isPrimary, onSetPrimary, onDeviceClick }) {
+  const inner = (
+    <div className={`flex items-center gap-1.5 px-2 py-1 rounded-lg border text-xs ${onDeviceClick ? 'cursor-pointer hover:opacity-80 transition-opacity' : ''}`}
       style={{
         borderColor: device.is_online ? 'rgba(74,200,100,0.3)' : 'var(--color-border)',
         background: device.is_online ? 'rgba(74,200,100,0.06)' : 'var(--color-surface-offset)',
@@ -98,20 +98,23 @@ function DeviceChip({ device, onRemove, isPrimary, onSetPrimary }) {
         <span className="text-[9px] font-bold text-brand uppercase tracking-wider ml-0.5">Primary</span>
       )}
       {onSetPrimary && !isPrimary && (
-        <button onClick={() => onSetPrimary(device.mac_address)}
+        <button onClick={e => { e.stopPropagation(); onSetPrimary(device.mac_address) }}
           title="Set as primary presence device"
           className="ml-0.5 opacity-50 hover:opacity-100 transition-opacity">
           <Star size={10} />
         </button>
       )}
       {onRemove && (
-        <button onClick={() => onRemove(device.mac_address)}
+        <button onClick={e => { e.stopPropagation(); onRemove(device.mac_address) }}
           className="ml-0.5 opacity-50 hover:opacity-100 transition-opacity">
           <X size={10} />
         </button>
       )}
     </div>
   )
+  return onDeviceClick
+    ? <button type="button" onClick={() => onDeviceClick(device.mac_address)} className="text-left">{inner}</button>
+    : inner
 }
 
 // ---------------------------------------------------------------------------
@@ -698,7 +701,7 @@ function BlockButton({ person, onUpdated }) {
   )
 }
 
-function PersonCard({ person, allDevices, onUpdated, onDeleted }) {
+function PersonCard({ person, allDevices, onUpdated, onDeleted, onDeviceClick }) {
   const [editing, setEditing] = useState(false)
 
   async function handleSave({ name, notes, photo, primary_mac, devices, existingPerson }) {
@@ -787,7 +790,8 @@ function PersonCard({ person, allDevices, onUpdated, onDeleted }) {
         {person.devices.length > 0 && (
           <div className="mt-3 flex flex-wrap gap-1.5">
             {person.devices.map(d => (
-              <DeviceChip key={d.mac_address} device={d} isPrimary={d.mac_address === person.primary_mac} />
+              <DeviceChip key={d.mac_address} device={d} isPrimary={d.mac_address === person.primary_mac}
+                onDeviceClick={onDeviceClick} />
             ))}
           </div>
         )}
@@ -814,7 +818,7 @@ function PersonCard({ person, allDevices, onUpdated, onDeleted }) {
 // Main page
 // ---------------------------------------------------------------------------
 
-export function PersonPresencePage({ devices }) {
+export function PersonPresencePage({ devices, onDeviceClick }) {
   const [persons,         setPersons]         = useState([])
   const [loading,         setLoading]         = useState(true)
   const [error,           setError]           = useState(null)
@@ -962,7 +966,8 @@ export function PersonPresencePage({ devices }) {
           {persons.map(person => (
             <PersonCard key={person.id} person={person} allDevices={allDevices}
               onUpdated={() => load()}
-              onDeleted={() => { load(); loadTimeline(days) }} />
+              onDeleted={() => { load(); loadTimeline(days) }}
+              onDeviceClick={onDeviceClick} />
           ))}
         </div>
       )}
