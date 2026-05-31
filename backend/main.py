@@ -2890,15 +2890,32 @@ def list_devices(
             ip_to_macs.setdefault(addr, set()).add(d.mac_address)
 
     mac_set = {d.mac_address for d in devices}
+    online_macs = {d.mac_address for d in devices if d.is_online}
+
+    # Map of CURRENT IPs (current/primary IP only, not full history) → MACs.
+    # Virtual interfaces (macvlan / container / VM) share the *current* IP with
+    # the physical NIC concurrently. We deliberately do NOT use full ip_history
+    # here: a phone using MAC randomisation has a locally-administered MAC, and
+    # if its old DHCP lease IP was later reassigned to another device, a history
+    # based match would wrongly flag the phone as a "virtual interface" and hide
+    # it from the device list.
+    current_ip_to_macs: dict[str, set] = {}
+    for d in devices:
+        for addr in filter(None, [d.ip_address, getattr(d, 'primary_ip', None)]):
+            current_ip_to_macs.setdefault(addr, set()).add(d.mac_address)
+
     virtual_of: dict[str, str] = {}
     for d in devices:
         if not _is_locally_admin_mac(d.mac_address):
             continue
-        my_ips = {ip for ip, macs in ip_to_macs.items() if d.mac_address in macs}
+        my_ips = {ip for ip, macs in current_ip_to_macs.items() if d.mac_address in macs}
         for ip in my_ips:
-            for other_mac in ip_to_macs.get(ip, set()):
+            for other_mac in current_ip_to_macs.get(ip, set()):
+                # A genuine virtual interface shares its CURRENT IP with a real
+                # (globally-administered) device that is also currently online.
                 if (other_mac != d.mac_address
                         and other_mac in mac_set
+                        and other_mac in online_macs
                         and not _is_locally_admin_mac(other_mac)):
                     virtual_of[d.mac_address] = other_mac
                     break
