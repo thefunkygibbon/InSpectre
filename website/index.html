@@ -1,0 +1,247 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>InSpectre — Know every device on your network</title>
+  <meta name="description" content="InSpectre is a self-hosted home network monitor and security scanner that automatically discovers, tracks, fingerprints, and scans every device on your LAN. No cloud, no subscriptions." />
+  <meta property="og:title" content="InSpectre — Know every device on your network" />
+  <meta property="og:description" content="Self-hosted network discovery, presence tracking, vulnerability scanning, device blocking and more. Runs entirely on your own hardware." />
+  <meta property="og:type" content="website" />
+  <meta property="og:url" content="https://www.inspectre.cc/" />
+  <link rel="icon" type="image/svg+xml" href="assets/logo.svg" />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="assets/style.css" />
+</head>
+<body>
+
+  <!-- NAV -->
+  <header class="nav">
+    <div class="container nav-inner">
+      <a href="index.html" class="brand-mark">
+        <img src="assets/logo.svg" alt="" class="logo" />
+        <span><span class="in">In</span><span class="spectre">Spectre</span></span>
+      </a>
+      <button class="nav-toggle" aria-label="Menu">
+        <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 6h18M3 12h18M3 18h18"/></svg>
+      </button>
+      <nav class="nav-links">
+        <a href="index.html" class="active">Home</a>
+        <a href="downloads.html">Downloads</a>
+        <a href="docs.html">Docs</a>
+        <a href="help.html">Help</a>
+        <a href="https://github.com/thefunkygibbon/InSpectre" class="gh" target="_blank" rel="noopener">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="M12 .3a12 12 0 0 0-3.8 23.4c.6.1.8-.3.8-.6v-2c-3.3.7-4-1.6-4-1.6-.6-1.4-1.4-1.8-1.4-1.8-1-.7.1-.7.1-.7 1.2 0 1.8 1.2 1.8 1.2 1 1.8 2.8 1.3 3.5 1 .1-.8.4-1.3.7-1.6-2.7-.3-5.5-1.3-5.5-6 0-1.2.5-2.3 1.3-3.1-.2-.4-.6-1.6 0-3.2 0 0 1-.3 3.3 1.2a11.5 11.5 0 0 1 6 0C17.3 4.7 18.3 5 18.3 5c.6 1.6.2 2.8 0 3.2.8.8 1.3 1.9 1.3 3.1 0 4.7-2.8 5.7-5.5 6 .4.4.8 1.1.8 2.2v3.3c0 .3.2.7.8.6A12 12 0 0 0 12 .3Z"/></svg>
+          GitHub
+        </a>
+      </nav>
+    </div>
+  </header>
+
+  <!-- HERO -->
+  <section class="hero">
+    <div class="container">
+      <span class="eyebrow"><span class="dot"></span> Self-hosted · No cloud · 100% yours</span>
+      <h1>Know every device on <span class="grad">your network</span>.</h1>
+      <p class="lead">InSpectre automatically discovers, tracks, fingerprints, and security-scans every device on your LAN — and lets you block, monitor, and get alerted on all of it. Runs entirely on your own hardware.</p>
+      <div class="hero-actions">
+        <a href="downloads.html" class="btn btn-primary btn-lg">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 3v12m0 0 4-4m-4 4-4-4M4 17v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-2"/></svg>
+          Get InSpectre
+        </a>
+        <a href="docs.html" class="btn btn-ghost btn-lg">Read the docs</a>
+      </div>
+      <p class="hero-note">Free &amp; open source (AGPL-3.0) · Deploy with one command</p>
+
+      <div class="shot" data-reveal>
+        <div class="shot-bar">
+          <span class="d"></span><span class="d"></span><span class="d"></span>
+          <span class="url">http://localhost:3000</span>
+        </div>
+        <div class="shot-placeholder">[ dashboard screenshot — drop your image at assets/screenshot.png ]</div>
+      </div>
+    </div>
+  </section>
+
+  <!-- STATS -->
+  <section style="padding-top:0;">
+    <div class="container">
+      <div class="stats">
+        <div class="stat"><div class="n">3</div><div class="l">lightweight containers</div></div>
+        <div class="stat"><div class="n">&lt;10s</div><div class="l">to detect a new device</div></div>
+        <div class="stat"><div class="n">25+</div><div class="l">built-in network tools</div></div>
+        <div class="stat"><div class="n">0</div><div class="l">data leaves your LAN</div></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- FEATURES -->
+  <section>
+    <div class="container">
+      <div class="section-head">
+        <h2>Everything, in one pane of glass</h2>
+        <p>From the moment a device joins your network to the moment you cut it off, InSpectre has it covered.</p>
+      </div>
+      <div class="grid grid-3">
+
+        <div class="card" data-reveal>
+          <div class="ic"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M12 2v4m0 12v4M2 12h4m12 0h4"/></svg></div>
+          <h3>Instant discovery</h3>
+          <p>Active ARP sweeps plus a passive packet sniffer surface new devices within seconds — no agents, no config.</p>
+        </div>
+
+        <div class="card" data-reveal>
+          <div class="ic"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 12l2 2 4-4m6 2a9 9 0 1 1-18 0 9 9 0 0 1 18 0Z"/></svg></div>
+          <h3>Vulnerability scanning</h3>
+          <p>Nuclei + nmap CVE scanning per device, with scheduled sweeps and a severity-grouped security dashboard.</p>
+        </div>
+
+        <div class="card" data-reveal>
+          <div class="ic"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18.36 6.64a9 9 0 1 1-12.73 0M12 2v10"/></svg></div>
+          <h3>One-click blocking</h3>
+          <p>Cut any device off the internet via ARP MITM. Pause the whole network, or schedule recurring blocks.</p>
+        </div>
+
+        <div class="card" data-reveal>
+          <div class="ic"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2M9 11a4 4 0 1 0 0-8 4 4 0 0 0 0 8Zm14 10v-2a4 4 0 0 0-3-3.87M16 3.13a4 4 0 0 1 0 7.75"/></svg></div>
+          <h3>Person presence</h3>
+          <p>Group a household member's devices under one person, see Home/Away at a glance, and block by person.</p>
+        </div>
+
+        <div class="card" data-reveal>
+          <div class="ic"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 12h-4l-3 9L9 3l-3 9H2"/></svg></div>
+          <h3>Traffic &amp; speed</h3>
+          <p>Per-device traffic analysis — domains, countries, unusual ports — plus scheduled Ookla speed tests.</p>
+        </div>
+
+        <div class="card" data-reveal>
+          <div class="ic"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 11a9 9 0 0 1 9 9M4 4a16 16 0 0 1 16 16M5 19a1 1 0 1 0 0 2 1 1 0 0 0 0-2Z"/></svg></div>
+          <h3>Live updates</h3>
+          <p>Server-Sent Events push changes to the UI the instant they happen — no jarring full-page refreshes.</p>
+        </div>
+
+        <div class="card" data-reveal>
+          <div class="ic"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="3" width="20" height="14" rx="2"/><path d="M8 21h8m-4-4v4"/></svg></div>
+          <h3>Container monitoring</h3>
+          <p>Watch Docker &amp; Proxmox hosts, stream logs, and Trivy-scan images for CVEs — all in the same UI.</p>
+        </div>
+
+        <div class="card" data-reveal>
+          <div class="ic"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2 2 7l10 5 10-5-10-5ZM2 17l10 5 10-5M2 12l10 5 10-5"/></svg></div>
+          <h3>Smart fingerprinting</h3>
+          <p>OUI, DHCP and port-pattern matching — with optional Fingerbank lookups — auto-classify every device.</p>
+        </div>
+
+        <div class="card" data-reveal>
+          <div class="ic"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9M13.7 21a2 2 0 0 1-3.4 0"/></svg></div>
+          <h3>Notifications, your way</h3>
+          <p>Channels &amp; Profiles route any event to ntfy, Gotify, Pushbullet, Slack, Telegram, Discord, HA &amp; more.</p>
+        </div>
+
+      </div>
+    </div>
+  </section>
+
+  <!-- SPLIT: Presence -->
+  <section style="padding-top:0;">
+    <div class="container">
+      <div class="split" data-reveal>
+        <div>
+          <span class="eyebrow"><span class="dot"></span> People, not just MACs</span>
+          <h3>See who's home at a glance</h3>
+          <p>Group the phone, laptop, watch and tablet a household member carries under a single named person with a photo. InSpectre turns "is any of their kit online?" into a clear Home/Away state.</p>
+          <ul class="tick-list">
+            <li><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3"><path d="M20 6 9 17l-5-5"/></svg> Colour-coded Home / Away cards with presence history</li>
+            <li><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3"><path d="M20 6 9 17l-5-5"/></svg> Nominate a primary device as the source of truth</li>
+            <li><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3"><path d="M20 6 9 17l-5-5"/></svg> Block all of a person's devices in one click</li>
+            <li><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3"><path d="M20 6 9 17l-5-5"/></svg> Recurring per-person block schedules</li>
+            <li><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3"><path d="M20 6 9 17l-5-5"/></svg> Arrived-home / left-home notifications</li>
+          </ul>
+        </div>
+        <div class="split-media">[ person presence screenshot ]</div>
+      </div>
+    </div>
+  </section>
+
+  <!-- SPLIT: Privacy -->
+  <section style="padding-top:0;">
+    <div class="container">
+      <div class="split rev" data-reveal>
+        <div class="split-media">[ security dashboard screenshot ]</div>
+        <div>
+          <span class="eyebrow"><span class="dot"></span> Your data stays yours</span>
+          <h3>100% self-hosted. No cloud. No accounts.</h3>
+          <p>InSpectre runs as three small containers on hardware you control. Nothing about your network — devices, traffic, vulnerabilities — ever leaves your LAN unless you explicitly enable an outbound integration.</p>
+          <ul class="tick-list">
+            <li><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3"><path d="M20 6 9 17l-5-5"/></svg> Built-in auth with JWT sessions &amp; "remember me"</li>
+            <li><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3"><path d="M20 6 9 17l-5-5"/></svg> Encrypted (AES-256-GCM) backups &amp; restore</li>
+            <li><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3"><path d="M20 6 9 17l-5-5"/></svg> Optional Home Assistant MQTT auto-discovery</li>
+            <li><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3"><path d="M20 6 9 17l-5-5"/></svg> Guided first-run setup wizard — no file editing</li>
+          </ul>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- CTA -->
+  <section>
+    <div class="container">
+      <div class="cta" data-reveal>
+        <h2>Spin it up in under a minute</h2>
+        <p>One command gets the whole stack running. Open your browser, finish the setup wizard, and watch your network appear.</p>
+        <div class="code" style="text-align:left;max-width:560px;margin:0 auto 28px;">
+          <div class="code-head"><span>bash</span><button data-copy>Copy</button></div>
+          <pre><code><span class="c"># clone &amp; launch</span>
+git clone https://github.com/thefunkygibbon/InSpectre.git
+cd InSpectre
+<span class="p">./inspectre.sh up</span></code></pre>
+        </div>
+        <div class="hero-actions">
+          <a href="downloads.html" class="btn btn-primary btn-lg">All download options</a>
+          <a href="docs.html" class="btn btn-ghost btn-lg">Installation guide</a>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- FOOTER -->
+  <footer class="footer">
+    <div class="container">
+      <div class="footer-grid">
+        <div class="footer-brand">
+          <a href="index.html" class="brand-mark"><img src="assets/logo.svg" alt="" class="logo" /><span><span class="in">In</span><span class="spectre">Spectre</span></span></a>
+          <p>The self-hosted network monitor and security scanner that keeps every byte on your own hardware.</p>
+        </div>
+        <div class="footer-cols">
+          <div class="footer-col">
+            <h5>Product</h5>
+            <a href="index.html">Features</a>
+            <a href="downloads.html">Downloads</a>
+            <a href="docs.html">Documentation</a>
+          </div>
+          <div class="footer-col">
+            <h5>Resources</h5>
+            <a href="https://github.com/thefunkygibbon/InSpectre" target="_blank" rel="noopener">GitHub</a>
+            <a href="https://github.com/thefunkygibbon/InSpectre/wiki" target="_blank" rel="noopener">Wiki</a>
+            <a href="help.html">Help &amp; Support</a>
+          </div>
+          <div class="footer-col">
+            <h5>Legal</h5>
+            <a href="https://github.com/thefunkygibbon/InSpectre/blob/main/LICENSE" target="_blank" rel="noopener">AGPL-3.0 Licence</a>
+            <a href="https://github.com/thefunkygibbon/InSpectre/blob/main/LICENSE-COMMERCIAL.md" target="_blank" rel="noopener">Commercial Licence</a>
+          </div>
+        </div>
+      </div>
+      <div class="footer-bottom">
+        <span>© <span id="yr"></span> InSpectre. Dual-licensed AGPL-3.0 / Commercial.</span>
+        <span>Made for people who like to know what's on their network.</span>
+      </div>
+    </div>
+  </footer>
+
+  <script>document.getElementById('yr').textContent = new Date().getFullYear();</script>
+  <script src="assets/main.js"></script>
+</body>
+</html>
