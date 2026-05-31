@@ -1301,6 +1301,16 @@ class PluginScheduler:
                 #   2. Device already has a hostname (from probe/ARP/DNS) → keep it
                 #   3. No hostname yet → accept plugin-provided name as fallback only
                 online_val = bool(dev.get("is_online")) if has_presence else False
+
+                # Read current presence state so we can detect offline→online transitions
+                # and write the corresponding event after the upsert.
+                prior = db.execute(
+                    text("SELECT is_online, suppress_presence_events FROM devices WHERE mac_address = :mac"),
+                    {"mac": mac_fmt},
+                ).fetchone()
+                was_online = prior[0] if prior is not None else None
+                suppress   = bool(prior[1]) if prior is not None else False
+
                 if has_presence:
                     db.execute(text("""
                         INSERT INTO devices (mac_address, ip_address, hostname, is_online, first_seen, last_seen)
@@ -1313,6 +1323,7 @@ class PluginScheduler:
                                             ELSE EXCLUDED.hostname
                                          END,
                             is_online  = EXCLUDED.is_online,
+                            miss_count = CASE WHEN EXCLUDED.is_online = TRUE THEN 0 ELSE devices.miss_count END,
                             last_seen  = NOW()
                     """), {
                         "mac":      mac_fmt,
@@ -1320,6 +1331,19 @@ class PluginScheduler:
                         "hostname": dev.get("hostname"),
                         "online":   online_val,
                     })
+
+                    # Write an "online" event when a device transitions offline → online,
+                    # unless the device has presence-event suppression enabled.
+                    if online_val and was_online is False and not suppress:
+                        db.execute(text(
+                            "INSERT INTO device_events (mac_address, type, detail, created_at) "
+                            "SELECT :mac, 'online', :detail::jsonb, NOW() "
+                            "WHERE EXISTS (SELECT 1 FROM devices WHERE mac_address = :mac)"
+                        ), {
+                            "mac":    mac_fmt,
+                            "detail": json.dumps({"source": plugin_id}),
+                        })
+                        print(f"[plugin-scheduler] {plugin_id}: online event written for {mac_fmt}", flush=True)
                 else:
                     db.execute(text("""
                         INSERT INTO devices (mac_address, ip_address, hostname, is_online, first_seen, last_seen)

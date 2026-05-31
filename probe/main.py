@@ -94,6 +94,18 @@ PROBE_API_PORT          = int(os.environ.get("PROBE_API_PORT",         8001))
 LAN_DNS_SERVER_ENV      = os.environ.get("LAN_DNS_SERVER", "").strip()
 MDNS_INTERVAL_MINUTES   = int(os.environ.get("MDNS_INTERVAL_MINUTES", 120))  # default: 2 hours
 
+# The probe's own interface MAC — ARP packets originating from this MAC are
+# our own (e.g. ARP restore packets sent after unblocking a device). The sniffer
+# must ignore them to prevent falsely marking target devices as "online".
+def _get_own_mac(iface: str) -> str | None:
+    try:
+        from scapy.all import get_if_hwaddr
+        return get_if_hwaddr(iface).lower()
+    except Exception:
+        return None
+
+_PROBE_OWN_MAC: str | None = _get_own_mac(INTERFACE)
+
 # Scan scheduling globals (overridden by DB settings at each cycle)
 NIGHTLY_SCAN_START      = int(os.environ.get("NIGHTLY_SCAN_START", 2))
 NIGHTLY_SCAN_END        = int(os.environ.get("NIGHTLY_SCAN_END",   4))
@@ -345,6 +357,7 @@ class Device(Base):
     miss_count   = Column(Integer, default=0)
     is_important = Column(Boolean, default=False, nullable=False)
     is_ignored   = Column(Boolean, default=False, nullable=False)
+    suppress_presence_events = Column(Boolean, default=False, nullable=False)
     device_type_override    = Column(String,  nullable=True)
     hostname_last_attempted = Column(DateTime(timezone=True), nullable=True)
     deep_scan_last_run      = Column(DateTime(timezone=True), nullable=True)
@@ -377,6 +390,13 @@ _upsert_locks_lock = threading.Lock()
 # window, so we don't falsely increment miss counts for devices the sniffer saw.
 _sniffer_seen_this_interval: set[str] = set()
 _sniffer_seen_lock = threading.Lock()
+
+# Track MACs for which an "offline" event has already been written and which
+# have not come back online since. Used to suppress duplicate offline events for
+# devices that are continuously offline (e.g. plugin-controlled standby devices).
+# Intentionally in-memory only — resets on probe restart.
+_confirmed_offline_macs: set[str] = set()
+_confirmed_offline_lock = threading.Lock()
 
 def _get_mac_lock(mac: str) -> threading.Lock:
     with _upsert_locks_lock:
@@ -423,6 +443,8 @@ def init_db() -> None:
             conn.execute(text("ALTER TABLE devices ADD COLUMN IF NOT EXISTS baseline_ports JSONB"))
             conn.execute(text("ALTER TABLE devices ADD COLUMN IF NOT EXISTS baseline_scan_count INTEGER NOT NULL DEFAULT 0"))
             conn.execute(text("ALTER TABLE devices ADD COLUMN IF NOT EXISTS primary_ip_locked BOOLEAN NOT NULL DEFAULT FALSE"))
+            conn.execute(text("ALTER TABLE devices ADD COLUMN IF NOT EXISTS suppress_presence_events BOOLEAN NOT NULL DEFAULT FALSE"))
+            conn.execute(text("ALTER TABLE devices ADD COLUMN IF NOT EXISTS group_manual BOOLEAN NOT NULL DEFAULT FALSE"))
             conn.commit()
         except Exception as e:
             print(f"[DB] Column migration note: {e}", flush=True)
@@ -1571,26 +1593,35 @@ def _is_generic_hostname(hostname: str) -> bool:
 
 def _try_auto_group_by_hostname(mac: str, hostname: str) -> bool:
     """
-    Look for an offline device with the same base hostname (first DNS label).
+    Look for an offline device with the same base DNS hostname (first DNS label).
     Handles andrewlaptop == andrewlaptop.lan == andrewlaptop.local etc.
-    If AUTO_GROUP_BY_HOSTNAME is enabled, assign both to a shared group_id
-    and return True (caller emits 'interface_joined' instead of 'joined').
-    If AUTO_GROUP_BY_HOSTNAME is False a 'group_suggestion' event is written
-    and False is returned.
+
+    Grouping is intentionally based on the *resolved DNS hostname* only — NOT the
+    DHCP hostname.  Many unrelated devices (especially from the same vendor) send
+    identical or generic DHCP hostnames, which previously caused completely
+    different devices (different MAC, IP and DNS name) to be merged.  A genuine
+    multi-interface device (e.g. a laptop's wired + wireless NICs) registers the
+    same DNS hostname for every interface, so DNS-hostname matching is reliable.
+
+    If AUTO_GROUP_BY_HOSTNAME is enabled, assign both to a shared group_id and
+    return True (caller emits 'interface_joined' instead of 'joined').  If it is
+    disabled a 'group_suggestion' event is written and False is returned.
     """
     base = _hostname_base(hostname)
-    if not base or _is_generic_hostname(hostname):
+    # Require a real, non-generic DNS hostname to group on.
+    if not hostname or not base or _is_generic_hostname(hostname):
         return False
     import uuid as _uuid
     sess = Session()
     try:
+        # Only match on the DNS hostname column, and only against devices that
+        # also have a real DNS hostname (so a differing/absent DNS name on the
+        # peer can never trigger a merge via DHCP-hostname coincidence).
         row = sess.execute(
             text("""
-                SELECT mac_address, group_id FROM devices
-                WHERE (
-                    LOWER(SPLIT_PART(COALESCE(hostname, ''), '.', 1))      = :base
-                    OR LOWER(SPLIT_PART(COALESCE(dhcp_hostname, ''), '.', 1)) = :base
-                )
+                SELECT mac_address, group_id, group_manual FROM devices
+                WHERE hostname IS NOT NULL AND hostname != ''
+                  AND LOWER(SPLIT_PART(hostname, '.', 1)) = :base
                   AND mac_address != :mac
                   AND is_online = false
                 LIMIT 1
@@ -1599,7 +1630,17 @@ def _try_auto_group_by_hostname(mac: str, hostname: str) -> bool:
         ).fetchone()
         if not row:
             return False
-        peer_mac, peer_gid = row[0], row[1]
+        peer_mac, peer_gid, peer_manual = row[0], row[1], row[2]
+
+        # Don't auto-merge into (or disturb) a user-curated manual group.
+        if peer_manual:
+            return False
+        cur_manual = sess.execute(
+            text("SELECT group_manual FROM devices WHERE mac_address = :m"),
+            {"m": mac},
+        ).scalar()
+        if cur_manual:
+            return False
 
         if not AUTO_GROUP_BY_HOSTNAME:
             _write_event(mac, "group_suggestion", {
@@ -1622,7 +1663,7 @@ def _try_auto_group_by_hostname(mac: str, hostname: str) -> bool:
             {"gid": new_gid, "m": mac},
         )
         sess.commit()
-        print(f"[+] Auto-grouped {mac} with {peer_mac} (base hostname='{base}')", flush=True)
+        print(f"[+] Auto-grouped {mac} with {peer_mac} (base DNS hostname='{base}')", flush=True)
         return True
     except Exception as exc:
         sess.rollback()
@@ -1811,7 +1852,13 @@ def upsert_seen_device(mac: str, ip: str, source: str) -> None:
             else:
                 if not was_online:
                     print(f"[~] Back online via {source}: {ip} ({mac})", flush=True)
-                    _write_event(mac, "online", {"ip": ip})
+                    # A device coming back online clears its "confirmed offline" state
+                    # so a future genuine offline transition will be recorded.
+                    with _confirmed_offline_lock:
+                        _confirmed_offline_macs.discard(mac)
+                    # Suppressed devices: keep status accurate but don't log the event.
+                    if not getattr(existing, "suppress_presence_events", False):
+                        _write_event(mac, "online", {"ip": ip, "source": source})
                 if ip_changed:
                     primary = existing.primary_ip or old_ip
                     if ip == primary or not was_online:
@@ -1982,6 +2029,13 @@ def process_arp_packet(packet) -> None:
         return
     if not packet.haslayer(ARP):
         return
+    # Ignore ARP packets that the probe itself sent (e.g. ARP restore packets
+    # sent after unblocking a device, which carry hwsrc=target_mac and would
+    # falsely mark that device as "seen this interval").
+    if packet.haslayer(Ether):
+        ether_src = (packet[Ether].src or "").lower().strip()
+        if _PROBE_OWN_MAC and ether_src == _PROBE_OWN_MAC:
+            return
     arp = packet[ARP]
     mac = (arp.hwsrc or "").lower().strip()
     ip  = (arp.psrc  or "").strip()
@@ -2155,6 +2209,13 @@ def _dispatch_packet(packet) -> None:
 
 
 def start_arp_sniffer() -> None:
+    # Refresh own-MAC now that INTERFACE is finalised (settings loaded). Used to
+    # ignore the probe's own ARP packets (e.g. unblock ARP-restore packets).
+    global _PROBE_OWN_MAC
+    own = _get_own_mac(INTERFACE)
+    if own:
+        _PROBE_OWN_MAC = own
+        print(f"[*] Probe interface MAC: {_PROBE_OWN_MAC} (own ARP packets ignored)", flush=True)
     for i in range(SNIFFER_WORKERS):
         threading.Thread(target=_sniffer_worker, name=f"sniffer-worker-{i}", daemon=True).start()
     # One DHCP worker is plenty — DHCP traffic is very infrequent
@@ -2186,6 +2247,8 @@ def update_presence_from_sweep(session, active_macs: set) -> None:
             dev.miss_count = 0
             continue
 
+        suppressed = getattr(dev, "suppress_presence_events", False)
+
         dev.miss_count = (dev.miss_count or 0) + 1
 
         if not dev.is_online:
@@ -2207,7 +2270,25 @@ def update_presence_from_sweep(session, active_macs: set) -> None:
             f"after {dev.miss_count} missed sweeps + ping confirm",
             flush=True,
         )
-        _write_event(dev.mac_address, "offline", {"ip": confirm_ip or dev.ip_address})
+
+        # Suppressed devices: is_online is updated above for accurate status display
+        # but no event is written and the confirmed-offline set is not touched.
+        if suppressed:
+            continue
+
+        # Only write an offline event if the device has come online since the
+        # last offline event was written. This suppresses repeated offline
+        # events for devices that are continuously offline (e.g. a plugin keeps
+        # resetting is_online=True between sweeps).
+        with _confirmed_offline_lock:
+            already_offline = dev.mac_address in _confirmed_offline_macs
+            _confirmed_offline_macs.add(dev.mac_address)
+        if not already_offline:
+            _write_event(dev.mac_address, "offline", {
+                "ip": confirm_ip or dev.ip_address,
+                "source": "sweep",
+                "confirmation": "icmp" if confirm_ip else None,
+            })
 
 # ---------------------------------------------------------------------------
 # ARP blocking (internet cut-off via ARP spoofing)
@@ -3380,9 +3461,13 @@ def _startup_nerva_backfill() -> None:
 # ---------------------------------------------------------------------------
 def _backfill_hostname_groups() -> None:
     """
-    Group already-stored devices that share a base hostname but have no group yet.
-    Runs once at startup so existing devices are covered without needing rediscovery.
-    Skips generic hostnames and devices that are already correctly grouped.
+    Group already-stored devices that share a base DNS hostname but have no group
+    yet.  Runs once at startup so existing devices are covered without needing
+    rediscovery.
+
+    Like _try_auto_group_by_hostname, this matches on the resolved DNS hostname
+    ONLY (never the DHCP hostname) to avoid merging unrelated devices that happen
+    to send the same/generic DHCP hostname.
     """
     if not AUTO_GROUP_BY_HOSTNAME:
         return
@@ -3390,17 +3475,19 @@ def _backfill_hostname_groups() -> None:
     sess = Session()
     try:
         rows = sess.execute(text("""
-            SELECT mac_address, hostname, dhcp_hostname, group_id, group_primary, is_online, last_seen
+            SELECT mac_address, hostname, dhcp_hostname, group_id, group_primary, is_online, last_seen, group_manual
             FROM devices
-            WHERE (hostname      IS NOT NULL AND hostname      != '')
-               OR (dhcp_hostname IS NOT NULL AND dhcp_hostname != '')
+            WHERE hostname IS NOT NULL AND hostname != ''
         """)).fetchall()
 
         # base_hostname -> list of device dicts
         base_map: dict[str, list] = {}
         for row in rows:
-            mac, hn, dhcp_hn, gid, gprimary, online, last_seen = row
-            base = _hostname_base(hn or dhcp_hn or '')
+            mac, hn, dhcp_hn, gid, gprimary, online, last_seen, gmanual = row
+            # Leave user-curated (manual) groups untouched.
+            if gmanual:
+                continue
+            base = _hostname_base(hn or '')
             if not base or _is_generic_hostname(base):
                 continue
             base_map.setdefault(base, []).append({
@@ -3453,6 +3540,82 @@ def _backfill_hostname_groups() -> None:
         sess.close()
 
 
+def _cleanup_bad_hostname_groups() -> None:
+    """
+    One-shot repair for groups created by the previous (over-eager) grouping
+    logic, which merged devices on DHCP-hostname coincidence.
+
+    A legitimate multi-interface group shares a single resolved DNS hostname.
+    Any existing group whose members have *conflicting* DNS hostnames (≥2 distinct
+    base DNS names), or no resolved DNS hostname at all, was almost certainly a
+    bad DHCP-hostname merge — so we split it: members are regrouped by their DNS
+    hostname base, and members with a unique/empty DNS name are ungrouped.
+    """
+    import uuid as _uuid
+    sess = Session()
+    try:
+        rows = sess.execute(text("""
+            SELECT mac_address, hostname, group_id, group_manual
+            FROM devices
+            WHERE group_id IS NOT NULL
+        """)).fetchall()
+
+        groups: dict[str, list] = {}
+        group_is_manual: dict[str, bool] = {}
+        for mac, hn, gid, gmanual in rows:
+            key = str(gid)
+            groups.setdefault(key, []).append({"mac": mac, "hostname": hn})
+            if gmanual:
+                group_is_manual[key] = True
+
+        repaired = 0
+        for gid, members in groups.items():
+            if len(members) < 2:
+                continue
+            # Never touch user-curated (manual) groups — they may legitimately
+            # span different DNS hostnames.
+            if group_is_manual.get(gid):
+                continue
+            # Distinct, non-generic DNS hostname bases present in this group
+            bases = {}
+            for m in members:
+                base = _hostname_base(m["hostname"] or "")
+                if base and not _is_generic_hostname(base):
+                    bases.setdefault(base, []).append(m["mac"])
+
+            # A clean group has exactly one DNS base shared by its members.
+            if len(bases) == 1:
+                continue
+
+            # Bad merge: dissolve and rebuild strictly by DNS base.
+            for m in members:
+                sess.execute(text(
+                    "UPDATE devices SET group_id = NULL, group_primary = false WHERE mac_address = :mac"
+                ), {"mac": m["mac"]})
+                repaired += 1
+
+            # Re-form a group only where ≥2 devices genuinely share a DNS base.
+            for base, macs in bases.items():
+                if len(macs) < 2:
+                    continue
+                new_gid = str(_uuid.uuid4())
+                for i, mac in enumerate(macs):
+                    sess.execute(text(
+                        "UPDATE devices SET group_id = :gid, group_primary = :pri WHERE mac_address = :mac"
+                    ), {"gid": new_gid, "pri": i == 0, "mac": mac})
+
+        if repaired:
+            sess.commit()
+            print(f"[grouping] Cleanup: dissolved/repaired {repaired} mis-grouped device(s)", flush=True)
+        else:
+            print("[grouping] Cleanup: no bad hostname groups found", flush=True)
+    except Exception as exc:
+        sess.rollback()
+        print(f"[grouping] Cleanup error: {exc}", flush=True)
+    finally:
+        sess.close()
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -3480,7 +3643,10 @@ def main() -> None:
     _load_settings_from_db()
     threading.Thread(target=refresh_missing_vendors,   daemon=True, name="vendor-refresh").start()
     threading.Thread(target=_startup_nerva_backfill,   daemon=True, name="nerva-backfill").start()
-    threading.Thread(target=_backfill_hostname_groups, daemon=True, name="group-backfill").start()
+    def _group_maintenance():
+        _cleanup_bad_hostname_groups()
+        _backfill_hostname_groups()
+    threading.Thread(target=_group_maintenance, daemon=True, name="group-backfill").start()
     print(
         f"[*] Scanning {IP_RANGE} on {INTERFACE} every {SCAN_INTERVAL}s\n"
         f"[*] Offline threshold: {OFFLINE_MISS_THRESHOLD} missed sweeps | OS confidence: {OS_CONFIDENCE_THRESHOLD}%",

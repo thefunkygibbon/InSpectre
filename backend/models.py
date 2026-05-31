@@ -37,6 +37,8 @@ class Device(Base):
     # Phase 5: zones and suppression
     zone                 = Column(String, nullable=True)
     is_ignored           = Column(Boolean, server_default='false', nullable=False)
+    suppress_presence_events = Column(Boolean, server_default='false', nullable=False)
+    person_id            = Column(String, nullable=True)
 
     # Tracks when is_online last changed (online↔offline transitions)
     status_changed_at        = Column(DateTime(timezone=True), nullable=True)
@@ -64,6 +66,9 @@ class Device(Base):
     # Phase 9 — device grouping (migration adds columns; model exposes them to ORM)
     group_id      = Column(String, nullable=True)
     group_primary = Column(Boolean, server_default='false', nullable=False)
+    # True when the group was created/edited by the user (manual grouping).
+    # Auto-grouping by hostname leaves this False; cleanup never touches manual groups.
+    group_manual  = Column(Boolean, server_default='false', nullable=False)
 
     # Phase 10 — device acknowledgement
     is_acknowledged = Column(Boolean, server_default='false', nullable=False)

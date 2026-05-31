@@ -1,9 +1,10 @@
 import { useState, useEffect, useCallback, useMemo } from 'react'
 import {
   ShieldOff, ShieldCheck, Plus, Trash2, ToggleLeft, ToggleRight,
-  Loader, AlertTriangle, Clock, Wifi, WifiOff, Calendar, Pencil, Tag,
+  Loader, AlertTriangle, Clock, Wifi, WifiOff, Calendar, Pencil, Tag, User, Settings2,
 } from 'lucide-react'
 import { api } from '../api'
+import { subscribeLive } from '../lib/liveEvents'
 
 const DAYS = [
   { key: 'mon', label: 'Mon' },
@@ -84,14 +85,21 @@ function DeviceChecklist({ devices, selected, onChange }) {
   )
 }
 
-function ScheduleForm({ devices, allTags, initial, onSave, onCancel, saveLabel = 'Save schedule' }) {
+function ScheduleForm({ devices, allTags, persons = [], initial, onSave, onCancel, saveLabel = 'Save schedule' }) {
   const [targetMode, setTargetMode] = useState(
     initial?.mac_addresses?.length ? 'devices'
     : initial?.tags ? 'tags'
+    : (initial?.person_ids?.length || initial?.person_id) ? 'person'
     : 'whole'
   )
-  const [selectedMacs, setSelectedMacs] = useState(initial?.mac_addresses || [])
-  const [tagInput,     setTagInput]     = useState(initial?.tags || '')
+  const [selectedMacs,      setSelectedMacs]      = useState(initial?.mac_addresses || [])
+  const [tagInput,          setTagInput]          = useState(initial?.tags || '')
+  // Multi-person: combine person_ids array + legacy person_id
+  const initPersonIds = Array.from(new Set([
+    ...(initial?.person_ids || []),
+    ...(initial?.person_id ? [initial.person_id] : []),
+  ]))
+  const [selectedPersonIds, setSelectedPersonIds] = useState(initPersonIds)
   const [label,        setLabel]        = useState(initial?.label || '')
   const [days,         setDays]         = useState(initial?.days_of_week || 'mon,tue,wed,thu,fri,sat,sun')
   const [start,        setStart]        = useState(initial?.start_time || '22:00')
@@ -105,12 +113,17 @@ function ScheduleForm({ devices, allTags, initial, onSave, onCancel, saveLabel =
     if (targetMode === 'devices' && !selectedMacs.length) {
       setError('Select at least one device'); return
     }
+    if (targetMode === 'person' && !selectedPersonIds.length) {
+      setError('Select at least one person'); return
+    }
     setSaving(true)
     setError(null)
     try {
       await onSave({
         mac_addresses: targetMode === 'devices' ? selectedMacs : [],
         tags:          targetMode === 'tags'    ? tagInput.trim() : '',
+        person_id:     targetMode === 'person'  ? (selectedPersonIds[0] || null) : null,
+        person_ids:    targetMode === 'person'  ? selectedPersonIds : [],
         label:         label || null,
         days_of_week:  days,
         start_time:    start,
@@ -134,6 +147,7 @@ function ScheduleForm({ devices, allTags, initial, onSave, onCancel, saveLabel =
               { key: 'whole',   label: 'Whole network' },
               { key: 'devices', label: 'Devices' },
               { key: 'tags',    label: 'By tags' },
+              { key: 'person',  label: 'Person' },
             ].map(opt => (
               <button key={opt.key} type="button"
                 onClick={() => setTargetMode(opt.key)}
@@ -185,6 +199,52 @@ function ScheduleForm({ devices, allTags, initial, onSave, onCancel, saveLabel =
         </div>
       )}
 
+      {targetMode === 'person' && (
+        <div>
+          <label className="block text-xs mb-1.5" style={{ color: 'var(--color-text-muted)' }}>
+            People ({selectedPersonIds.length} selected)
+          </label>
+          {persons.length === 0 ? (
+            <p className="text-xs italic" style={{ color: 'var(--color-text-faint)' }}>
+              No people configured yet. Add people in the Person Presence page first.
+            </p>
+          ) : (
+            <div className="space-y-1 max-h-40 overflow-y-auto pr-1">
+              {persons.map(p => {
+                const checked = selectedPersonIds.includes(p.id)
+                return (
+                  <label key={p.id}
+                    className="flex items-center gap-2.5 px-2.5 py-2 rounded-lg cursor-pointer transition-colors select-none"
+                    style={{
+                      background: checked ? 'color-mix(in srgb, var(--color-brand) 10%, transparent)' : 'var(--color-surface)',
+                      border: `1px solid ${checked ? 'color-mix(in srgb, var(--color-brand) 30%, transparent)' : 'var(--color-border)'}`,
+                    }}>
+                    <input type="checkbox" className="sr-only" checked={checked}
+                      onChange={() => setSelectedPersonIds(prev =>
+                        checked ? prev.filter(id => id !== p.id) : [...prev, p.id]
+                      )} />
+                    <div className={`w-3.5 h-3.5 rounded border flex items-center justify-center flex-shrink-0 transition-colors ${
+                      checked ? 'border-brand bg-brand' : 'border-border bg-surface'
+                    }`} style={checked ? { background: 'var(--color-brand)', borderColor: 'var(--color-brand)' } : {}}>
+                      {checked && <svg viewBox="0 0 8 6" width="8" height="6" fill="none" stroke="black" strokeWidth="1.5"><polyline points="1,3 3,5 7,1"/></svg>}
+                    </div>
+                    <span className="text-xs font-medium" style={{ color: checked ? 'var(--color-brand)' : 'var(--color-text)' }}>
+                      {p.name}
+                    </span>
+                    <span className={`ml-auto text-[10px] ${p.is_home ? 'text-green-400' : ''}`} style={{ color: p.is_home ? undefined : 'var(--color-text-faint)' }}>
+                      {p.is_home ? 'At home' : 'Away'}
+                    </span>
+                  </label>
+                )
+              })}
+            </div>
+          )}
+          <p className="text-[10px] mt-1.5" style={{ color: 'var(--color-text-faint)' }}>
+            All devices assigned to selected {selectedPersonIds.length === 1 ? 'person' : 'people'} will be blocked during the schedule.
+          </p>
+        </div>
+      )}
+
       <div>
         <label className="block text-xs mb-2" style={{ color: 'var(--color-text-muted)' }}>Days</label>
         <DaysSelector value={days} onChange={setDays} />
@@ -224,11 +284,25 @@ function ScheduleForm({ devices, allTags, initial, onSave, onCancel, saveLabel =
   )
 }
 
-function ScheduleRow({ schedule, devices, allTags, onToggle, onDelete, onSave }) {
+function ScheduleRow({ schedule, devices, allTags, persons = [], onToggle, onDelete, onSave }) {
   const [deleting, setDeleting] = useState(false)
   const [editing,  setEditing]  = useState(false)
 
   const targetLabel = useMemo(() => {
+    // Effective person IDs (person_ids array union with legacy person_id)
+    const effectivePids = Array.from(new Set([
+      ...(schedule.person_ids || []),
+      ...(schedule.person_id ? [schedule.person_id] : []),
+    ]))
+    if (effectivePids.length > 0) {
+      const names = effectivePids.map(pid => {
+        const p = persons.find(x => x.id === pid)
+        return p ? p.name : pid.slice(0, 8) + '…'
+      })
+      if (names.length === 1) return names[0]
+      if (names.length <= 3) return names.join(', ')
+      return `${names.slice(0, 2).join(', ')} +${names.length - 2} more`
+    }
     if (schedule.mac_addresses?.length) {
       const names = schedule.mac_addresses.map(mac => {
         const d = devices.find(x => x.mac_address === mac)
@@ -243,7 +317,7 @@ function ScheduleRow({ schedule, devices, allTags, onToggle, onDelete, onSave })
       return devices.find(d => d.mac_address === schedule.mac_address)?.display_name || schedule.mac_address
     }
     return 'Whole network'
-  }, [schedule, devices])
+  }, [schedule, devices, persons])
 
   async function handleDelete() {
     if (!confirm('Delete this schedule?')) return
@@ -265,6 +339,7 @@ function ScheduleRow({ schedule, devices, allTags, onToggle, onDelete, onSave })
         <ScheduleForm
           devices={devices}
           allTags={allTags}
+          persons={persons}
           initial={schedule}
           onSave={handleSave}
           onCancel={() => setEditing(false)}
@@ -292,7 +367,14 @@ function ScheduleRow({ schedule, devices, allTags, onToggle, onDelete, onSave })
               {schedule.label}
             </span>
           )}
-          {schedule.tags ? (
+          {(schedule.person_id || schedule.person_ids?.length) ? (
+            <span className="flex items-center gap-1">
+              <User size={10} style={{ color: 'var(--color-brand)' }} />
+              <span className="text-xs font-mono" style={{ color: schedule.label ? 'var(--color-text-faint)' : (schedule.enabled ? 'var(--color-text)' : 'var(--color-text-faint)') }}>
+                {targetLabel}
+              </span>
+            </span>
+          ) : schedule.tags ? (
             <span className="flex items-center gap-1">
               <Tag size={10} style={{ color: 'var(--color-brand)' }} />
               {schedule.tags.split(',').map(t => t.trim()).filter(Boolean).map(t => (
@@ -338,14 +420,16 @@ function ScheduleRow({ schedule, devices, allTags, onToggle, onDelete, onSave })
 }
 
 export function DeviceBlocking({ devices, onDeviceClick }) {
-  const [networkStatus, setNetworkStatus] = useState(null)
-  const [schedules,     setSchedules]     = useState([])
-  const [loading,       setLoading]       = useState(true)
-  const [pausing,       setPausing]       = useState(false)
-  const [showAddForm,   setShowAddForm]   = useState(false)
-  const [error,         setError]         = useState(null)
-  const [autoBlockNew,  setAutoBlockNew]  = useState(false)
-  const [autoBlockSev,  setAutoBlockSev]  = useState('none')
+  const [networkStatus,   setNetworkStatus]   = useState(null)
+  const [schedules,       setSchedules]       = useState([])
+  const [persons,         setPersons]         = useState([])
+  const [loading,         setLoading]         = useState(true)
+  const [pausing,         setPausing]         = useState(false)
+  const [showAddForm,     setShowAddForm]     = useState(false)
+  const [showAutoRules,   setShowAutoRules]   = useState(false)
+  const [error,           setError]           = useState(null)
+  const [autoBlockNew,    setAutoBlockNew]    = useState(false)
+  const [autoBlockSev,    setAutoBlockSev]    = useState('none')
 
   const blockedDevices = devices.filter(d => d.is_blocked)
 
@@ -360,13 +444,15 @@ export function DeviceBlocking({ devices, onDeviceClick }) {
   const load = useCallback(async () => {
     setLoading(true)
     try {
-      const [status, scheds, settings] = await Promise.all([
+      const [status, scheds, settings, ppl] = await Promise.all([
         api.getNetworkStatus(),
         api.getBlockSchedules(),
         api.getSettings(),
+        api.getPersons().catch(() => []),
       ])
       setNetworkStatus(status)
       setSchedules(scheds)
+      setPersons(ppl)
       const autoNew = settings.find(s => s.key === 'auto_block_new_devices')
       const autoSev = settings.find(s => s.key === 'auto_block_vuln_severity')
       if (autoNew) setAutoBlockNew(autoNew.value === 'true')
@@ -379,6 +465,25 @@ export function DeviceBlocking({ devices, onDeviceClick }) {
   }, [])
 
   useEffect(() => { load() }, [load])
+
+  // Live refresh: react to schedule/block changes immediately; skip while an
+  // input is focused; slow fallback poll as a safety net.
+  useEffect(() => {
+    function doRefresh() {
+      const el = document.activeElement
+      const busy = el && (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA' || el.tagName === 'SELECT')
+      if (!busy) load()
+    }
+    function onVisible() { if (document.visibilityState === 'visible') doRefresh() }
+    document.addEventListener('visibilitychange', onVisible)
+    const unsub = subscribeLive(['devices', 'schedules'], doRefresh)
+    const id = setInterval(doRefresh, 60000)
+    return () => {
+      clearInterval(id)
+      document.removeEventListener('visibilitychange', onVisible)
+      unsub()
+    }
+  }, [load])
 
   async function handleNetworkToggle() {
     if (!networkStatus) return
@@ -449,6 +554,23 @@ export function DeviceBlocking({ devices, onDeviceClick }) {
   return (
     <div className="max-w-3xl mx-auto">
 
+      {/* Page header with settings gear */}
+      <div className="flex items-center justify-between mb-5">
+        <div>
+          <h2 className="text-lg font-bold" style={{ color: 'var(--color-text)' }}>Internet Blocking</h2>
+          <p className="text-xs mt-0.5" style={{ color: 'var(--color-text-muted)' }}>
+            Block devices, schedule access windows, and control network-wide internet access.
+          </p>
+        </div>
+        <button
+          onClick={() => setShowAutoRules(v => !v)}
+          className="btn-ghost p-2 transition-colors rounded-lg"
+          title="Automatic blocking options"
+          style={showAutoRules ? { color: 'var(--color-brand)' } : { color: 'var(--color-text-muted)' }}>
+          <Settings2 size={17} />
+        </button>
+      </div>
+
       {error && (
         <div className="mb-5 flex items-center gap-3 px-4 py-3 rounded-xl text-sm"
           style={{ background: 'rgba(239,68,68,0.1)', border: '1px solid rgba(239,68,68,0.2)', color: '#ef4444' }}>
@@ -458,51 +580,67 @@ export function DeviceBlocking({ devices, onDeviceClick }) {
         </div>
       )}
 
-      {/* Auto-block rules */}
-      <PageSection title="Automatic Blocking Rules">
-        <div className="space-y-4">
-          <div className="flex items-start gap-3">
-            <button onClick={async () => {
-              const next = !autoBlockNew
-              setAutoBlockNew(next)
-              await api.updateSetting('auto_block_new_devices', next ? 'true' : 'false').catch(() => {})
-            }}
-              className="shrink-0 mt-0.5 transition-colors"
-              title={autoBlockNew ? 'Disable auto-block for new devices' : 'Enable auto-block for new devices'}>
-              {autoBlockNew
-                ? <ToggleRight size={20} style={{ color: 'var(--color-brand)' }} />
-                : <ToggleLeft  size={20} style={{ color: 'var(--color-text-faint)' }} />}
+      {/* Collapsible auto-block rules */}
+      {showAutoRules && (
+        <div className="rounded-xl border overflow-hidden mb-6"
+          style={{ borderColor: 'var(--color-border)', background: 'var(--color-surface)' }}>
+          <div className="px-5 py-3 border-b flex items-center justify-between"
+            style={{ borderColor: 'var(--color-border)', background: 'var(--color-surface-offset)' }}>
+            <span className="flex items-center gap-2 text-xs font-semibold uppercase tracking-wider"
+              style={{ color: 'var(--color-text-muted)' }}>
+              <Settings2 size={12} /> Automatic Blocking Rules
+            </span>
+            <button onClick={() => setShowAutoRules(false)} className="p-1 rounded hover:opacity-70 transition-opacity"
+              style={{ color: 'var(--color-text-faint)' }}>
+              <svg viewBox="0 0 14 14" width="14" height="14" fill="none" stroke="currentColor" strokeWidth="2">
+                <line x1="1" y1="1" x2="13" y2="13"/><line x1="13" y1="1" x2="1" y2="13"/>
+              </svg>
             </button>
-            <div>
-              <p className="text-sm font-medium" style={{ color: 'var(--color-text)' }}>Block new devices on discovery</p>
-              <p className="text-xs mt-0.5" style={{ color: 'var(--color-text-muted)' }}>
-                Automatically block any device the moment it is first discovered. Useful for a whitelist-style approach — manually unblock trusted devices.
-              </p>
-            </div>
           </div>
+          <div className="p-5 space-y-5">
+            <div className="flex items-start gap-3">
+              <button onClick={async () => {
+                const next = !autoBlockNew
+                setAutoBlockNew(next)
+                await api.updateSetting('auto_block_new_devices', next ? 'true' : 'false').catch(() => {})
+              }}
+                className="shrink-0 mt-0.5 transition-colors"
+                title={autoBlockNew ? 'Disable auto-block for new devices' : 'Enable auto-block for new devices'}>
+                {autoBlockNew
+                  ? <ToggleRight size={20} style={{ color: 'var(--color-brand)' }} />
+                  : <ToggleLeft  size={20} style={{ color: 'var(--color-text-faint)' }} />}
+              </button>
+              <div>
+                <p className="text-sm font-medium" style={{ color: 'var(--color-text)' }}>Block new devices on discovery</p>
+                <p className="text-xs mt-0.5" style={{ color: 'var(--color-text-muted)' }}>
+                  Automatically block any device the moment it is first discovered. Useful for a whitelist-style approach — manually unblock trusted devices.
+                </p>
+              </div>
+            </div>
 
-          <div className="flex items-start gap-3">
-            <div className="flex-1">
-              <p className="text-sm font-medium mb-1" style={{ color: 'var(--color-text)' }}>Auto-block on vulnerability severity</p>
-              <p className="text-xs mb-2" style={{ color: 'var(--color-text-muted)' }}>
-                Block a device automatically when a vuln scan finds issues at or above the selected severity.
-              </p>
-              <select className="input text-xs w-48"
-                value={autoBlockSev}
-                onChange={async e => {
-                  const v = e.target.value
-                  setAutoBlockSev(v)
-                  await api.updateSetting('auto_block_vuln_severity', v).catch(() => {})
-                }}>
-                <option value="none">Disabled</option>
-                <option value="medium">Medium and above</option>
-                <option value="high">High and above</option>
-                <option value="critical">Critical only</option>
-              </select>
+            <div className="flex items-start gap-3">
+              <div className="flex-1">
+                <p className="text-sm font-medium mb-1" style={{ color: 'var(--color-text)' }}>Auto-block on vulnerability severity</p>
+                <p className="text-xs mb-2" style={{ color: 'var(--color-text-muted)' }}>
+                  Block a device automatically when a vuln scan finds issues at or above the selected severity.
+                </p>
+                <select className="input text-xs w-48"
+                  value={autoBlockSev}
+                  onChange={async e => {
+                    const v = e.target.value
+                    setAutoBlockSev(v)
+                    await api.updateSetting('auto_block_vuln_severity', v).catch(() => {})
+                  }}>
+                  <option value="none">Disabled</option>
+                  <option value="medium">Medium and above</option>
+                  <option value="high">High and above</option>
+                  <option value="critical">Critical only</option>
+                </select>
+              </div>
             </div>
           </div>
         </div>
-      </PageSection>
+      )}
 
       {/* Network-wide pause */}
       <PageSection title="Network Internet Pause">
@@ -544,7 +682,7 @@ export function DeviceBlocking({ devices, onDeviceClick }) {
         ) : (
           <div className="rounded-lg border overflow-hidden mb-4" style={{ borderColor: 'var(--color-border)' }}>
             {schedules.map(s => (
-              <ScheduleRow key={s.id} schedule={s} devices={devices} allTags={allTags}
+              <ScheduleRow key={s.id} schedule={s} devices={devices} allTags={allTags} persons={persons}
                 onToggle={handleToggleSchedule}
                 onDelete={handleDeleteSchedule}
                 onSave={handleSaveSchedule} />
@@ -556,6 +694,7 @@ export function DeviceBlocking({ devices, onDeviceClick }) {
           <ScheduleForm
             devices={devices}
             allTags={allTags}
+            persons={persons}
             onSave={async data => {
               const created = await api.createBlockSchedule(data)
               setSchedules(prev => [created, ...prev])

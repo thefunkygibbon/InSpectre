@@ -66,7 +66,11 @@ export const api = {
   },
 
   // Auth
-  login:          (username, password) => request('POST', '/auth/login', { username, password }),
+  login:          (username, password, rememberMe = false) => request('POST', '/auth/login', {
+    username,
+    password,
+    remember_me: !!rememberMe,
+  }),
   authMe:         ()                   => request('GET',  '/auth/me'),
   changePassword: (current, next)      => request('POST', '/auth/change-password', { current_password: current, new_password: next }),
 
@@ -120,6 +124,11 @@ export const api = {
     if (limit) p.set('limit', limit)
     if (type)  p.set('event_type', type)
     return request('GET', `/events${p.toString() ? '?' + p : ''}`)
+  },
+  getStatusEvents: (limit) => {
+    const p = new URLSearchParams()
+    if (limit) p.set('limit', limit)
+    return request('GET', `/events/status${p.toString() ? '?' + p : ''}`)
   },
 
   // Vendor list for autocomplete
@@ -271,6 +280,17 @@ export const api = {
   createBlockSchedule:  (body)      => request('POST',   '/block-schedules', body),
   updateBlockSchedule:  (id, body)  => request('PATCH',  `/block-schedules/${id}`, body),
   deleteBlockSchedule:  (id)        => request('DELETE', `/block-schedules/${id}`),
+
+  // Person Presence
+  getPersons:           ()                    => request('GET',    '/persons'),
+  createPerson:         (body)               => request('POST',   '/persons', body),
+  updatePerson:         (id, body)           => request('PATCH',  `/persons/${id}`, body),
+  deletePerson:         (id)                 => request('DELETE', `/persons/${id}`),
+  addPersonDevice:      (id, body)           => request('POST',   `/persons/${id}/devices`, body),
+  removePersonDevice:   (id, mac)            => request('DELETE', `/persons/${id}/devices/${mac}`),
+  getPersonsTimeline:   (days)               => request('GET',    `/persons/timeline${days ? `?days=${days}` : ''}`),
+  blockPerson:          (id, body)           => request('POST',   `/persons/${id}/block`, body),
+  unblockPerson:        (id)                 => request('POST',   `/persons/${id}/unblock`),
 
   // Network pause / resume
   getNetworkStatus: ()  => request('GET',  '/network/status'),

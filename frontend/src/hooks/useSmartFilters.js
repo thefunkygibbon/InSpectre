@@ -1,4 +1,4 @@
-import { useState, useCallback } from 'react'
+import { useState, useCallback, useEffect } from 'react'
 
 export const SMART_FILTERS = [
   {
@@ -127,7 +127,8 @@ export const SMART_FILTERS = [
   },
 ]
 
-const SAVED_VIEWS_KEY = 'inspectre_saved_views'
+const SAVED_VIEWS_KEY    = 'inspectre_saved_views'
+const ACTIVE_FILTERS_KEY = 'inspectre_active_filters'
 
 function loadSavedViews() {
   try {
@@ -140,10 +141,22 @@ function persistSavedViews(views) {
   try { localStorage.setItem(SAVED_VIEWS_KEY, JSON.stringify(views)) } catch {}
 }
 
+function loadActiveFilters() {
+  try {
+    const raw = localStorage.getItem(ACTIVE_FILTERS_KEY)
+    return raw ? JSON.parse(raw) : {}
+  } catch { return {} }
+}
+
 export function useSmartFilters() {
   // activeFilters: { [id]: 'include' | 'exclude' }
-  const [activeFilters, setActiveFilters] = useState({})
+  const [activeFilters, setActiveFilters] = useState(() => loadActiveFilters())
   const [savedViews,    setSavedViews]    = useState(() => loadSavedViews())
+
+  // Persist active filters whenever they change
+  useEffect(() => {
+    try { localStorage.setItem(ACTIVE_FILTERS_KEY, JSON.stringify(activeFilters)) } catch {}
+  }, [activeFilters])
 
   // Cycle: off → include → exclude → off (standard filters)
   //        off → state[0] → state[1] → … → off (multi-state filters)

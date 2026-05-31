@@ -3,8 +3,9 @@ import {
   Wifi, WifiOff, Monitor, Settings,
   Search, AlertCircle, Activity,
   LayoutGrid, List, Sun, Moon, ChevronDown,
-  Bell, X, Layers, Star, ShieldAlert, Wrench, Ban, BarChart2,
+  Bell, X, Layers, Star, ShieldAlert, Wrench, Ban, BarChart2, Clock,
   ArrowLeft, SlidersHorizontal, LogOut, Eye, EyeOff, Box, Download, Sparkles,
+  Users,
 } from 'lucide-react'
 import { TrafficPage } from './components/TrafficPage'
 import { ContainersPage } from './components/ContainersPage'
@@ -22,11 +23,13 @@ import { SecurityDashboard }   from './components/SecurityDashboard'
 import { NetworkTools }        from './components/NetworkTools'
 import { DeviceBlocking }      from './components/DeviceBlocking'
 import { NetworkTimeline }     from './components/NetworkTimeline'
+import { NetworkEventLog }     from './components/NetworkEventLog'
 import { CategoryView }        from './components/CategoryView'
 import { SmartFilterBar }      from './components/SmartFilterBar'
 import { LoginPage }           from './components/LoginPage'
 import { SetupWizard }         from './components/SetupWizard'
 import { StatusButton }        from './components/StatusButton'
+import { PersonPresencePage }  from './components/PersonPresencePage'
 
 const APP_VERSION = '1.1.0'
 
@@ -46,10 +49,12 @@ const TOAST_DURATION = 2500
 
 // Page definitions for the nav
 const PAGES = [
-  { id: 'tools',      label: 'Network Tools',       Icon: Wrench,      title: 'Network Tools' },
+  { id: 'tools',      label: 'Network Tools',        Icon: Wrench,      title: 'Network Tools' },
   { id: 'security',   label: 'Vulnerability Report', Icon: ShieldAlert, title: 'Vulnerability Report' },
   { id: 'blocking',   label: 'Device Blocking',      Icon: Ban,         title: 'Device Blocking' },
-  { id: 'timeline',   label: 'Device Timeline',      Icon: BarChart2,   title: 'Device Timeline' },
+  { id: 'people',     label: 'Person Presence',      Icon: Users,       title: 'Person Presence' },
+  { id: 'presence',   label: 'Device Presence',      Icon: BarChart2,   title: 'Device Presence' },
+  { id: 'events',     label: 'Network Events',       Icon: Clock,       title: 'Network Events' },
   { id: 'traffic',    label: 'Traffic Monitor',      Icon: Activity,    title: 'Traffic Monitor' },
   { id: 'containers', label: 'Docker Containers',    Icon: Box,         title: 'Docker Containers' },
 ]
@@ -279,7 +284,7 @@ function MainApp({ onLogout }) {
     dismissNewDevice, dismissOffline,
     dismissAllNew, dismissAllOffline,
     optimisticUpdate,
-  } = useDevices(10000, { onAlert: handleAlert })
+  } = useDevices(45000, { onAlert: handleAlert })
 
   const [vulnScansByMac, setVulnScansByMac] = useState({})
   function updateVulnScan(mac, patchOrFn) {
@@ -313,10 +318,10 @@ function MainApp({ onLogout }) {
   const clock = useClock()
   const { activeFilters, toggleFilter, clearFilters, applyFilters, savedViews, saveView, loadView, deleteView } = useSmartFilters()
 
-  const [search,        setSearch]        = useState('')
-  const [filter,        setFilter]        = useState('all')
-  const [sort,          setSort]          = useState('last_seen_desc')
-  const [layout,        setLayout]        = useState('grid')
+  const [search,        setSearch]        = useState(() => { try { return JSON.parse(localStorage.getItem('inspectre-prefs') || '{}').search  ?? '' } catch { return '' } })
+  const [filter,        setFilter]        = useState(() => { try { return JSON.parse(localStorage.getItem('inspectre-prefs') || '{}').filter  ?? 'all' } catch { return 'all' } })
+  const [sort,          setSort]          = useState(() => { try { return JSON.parse(localStorage.getItem('inspectre-prefs') || '{}').sort    ?? 'last_seen_desc' } catch { return 'last_seen_desc' } })
+  const [layout,        setLayout]        = useState(() => { try { return JSON.parse(localStorage.getItem('inspectre-prefs') || '{}').layout  ?? 'grid' } catch { return 'grid' } })
   const [selected,         setSelected]         = useState(null)
   const [drawerInitialTab, setDrawerInitialTab] = useState('overview')
   const [showSettings,     setShowSettings]     = useState(false)
@@ -331,6 +336,14 @@ function MainApp({ onLogout }) {
     window.addEventListener('resize', onResize)
     return () => window.removeEventListener('resize', onResize)
   }, [])
+
+  // Persist filter/sort/view preferences
+  useEffect(() => {
+    try {
+      const prefs = { search, filter, sort, layout }
+      localStorage.setItem('inspectre-prefs', JSON.stringify(prefs))
+    } catch {}
+  }, [search, filter, sort, layout])
 
   useEffect(() => {
     if (activePage !== 'containers') setContainerToOpen(null)
@@ -521,8 +534,23 @@ function MainApp({ onLogout }) {
         }} />
       )}
 
-      {activePage === 'timeline' && (
+      {activePage === 'people' && (
+        <PersonPresencePage devices={devices} onDeviceClick={mac => {
+          const dev = devices.find(d => d.mac_address === mac)
+          if (dev) openDevice(dev)
+        }} />
+      )}
+
+      {activePage === 'presence' && (
         <NetworkTimeline onDeviceClick={mac => {
+          setActivePage(null)
+          const dev = devices.find(d => d.mac_address === mac)
+          if (dev) openDevice(dev)
+        }} />
+      )}
+
+      {activePage === 'events' && (
+        <NetworkEventLog onDeviceClick={mac => {
           setActivePage(null)
           const dev = devices.find(d => d.mac_address === mac)
           if (dev) openDevice(dev)
