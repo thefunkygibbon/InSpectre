@@ -235,8 +235,9 @@ systemd_unit() {
   cat <<'UNIT'
 [Unit]
 Description=InSpectre Container Orchestration Framework
-After=docker.service network-online.target
-Requires=docker.service
+# FIX: Force strict sequencing after the network is fully online and verified
+After=docker.service systemd-networkd-wait-online.service network-online.target
+Wants=docker.service systemd-networkd-wait-online.service network-online.target
 
 [Service]
 Type=oneshot
