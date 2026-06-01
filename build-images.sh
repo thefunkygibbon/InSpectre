@@ -322,6 +322,20 @@ build_vm_image() {
   # CRITICAL FIX: Lock down cloud-init metadata user mutations, keeping fallback DHCP alive
   sudo mkdir -p "${mnt}/etc/cloud/cloud.cfg.d"
   sudo tee "${mnt}/etc/cloud/cloud.cfg.d/99-disable-user-manipulation.cfg" >/dev/null <<'EOF'
+network: {config: disabled}
+EOF
+
+  # 2. Add a bulletproof Netplan configuration that catches ANY ethernet adapter (e*) and forces DHCP
+  sudo tee "${mnt}/etc/netplan/01-netcfg.yaml" >/dev/null <<'EOF'
+network:
+  version: 2
+  renderer: networkd
+  ethernets:
+    all_eth:
+      match:
+        name: e*
+      dhcp4: true
+EOF
 users: []
 disable_root: false
 preserve_hostname: true
