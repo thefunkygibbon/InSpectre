@@ -1,4 +1,3 @@
-$ cat << 'SCRIPT' > /tmp/build-images.sh
 #!/usr/bin/env bash
 # =============================================================================
 #  InSpectre — Appliance Image Builder  v5.2 (Production Master)
@@ -26,7 +25,7 @@ BUILD_CONTAINERS_ARM=false
 CLI_TARGET_SPECIFIED=false
 MAX_COMPRESS=false
 PUSH_DOCKERHUB=false
-VM_BASE_OS="ubuntu"   # "ubuntu" or "debian"
+VM_BASE_OS="ubuntu"   # "ubuntu" or "debian" — set interactively or via --debian flag
 
 REPO_URL="https://github.com/thefunkygibbon/InSpectre.git"
 REPO_BRANCH="main"
@@ -39,10 +38,10 @@ VM_ONLINE_IMAGE="inspectre-vm-online.qcow2"
 PI_IMAGE="inspectre-pi.img"
 PI_ONLINE_IMAGE="inspectre-pi-online.img"
 
+# ── Base OS image URLs ────────────────────────────────────────────────────────
 UBUNTU_URL="https://cloud-images.ubuntu.com/jammy/current/jammy-server-cloudimg-amd64.img"
 UBUNTU_SHA_URL="https://cloud-images.ubuntu.com/jammy/current/SHA256SUMS"
 DEBIAN_URL="https://cloud.debian.org/images/cloud/bookworm/latest/debian-12-genericcloud-amd64.qcow2"
-
 RPI_INDEX="https://downloads.raspberrypi.com/raspios_lite_arm64/images"
 
 WORK="$(mktemp -d /tmp/inspectre-build.XXXXXX)"
@@ -130,41 +129,32 @@ if ! $CLI_TARGET_SPECIFIED; then
     *) die "Invalid choice selected: '$choice'" ;;
   esac
 
-  # Ask about Docker Hub push when containers are being built
-  if $BUILD_CONTAINERS_AMD || $BUILD_CONTAINERS_ARM; then
-    read -rp "Push built images to Docker Hub (thefunkygibbon)? [y/N]: " push_choice
-    [[ "$push_choice" =~ ^[Yy]$ ]] && PUSH_DOCKERHUB=true
-    echo ""
-  fi
-
-  # Ask about VM base OS when a VM build is selected
+  # ── VM base OS selection (only when a VM build was chosen) ──────────────────
   if $BUILD_VM || $BUILD_VM_ONLINE; then
+    echo ""
     echo -e "${CYAN}${BOLD}╔══════════════════════════════════════════════════╗${NC}"
-    echo -e "${CYAN}${BOLD}║             VM Base OS Selection                 ║${NC}"
-    echo -e "${CYAN}${BOLD}╠══════════════════════════════════════════════════╣${NC}"
-    echo -e "${CYAN}${BOLD}║  1) Ubuntu 22.04 LTS (Jammy)  — ~900MB xz       ║${NC}"
-    echo -e "${CYAN}${BOLD}║     Larger, more familiar, netplan networking    ║${NC}"
-    echo -e "${CYAN}${BOLD}║  2) Debian 12 (Bookworm)      — ~350MB xz       ║${NC}"
-    echo -e "${CYAN}${BOLD}║     Smaller, leaner, Docker official repo        ║${NC}"
+    echo -e "${CYAN}${BOLD}║          Select VM Base Operating System         ║${NC}"
     echo -e "${CYAN}${BOLD}╚══════════════════════════════════════════════════╝${NC}"
-    read -rp "Select base OS [1/2, default=1]: " os_choice
+    echo -e "  1) Ubuntu 22.04 LTS (Jammy)   — larger (~550 MB base), well-tested"
+    echo -e "  2) Debian 12 (Bookworm)        — smaller (~200 MB base), leaner image"
+    echo ""
+    read -rp "Enter selection [1-2, default=1]: " os_choice
     echo ""
     case "${os_choice}" in
       2) VM_BASE_OS="debian"; info "Using Debian 12 Bookworm as VM base OS." ;;
       *) VM_BASE_OS="ubuntu"; info "Using Ubuntu 22.04 Jammy as VM base OS." ;;
     esac
-    echo ""
   fi
 
+  # ── Ask about Docker Hub push when containers are being built ────────────────
+  if $BUILD_CONTAINERS_AMD || $BUILD_CONTAINERS_ARM; then
+    read -rp "Push built images to Docker Hub (thefunkygibbon)? [y/N]: " push_choice
+    [[ "$push_choice" =~ ^[Yy]$ ]] && PUSH_DOCKERHUB=true
+    echo ""
+  fi
 else
   if $BUILD_VM   && [[ ! -f "$TAR_AMD" ]]; then BUILD_CONTAINERS_AMD=true; fi
   if $BUILD_PI   && [[ ! -f "$TAR_ARM" ]]; then BUILD_CONTAINERS_ARM=true; fi
-fi
-
-# Update image names to reflect OS choice
-if [[ "${VM_BASE_OS}" == "debian" ]]; then
-  VM_IMAGE="inspectre-vm-debian.qcow2"
-  VM_ONLINE_IMAGE="inspectre-vm-debian-online.qcow2"
 fi
 
 # ── Optional Compression Menu ─────────────────────────────────────────────────
@@ -172,7 +162,7 @@ if ! $MAX_COMPRESS && ( $BUILD_VM || $BUILD_VM_ONLINE || $BUILD_PI || $BUILD_PI_
   echo -e "${YELLOW}${BOLD}╔══════════════════════════════════════════════════╗${NC}"
   echo -e "${YELLOW}${BOLD}║           Archive Size Optimization              ║${NC}"
   echo -e "${YELLOW}${BOLD}╚══════════════════════════════════════════════════╝${NC}"
-  read -rp "Enable maximum archive compression (uses heavy xz -9)? [y/N]: " compress_choice
+  read -rp "Enable maximum archive compression (uses xz -9)? [y/N]: " compress_choice
   [[ "$compress_choice" =~ ^[Yy]$ ]] && MAX_COMPRESS=true
   echo ""
 fi
@@ -407,7 +397,6 @@ motd_content() {
 MOTD
 }
 
-# ── Shared: write appliance.json flag file ────────────────────────────────────
 write_appliance_json() {
   local mnt="$1" type="$2" arch="$3" mode="$4" base_os="$5"
   sudo tee "${mnt}/opt/inspectre/appliance.json" >/dev/null <<EOF
@@ -422,26 +411,25 @@ write_appliance_json() {
 EOF
 }
 
-# ── Shared: download the appropriate VM base image ────────────────────────────
-_download_vm_base() {
-  local vw="$1"
-  if [[ "${VM_BASE_OS}" == "debian" ]]; then
-    info "Downloading Debian 12 Bookworm cloud image..."
-    curl -L --progress-bar "${DEBIAN_URL}" -o "${vw}/vm-base.qcow2"
-  else
-    info "Downloading Ubuntu 22.04 Jammy cloud image..."
-    curl -L --progress-bar "${UBUNTU_URL}" -o "${vw}/vm-base.qcow2"
-  fi
-}
-
-# ── Shared: mount a qcow2 VM base image, resize, bind-mount ──────────────────
-_mount_vm_base() {
+# ── Shared: mount base VM image (Ubuntu or Debian) ────────────────────────────
+_mount_ubuntu_base() {
   local vw="$1" disk_name="$2" disk_size="$3"
+  local base_url img_format
 
-  _download_vm_base "${vw}"
+  if [[ "${VM_BASE_OS}" == "debian" ]]; then
+    base_url="${DEBIAN_URL}"
+    img_format="qcow2"
+    info "Downloading Debian 12 Bookworm cloud image..."
+  else
+    base_url="${UBUNTU_URL}"
+    img_format="qcow2"
+    info "Downloading Ubuntu 22.04 Jammy cloud image..."
+  fi
+
+  curl -L --progress-bar "${base_url}" -o "${vw}/base.img"
 
   local disk="${vw}/${disk_name}"
-  qemu-img convert -f qcow2 -O qcow2 "${vw}/vm-base.qcow2" "${disk}"
+  qemu-img convert -f "${img_format}" -O qcow2 "${vw}/base.img" "${disk}"
   qemu-img resize "${disk}" "${disk_size}"
 
   sudo modprobe nbd max_part=8 2>/dev/null || true
@@ -485,34 +473,27 @@ _mount_vm_base() {
   sudo mv "${mnt}/etc/resolv.conf" "${mnt}/etc/resolv.conf.bak" 2>/dev/null || true
   echo "nameserver 8.8.8.8" | sudo tee "${mnt}/etc/resolv.conf" >/dev/null
 
-  # ── OS-specific networking + cloud-init config ──────────────────────────────
+  # ── OS-specific network + cloud-init config ──────────────────────────────
   if [[ "${VM_BASE_OS}" == "debian" ]]; then
-    # Debian: no netplan — configure systemd-networkd directly with a .network file.
-    # The genericcloud image uses cloud-init but we disable network management
-    # from it and let systemd-networkd handle DHCP on all ethernet interfaces.
+    # Debian uses systemd-networkd directly — no netplan package available
     sudo mkdir -p "${mnt}/etc/systemd/network"
-    sudo tee "${mnt}/etc/systemd/network/20-wired.network" >/dev/null <<'EOF'
+    sudo tee "${mnt}/etc/systemd/network/10-dhcp.network" >/dev/null <<'EOF'
 [Match]
 Name=e*
 
 [Network]
 DHCP=yes
-DNS=8.8.8.8
-DNS=8.8.4.4
-
-[DHCP]
-UseDNS=true
-RouteMetric=10
 EOF
-    # Enable systemd-networkd + systemd-resolved in chroot later
-    # Disable the default ifupdown config that genericcloud ships with
-    sudo rm -f "${mnt}/etc/network/interfaces.d/ens*" 2>/dev/null || true
-    sudo tee "${mnt}/etc/network/interfaces" >/dev/null <<'EOF'
-# Networking is managed by systemd-networkd — see /etc/systemd/network/
-source /etc/network/interfaces.d/*
-EOF
+    # Ensure systemd-networkd and resolved are enabled
+    sudo mkdir -p "${mnt}/etc/systemd/system/multi-user.target.wants"
+    sudo ln -sf /lib/systemd/system/systemd-networkd.service \
+      "${mnt}/etc/systemd/system/multi-user.target.wants/systemd-networkd.service" 2>/dev/null || true
+    sudo ln -sf /lib/systemd/system/systemd-resolved.service \
+      "${mnt}/etc/systemd/system/multi-user.target.wants/systemd-resolved.service" 2>/dev/null || true
+    # Point resolv.conf at systemd-resolved stub
+    sudo ln -sf /run/systemd/resolve/stub-resolv.conf "${mnt}/etc/resolv.conf.new" 2>/dev/null || true
 
-    # Cloud-init: disable network config, disable user manipulation
+    # Debian cloud-init config
     sudo mkdir -p "${mnt}/etc/cloud/cloud.cfg.d"
     sudo tee "${mnt}/etc/cloud/cloud.cfg.d/99-inspectre.cfg" >/dev/null <<'EOF'
 users: []
@@ -523,9 +504,9 @@ network: {config: disabled}
 EOF
 
   else
-    # Ubuntu: uses netplan + cloud-init, configure as before
+    # Ubuntu uses netplan
     sudo mkdir -p "${mnt}/etc/cloud/cloud.cfg.d"
-    sudo tee "${mnt}/etc/cloud/cloud.cfg.d/99-inspectre.cfg" >/dev/null <<'EOF'
+    sudo tee "${mnt}/etc/cloud/cloud.cfg.d/99-disable-user-manipulation.cfg" >/dev/null <<'EOF'
 users: []
 disable_root: false
 preserve_hostname: true
@@ -556,24 +537,22 @@ POLICY
   _MOUNT_DISK="${disk}"
 }
 
-# ── Shared: install Docker + users inside a VM chroot ────────────────────────
+# ── Shared: install Docker + users inside a chroot ────────────────────────────
+# Handles both Ubuntu (docker.io pkg) and Debian (Docker official apt repo,
+# since docker-compose-v2 is not in Debian's own repos).
 _chroot_vm_setup() {
   local mnt="$1"
 
   if [[ "${VM_BASE_OS}" == "debian" ]]; then
-    # Debian: docker.io and docker-compose-v2 are not in Debian repos (or are
-    # outdated). Use Docker's official apt repository instead — same method as
-    # Docker's own install script, just done inside the chroot.
     sudo chroot "${mnt}" /bin/bash <<'CHROOT'
 set -e
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
 apt-get install -y --no-install-recommends \
   ca-certificates curl gnupg lsb-release \
-  openssh-server net-tools jq \
-  systemd-networkd systemd-resolved
+  net-tools jq openssh-server
 
-# Add Docker's official GPG key + apt repo
+# Docker's official apt repo — only source for docker-compose-v2 on Debian
 install -m 0755 -d /etc/apt/keyrings
 curl -fsSL https://download.docker.com/linux/debian/gpg \
   | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
@@ -586,19 +565,12 @@ apt-get install -y --no-install-recommends \
   docker-ce docker-ce-cli containerd.io docker-compose-plugin
 apt-get clean
 
-# Enable services
-systemctl enable ssh docker systemd-networkd systemd-resolved
+# SSH hardening
+systemctl enable ssh
+sed -i 's/^#*PasswordAuthentication .*/PasswordAuthentication yes/' /etc/ssh/sshd_config
+sed -i 's/^#*PermitRootLogin .*/PermitRootLogin yes/' /etc/ssh/sshd_config
 
-# SSH config
-if [ -f /etc/ssh/sshd_config ]; then
-  sed -i 's/^#*PasswordAuthentication .*/PasswordAuthentication yes/' /etc/ssh/sshd_config
-  sed -i 's/^#*PermitRootLogin .*/PermitRootLogin yes/' /etc/ssh/sshd_config
-fi
-
-# resolv.conf → systemd-resolved stub
-ln -sf /run/systemd/resolve/stub-resolv.conf /etc/resolv.conf 2>/dev/null || true
-
-# Create inspectre user
+# inspectre user
 if ! id inspectre &>/dev/null; then
   useradd -m -s /bin/bash inspectre
 fi
@@ -610,7 +582,7 @@ chmod 0440 /etc/sudoers.d/inspectre
 CHROOT
 
   else
-    # Ubuntu: docker.io + docker-compose-v2 are in the Ubuntu repos and work fine
+    # Ubuntu — docker.io + docker-compose-v2 are in universe repos
     sudo chroot "${mnt}" /bin/bash <<'CHROOT'
 set -e
 export DEBIAN_FRONTEND=noninteractive
@@ -618,12 +590,10 @@ apt-get update -qq
 apt-get install -y --no-install-recommends \
   docker.io docker-compose-v2 curl jq net-tools ca-certificates openssh-server
 apt-get clean
-systemctl enable ssh docker
 
-if [ -f /etc/ssh/sshd_config ]; then
-  sed -i 's/^#*PasswordAuthentication .*/PasswordAuthentication yes/' /etc/ssh/sshd_config
-  sed -i 's/^#*PermitRootLogin .*/PermitRootLogin yes/' /etc/ssh/sshd_config
-fi
+systemctl enable ssh
+sed -i 's/^#*PasswordAuthentication .*/PasswordAuthentication yes/' /etc/ssh/sshd_config
+sed -i 's/^#*PermitRootLogin .*/PermitRootLogin yes/' /etc/ssh/sshd_config
 
 if ! id inspectre &>/dev/null; then
   useradd -m -s /bin/bash inspectre
@@ -653,15 +623,16 @@ _finalise_vm() {
   sleep 1
 
   if $MAX_COMPRESS; then
-    # No -c: leave qcow2 uncompressed so xz works on raw data for best ratio.
-    # Double-compressing (qcow2 zlib then xz) gives a larger result than xz alone.
+    # No -c: leave qcow2 uncompressed so xz compresses raw data — not pre-zlib'd clusters.
+    # Double compression (qcow2 -c then xz) results in a larger output than xz alone.
     info "Converting to uncompressed qcow2 for xz pass..."
     qemu-img convert -O qcow2 "${disk}" "${OUTPUT_DIR}/${out_image}"
     info "Compressing VM image (xz -9) — this may take a while..."
     xz --threads=0 -9 -f "${OUTPUT_DIR}/${out_image}"
     ok "VM image built: ${OUTPUT_DIR}/${out_image}.xz"
   else
-    # Without xz, -c gives moderate compression instantly — good default
+    # Without xz follow-up, qcow2 internal compression (-c) gives moderate
+    # size reduction with no wait time — best for ready-to-use distribution.
     qemu-img convert -c -O qcow2 "${disk}" "${OUTPUT_DIR}/${out_image}"
     ok "VM image built: ${OUTPUT_DIR}/${out_image}"
   fi
@@ -675,7 +646,7 @@ build_vm_image() {
   local vw="${WORK}/vm"
   mkdir -p "${vw}" "${OUTPUT_DIR}"
 
-  _mount_vm_base "${vw}" "${VM_IMAGE}" "${VM_DISK_SIZE}"
+  _mount_ubuntu_base "${vw}" "${VM_IMAGE}" "${VM_DISK_SIZE}"
   local mnt="${_MOUNT_MNT}" nbd="${_MOUNT_NBD}" disk="${_MOUNT_DISK}"
 
   _chroot_vm_setup "${mnt}"
@@ -684,10 +655,10 @@ build_vm_image() {
   sudo cp "${TAR_AMD}" "${mnt}/opt/inspectre/images/inspectre-images.tar"
   sudo cp "${REPO}/docker-compose.vm.yml" "${mnt}/opt/inspectre/docker-compose.yml"
   write_appliance_json "${mnt}" "vm" "amd64" "offline" "${VM_BASE_OS}"
-  startup_script | sudo tee "${mnt}/opt/inspectre/start.sh" >/dev/null
+  startup_script        | sudo tee "${mnt}/opt/inspectre/start.sh" >/dev/null
   sudo chmod +x "${mnt}/opt/inspectre/start.sh"
-  systemd_unit   | sudo tee "${mnt}/etc/systemd/system/inspectre.service" >/dev/null
-  motd_content   | sudo tee "${mnt}/etc/motd" >/dev/null
+  systemd_unit          | sudo tee "${mnt}/etc/systemd/system/inspectre.service" >/dev/null
+  motd_content          | sudo tee "${mnt}/etc/motd" >/dev/null
   sudo chroot "${mnt}" /bin/bash -c "systemctl enable docker inspectre"
 
   _finalise_vm "${mnt}" "${nbd}" "${disk}" "${VM_IMAGE}"
@@ -701,7 +672,7 @@ build_vm_online_image() {
   local vw="${WORK}/vm-online"
   mkdir -p "${vw}" "${OUTPUT_DIR}"
 
-  _mount_vm_base "${vw}" "${VM_ONLINE_IMAGE}" "${VM_ONLINE_DISK_SIZE}"
+  _mount_ubuntu_base "${vw}" "${VM_ONLINE_IMAGE}" "${VM_ONLINE_DISK_SIZE}"
   local mnt="${_MOUNT_MNT}" nbd="${_MOUNT_NBD}" disk="${_MOUNT_DISK}"
 
   _chroot_vm_setup "${mnt}"
@@ -742,7 +713,7 @@ _prepare_pi_base() {
   _PI_LOOP="${loop}"
 }
 
-# ── Shared: mount Pi loop device, bind-mount proc/sys/dev, set resolv.conf ────
+# ── Shared: mount Pi loop device ──────────────────────────────────────────────
 _mount_pi_base() {
   local pw="$1"
   local mnt="${pw}/mnt"
@@ -796,7 +767,6 @@ _finalise_pi() {
   sleep 1
 
   if $MAX_COMPRESS; then
-    # Pi base is already raw .img — xz compresses directly, optimal ratio
     info "Compressing Pi image (xz -9) — this may take a while..."
     xz --threads=0 -9 -z "${raw}" -c > "${OUTPUT_DIR}/${out_image}.xz"
     ok "Pi image built: ${OUTPUT_DIR}/${out_image}.xz"
@@ -806,7 +776,7 @@ _finalise_pi() {
   fi
 }
 
-# ── Shared: write Pi boot files (ssh enable, userconf) ────────────────────────
+# ── Shared: write Pi boot files ───────────────────────────────────────────────
 _pi_boot_setup() {
   local boot_mnt="$1"
   sudo touch "${boot_mnt}/ssh" || true
@@ -842,10 +812,10 @@ build_pi_image() {
   sudo cp "${TAR_ARM}" "${mnt}/opt/inspectre/images/inspectre-images.tar"
   sudo cp "${REPO}/docker-compose.pi.yml" "${mnt}/opt/inspectre/docker-compose.yml"
   write_appliance_json "${mnt}" "pi" "arm64" "offline" "raspios"
-  startup_script | sudo tee "${mnt}/opt/inspectre/start.sh" >/dev/null
+  startup_script      | sudo tee "${mnt}/opt/inspectre/start.sh" >/dev/null
   sudo chmod +x "${mnt}/opt/inspectre/start.sh"
-  systemd_unit   | sudo tee "${mnt}/etc/systemd/system/inspectre.service" >/dev/null
-  motd_content   | sudo tee "${mnt}/etc/motd" >/dev/null
+  systemd_unit        | sudo tee "${mnt}/etc/systemd/system/inspectre.service" >/dev/null
+  motd_content        | sudo tee "${mnt}/etc/motd" >/dev/null
 
   _pi_boot_setup "${boot_mnt}"
   _pi_enable_services "${mnt}"
@@ -922,5 +892,3 @@ main() {
 }
 
 main "$@"
-SCRIPT
-echo "Written OK. Lines: $(wc -l < /tmp/build-images.sh)"
