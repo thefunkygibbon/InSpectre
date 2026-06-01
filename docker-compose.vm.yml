@@ -1,9 +1,9 @@
 version: '3.8'
 
 services:
-  postgres:
+  db:
     image: inspectre-postgres:amd64
-    container_name: inspectre-postgres
+    container_name: inspectre-db
     restart: unless-stopped
     ports:
       - "5432:5432"
@@ -19,9 +19,9 @@ services:
       timeout: 5s
       retries: 5
 
-  backend:
+  web:
     image: inspectre-backend:amd64
-    container_name: inspectre-backend
+    container_name: inspectre-web
     restart: unless-stopped
     ports:
       - "8000:8000"
@@ -30,7 +30,7 @@ services:
       - SECRET_KEY=${SECRET_KEY:-your-secret-key}
       - ENVIRONMENT=${ENVIRONMENT:-production}
     depends_on:
-      postgres:
+      db:
         condition: service_healthy
 
   frontend:
@@ -40,7 +40,7 @@ services:
     ports:
       - "3000:80"
     depends_on:
-      - backend
+      - web
 
   probe:
     image: inspectre-probe:amd64
@@ -56,7 +56,7 @@ services:
       - NET_ADMIN
       - NET_RAW
     depends_on:
-      postgres:
+      db:
         condition: service_healthy
 
 volumes:
