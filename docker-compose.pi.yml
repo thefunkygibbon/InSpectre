@@ -1,9 +1,9 @@
 version: '3.8'
 
 services:
-  postgres:
+  db:
     image: inspectre-postgres:arm64
-    container_name: inspectre-postgres
+    container_name: inspectre-db
     restart: unless-stopped
     ports:
       - "5432:5432"
@@ -19,9 +19,9 @@ services:
       timeout: 5s
       retries: 5
 
-  backend:
+  web:
     image: inspectre-backend:arm64
-    container_name: inspectre-backend
+    container_name: inspectre-web
     restart: unless-stopped
     ports:
       - "8000:8000"
