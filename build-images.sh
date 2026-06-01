@@ -265,6 +265,7 @@ MOTD
 }
 
 # ── VM Appliance Build Context ────────────────────────────────────────────────
+# ── VM Appliance Build Context ────────────────────────────────────────────────
 build_vm_image() {
   step "Building VM Appliance image (x86_64)"
   [[ -f "$TAR_AMD" ]] || die "x64 container bundle cache missing."
@@ -319,13 +320,18 @@ build_vm_image() {
   sudo mv "${mnt}/etc/resolv.conf" "${mnt}/etc/resolv.conf.bak" 2>/dev/null || true
   echo "nameserver 8.8.8.8" | sudo tee "${mnt}/etc/resolv.conf" >/dev/null
 
-  # CRITICAL FIX: Lock down cloud-init metadata user mutations, keeping fallback DHCP alive
+  # 1. Lock down cloud-init metadata mutations cleanly
   sudo mkdir -p "${mnt}/etc/cloud/cloud.cfg.d"
   sudo tee "${mnt}/etc/cloud/cloud.cfg.d/99-disable-user-manipulation.cfg" >/dev/null <<'EOF'
+users: []
+disable_root: false
+preserve_hostname: true
+ssh_pwauth: true
 network: {config: disabled}
 EOF
 
   # 2. Add a bulletproof Netplan configuration that catches ANY ethernet adapter (e*) and forces DHCP
+  sudo mkdir -p "${mnt}/etc/netplan"
   sudo tee "${mnt}/etc/netplan/01-netcfg.yaml" >/dev/null <<'EOF'
 network:
   version: 2
@@ -336,39 +342,32 @@ network:
         name: e*
       dhcp4: true
 EOF
-users: []
-disable_root: false
-preserve_hostname: true
-ssh_pwauth: true
-EOF
 
+  # 3. Create the safety policy descriptor to stop packages from autostarting on install
   sudo tee "${mnt}/usr/sbin/policy-rc.d" >/dev/null <<'POLICY'
 #!/bin/sh
 exit 101
 POLICY
   sudo chmod +x "${mnt}/usr/sbin/policy-rc.d"
 
+  # 4. Enter the Appliance Image Environment to set up users and tools
   sudo chroot "${mnt}" /bin/bash <<'CHROOT'
 set -e
-# 1. Install OpenSSH Server cleanly inside the appliance image
-apt-get update
-apt-get install -y openssh-server
-
-# 2. Ensure the SSH service is enabled to start on system bootup
-systemctl enable ssh
-
-# 3. Explicitly allow password authentication (in case cloud-init restricts it)
-sed -i 's/^#PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config
-sed -i 's/^PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config
-
-CHROOT
-
 export DEBIAN_FRONTEND=noninteractive
 
+# Update and install primary dependencies
 apt-get update -qq
-apt-get install -y --no-install-recommends docker.io docker-compose-v2 curl jq net-tools ca-certificates
+apt-get install -y --no-install-recommends docker.io docker-compose-v2 curl jq net-tools ca-certificates openssh-server
 apt-get clean
 
+# Setup OpenSSH runtime constraints
+systemctl enable ssh
+if [ -f /etc/ssh/sshd_config ]; then
+  sed -i 's/^#*PasswordAuthentication .*/PasswordAuthentication yes/' /etc/ssh/sshd_config
+  sed -i 's/^#*PermitRootLogin .*/PermitRootLogin yes/' /etc/ssh/sshd_config
+fi
+
+# Configure deployment user accounts
 if ! id inspectre &>/dev/null; then
   useradd -m -s /bin/bash inspectre
 fi
@@ -378,11 +377,6 @@ echo "root:inspectre" | chpasswd
 
 echo "inspectre ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/inspectre
 chmod 0440 /etc/sudoers.d/inspectre
-
-if [ -f /etc/ssh/sshd_config ]; then
-  sed -i 's/^#*PasswordAuthentication .*/PasswordAuthentication yes/' /etc/ssh/sshd_config
-  sed -i 's/^#*PermitRootLogin .*/PermitRootLogin yes/' /etc/ssh/sshd_config
-fi
 CHROOT
 
   # Bake user's specific VM profile directly from the repo
