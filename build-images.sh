@@ -350,6 +350,19 @@ POLICY
 
   sudo chroot "${mnt}" /bin/bash <<'CHROOT'
 set -e
+# 1. Install OpenSSH Server cleanly inside the appliance image
+apt-get update
+apt-get install -y openssh-server
+
+# 2. Ensure the SSH service is enabled to start on system bootup
+systemctl enable ssh
+
+# 3. Explicitly allow password authentication (in case cloud-init restricts it)
+sed -i 's/^#PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config
+sed -i 's/^PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config
+
+CHROOT
+
 export DEBIAN_FRONTEND=noninteractive
 
 apt-get update -qq
