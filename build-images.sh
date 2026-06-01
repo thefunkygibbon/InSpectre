@@ -21,6 +21,7 @@ BUILD_PI=false
 BUILD_CONTAINERS_AMD=false
 BUILD_CONTAINERS_ARM=false
 CLI_TARGET_SPECIFIED=false
+MAX_COMPRESS=false # ◄── Added global toggle for heavy compression
 
 REPO_URL="https://github.com/thefunkygibbon/InSpectre.git"
 REPO_BRANCH="main"
@@ -45,6 +46,7 @@ while [[ $# -gt 0 ]]; do
   case $1 in
     --vm-only)     BUILD_VM=true; CLI_TARGET_SPECIFIED=true ;;
     --pi-only)     BUILD_PI=true; CLI_TARGET_SPECIFIED=true ;;
+    --compress)    MAX_COMPRESS=true ;; # ◄── Added CLI automation flag
     --branch)      REPO_BRANCH="$2"; shift ;;
     --output-dir)  OUTPUT_DIR="$2"; shift ;;
     --help|-h)     sed -n '2,15p' "$0" | sed 's/^#  \{0,2\}//'; exit 0 ;;
@@ -112,6 +114,18 @@ else
   if $BUILD_PI && [[ ! -f "$TAR_ARM" ]]; then BUILD_CONTAINERS_ARM=true; fi
 fi
 
+# ── Optional Compression Menu ───────────────────────────────────────────────
+if ! $MAX_COMPRESS && ( $BUILD_VM || $BUILD_PI ); then
+  echo -e "${YELLOW}${BOLD}╔══════════════════════════════════════════════════╗${NC}"
+  echo -e "${YELLOW}${BOLD}║           Archive Size Optimization              ║${NC}"
+  echo -e "${YELLOW}${BOLD}╚══════════════════════════════════════════════════╝${NC}"
+  read -rp "Enable maximum archive compression (uses heavy xz -9)? [y/N]: " compress_choice
+  if [[ "$compress_choice" =~ ^[Yy]$ ]]; then
+    MAX_COMPRESS=true
+  fi
+  echo ""
+fi
+
 # ── Dependency Check ──────────────────────────────────────────────────────────
 check_deps() {
   step "Checking dependencies"
@@ -132,7 +146,6 @@ check_deps() {
 
 clone_repo() {
   step "Cloning InSpectre (branch: ${REPO_BRANCH})"
-  # FIX: Change the first "${REPO}" to "${REPO_URL}"
   git clone --depth=1 --branch "${REPO_BRANCH}" "${REPO_URL}" "${REPO}"
 }
 
@@ -236,7 +249,6 @@ systemd_unit() {
   cat <<'UNIT'
 [Unit]
 Description=InSpectre Container Orchestration Framework
-# FIX: Force strict sequencing after the network is fully online and verified
 After=docker.service systemd-networkd-wait-online.service network-online.target
 Wants=docker.service systemd-networkd-wait-online.service network-online.target
 
@@ -264,7 +276,6 @@ motd_content() {
 MOTD
 }
 
-# ── VM Appliance Build Context ────────────────────────────────────────────────
 # ── VM Appliance Build Context ────────────────────────────────────────────────
 build_vm_image() {
   step "Building VM Appliance image (x86_64)"
@@ -355,19 +366,16 @@ POLICY
 set -e
 export DEBIAN_FRONTEND=noninteractive
 
-# Update and install primary dependencies
 apt-get update -qq
 apt-get install -y --no-install-recommends docker.io docker-compose-v2 curl jq net-tools ca-certificates openssh-server
 apt-get clean
 
-# Setup OpenSSH runtime constraints
 systemctl enable ssh
 if [ -f /etc/ssh/sshd_config ]; then
   sed -i 's/^#*PasswordAuthentication .*/PasswordAuthentication yes/' /etc/ssh/sshd_config
   sed -i 's/^#*PermitRootLogin .*/PermitRootLogin yes/' /etc/ssh/sshd_config
 fi
 
-# Configure deployment user accounts
 if ! id inspectre &>/dev/null; then
   useradd -m -s /bin/bash inspectre
 fi
@@ -403,8 +411,17 @@ CHROOT
   sudo qemu-nbd --disconnect "${nbd}"
   sleep 1
 
+  # Native compressed cluster compilation
   qemu-img convert -c -O qcow2 "${disk}" "${OUTPUT_DIR}/${VM_IMAGE}"
-  ok "VM appliance image built: ${OUTPUT_DIR}/${VM_IMAGE}"
+
+  # ◄── Conditionally apply high ratio archive compression to the VM target
+  if $MAX_COMPRESS; then
+    info "Compressing VM file to absolute minimum size (using xz -9)..."
+    xz --threads=0 -9 -f "${OUTPUT_DIR}/${VM_IMAGE}"
+    ok "VM appliance image built and compressed: ${OUTPUT_DIR}/${VM_IMAGE}.xz"
+  else
+    ok "VM appliance image built: ${OUTPUT_DIR}/${VM_IMAGE}"
+  fi
 }
 
 # ── Pi Appliance Build Context ────────────────────────────────────────────────
@@ -460,7 +477,6 @@ echo "root:inspectre" | chpasswd
 apt-get clean
 CHROOT
 
-  # Bake specific Pi composition structure directly from repo
   sudo mkdir -p "${mnt}/opt/inspectre/images"
   sudo cp "${TAR_ARM}" "${mnt}/opt/inspectre/images/inspectre-images.tar"
   sudo cp "${REPO}/docker-compose.pi.yml" "${mnt}/opt/inspectre/docker-compose.yml"
@@ -488,8 +504,16 @@ CHROOT
   sudo losetup -d "${loop}"
   sleep 1
 
-  xz --threads=0 -9 -z "${raw}" -c > "${OUTPUT_DIR}/${PI_IMAGE}.xz"
-  ok "Pi Flash image built: ${OUTPUT_DIR}/${PI_IMAGE}.xz"
+  # ◄── Conditionally compress the Pi image target or emit raw file for speed
+  if $MAX_COMPRESS; then
+    info "Compressing Pi image to absolute minimum size (using xz -9)..."
+    xz --threads=0 -9 -z "${raw}" -c > "${OUTPUT_DIR}/${PI_IMAGE}.xz"
+    ok "Pi Flash image built: ${OUTPUT_DIR}/${PI_IMAGE}.xz"
+  else
+    info "Saving uncompressed raw Pi image file for rapid testing..."
+    cp "${raw}" "${OUTPUT_DIR}/${PI_IMAGE}"
+    ok "Pi Flash image built: ${OUTPUT_DIR}/${PI_IMAGE}"
+  fi
 }
 
 cleanup() {
