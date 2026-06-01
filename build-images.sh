@@ -1,6 +1,7 @@
+$ cat << 'SCRIPT' > /tmp/build-images.sh
 #!/usr/bin/env bash
 # =============================================================================
-#  InSpectre — Appliance Image Builder  v5.1 (Production Master)
+#  InSpectre — Appliance Image Builder  v5.2 (Production Master)
 # =============================================================================
 set -euo pipefail
 export DOCKER_BUILDKIT=1
@@ -25,6 +26,7 @@ BUILD_CONTAINERS_ARM=false
 CLI_TARGET_SPECIFIED=false
 MAX_COMPRESS=false
 PUSH_DOCKERHUB=false
+VM_BASE_OS="ubuntu"   # "ubuntu" or "debian"
 
 REPO_URL="https://github.com/thefunkygibbon/InSpectre.git"
 REPO_BRANCH="main"
@@ -36,8 +38,11 @@ VM_IMAGE="inspectre-vm.qcow2"
 VM_ONLINE_IMAGE="inspectre-vm-online.qcow2"
 PI_IMAGE="inspectre-pi.img"
 PI_ONLINE_IMAGE="inspectre-pi-online.img"
+
 UBUNTU_URL="https://cloud-images.ubuntu.com/jammy/current/jammy-server-cloudimg-amd64.img"
 UBUNTU_SHA_URL="https://cloud-images.ubuntu.com/jammy/current/SHA256SUMS"
+DEBIAN_URL="https://cloud.debian.org/images/cloud/bookworm/latest/debian-12-genericcloud-amd64.qcow2"
+
 RPI_INDEX="https://downloads.raspberrypi.com/raspios_lite_arm64/images"
 
 WORK="$(mktemp -d /tmp/inspectre-build.XXXXXX)"
@@ -56,6 +61,8 @@ while [[ $# -gt 0 ]]; do
     --pi-online-only) BUILD_PI_ONLINE=true; CLI_TARGET_SPECIFIED=true ;;
     --compress)       MAX_COMPRESS=true ;;
     --push)           PUSH_DOCKERHUB=true ;;
+    --debian)         VM_BASE_OS="debian" ;;
+    --ubuntu)         VM_BASE_OS="ubuntu" ;;
     --branch)         REPO_BRANCH="$2"; shift ;;
     --output-dir)     OUTPUT_DIR="$2"; shift ;;
     --help|-h)        sed -n '2,15p' "$0" | sed 's/^#  \{0,2\}//'; exit 0 ;;
@@ -93,9 +100,7 @@ if ! $CLI_TARGET_SPECIFIED; then
         BUILD_CONTAINERS_AMD=true
       fi
       ;;
-    4)
-      BUILD_VM_ONLINE=true
-      ;;
+    4) BUILD_VM_ONLINE=true ;;
     5)
       BUILD_PI=true
       if [[ -f "$TAR_ARM" ]]; then
@@ -105,9 +110,7 @@ if ! $CLI_TARGET_SPECIFIED; then
         BUILD_CONTAINERS_ARM=true
       fi
       ;;
-    6)
-      BUILD_PI_ONLINE=true
-      ;;
+    6) BUILD_PI_ONLINE=true ;;
     7)
       BUILD_VM=true; BUILD_VM_ONLINE=true; BUILD_PI=true; BUILD_PI_ONLINE=true
       if [[ -f "$TAR_AMD" ]]; then
@@ -133,10 +136,35 @@ if ! $CLI_TARGET_SPECIFIED; then
     [[ "$push_choice" =~ ^[Yy]$ ]] && PUSH_DOCKERHUB=true
     echo ""
   fi
+
+  # Ask about VM base OS when a VM build is selected
+  if $BUILD_VM || $BUILD_VM_ONLINE; then
+    echo -e "${CYAN}${BOLD}╔══════════════════════════════════════════════════╗${NC}"
+    echo -e "${CYAN}${BOLD}║             VM Base OS Selection                 ║${NC}"
+    echo -e "${CYAN}${BOLD}╠══════════════════════════════════════════════════╣${NC}"
+    echo -e "${CYAN}${BOLD}║  1) Ubuntu 22.04 LTS (Jammy)  — ~900MB xz       ║${NC}"
+    echo -e "${CYAN}${BOLD}║     Larger, more familiar, netplan networking    ║${NC}"
+    echo -e "${CYAN}${BOLD}║  2) Debian 12 (Bookworm)      — ~350MB xz       ║${NC}"
+    echo -e "${CYAN}${BOLD}║     Smaller, leaner, Docker official repo        ║${NC}"
+    echo -e "${CYAN}${BOLD}╚══════════════════════════════════════════════════╝${NC}"
+    read -rp "Select base OS [1/2, default=1]: " os_choice
+    echo ""
+    case "${os_choice}" in
+      2) VM_BASE_OS="debian"; info "Using Debian 12 Bookworm as VM base OS." ;;
+      *) VM_BASE_OS="ubuntu"; info "Using Ubuntu 22.04 Jammy as VM base OS." ;;
+    esac
+    echo ""
+  fi
+
 else
   if $BUILD_VM   && [[ ! -f "$TAR_AMD" ]]; then BUILD_CONTAINERS_AMD=true; fi
   if $BUILD_PI   && [[ ! -f "$TAR_ARM" ]]; then BUILD_CONTAINERS_ARM=true; fi
-  # Online builds never need local container compilation
+fi
+
+# Update image names to reflect OS choice
+if [[ "${VM_BASE_OS}" == "debian" ]]; then
+  VM_IMAGE="inspectre-vm-debian.qcow2"
+  VM_ONLINE_IMAGE="inspectre-vm-debian-online.qcow2"
 fi
 
 # ── Optional Compression Menu ─────────────────────────────────────────────────
@@ -322,7 +350,6 @@ startup_script_online() {
 set -e
 cd /opt/inspectre
 
-# Wait for internet connectivity (Docker Hub must be reachable)
 echo "[InSpectre] Waiting for internet access..."
 for i in $(seq 1 30); do
   curl -fsSL --max-time 5 https://hub.docker.com > /dev/null 2>&1 && break
@@ -382,26 +409,39 @@ MOTD
 
 # ── Shared: write appliance.json flag file ────────────────────────────────────
 write_appliance_json() {
-  local mnt="$1" type="$2" arch="$3" mode="$4"
+  local mnt="$1" type="$2" arch="$3" mode="$4" base_os="$5"
   sudo tee "${mnt}/opt/inspectre/appliance.json" >/dev/null <<EOF
 {
   "type": "${type}",
   "arch": "${arch}",
   "mode": "${mode}",
+  "base_os": "${base_os}",
   "built_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
   "version": "1.0.0"
 }
 EOF
 }
 
-# ── Shared: mount a qcow2 Ubuntu base image and return nbd + mnt paths ────────
-_mount_ubuntu_base() {
+# ── Shared: download the appropriate VM base image ────────────────────────────
+_download_vm_base() {
+  local vw="$1"
+  if [[ "${VM_BASE_OS}" == "debian" ]]; then
+    info "Downloading Debian 12 Bookworm cloud image..."
+    curl -L --progress-bar "${DEBIAN_URL}" -o "${vw}/vm-base.qcow2"
+  else
+    info "Downloading Ubuntu 22.04 Jammy cloud image..."
+    curl -L --progress-bar "${UBUNTU_URL}" -o "${vw}/vm-base.qcow2"
+  fi
+}
+
+# ── Shared: mount a qcow2 VM base image, resize, bind-mount ──────────────────
+_mount_vm_base() {
   local vw="$1" disk_name="$2" disk_size="$3"
 
-  curl -L --progress-bar "${UBUNTU_URL}" -o "${vw}/ubuntu-base.img"
+  _download_vm_base "${vw}"
 
   local disk="${vw}/${disk_name}"
-  qemu-img convert -f qcow2 -O qcow2 "${vw}/ubuntu-base.img" "${disk}"
+  qemu-img convert -f qcow2 -O qcow2 "${vw}/vm-base.qcow2" "${disk}"
   qemu-img resize "${disk}" "${disk_size}"
 
   sudo modprobe nbd max_part=8 2>/dev/null || true
@@ -426,6 +466,7 @@ _mount_ubuntu_base() {
       root_part="${part}"; part_num="${part#${nbd}p}"; break
     fi
   done
+  [[ -n "${root_part}" ]] || die "Could not find ext4 root partition on ${nbd}"
 
   sudo parted -f -s "${nbd}" resizepart "${part_num}" 100%
   sudo partprobe "${nbd}" 2>/dev/null || true
@@ -444,9 +485,36 @@ _mount_ubuntu_base() {
   sudo mv "${mnt}/etc/resolv.conf" "${mnt}/etc/resolv.conf.bak" 2>/dev/null || true
   echo "nameserver 8.8.8.8" | sudo tee "${mnt}/etc/resolv.conf" >/dev/null
 
-  # Cloud-init + netplan
-  sudo mkdir -p "${mnt}/etc/cloud/cloud.cfg.d"
-  sudo tee "${mnt}/etc/cloud/cloud.cfg.d/99-disable-user-manipulation.cfg" >/dev/null <<'EOF'
+  # ── OS-specific networking + cloud-init config ──────────────────────────────
+  if [[ "${VM_BASE_OS}" == "debian" ]]; then
+    # Debian: no netplan — configure systemd-networkd directly with a .network file.
+    # The genericcloud image uses cloud-init but we disable network management
+    # from it and let systemd-networkd handle DHCP on all ethernet interfaces.
+    sudo mkdir -p "${mnt}/etc/systemd/network"
+    sudo tee "${mnt}/etc/systemd/network/20-wired.network" >/dev/null <<'EOF'
+[Match]
+Name=e*
+
+[Network]
+DHCP=yes
+DNS=8.8.8.8
+DNS=8.8.4.4
+
+[DHCP]
+UseDNS=true
+RouteMetric=10
+EOF
+    # Enable systemd-networkd + systemd-resolved in chroot later
+    # Disable the default ifupdown config that genericcloud ships with
+    sudo rm -f "${mnt}/etc/network/interfaces.d/ens*" 2>/dev/null || true
+    sudo tee "${mnt}/etc/network/interfaces" >/dev/null <<'EOF'
+# Networking is managed by systemd-networkd — see /etc/systemd/network/
+source /etc/network/interfaces.d/*
+EOF
+
+    # Cloud-init: disable network config, disable user manipulation
+    sudo mkdir -p "${mnt}/etc/cloud/cloud.cfg.d"
+    sudo tee "${mnt}/etc/cloud/cloud.cfg.d/99-inspectre.cfg" >/dev/null <<'EOF'
 users: []
 disable_root: false
 preserve_hostname: true
@@ -454,8 +522,18 @@ ssh_pwauth: true
 network: {config: disabled}
 EOF
 
-  sudo mkdir -p "${mnt}/etc/netplan"
-  sudo tee "${mnt}/etc/netplan/01-netcfg.yaml" >/dev/null <<'EOF'
+  else
+    # Ubuntu: uses netplan + cloud-init, configure as before
+    sudo mkdir -p "${mnt}/etc/cloud/cloud.cfg.d"
+    sudo tee "${mnt}/etc/cloud/cloud.cfg.d/99-inspectre.cfg" >/dev/null <<'EOF'
+users: []
+disable_root: false
+preserve_hostname: true
+ssh_pwauth: true
+network: {config: disabled}
+EOF
+    sudo mkdir -p "${mnt}/etc/netplan"
+    sudo tee "${mnt}/etc/netplan/01-netcfg.yaml" >/dev/null <<'EOF'
 network:
   version: 2
   renderer: networkd
@@ -465,6 +543,7 @@ network:
         name: e*
       dhcp4: true
 EOF
+  fi
 
   sudo tee "${mnt}/usr/sbin/policy-rc.d" >/dev/null <<'POLICY'
 #!/bin/sh
@@ -477,20 +556,49 @@ POLICY
   _MOUNT_DISK="${disk}"
 }
 
-# ── Shared: install Docker + users inside a chroot ────────────────────────────
+# ── Shared: install Docker + users inside a VM chroot ────────────────────────
 _chroot_vm_setup() {
   local mnt="$1"
-  sudo chroot "${mnt}" /bin/bash <<'CHROOT'
+
+  if [[ "${VM_BASE_OS}" == "debian" ]]; then
+    # Debian: docker.io and docker-compose-v2 are not in Debian repos (or are
+    # outdated). Use Docker's official apt repository instead — same method as
+    # Docker's own install script, just done inside the chroot.
+    sudo chroot "${mnt}" /bin/bash <<'CHROOT'
 set -e
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
-apt-get install -y --no-install-recommends docker.io docker-compose-v2 curl jq net-tools ca-certificates openssh-server
+apt-get install -y --no-install-recommends \
+  ca-certificates curl gnupg lsb-release \
+  openssh-server net-tools jq \
+  systemd-networkd systemd-resolved
+
+# Add Docker's official GPG key + apt repo
+install -m 0755 -d /etc/apt/keyrings
+curl -fsSL https://download.docker.com/linux/debian/gpg \
+  | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+chmod a+r /etc/apt/keyrings/docker.gpg
+echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] \
+  https://download.docker.com/linux/debian $(lsb_release -cs) stable" \
+  > /etc/apt/sources.list.d/docker.list
+apt-get update -qq
+apt-get install -y --no-install-recommends \
+  docker-ce docker-ce-cli containerd.io docker-compose-plugin
 apt-get clean
-systemctl enable ssh
+
+# Enable services
+systemctl enable ssh docker systemd-networkd systemd-resolved
+
+# SSH config
 if [ -f /etc/ssh/sshd_config ]; then
   sed -i 's/^#*PasswordAuthentication .*/PasswordAuthentication yes/' /etc/ssh/sshd_config
   sed -i 's/^#*PermitRootLogin .*/PermitRootLogin yes/' /etc/ssh/sshd_config
 fi
+
+# resolv.conf → systemd-resolved stub
+ln -sf /run/systemd/resolve/stub-resolv.conf /etc/resolv.conf 2>/dev/null || true
+
+# Create inspectre user
 if ! id inspectre &>/dev/null; then
   useradd -m -s /bin/bash inspectre
 fi
@@ -500,6 +608,33 @@ echo "root:inspectre" | chpasswd
 echo "inspectre ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/inspectre
 chmod 0440 /etc/sudoers.d/inspectre
 CHROOT
+
+  else
+    # Ubuntu: docker.io + docker-compose-v2 are in the Ubuntu repos and work fine
+    sudo chroot "${mnt}" /bin/bash <<'CHROOT'
+set -e
+export DEBIAN_FRONTEND=noninteractive
+apt-get update -qq
+apt-get install -y --no-install-recommends \
+  docker.io docker-compose-v2 curl jq net-tools ca-certificates openssh-server
+apt-get clean
+systemctl enable ssh docker
+
+if [ -f /etc/ssh/sshd_config ]; then
+  sed -i 's/^#*PasswordAuthentication .*/PasswordAuthentication yes/' /etc/ssh/sshd_config
+  sed -i 's/^#*PermitRootLogin .*/PermitRootLogin yes/' /etc/ssh/sshd_config
+fi
+
+if ! id inspectre &>/dev/null; then
+  useradd -m -s /bin/bash inspectre
+fi
+usermod -aG sudo,docker inspectre
+echo "inspectre:inspectre" | chpasswd
+echo "root:inspectre" | chpasswd
+echo "inspectre ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/inspectre
+chmod 0440 /etc/sudoers.d/inspectre
+CHROOT
+  fi
 }
 
 # ── Shared: unmount + finalise a VM image ─────────────────────────────────────
@@ -518,16 +653,15 @@ _finalise_vm() {
   sleep 1
 
   if $MAX_COMPRESS; then
-    # No -c: leave qcow2 uncompressed so xz can compress the raw data optimally.
-    # Using -c first (zlib) then xz is double-compression and results in a larger file.
+    # No -c: leave qcow2 uncompressed so xz works on raw data for best ratio.
+    # Double-compressing (qcow2 zlib then xz) gives a larger result than xz alone.
     info "Converting to uncompressed qcow2 for xz pass..."
     qemu-img convert -O qcow2 "${disk}" "${OUTPUT_DIR}/${out_image}"
     info "Compressing VM image (xz -9) — this may take a while..."
     xz --threads=0 -9 -f "${OUTPUT_DIR}/${out_image}"
     ok "VM image built: ${OUTPUT_DIR}/${out_image}.xz"
   else
-    # Without xz, qcow2 internal compression (-c) is the right choice for a
-    # ready-to-use file that's reasonably sized without the long xz wait.
+    # Without xz, -c gives moderate compression instantly — good default
     qemu-img convert -c -O qcow2 "${disk}" "${OUTPUT_DIR}/${out_image}"
     ok "VM image built: ${OUTPUT_DIR}/${out_image}"
   fi
@@ -535,13 +669,13 @@ _finalise_vm() {
 
 # ── VM Appliance — Offline (containers baked in) ──────────────────────────────
 build_vm_image() {
-  step "Building VM Appliance image — Offline (x86_64)"
+  step "Building VM Appliance image — Offline (x86_64) [base: ${VM_BASE_OS}]"
   [[ -f "$TAR_AMD" ]] || die "x64 container bundle cache missing."
 
   local vw="${WORK}/vm"
   mkdir -p "${vw}" "${OUTPUT_DIR}"
 
-  _mount_ubuntu_base "${vw}" "${VM_IMAGE}" "${VM_DISK_SIZE}"
+  _mount_vm_base "${vw}" "${VM_IMAGE}" "${VM_DISK_SIZE}"
   local mnt="${_MOUNT_MNT}" nbd="${_MOUNT_NBD}" disk="${_MOUNT_DISK}"
 
   _chroot_vm_setup "${mnt}"
@@ -549,11 +683,11 @@ build_vm_image() {
   sudo mkdir -p "${mnt}/opt/inspectre/images"
   sudo cp "${TAR_AMD}" "${mnt}/opt/inspectre/images/inspectre-images.tar"
   sudo cp "${REPO}/docker-compose.vm.yml" "${mnt}/opt/inspectre/docker-compose.yml"
-  write_appliance_json "${mnt}" "vm" "amd64" "offline"
-  startup_script        | sudo tee "${mnt}/opt/inspectre/start.sh" >/dev/null
+  write_appliance_json "${mnt}" "vm" "amd64" "offline" "${VM_BASE_OS}"
+  startup_script | sudo tee "${mnt}/opt/inspectre/start.sh" >/dev/null
   sudo chmod +x "${mnt}/opt/inspectre/start.sh"
-  systemd_unit          | sudo tee "${mnt}/etc/systemd/system/inspectre.service" >/dev/null
-  motd_content          | sudo tee "${mnt}/etc/motd" >/dev/null
+  systemd_unit   | sudo tee "${mnt}/etc/systemd/system/inspectre.service" >/dev/null
+  motd_content   | sudo tee "${mnt}/etc/motd" >/dev/null
   sudo chroot "${mnt}" /bin/bash -c "systemctl enable docker inspectre"
 
   _finalise_vm "${mnt}" "${nbd}" "${disk}" "${VM_IMAGE}"
@@ -561,21 +695,20 @@ build_vm_image() {
 
 # ── VM Appliance — Online (pulls from Docker Hub on boot) ─────────────────────
 build_vm_online_image() {
-  step "Building VM Appliance image — Online / Docker Hub (x86_64)"
+  step "Building VM Appliance image — Online / Docker Hub (x86_64) [base: ${VM_BASE_OS}]"
   info "This image pulls thefunkygibbon/inspectre-* from Docker Hub on first boot."
-  info "No local container build required."
 
   local vw="${WORK}/vm-online"
   mkdir -p "${vw}" "${OUTPUT_DIR}"
 
-  _mount_ubuntu_base "${vw}" "${VM_ONLINE_IMAGE}" "${VM_ONLINE_DISK_SIZE}"
+  _mount_vm_base "${vw}" "${VM_ONLINE_IMAGE}" "${VM_ONLINE_DISK_SIZE}"
   local mnt="${_MOUNT_MNT}" nbd="${_MOUNT_NBD}" disk="${_MOUNT_DISK}"
 
   _chroot_vm_setup "${mnt}"
 
   sudo mkdir -p "${mnt}/opt/inspectre"
   sudo cp "${REPO}/docker-compose.vm.online.yml" "${mnt}/opt/inspectre/docker-compose.yml"
-  write_appliance_json "${mnt}" "vm" "amd64" "online"
+  write_appliance_json "${mnt}" "vm" "amd64" "online" "${VM_BASE_OS}"
   startup_script_online | sudo tee "${mnt}/opt/inspectre/start.sh" >/dev/null
   sudo chmod +x "${mnt}/opt/inspectre/start.sh"
   systemd_unit           | sudo tee "${mnt}/etc/systemd/system/inspectre.service" >/dev/null
@@ -663,8 +796,7 @@ _finalise_pi() {
   sleep 1
 
   if $MAX_COMPRESS; then
-    # Pi base is already a raw .img — xz compresses it directly with no intermediate
-    # conversion step needed. This gives optimal compression ratios.
+    # Pi base is already raw .img — xz compresses directly, optimal ratio
     info "Compressing Pi image (xz -9) — this may take a while..."
     xz --threads=0 -9 -z "${raw}" -c > "${OUTPUT_DIR}/${out_image}.xz"
     ok "Pi image built: ${OUTPUT_DIR}/${out_image}.xz"
@@ -709,11 +841,11 @@ build_pi_image() {
   sudo mkdir -p "${mnt}/opt/inspectre/images"
   sudo cp "${TAR_ARM}" "${mnt}/opt/inspectre/images/inspectre-images.tar"
   sudo cp "${REPO}/docker-compose.pi.yml" "${mnt}/opt/inspectre/docker-compose.yml"
-  write_appliance_json "${mnt}" "pi" "arm64" "offline"
-  startup_script      | sudo tee "${mnt}/opt/inspectre/start.sh" >/dev/null
+  write_appliance_json "${mnt}" "pi" "arm64" "offline" "raspios"
+  startup_script | sudo tee "${mnt}/opt/inspectre/start.sh" >/dev/null
   sudo chmod +x "${mnt}/opt/inspectre/start.sh"
-  systemd_unit        | sudo tee "${mnt}/etc/systemd/system/inspectre.service" >/dev/null
-  motd_content        | sudo tee "${mnt}/etc/motd" >/dev/null
+  systemd_unit   | sudo tee "${mnt}/etc/systemd/system/inspectre.service" >/dev/null
+  motd_content   | sudo tee "${mnt}/etc/motd" >/dev/null
 
   _pi_boot_setup "${boot_mnt}"
   _pi_enable_services "${mnt}"
@@ -724,7 +856,6 @@ build_pi_image() {
 build_pi_online_image() {
   step "Building Raspberry Pi Image — Online / Docker Hub (arm64)"
   info "This image pulls thefunkygibbon/inspectre-*:raspi from Docker Hub on first boot."
-  info "No local container build required."
 
   local pw="${WORK}/pi-online"
   mkdir -p "${pw}" "${OUTPUT_DIR}"
@@ -737,7 +868,7 @@ build_pi_online_image() {
 
   sudo mkdir -p "${mnt}/opt/inspectre"
   sudo cp "${REPO}/docker-compose.pi.online.yml" "${mnt}/opt/inspectre/docker-compose.yml"
-  write_appliance_json "${mnt}" "pi" "arm64" "online"
+  write_appliance_json "${mnt}" "pi" "arm64" "online" "raspios"
   startup_script_online | sudo tee "${mnt}/opt/inspectre/start.sh" >/dev/null
   sudo chmod +x "${mnt}/opt/inspectre/start.sh"
   systemd_unit           | sudo tee "${mnt}/etc/systemd/system/inspectre.service" >/dev/null
@@ -777,7 +908,7 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 main() {
-  echo -e "\n${CYAN}${BOLD}InSpectre Image Builder v5.1 Active${NC}"
+  echo -e "\n${CYAN}${BOLD}InSpectre Image Builder v5.2 Active${NC}"
   check_deps
   clone_repo
   ( $BUILD_VM || $BUILD_PI ) && patch_dockerfiles
@@ -791,3 +922,5 @@ main() {
 }
 
 main "$@"
+SCRIPT
+echo "Written OK. Lines: $(wc -l < /tmp/build-images.sh)"
