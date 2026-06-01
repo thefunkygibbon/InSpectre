@@ -1,7 +1,7 @@
 version: '3.8'
 
 services:
-  inspectre-db:
+  db:
     image: inspectre-postgres:amd64
     container_name: inspectre-db
     restart: unless-stopped
@@ -20,14 +20,14 @@ services:
       retries: 5
       start_period: 10s
 
-  inspectre-web:
+  web:
     image: inspectre-backend:amd64
     container_name: inspectre-web
     restart: unless-stopped
     ports:
       - "8000:8000"
     environment:
-      - DATABASE_URL=postgresql://${POSTGRES_USER:-inspectre}:${POSTGRES_PASSWORD:-inspectre}@inspectre-db:5432/${POSTGRES_DB:-inspectre}
+      - DATABASE_URL=postgresql://${POSTGRES_USER:-inspectre}:${POSTGRES_PASSWORD:-inspectre}@db:5432/${POSTGRES_DB:-inspectre}
       - SECRET_KEY=${SECRET_KEY:-your-secret-key}
       - ENVIRONMENT=${ENVIRONMENT:-production}
       - PROBE_API_URL=http://host.docker.internal:8666
@@ -37,19 +37,19 @@ services:
     volumes:
       - ./data/vuln/trivy:/root/.cache/trivy
     depends_on:
-      inspectre-db:
+      db:
         condition: service_healthy
 
-  inspectre-frontend:
+  frontend:
     image: inspectre-frontend:amd64
     container_name: inspectre-frontend
     restart: unless-stopped
     ports:
       - "3000:80"
     depends_on:
-      - inspectre-web
+      - web
 
-  inspectre-probe:
+  probe:
     image: inspectre-probe:amd64
     container_name: inspectre-probe
     restart: unless-stopped
@@ -68,7 +68,7 @@ services:
       - NET_ADMIN
       - NET_RAW
     depends_on:
-      inspectre-db:
+      db:
         condition: service_healthy
 
 volumes:
