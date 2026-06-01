@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-#  InSpectre — Appliance Image Builder  v5.0 (Production Master)
+#  InSpectre — Appliance Image Builder  v5.1 (Production Master)
 # =============================================================================
 set -euo pipefail
 export DOCKER_BUILDKIT=1
@@ -24,6 +24,7 @@ BUILD_CONTAINERS_AMD=false
 BUILD_CONTAINERS_ARM=false
 CLI_TARGET_SPECIFIED=false
 MAX_COMPRESS=false
+PUSH_DOCKERHUB=false
 
 REPO_URL="https://github.com/thefunkygibbon/InSpectre.git"
 REPO_BRANCH="main"
@@ -54,6 +55,7 @@ while [[ $# -gt 0 ]]; do
     --pi-only)        BUILD_PI=true; CLI_TARGET_SPECIFIED=true ;;
     --pi-online-only) BUILD_PI_ONLINE=true; CLI_TARGET_SPECIFIED=true ;;
     --compress)       MAX_COMPRESS=true ;;
+    --push)           PUSH_DOCKERHUB=true ;;
     --branch)         REPO_BRANCH="$2"; shift ;;
     --output-dir)     OUTPUT_DIR="$2"; shift ;;
     --help|-h)        sed -n '2,15p' "$0" | sed 's/^#  \{0,2\}//'; exit 0 ;;
@@ -124,6 +126,13 @@ if ! $CLI_TARGET_SPECIFIED; then
     [Qq]*) echo "Exiting."; exit 0 ;;
     *) die "Invalid choice selected: '$choice'" ;;
   esac
+
+  # Ask about Docker Hub push when containers are being built
+  if $BUILD_CONTAINERS_AMD || $BUILD_CONTAINERS_ARM; then
+    read -rp "Push built images to Docker Hub (thefunkygibbon)? [y/N]: " push_choice
+    [[ "$push_choice" =~ ^[Yy]$ ]] && PUSH_DOCKERHUB=true
+    echo ""
+  fi
 else
   if $BUILD_VM   && [[ ! -f "$TAR_AMD" ]]; then BUILD_CONTAINERS_AMD=true; fi
   if $BUILD_PI   && [[ ! -f "$TAR_ARM" ]]; then BUILD_CONTAINERS_ARM=true; fi
@@ -238,6 +247,52 @@ build_docker_images() {
     docker save inspectre-backend:arm64 inspectre-probe:arm64 inspectre-frontend:arm64 inspectre-postgres:arm64 > "${TAR_ARM}"
   fi
   cd - >/dev/null
+}
+
+# ── Push images to Docker Hub ─────────────────────────────────────────────────
+push_images() {
+  step "Pushing images to Docker Hub (thefunkygibbon)"
+
+  if [[ -z "${DOCKERHUB_TOKEN:-}" ]]; then
+    die "DOCKERHUB_TOKEN environment variable is not set. Export it before running with --push."
+  fi
+
+  echo "${DOCKERHUB_TOKEN}" | docker login -u thefunkygibbon --password-stdin \
+    || die "Docker Hub login failed. Check your DOCKERHUB_TOKEN."
+
+  local pushes=()
+
+  if $BUILD_CONTAINERS_AMD; then
+    docker tag inspectre-backend:amd64  thefunkygibbon/inspectre-web:latest
+    docker tag inspectre-frontend:amd64 thefunkygibbon/inspectre-frontend:latest
+    docker tag inspectre-probe:amd64    thefunkygibbon/inspectre-probe:latest
+    pushes+=(
+      thefunkygibbon/inspectre-web:latest
+      thefunkygibbon/inspectre-frontend:latest
+      thefunkygibbon/inspectre-probe:latest
+    )
+  fi
+
+  if $BUILD_CONTAINERS_ARM; then
+    docker tag inspectre-backend:arm64  thefunkygibbon/inspectre-web:raspi
+    docker tag inspectre-frontend:arm64 thefunkygibbon/inspectre-frontend:raspi
+    docker tag inspectre-probe:arm64    thefunkygibbon/inspectre-probe:raspi
+    pushes+=(
+      thefunkygibbon/inspectre-web:raspi
+      thefunkygibbon/inspectre-frontend:raspi
+      thefunkygibbon/inspectre-probe:raspi
+    )
+  fi
+
+  [[ ${#pushes[@]} -eq 0 ]] && { warn "No images were built this run — nothing to push."; return 0; }
+
+  for img in "${pushes[@]}"; do
+    info "Pushing ${img}..."
+    docker push "${img}"
+    ok "Pushed ${img}"
+  done
+
+  docker logout 2>/dev/null || true
 }
 
 # ── Startup script: offline (loads baked tar on first boot) ───────────────────
@@ -417,7 +472,6 @@ exit 101
 POLICY
   sudo chmod +x "${mnt}/usr/sbin/policy-rc.d"
 
-  # Return nbd and mnt via global-ish vars (bash doesn't have return values)
   _MOUNT_NBD="${nbd}"
   _MOUNT_MNT="${mnt}"
   _MOUNT_DISK="${disk}"
@@ -463,13 +517,18 @@ _finalise_vm() {
   sudo qemu-nbd --disconnect "${nbd}"
   sleep 1
 
-  qemu-img convert -c -O qcow2 "${disk}" "${OUTPUT_DIR}/${out_image}"
-
   if $MAX_COMPRESS; then
-    info "Compressing VM image (xz -9)..."
+    # No -c: leave qcow2 uncompressed so xz can compress the raw data optimally.
+    # Using -c first (zlib) then xz is double-compression and results in a larger file.
+    info "Converting to uncompressed qcow2 for xz pass..."
+    qemu-img convert -O qcow2 "${disk}" "${OUTPUT_DIR}/${out_image}"
+    info "Compressing VM image (xz -9) — this may take a while..."
     xz --threads=0 -9 -f "${OUTPUT_DIR}/${out_image}"
     ok "VM image built: ${OUTPUT_DIR}/${out_image}.xz"
   else
+    # Without xz, qcow2 internal compression (-c) is the right choice for a
+    # ready-to-use file that's reasonably sized without the long xz wait.
+    qemu-img convert -c -O qcow2 "${disk}" "${OUTPUT_DIR}/${out_image}"
     ok "VM image built: ${OUTPUT_DIR}/${out_image}"
   fi
 }
@@ -590,7 +649,7 @@ apt-get clean
 CHROOT
 }
 
-# ── Shared: finalise Pi image ──────────────────────────────────────────────────
+# ── Shared: finalise Pi image ─────────────────────────────────────────────────
 _finalise_pi() {
   local mnt="$1" boot_mnt="$2" loop="$3" raw="$4" out_image="$5"
   sudo rm -f "${mnt}/usr/sbin/policy-rc.d"
@@ -604,7 +663,9 @@ _finalise_pi() {
   sleep 1
 
   if $MAX_COMPRESS; then
-    info "Compressing Pi image (xz -9)..."
+    # Pi base is already a raw .img — xz compresses it directly with no intermediate
+    # conversion step needed. This gives optimal compression ratios.
+    info "Compressing Pi image (xz -9) — this may take a while..."
     xz --threads=0 -9 -z "${raw}" -c > "${OUTPUT_DIR}/${out_image}.xz"
     ok "Pi image built: ${OUTPUT_DIR}/${out_image}.xz"
   else
@@ -656,7 +717,7 @@ build_pi_image() {
 
   _pi_boot_setup "${boot_mnt}"
   _pi_enable_services "${mnt}"
-  _finalise_pi "${mnt}" "${boot_mnt}" "${loop}" "${raw}" "${PI_ONLINE_IMAGE}"
+  _finalise_pi "${mnt}" "${boot_mnt}" "${loop}" "${raw}" "${PI_IMAGE}"
 }
 
 # ── Pi Appliance — Online (pulls from Docker Hub on boot) ─────────────────────
@@ -689,20 +750,20 @@ build_pi_online_image() {
 
 cleanup() {
   for mp in \
-    "${WORK}/pi/mnt/dev/pts"         "${WORK}/pi/mnt/dev"     \
-    "${WORK}/pi/mnt/sys"             "${WORK}/pi/mnt/proc"    \
-    "${WORK}/pi/mnt/boot/firmware"   "${WORK}/pi/mnt/boot"    \
-    "${WORK}/pi/mnt"                 \
-    "${WORK}/pi-online/mnt/dev/pts"  "${WORK}/pi-online/mnt/dev"  \
-    "${WORK}/pi-online/mnt/sys"      "${WORK}/pi-online/mnt/proc" \
-    "${WORK}/pi-online/mnt/boot/firmware" "${WORK}/pi-online/mnt/boot" \
-    "${WORK}/pi-online/mnt"          \
-    "${WORK}/vm/mnt/dev/pts"         "${WORK}/vm/mnt/dev"     \
-    "${WORK}/vm/mnt/sys"             "${WORK}/vm/mnt/proc"    \
-    "${WORK}/vm/mnt"                 \
-    "${WORK}/vm-online/mnt/dev/pts"  "${WORK}/vm-online/mnt/dev"  \
-    "${WORK}/vm-online/mnt/sys"      "${WORK}/vm-online/mnt/proc" \
-    "${WORK}/vm-online/mnt"          \
+    "${WORK}/pi/mnt/dev/pts"              "${WORK}/pi/mnt/dev"          \
+    "${WORK}/pi/mnt/sys"                  "${WORK}/pi/mnt/proc"         \
+    "${WORK}/pi/mnt/boot/firmware"        "${WORK}/pi/mnt/boot"         \
+    "${WORK}/pi/mnt"                      \
+    "${WORK}/pi-online/mnt/dev/pts"       "${WORK}/pi-online/mnt/dev"   \
+    "${WORK}/pi-online/mnt/sys"           "${WORK}/pi-online/mnt/proc"  \
+    "${WORK}/pi-online/mnt/boot/firmware" "${WORK}/pi-online/mnt/boot"  \
+    "${WORK}/pi-online/mnt"               \
+    "${WORK}/vm/mnt/dev/pts"              "${WORK}/vm/mnt/dev"          \
+    "${WORK}/vm/mnt/sys"                  "${WORK}/vm/mnt/proc"         \
+    "${WORK}/vm/mnt"                      \
+    "${WORK}/vm-online/mnt/dev/pts"       "${WORK}/vm-online/mnt/dev"   \
+    "${WORK}/vm-online/mnt/sys"           "${WORK}/vm-online/mnt/proc"  \
+    "${WORK}/vm-online/mnt"               \
   ; do
     sudo umount "${mp}" 2>/dev/null || true
   done
@@ -716,11 +777,12 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 main() {
-  echo -e "\n${CYAN}${BOLD}InSpectre Image Builder v5.0 Active${NC}"
+  echo -e "\n${CYAN}${BOLD}InSpectre Image Builder v5.1 Active${NC}"
   check_deps
   clone_repo
   ( $BUILD_VM || $BUILD_PI ) && patch_dockerfiles
   build_docker_images
+  $PUSH_DOCKERHUB  && push_images
   $BUILD_VM        && build_vm_image
   $BUILD_VM_ONLINE && build_vm_online_image
   $BUILD_PI        && build_pi_image
