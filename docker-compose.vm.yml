@@ -1,0 +1,63 @@
+version: '3.8'
+
+services:
+  postgres:
+    image: inspectre-postgres:amd64
+    container_name: inspectre-postgres
+    restart: unless-stopped
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-inspectre}
+      POSTGRES_USER: ${POSTGRES_USER:-inspectre}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-inspectre}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-inspectre} -d ${POSTGRES_DB:-inspectre}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  backend:
+    image: inspectre-backend:amd64
+    container_name: inspectre-backend
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    environment:
+      - DATABASE_URL=postgresql://${POSTGRES_USER:-inspectre}:${POSTGRES_PASSWORD:-inspectre}@postgres:5432/${POSTGRES_DB:-inspectre}
+      - SECRET_KEY=${SECRET_KEY:-your-secret-key}
+      - ENVIRONMENT=${ENVIRONMENT:-production}
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  frontend:
+    image: inspectre-frontend:amd64
+    container_name: inspectre-frontend
+    restart: unless-stopped
+    ports:
+      - "3000:80"
+    depends_on:
+      - backend
+
+  probe:
+    image: inspectre-probe:amd64
+    container_name: inspectre-probe
+    restart: unless-stopped
+    network_mode: "host"
+    privileged: true
+    environment:
+      # Adjusted to look at the host bridge mapping for Postgres
+      - DATABASE_URL=postgresql://${POSTGRES_USER:-inspectre}:${POSTGRES_PASSWORD:-inspectre}@172.17.0.1:5432/${POSTGRES_DB:-inspectre}
+      - BACKEND_URL=http://172.17.0.1:8000
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+volumes:
+  postgres_data:
