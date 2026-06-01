@@ -132,7 +132,8 @@ check_deps() {
 
 clone_repo() {
   step "Cloning InSpectre (branch: ${REPO_BRANCH})"
-  git clone --depth=1 --branch "${REPO_BRANCH}" "${REPO}" "${REPO}"
+  # FIX: Change the first "${REPO}" to "${REPO_URL}"
+  git clone --depth=1 --branch "${REPO_BRANCH}" "${REPO_URL}" "${REPO}"
 }
 
 patch_dockerfiles() {
