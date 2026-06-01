@@ -1,7 +1,7 @@
 version: '3.8'
 
 services:
-  inspectre-db: # ◄── Top-level key matches container name for internal DNS routing
+  inspectre-db:
     image: inspectre-postgres:amd64
     container_name: inspectre-db
     restart: unless-stopped
@@ -18,8 +18,9 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
+      start_period: 10s
 
-  inspectre-web: # ◄── Top-level key matches container name for internal DNS routing
+  inspectre-web:
     image: inspectre-backend:amd64
     container_name: inspectre-web
     restart: unless-stopped
@@ -29,11 +30,17 @@ services:
       - DATABASE_URL=postgresql://${POSTGRES_USER:-inspectre}:${POSTGRES_PASSWORD:-inspectre}@inspectre-db:5432/${POSTGRES_DB:-inspectre}
       - SECRET_KEY=${SECRET_KEY:-your-secret-key}
       - ENVIRONMENT=${ENVIRONMENT:-production}
+      - PROBE_API_URL=http://host.docker.internal:8666
+      - CORS_ORIGINS=${CORS_ORIGINS:-http://localhost:3000}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - ./data/vuln/trivy:/root/.cache/trivy
     depends_on:
       inspectre-db:
         condition: service_healthy
 
-  frontend:
+  inspectre-frontend:
     image: inspectre-frontend:amd64
     container_name: inspectre-frontend
     restart: unless-stopped
@@ -42,15 +49,21 @@ services:
     depends_on:
       - inspectre-web
 
-  probe:
+  inspectre-probe:
     image: inspectre-probe:amd64
     container_name: inspectre-probe
     restart: unless-stopped
     network_mode: "host"
     privileged: true
     environment:
-      - DATABASE_URL=postgresql://${POSTGRES_USER:-inspectre}:${POSTGRES_PASSWORD:-inspectre}@172.17.0.1:5432/${POSTGRES_DB:-inspectre}
-      - BACKEND_URL=http://172.17.0.1:8000
+      - DATABASE_URL=postgresql://${POSTGRES_USER:-inspectre}:${POSTGRES_PASSWORD:-inspectre}@localhost:5432/${POSTGRES_DB:-inspectre}
+      - SCAN_INTERVAL=${SCAN_INTERVAL:-60}
+      - NMAP_ARGS=${NMAP_ARGS:--sT -O --osscan-limit -T4}
+      - PROBE_API_PORT=${PROBE_API_PORT:-8666}
+      - PYTHONUNBUFFERED=1
+      - NMAP_OPTS=
+    volumes:
+      - ./data/vuln/nuclei:/root/nuclei-templates
     cap_add:
       - NET_ADMIN
       - NET_RAW
