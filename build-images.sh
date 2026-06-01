@@ -36,7 +36,7 @@ VM_DISK_SIZE="20G"
 VM_IMAGE="inspectre-vm.qcow2"
 PI_IMAGE="inspectre-pi.img"
 UBUNTU_URL="https://cloud-images.ubuntu.com/jammy/current/jammy-server-cloudimg-amd64.img"
-UBUNTU_SHA_URL="${UBUNTU_URL}.sha256sum"
+UBUNTU_SHA_URL="https://cloud-images.ubuntu.com/jammy/current/SHA256SUMS"
 RPI_INDEX="https://downloads.raspberrypi.com/raspios_lite_arm64/images"
 
 WORK="$(mktemp -d /tmp/inspectre-build.XXXXXX)"
@@ -440,7 +440,8 @@ build_vm_image() {
   curl -L --progress-bar "${UBUNTU_URL}" -o "${base}"
   
   info "Validating architecture download checksums..."
-  local expected; expected=$(curl -sL "${UBUNTU_SHA_URL}" | awk '{print $1}')
+  local expected
+  expected=$(curl -sL "${UBUNTU_SHA_URL}" | grep "jammy-server-cloudimg-amd64.img" | head -n1 | awk '{print $1}')
   echo "${expected}  ${base}" | sha256sum --check - || die "Base OS image download corrupted."
 
   local disk="${vw}/${VM_IMAGE}"
@@ -529,7 +530,7 @@ USERDATA
   sudo qemu-nbd --disconnect "${nbd}"
   sleep 1
 
-  # Add dynamic KVM hardware acceleration checks for hyper-speed background runs
+  # Check for /dev/kvm write access to attach hardware virtualization acceleration
   local kvm_arg=""
   if [[ -w /dev/kvm ]]; then
     kvm_arg="-enable-kvm"
