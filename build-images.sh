@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-#  InSpectre — Appliance Image Builder  v2.1 (Interactive Edition)
+#  InSpectre — Appliance Image Builder  v2.1
 #
 #  Produces:
 #    output/inspectre-vm.qcow2      x86_64 VM  (QEMU/KVM, Proxmox, VirtualBox)
@@ -21,140 +21,53 @@ warn()    { echo -e "${YELLOW}[WARN]${NC}  $*"; }
 die()     { echo -e "${RED}[FAIL]${NC}  $*" >&2; exit 1; }
 step()    { echo -e "\n${BOLD}${CYAN}━━━  $* ━━━${NC}"; }
 
-# ── Defaults & Toggles ────────────────────────────────────────────────────────
-BUILD_VM=false
-BUILD_PI=false
-BUILD_CONTAINERS_AMD=false
-BUILD_CONTAINERS_ARM=false
-CLI_TARGET_SPECIFIED=false
-
+# ── Defaults ──────────────────────────────────────────────────────────────────
+BUILD_VM=true
+BUILD_PI=true
 REPO_URL="https://github.com/thefunkygibbon/InSpectre.git"
 REPO_BRANCH="main"
 OUTPUT_DIR="$(pwd)/output"
-CACHE_DIR="${OUTPUT_DIR}/.cache"
 VM_DISK_SIZE="20G"
 VM_IMAGE="inspectre-vm.qcow2"
 PI_IMAGE="inspectre-pi.img"
 UBUNTU_URL="https://cloud-images.ubuntu.com/jammy/current/jammy-server-cloudimg-amd64.img"
-UBUNTU_SHA_URL="https://cloud-images.ubuntu.com/jammy/current/SHA256SUMS"
+UBUNTU_SHA_URL="${UBUNTU_URL}.sha256sum"
 RPI_INDEX="https://downloads.raspberrypi.com/raspios_lite_arm64/images"
 
 WORK="$(mktemp -d /tmp/inspectre-build.XXXXXX)"
 REPO="${WORK}/repo"
-TAR_AMD="${CACHE_DIR}/inspectre-amd64.tar"
-TAR_ARM="${CACHE_DIR}/inspectre-arm64.tar"
+TAR_AMD="${WORK}/inspectre-amd64.tar"
+TAR_ARM="${WORK}/inspectre-arm64.tar"
 
 # ── Args ──────────────────────────────────────────────────────────────────────
 while [[ $# -gt 0 ]]; do
   case $1 in
-    --vm-only)     BUILD_VM=true; CLI_TARGET_SPECIFIED=true ;;
-    --pi-only)     BUILD_PI=true; CLI_TARGET_SPECIFIED=true ;;
+    --vm-only)     BUILD_PI=false ;;
+    --pi-only)     BUILD_VM=false ;;
     --branch)      REPO_BRANCH="$2"; shift ;;
     --output-dir)  OUTPUT_DIR="$2"; shift ;;
-    --help|-h)     sed -n '2,15p' "$0" | sed 's/^#  \{0,2\}//'; exit 0 ;;
+    --help|-h)     sed -n '2,20p' "$0" | sed 's/^#  \{0,2\}//'; exit 0 ;;
     *)             die "Unknown option: $1" ;;
   esac
   shift
 done
 
-# Ensure output and cache tracking paths exist early
-mkdir -p "${CACHE_DIR}"
-
-# ── Interactive Prompt Selection ──────────────────────────────────────────────
-if ! $CLI_TARGET_SPECIFIED; then
-  echo -e "${CYAN}${BOLD}╔══════════════════════════════════════════════════╗${NC}"
-  echo -e "${CYAN}${BOLD}║            Select a Build Option                 ║${NC}"
-  echo -e "${CYAN}${BOLD}╚══════════════════════════════════════════════════╝${NC}"
-  echo -e "  1) Build x64 Docker Container Images Only"
-  echo -e "  2) Build ARM Docker Container Images Only"
-  echo -e "  3) Build x64 VM Appliance Image (.qcow2)"
-  echo -e "  4) Build Raspberry Pi SD Card Image (.img.xz)"
-  echo -e "  5) Build Everything (All Container & Appliance Images)"
-  echo -e "  q) Quit"
-  echo ""
-  read -rp "Enter selection [1-5/q]: " choice
-  echo ""
-
-  case "$choice" in
-    1)
-      BUILD_CONTAINERS_AMD=true
-      ;;
-    2)
-      BUILD_CONTAINERS_ARM=true
-      ;;
-    3)
-      BUILD_VM=true
-      if [[ -f "$TAR_AMD" ]]; then
-        echo -e "${YELLOW}[WARN] Found existing cached x64 container bundle.${NC}"
-        read -rp "Do you want to re-compile the x64 container images? [y/N]: " recompile
-        if [[ "$recompile" =~ ^[Yy]$ ]]; then BUILD_CONTAINERS_AMD=true; fi
-      else
-        BUILD_CONTAINERS_AMD=true
-      fi
-      ;;
-    4)
-      BUILD_PI=true
-      if [[ -f "$TAR_ARM" ]]; then
-        echo -e "${YELLOW}[WARN] Found existing cached ARM container bundle.${NC}"
-        read -rp "Do you want to re-compile the ARM container images? [y/N]: " recompile
-        if [[ "$recompile" =~ ^[Yy]$ ]]; then BUILD_CONTAINERS_ARM=true; fi
-      else
-        BUILD_CONTAINERS_ARM=true
-      fi
-      ;;
-    5)
-      BUILD_VM=true
-      BUILD_PI=true
-      if [[ -f "$TAR_AMD" ]]; then
-        read -rp "Found cached x64 container bundle. Re-compile? [y/N]: " recomp_amd
-        if [[ "$recomp_amd" =~ ^[Yy]$ ]]; then BUILD_CONTAINERS_AMD=true; fi
-      else
-        BUILD_CONTAINERS_AMD=true
-      fi
-      if [[ -f "$TAR_ARM" ]]; then
-        read -rp "Found cached ARM container bundle. Re-compile? [y/N]: " recomp_arm
-        if [[ "$recomp_arm" =~ ^[Yy]$ ]]; then BUILD_CONTAINERS_ARM=true; fi
-      else
-        BUILD_CONTAINERS_ARM=true
-      fi
-      ;;
-    [Qq]*)
-      echo "Exiting."
-      exit 0
-      ;;
-    *)
-      die "Invalid choice selected: '$choice'"
-      ;;
-  esac
-else
-  # Non-interactive CLI target fallback evaluations
-  if $BUILD_VM && [[ ! -f "$TAR_AMD" ]]; then BUILD_CONTAINERS_AMD=true; fi
-  if $BUILD_PI && [[ ! -f "$TAR_ARM" ]]; then BUILD_CONTAINERS_ARM=true; fi
-fi
-
 # ── Dependency check ──────────────────────────────────────────────────────────
 check_deps() {
   step "Checking dependencies"
   local missing=()
-  local deps=(docker git curl xz sha256sum)
-  
-  if $BUILD_VM || $BUILD_PI; then
-    deps+=(parted e2fsck resize2fs losetup)
-  fi
-  $BUILD_VM && deps+=(qemu-img cloud-localds qemu-system-x86_64 qemu-nbd)
+  local deps=(docker git curl xz sha256sum parted e2fsck resize2fs losetup qemu-img)
+  $BUILD_VM && deps+=(cloud-localds qemu-system-x86_64 qemu-nbd)
   $BUILD_PI && deps+=(chroot)
-  
   for d in "${deps[@]}"; do
     command -v "$d" &>/dev/null && ok "$d" || missing+=("$d")
   done
   [[ ${#missing[@]} -eq 0 ]] || \
     die "Missing tools: ${missing[*]}\n\nInstall:\n  sudo apt-get install -y qemu-system-x86 qemu-system-arm qemu-utils cloud-image-utils git curl xz-utils parted e2fsprogs"
 
-  # Docker buildx verification
   docker buildx version &>/dev/null || die "docker buildx not available"
 
-  # binfmt for cross-compiling ARM architecture on x86 machines
-  if $BUILD_CONTAINERS_ARM && ! ls /proc/sys/fs/binfmt_misc/ 2>/dev/null | grep -q aarch64; then
+  if $BUILD_PI && ! ls /proc/sys/fs/binfmt_misc/ 2>/dev/null | grep -q aarch64; then
     warn "Registering QEMU binfmt for arm64..."
     docker run --rm --privileged multiarch/qemu-user-static --reset -p yes \
       || die "Failed. Run manually: docker run --rm --privileged multiarch/qemu-user-static --reset -p yes"
@@ -172,63 +85,43 @@ clone_repo() {
 # ── Step 2: Patch Dockerfiles for multi-arch ──────────────────────────────────
 patch_dockerfiles() {
   step "Patching Dockerfiles for multi-arch compatibility"
-
   local probe_df="${REPO}/probe/Dockerfile"
   local backend_df="${REPO}/backend/Dockerfile"
 
-  # ── probe/Dockerfile ──────────────────────────────────────────────────────
   python3 - "${probe_df}" <<'PY'
 import sys, re
 path = sys.argv[1]
 with open(path) as f:
     txt = f.read()
-
-txt = re.sub(
-    r'(^FROM python:3\.12-slim\n)',
-    r'\1ARG TARGETARCH=amd64\n',
-    txt, count=1, flags=re.MULTILINE
-)
+txt = re.sub(r'(^FROM python:3\.12-slim\n)', r'\1ARG TARGETARCH=amd64\n', txt, count=1, flags=re.MULTILINE)
 txt = txt.replace('nuclei_${NUCLEI_VERSION}_linux_amd64.zip', 'nuclei_${NUCLEI_VERSION}_linux_${TARGETARCH}.zip')
 txt = txt.replace('nerva-linux-amd64.tar.gz', 'nerva-linux-${TARGETARCH}.tar.gz')
-
 with open(path, 'w') as f:
     f.write(txt)
 print("  probe/Dockerfile patched")
 PY
 
-  # ── backend/Dockerfile ────────────────────────────────────────────────────
   python3 - "${backend_df}" <<'PY'
 import sys, re
 path = sys.argv[1]
 with open(path) as f:
     txt = f.read()
-
-txt = re.sub(
-    r'(^FROM python:3\.12-slim\n)',
-    r'\1ARG TARGETARCH=amd64\n',
-    txt, count=1, flags=re.MULTILINE
-)
+txt = re.sub(r'(^FROM python:3\.12-slim\n)', r'\1ARG TARGETARCH=amd64\n', txt, count=1, flags=re.MULTILINE)
 txt = txt.replace(
     '"https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz"',
     '"https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/trivy_${TRIVY_VERSION}_Linux-$([ \\"$TARGETARCH\\" = \\"arm64\\" ] && echo ARM64 || echo 64bit).tar.gz"'
 )
-
 with open(path, 'w') as f:
     f.write(txt)
 print("  backend/Dockerfile patched")
 PY
 
-  ok "Dockerfiles patched successfully"
+  ok "Dockerfiles patched"
 }
 
 # ── Step 3: Build Docker images ───────────────────────────────────────────────
 build_docker_images() {
-  if ! $BUILD_CONTAINERS_AMD && ! $BUILD_CONTAINERS_ARM; then
-    info "Skipping container compiling phases (Using cached tar bundles)."
-    return 0
-  fi
-
-  step "Building Docker container images"
+  step "Building Docker images (amd64 + arm64 in parallel)"
   cd "${REPO}"
 
   local builder="inspectre-builder-$$"
@@ -239,11 +132,12 @@ build_docker_images() {
     --use >/dev/null
   trap "docker buildx rm ${builder} 2>/dev/null || true" RETURN
 
-  local pids=() log files tags=()
-
+  local pids=() logs=() tags=()
   _build_bg() {
     local name="$1" platform="$2" context="$3" tag="$4"
-    local logfile="${WORK}/build-${name}.log"
+    local log="${WORK}/build-${name}.log"
+    logs+=("${log}")
+    tags+=("${tag}")
     docker buildx build \
       --builder "${builder}" \
       --platform "${platform}" \
@@ -251,19 +145,16 @@ build_docker_images() {
       --load \
       --progress plain \
       "${context}" \
-      >"${logfile}" 2>&1 &
+      >"${log}" 2>&1 &
     pids+=($!)
-    tags+=("${tag}")
-    info "  Started: ${tag} [pid $!]"
+    info "  Started: ${tag}  [pid $!]"
   }
 
-  if $BUILD_CONTAINERS_AMD; then
-    _build_bg "backend-amd"  "linux/amd64" "./backend"  "inspectre-backend:amd64"
-    _build_bg "probe-amd"    "linux/amd64" "./probe"    "inspectre-probe:amd64"
-    _build_bg "frontend-amd" "linux/amd64" "./frontend" "inspectre-frontend:amd64"
-  fi
+  _build_bg "backend-amd"  "linux/amd64" "./backend"  "inspectre-backend:amd64"
+  _build_bg "probe-amd"    "linux/amd64" "./probe"    "inspectre-probe:amd64"
+  _build_bg "frontend-amd" "linux/amd64" "./frontend" "inspectre-frontend:amd64"
 
-  if $BUILD_CONTAINERS_ARM; then
+  if $BUILD_PI; then
     _build_bg "backend-arm"  "linux/arm64" "./backend"  "inspectre-backend:arm64"
     _build_bg "probe-arm"    "linux/arm64" "./probe"    "inspectre-probe:arm64"
     _build_bg "frontend-arm" "linux/arm64" "./frontend" "inspectre-frontend:arm64"
@@ -272,36 +163,39 @@ build_docker_images() {
   local failed=0
   for i in "${!pids[@]}"; do
     if wait "${pids[$i]}"; then
-      ok "  ${tags[$i]} completed successfully"
+      ok "  ${tags[$i]} done"
     else
-      warn "  ${tags[$i]} FAILED. Check build log details inside ${WORK}/"
+      warn "  ${tags[$i]} FAILED — showing tail of log:"
+      tail -30 "${logs[$i]}" >&2
       failed=1
     fi
   done
-  [[ $failed -eq 0 ]] || die "One or more parallel Docker image compilations failed."
+  [[ $failed -eq 0 ]] || die "One or more Docker builds failed — see logs in ${WORK}/"
 
-  if $BUILD_CONTAINERS_AMD; then
-    info "Pulling postgres:15-alpine (amd64)..."
-    docker pull --platform linux/amd64 --quiet postgres:15-alpine
-    docker tag postgres:15-alpine inspectre-postgres:amd64
-    info "Exporting amd64 container bundle..."
-    docker save inspectre-backend:amd64 inspectre-probe:amd64 inspectre-frontend:amd64 inspectre-postgres:amd64 > "${TAR_AMD}"
-    ok "amd64 cached container bundle finalized: $(du -sh "${TAR_AMD}" | cut -f1)"
-  fi
+  info "Pulling postgres:15-alpine (amd64)..."
+  docker pull --platform linux/amd64 --quiet postgres:15-alpine
+  docker tag postgres:15-alpine inspectre-postgres:amd64
 
-  if $BUILD_CONTAINERS_ARM; then
+  if $BUILD_PI; then
     info "Pulling postgres:15-alpine (arm64)..."
     docker pull --platform linux/arm64 --quiet postgres:15-alpine
     docker tag postgres:15-alpine inspectre-postgres:arm64
-    info "Exporting arm64 container bundle..."
-    docker save inspectre-backend:arm64 inspectre-probe:arm64 inspectre-frontend:arm64 inspectre-postgres:arm64 > "${TAR_ARM}"
-    ok "arm64 cached container bundle finalized: $(du -sh "${TAR_ARM}" | cut -f1)"
+  fi
+
+  info "Exporting amd64 image bundle..."
+  docker save inspectre-backend:amd64 inspectre-probe:amd64 inspectre-frontend:amd64 inspectre-postgres:amd64 >"${TAR_AMD}"
+  ok "amd64 bundle: $(du -sh "${TAR_AMD}" | cut -f1)"
+
+  if $BUILD_PI; then
+    info "Exporting arm64 image bundle..."
+    docker save inspectre-backend:arm64 inspectre-probe:arm64 inspectre-frontend:arm64 inspectre-postgres:arm64 >"${TAR_ARM}"
+    ok "arm64 bundle: $(du -sh "${TAR_ARM}" | cut -f1)"
   fi
 
   cd - >/dev/null
 }
 
-# ── Helpers: Appliance Configuration Content Creators ─────────────────────────
+# ── Helpers: shared file content generators ───────────────────────────────────
 compose_content() {
   local arch="$1"
   cat <<COMPOSE
@@ -378,18 +272,19 @@ startup_script() {
 set -e
 TAR="/opt/inspectre/images/inspectre-images.tar"
 if [[ -f "$TAR" ]]; then
-  echo "[InSpectre] Loading baked container system images from bundle archive..."
+  echo "[InSpectre] Loading Docker images from bundle..."
   docker load < "$TAR"
   rm -f "$TAR"
+  echo "[InSpectre] Images loaded."
 fi
 cd /opt/inspectre
 docker compose up -d
 IP=$(hostname -I | awk '{print $1}')
 echo ""
 echo "╔══════════════════════════════════════════════════╗"
-echo "║  InSpectre Application Active                    ║"
-echo "║  Frontend UI : http://${IP}:3000                 ║"
-echo "║  Backend API : http://${IP}:8000                 ║"
+echo "║  InSpectre is running!                           ║"
+echo "║  Frontend : http://${IP}:3000                    ║"
+echo "║  API      : http://${IP}:8000                    ║"
 echo "╚══════════════════════════════════════════════════╝"
 STARTUP
 }
@@ -397,16 +292,17 @@ STARTUP
 systemd_unit() {
   cat <<'UNIT'
 [Unit]
-Description=InSpectre System Framework
+Description=InSpectre Network Scanner
 After=docker.service network-online.target
 Requires=docker.service
+Wants=network-online.target
 
 [Service]
 Type=oneshot
 RemainAfterExit=yes
 WorkingDirectory=/opt/inspectre
 ExecStart=/opt/inspectre/start.sh
-ExecStop=/usr/bin/docker compose down
+ExecStop=/usr/bin/docker compose -f /opt/inspectre/docker-compose.yml down
 TimeoutStartSec=600
 
 [Install]
@@ -418,36 +314,34 @@ motd_content() {
   cat <<'MOTD'
 
 ╔══════════════════════════════════════════════════════╗
-║           InSpectre System Scanner Appliance         ║
+║           InSpectre Network Scanner                  ║
 ╠══════════════════════════════════════════════════════╣
-║  UI Browser Access : http://<this-ip>:3000           ║
-║  Core API Backend  : http://<this-ip>:8000           ║
-║  System Logs       : sudo journalctl -u inspectre -f ║
+║  Open in browser : http://<this-ip>:3000             ║
+║  API             : http://<this-ip>:8000             ║
+║  View logs       : sudo journalctl -u inspectre -f   ║
 ╚══════════════════════════════════════════════════════╝
 MOTD
 }
 
-# ── Step 4: VM Image Generation ───────────────────────────────────────────────
+# ── Step 4: VM Image ──────────────────────────────────────────────────────────
 build_vm_image() {
   step "Building VM image (x86_64)"
-  [[ -f "$TAR_AMD" ]] || die "x64 container compilation bundle missing from local cache."
-  
   local vw="${WORK}/vm"
   mkdir -p "${vw}" "${OUTPUT_DIR}"
 
-  info "Downloading Ubuntu Cloud framework image..."
+  info "Downloading Ubuntu 22.04 cloud image..."
   local base="${vw}/ubuntu-base.img"
   curl -L --progress-bar "${UBUNTU_URL}" -o "${base}"
-  
-  info "Validating architecture download checksums..."
-  local expected
-  expected=$(curl -sL "${UBUNTU_SHA_URL}" | grep "jammy-server-cloudimg-amd64.img" | head -n1 | awk '{print $1}')
-  echo "${expected}  ${base}" | sha256sum --check - || die "Base OS image download corrupted."
+  info "Verifying checksum..."
+  local expected; expected=$(curl -sL "${UBUNTU_SHA_URL}" | awk '{print $1}')
+  echo "${expected}  ${base}" | sha256sum --check - || die "Ubuntu image checksum mismatch"
 
   local disk="${vw}/${VM_IMAGE}"
+  info "Creating ${VM_DISK_SIZE} qcow2 disk..."
   qemu-img convert -f qcow2 -O qcow2 "${base}" "${disk}"
   qemu-img resize "${disk}" "${VM_DISK_SIZE}"
 
+  info "Generating cloud-init seed..."
   local ci="${vw}/cloud-init"
   mkdir -p "${ci}"
   echo "instance-id: inspectre-appliance" > "${ci}/meta-data"
@@ -489,59 +383,65 @@ runcmd:
   - usermod -aG docker inspectre
   - mkdir -p /opt/inspectre/images
   - systemctl enable inspectre
+  - systemctl daemon-reload
 USERDATA
 
   local seed="${vw}/seed.iso"
   cloud-localds "${seed}" "${ci}/user-data" "${ci}/meta-data"
 
-  info "Injecting cached x64 containers directly into internal partition structure..."
+  info "Injecting Docker image bundle into VM disk..."
   sudo modprobe nbd max_part=8 2>/dev/null || true
-  
+
   local nbd=""
   for dev in /dev/nbd{0..15}; do
     if [[ -b "${dev}" ]] && ! sudo lsblk "${dev}" 2>/dev/null | grep -q "part\|disk.*[0-9]$"; then
       nbd="${dev}"; break
     fi
   done
-  [[ -n "${nbd}" ]] || die "Network block devices exhausted. Check kernel module loads."
+  [[ -n "${nbd}" ]] || die "No free nbd device found — is the nbd kernel module loaded?"
 
   sudo qemu-nbd --connect="${nbd}" "${disk}"
   sleep 2
   sudo partprobe "${nbd}" 2>/dev/null || true
   sleep 1
 
-  local mnt="${vw}/mnt"
-  mkdir -p "${mnt}"
-  local mounted=false
-  for part in "${nbd}p1" "${nbd}p2" "${nbd}p3"; do
-    [[ -b "${part}" ]] || continue
-    sudo mount "${part}" "${mnt}" 2>/dev/null && mounted=true && break
+  # NEW LOGIC: Dynamic mapping, growing partition boundaries, and resizing filesystem
+  local root_part=""
+  local part_num=""
+  for part in "${nbd}p1" "${nbd}p2" "${nbd}p3" "${nbd}p4" "${nbd}p5"; do
+    if [[ -b "${part}" ]] && sudo blkid "${part}" | grep -q 'ext4'; then
+      root_part="${part}"
+      part_num="${part#${nbd}p}"
+      break
+    fi
   done
-  
-  if ! $mounted; then
+
+  if [[ -n "${root_part}" ]]; then
+    info "Expanding root partition ${part_num} and filesystem maps to fill allocation..."
+    sudo parted -s "${nbd}" resizepart "${part_num}" 100%
+    sudo partprobe "${nbd}" 2>/dev/null || true
+    sleep 1
+    sudo e2fsck -f "${root_part}" -y >/dev/null 2>&1 || true
+    sudo resize2fs "${root_part}" >/dev/null 2>&1 || true
+  else
     sudo qemu-nbd --disconnect "${nbd}"
-    die "Failed tracking viable filesystem structures inside VM target disk partitions."
+    die "Could not locate a recognizable ext4 filesystem map inside the image partition tables."
   fi
 
+  local mnt="${vw}/mnt"
+  mkdir -p "${mnt}"
+  sudo mount "${root_part}" "${mnt}"
+
   sudo mkdir -p "${mnt}/opt/inspectre/images"
+  info "Copying amd64 bundle ($(du -sh "${TAR_AMD}" | cut -f1)) — please wait..."
   sudo cp "${TAR_AMD}" "${mnt}/opt/inspectre/images/inspectre-images.tar"
 
   sudo umount "${mnt}"
   sudo qemu-nbd --disconnect "${nbd}"
   sleep 1
 
-  # Check for /dev/kvm write access to attach hardware virtualization acceleration
-  local kvm_arg=""
-  if [[ -w /dev/kvm ]]; then
-    kvm_arg="-enable-kvm"
-    info "KVM acceleration detected. Initializing rapid headless configuration engine..."
-  else
-    warn "KVM acceleration missing. Running step via standard software virtualization emulation..."
-  fi
-
-  info "Executing headless target environment configuration operations..."
+  info "Running first-boot provisioning via QEMU (up to 8 min)..."
   timeout 480 qemu-system-x86_64 \
-    ${kvm_arg} \
     -name "inspectre-firstboot" \
     -m 2048 -smp 4 \
     -drive "file=${disk},format=qcow2,if=virtio" \
@@ -551,40 +451,42 @@ USERDATA
     -no-reboot \
     -netdev "user,id=net0" \
     -device "virtio-net-pci,netdev=net0" \
-    2>&1 | grep --line-buffered -E "cloud-init|inspectre|Reached target|login:|runcmd" || true
+    2>&1 | grep --line-buffered -E "cloud-init|inspectre|Reached target|login:|runcmd|WARN|ERROR" \
+    || warn "First-boot QEMU exited non-zero (usually fine if cloud-init completed)"
 
-  info "Compressing final production appliance artifact..."
+  info "Compressing VM image..."
   qemu-img convert -c -O qcow2 "${disk}" "${OUTPUT_DIR}/${VM_IMAGE}"
-  ok "VM build finalized: ${OUTPUT_DIR}/${VM_IMAGE}"
+  ok "VM image: ${OUTPUT_DIR}/${VM_IMAGE}  ($(du -sh "${OUTPUT_DIR}/${VM_IMAGE}" | cut -f1))"
 }
 
-# ── Step 5: Pi Image Generation ───────────────────────────────────────────────
+# ── Step 5: Pi Image ──────────────────────────────────────────────────────────
 build_pi_image() {
-  step "Building Raspberry Pi SD Card Image (arm64)"
-  [[ -f "$TAR_ARM" ]] || die "ARM container compilation bundle missing from local cache."
-
+  step "Building Raspberry Pi image (arm64)"
   local pw="${WORK}/pi"
   mkdir -p "${pw}" "${OUTPUT_DIR}"
 
-  info "Locating stable upstream image distributions..."
+  info "Finding latest Raspberry Pi OS Lite (64-bit)..."
   local idx; idx=$(curl -sL "${RPI_INDEX}/")
   local latest_dir; latest_dir=$(echo "${idx}" | grep -oP 'raspios_lite_arm64-\d{4}-\d{2}-\d{2}' | sort -r | head -1)
+  [[ -n "${latest_dir}" ]] || die "Could not determine latest RPi OS directory"
   local dir_url="${RPI_INDEX}/${latest_dir}/"
   local img_xz; img_xz=$(curl -sL "${dir_url}" | grep -oP '[\w\-]+\.img\.xz' | head -1)
 
   local xz_path="${pw}/${img_xz}"
+  info "Downloading ${img_xz}..."
   curl -L --progress-bar "${dir_url}${img_xz}" -o "${xz_path}"
-  
-  info "Extracting Raspberry Pi OS filesystems..."
+
+  info "Decompressing (all CPU threads)..."
   xz --decompress --keep --threads=0 "${xz_path}"
   local raw="${pw}/${img_xz%.xz}"
 
-  info "Expanding local base storage tracks by 10GB..."
+  info "Expanding image by 10 GB..."
   dd if=/dev/zero bs=1M count=10240 >>"${raw}" 2>/dev/null
   sudo parted -s "${raw}" resizepart 2 100% 2>/dev/null || true
 
   local loop; loop=$(sudo losetup --find --show --partscan "${raw}")
   sleep 2
+
   sudo e2fsck -f "${loop}p2" -y >/dev/null 2>&1 || true
   sudo resize2fs "${loop}p2" >/dev/null 2>&1 || true
 
@@ -594,9 +496,9 @@ build_pi_image() {
 
   local boot_mnt="${mnt}/boot"
   [[ -d "${mnt}/boot/firmware" ]] && boot_mnt="${mnt}/boot/firmware"
-  sudo mount "${loop}p1" "${boot_mnt}" 2>/dev/null || true
+  sudo mount "${loop}p1" "${boot_mnt}" 2>/dev/null || warn "Could not mount boot partition"
 
-  info "Initializing isolated OS Environment Chroot for system updates..."
+  info "Pre-installing Docker into Pi chroot..."
   sudo mount --bind /proc    "${mnt}/proc"
   sudo mount --bind /sys     "${mnt}/sys"
   sudo mount --bind /dev     "${mnt}/dev"
@@ -618,7 +520,9 @@ apt-get clean
 rm -rf /var/lib/apt/lists/*
 CHROOT
 
-  info "Baking system service profiles and cached ARM containers into Pi tracks..."
+  ok "Docker installed in chroot"
+
+  info "Injecting Docker image bundle..."
   sudo mkdir -p "${mnt}/opt/inspectre/images"
   sudo cp "${TAR_ARM}" "${mnt}/opt/inspectre/images/inspectre-images.tar"
 
@@ -629,32 +533,31 @@ CHROOT
   motd_content | sudo tee "${mnt}/etc/motd" >/dev/null
 
   sudo mkdir -p "${mnt}/etc/systemd/system/multi-user.target.wants"
-  sudo ln -sf /lib/systemd/system/docker.service "${mnt}/etc/systemd/system/multi-user.target.wants/docker.service" || true
-  sudo ln -sf /etc/systemd/system/inspectre.service "${mnt}/etc/systemd/system/multi-user.target.wants/inspectre.service" || true
+  sudo ln -sf /lib/systemd/system/docker.service "${mnt}/etc/systemd/system/multi-user.target.wants/docker.service" 2>/dev/null || true
+  sudo ln -sf /etc/systemd/system/inspectre.service "${mnt}/etc/systemd/system/multi-user.target.wants/inspectre.service" 2>/dev/null || true
 
-  sudo touch "${boot_mnt}/ssh" || true
-  
+  sudo touch "${boot_mnt}/ssh" 2>/dev/null || true
+
   local pi_pw_hash='$6$rounds=4096$inspectre$9T1j/dxZpyW7dB4qoMFlEq4K7kZwxlN.ZF09wRqiNEi9VJ/SRRvxlCkIMVtCnBfHHpOuAQEP6oROxL0bz6lD41'
   echo "pi:${pi_pw_hash}" | sudo tee "${boot_mnt}/userconf.txt" >/dev/null
   sudo chroot "${mnt}" usermod -aG docker pi 2>/dev/null || true
 
-  # Chroot Environment Cleanup Execution Block
   sudo rm -f "${mnt}/usr/sbin/policy-rc.d"
   sudo umount "${mnt}/dev/pts" 2>/dev/null || true
   sudo umount "${mnt}/dev"     2>/dev/null || true
   sudo umount "${mnt}/sys"     2>/dev/null || true
   sudo umount "${mnt}/proc"    2>/dev/null || true
-  sudo umount "${boot_mnt}"    2>/dev/null || true
+  sudo umount "${boot_mnt}" 2>/dev/null || true
   sudo umount "${mnt}"
   sudo losetup -d "${loop}"
   sleep 1
 
-  info "Packing compressed multi-threaded Pi SD Card production artifact..."
-  xz --threads=0 -9 -z "${raw}" -c > "${OUTPUT_DIR}/${PI_IMAGE}.xz"
-  ok "Pi Flash image finalized: ${OUTPUT_DIR}/${PI_IMAGE}.xz"
+  info "Compressing Pi image..."
+  xz --threads=0 -9 -z "${raw}" -c >"${OUTPUT_DIR}/${PI_IMAGE}.xz"
+  ok "Pi image: ${OUTPUT_DIR}/${PI_IMAGE}.xz  ($(du -sh "${OUTPUT_DIR}/${PI_IMAGE}.xz" | cut -f1))"
 }
 
-# ── Dynamic System Mount Safe-cleanup Engine ──────────────────────────────────
+# ── Cleanup trap ──────────────────────────────────────────────────────────────
 cleanup() {
   for mp in "${WORK}/pi/mnt/dev/pts" "${WORK}/pi/mnt/dev" "${WORK}/pi/mnt/sys" "${WORK}/pi/mnt/proc" "${WORK}/pi/mnt/boot/firmware" "${WORK}/pi/mnt/boot" "${WORK}/pi/mnt" "${WORK}/vm/mnt"; do
     sudo umount "${mp}" 2>/dev/null || true
@@ -668,26 +571,19 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-# ── Main Context Execution ────────────────────────────────────────────────────
+# ── Main ──────────────────────────────────────────────────────────────────────
 main() {
-  echo -e "\n${CYAN}${BOLD}╔══════════════════════════════════════════════════╗${NC}"
+  echo ""
+  echo -e "${CYAN}${BOLD}╔══════════════════════════════════════════════════╗${NC}"
   echo -e "${CYAN}${BOLD}║    InSpectre Appliance Image Builder  v2.1       ║${NC}"
-  echo -e "${CYAN}${BOLD}╚══════════════════════════════════════════════════╝${NC}\n"
-  
+  echo -e "${CYAN}${BOLD}╚══════════════════════════════════════════════════╝${NC}"
+  echo ""
   info "Branch  : ${REPO_BRANCH}"
   info "Output  : ${OUTPUT_DIR}"
-  
-  local desc=""
-  $BUILD_CONTAINERS_AMD && desc+="[x64 Containers] "
-  $BUILD_CONTAINERS_ARM && desc+="[ARM Containers] "
-  $BUILD_VM && desc+="[x64 VM Image] "
-  $BUILD_PI && desc+="[Pi SD Card Image] "
-  info "Building: ${desc:-Nothing Selected. Exit.}"
-  
-  if [[ -z "${desc}" ]]; then exit 0; fi
+  info "Building: $( $BUILD_VM && $BUILD_PI && echo 'VM + Pi' || ( $BUILD_VM && echo 'VM only' ) || echo 'Pi only' )"
+  echo ""
 
   local start_time=$SECONDS
-
   check_deps
   clone_repo
   patch_dockerfiles
@@ -696,27 +592,18 @@ main() {
   $BUILD_PI && build_pi_image
 
   local elapsed=$(( SECONDS - start_time ))
-  echo -e "\n${GREEN}${BOLD}╔══════════════════════════════════════════════════╗${NC}"
-  echo -e "${GREEN}${BOLD}║              Build Complete! 🎉                 ║${NC}"
-  echo -e "${GREEN}${BOLD}╚══════════════════════════════════════════════════╝${NC}\n"
-  echo "  Total build execution runtime time: $((elapsed / 60))m $((elapsed % 60))s"
-  
-  echo -e "\n  Generated Targets:"
-  ls -lh "${OUTPUT_DIR}/" 2>/dev/null || true
+  local mins=$(( elapsed / 60 ))
+  local secs=$(( elapsed % 60 ))
 
-  if $BUILD_VM; then
-    echo -e "\n${BOLD}  VM Launch Instructions (KVM/QEMU):${NC}"
-    echo "    qemu-system-x86_64 -m 4096 -smp 4 -accel kvm \\"
-    echo "      -drive file=${OUTPUT_DIR}/${VM_IMAGE},format=qcow2,if=virtio \\"
-    echo "      -netdev user,id=n,hostfwd=tcp::3000-:3000,hostfwd=tcp::8000-:8000 \\"
-    echo "      -device virtio-net-pci,netdev=n -nographic"
-  fi
-  
-  if $BUILD_PI; then
-    echo -e "\n${BOLD}  Pi SD Flash Instructions:${NC}"
-    echo "    xzcat ${OUTPUT_DIR}/${PI_IMAGE}.xz | sudo dd of=/dev/sdX bs=4M status=progress conv=fsync"
-  fi
-  echo -e "\n${YELLOW}${BOLD}  Default Appliance System Logins: inspectre / inspectre${NC}\n"
+  echo ""
+  echo -e "${GREEN}${BOLD}╔══════════════════════════════════════════════════╗${NC}"
+  echo -e "${GREEN}${BOLD}║              Build Complete!  🎉                 ║${NC}"
+  echo -e "${GREEN}${BOLD}╚══════════════════════════════════════════════════╝${NC}"
+  echo ""
+  echo "  Total build time: ${mins}m ${secs}s"
+  echo ""
+  ls -lh "${OUTPUT_DIR}/" 2>/dev/null || true
+  echo ""
 }
 
 main "$@"
