@@ -1,7 +1,7 @@
 version: '3.8'
 
 services:
-  db:
+  postgres: # ◄── FIX: Changed from 'db' to 'postgres' to match your backend URL string
     image: inspectre-postgres:amd64
     container_name: inspectre-db
     restart: unless-stopped
@@ -30,7 +30,7 @@ services:
       - SECRET_KEY=${SECRET_KEY:-your-secret-key}
       - ENVIRONMENT=${ENVIRONMENT:-production}
     depends_on:
-      db:
+      postgres: # ◄── FIX: Updated to point to the renamed service
         condition: service_healthy
 
   frontend:
@@ -49,14 +49,13 @@ services:
     network_mode: "host"
     privileged: true
     environment:
-      # Adjusted to look at the host bridge mapping for Postgres
       - DATABASE_URL=postgresql://${POSTGRES_USER:-inspectre}:${POSTGRES_PASSWORD:-inspectre}@172.17.0.1:5432/${POSTGRES_DB:-inspectre}
       - BACKEND_URL=http://172.17.0.1:8000
     cap_add:
       - NET_ADMIN
       - NET_RAW
     depends_on:
-      db:
+      postgres: # ◄── FIX: Updated to point to the renamed service
         condition: service_healthy
 
 volumes:
