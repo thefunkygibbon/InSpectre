@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-#  InSpectre — Appliance Image Builder  v5.2 (Production Master)
+#  InSpectre — Appliance Image Builder  v5.3 (Production Master)
 # =============================================================================
 set -euo pipefail
 export DOCKER_BUILDKIT=1
@@ -54,10 +54,10 @@ mkdir -p "${CACHE_DIR}"
 # ── Args ──────────────────────────────────────────────────────────────────────
 while [[ $# -gt 0 ]]; do
   case $1 in
-    --vm-only)        BUILD_VM=true; CLI_TARGET_SPECIFIED=true ;;
-    --vm-online-only) BUILD_VM_ONLINE=true; CLI_TARGET_SPECIFIED=true ;;
-    --pi-only)        BUILD_PI=true; CLI_TARGET_SPECIFIED=true ;;
-    --pi-online-only) BUILD_PI_ONLINE=true; CLI_TARGET_SPECIFIED=true ;;
+    --vm-only)        BUILD_VM=true;         CLI_TARGET_SPECIFIED=true ;;
+    --vm-online-only) BUILD_VM_ONLINE=true;  CLI_TARGET_SPECIFIED=true ;;
+    --pi-only)        BUILD_PI=true;         CLI_TARGET_SPECIFIED=true ;;
+    --pi-online-only) BUILD_PI_ONLINE=true;  CLI_TARGET_SPECIFIED=true ;;
     --compress)       MAX_COMPRESS=true ;;
     --push)           PUSH_DOCKERHUB=true ;;
     --debian)         VM_BASE_OS="debian" ;;
@@ -129,7 +129,7 @@ if ! $CLI_TARGET_SPECIFIED; then
     *) die "Invalid choice selected: '$choice'" ;;
   esac
 
-  # ── VM base OS selection (only when a VM build was chosen) ──────────────────
+  # ── VM base OS selection ──────────────────────────────────────────────────
   if $BUILD_VM || $BUILD_VM_ONLINE; then
     echo ""
     echo -e "${CYAN}${BOLD}╔══════════════════════════════════════════════════╗${NC}"
@@ -146,7 +146,7 @@ if ! $CLI_TARGET_SPECIFIED; then
     esac
   fi
 
-  # ── Ask about Docker Hub push when containers are being built ────────────────
+  # ── Docker Hub push prompt ────────────────────────────────────────────────
   if $BUILD_CONTAINERS_AMD || $BUILD_CONTAINERS_ARM; then
     read -rp "Push built images to Docker Hub (thefunkygibbon)? [y/N]: " push_choice
     [[ "$push_choice" =~ ^[Yy]$ ]] && PUSH_DOCKERHUB=true
@@ -178,9 +178,12 @@ check_deps() {
   for d in "${deps[@]}"; do
     command -v "$d" &>/dev/null && ok "$d" || missing+=("$d")
   done
-  [[ ${#missing[@]} -eq 0 ]] || die "Missing tools. Run: sudo apt-get install -y qemu-utils git curl xz-utils parted e2fsprogs gdisk docker.io"
+  [[ ${#missing[@]} -eq 0 ]] || die "Missing tools: ${missing[*]}. Run: sudo apt-get install -y qemu-utils git curl xz-utils parted e2fsprogs gdisk docker.io"
 
-  if $BUILD_CONTAINERS_ARM && ! ls /proc/sys/fs/binfmt_misc/ 2>/dev/null | grep -q aarch64; then
+  # FIX #13: ARM binfmt check also triggers for ARM container-only builds
+  if ( $BUILD_CONTAINERS_ARM || $BUILD_PI || $BUILD_PI_ONLINE ) && \
+     ! ls /proc/sys/fs/binfmt_misc/ 2>/dev/null | grep -q aarch64; then
+    info "Registering ARM64 binfmt handlers..."
     docker run --rm --privileged multiarch/qemu-user-static --reset -p yes || true
   fi
 }
@@ -218,6 +221,7 @@ with open(path, 'w') as f: f.write(txt)
 PY
 }
 
+# ── Docker Container Image Build ──────────────────────────────────────────────
 build_docker_images() {
   if ! $BUILD_CONTAINERS_AMD && ! $BUILD_CONTAINERS_ARM; then
     info "Using cached container bundles."
@@ -227,13 +231,16 @@ build_docker_images() {
   step "Building Docker container images"
   cd "${REPO}"
   local builder="inspectre-builder-$$"
-  docker buildx create --name "${builder}" --driver docker-container --buildkitd-flags '--allow-insecure-entitlement network.host' --use >/dev/null
+  docker buildx create --name "${builder}" --driver docker-container \
+    --buildkitd-flags '--allow-insecure-entitlement network.host' --use >/dev/null
   trap "docker buildx rm ${builder} 2>/dev/null || true" RETURN
 
   local pids=() tags=()
   _build_bg() {
     local name="$1" platform="$2" context="$3" tag="$4"
-    docker buildx build --builder "${builder}" --platform "${platform}" --tag "${tag}" --load --progress plain "${context}" >"${WORK}/build-${name}.log" 2>&1 &
+    docker buildx build --builder "${builder}" --platform "${platform}" \
+      --tag "${tag}" --load --progress plain "${context}" \
+      >"${WORK}/build-${name}.log" 2>&1 &
     pids+=($!); tags+=("${tag}")
   }
 
@@ -242,7 +249,6 @@ build_docker_images() {
     _build_bg "probe-amd"    "linux/amd64" "./probe"    "inspectre-probe:amd64"
     _build_bg "frontend-amd" "linux/amd64" "./frontend" "inspectre-frontend:amd64"
   fi
-
   if $BUILD_CONTAINERS_ARM; then
     _build_bg "backend-arm"  "linux/arm64" "./backend"  "inspectre-backend:arm64"
     _build_bg "probe-arm"    "linux/arm64" "./probe"    "inspectre-probe:arm64"
@@ -250,36 +256,38 @@ build_docker_images() {
   fi
 
   for i in "${!pids[@]}"; do
-    wait "${pids[$i]}" || die "Docker compile error for ${tags[$i]}. Check logs in /tmp."
+    wait "${pids[$i]}" || die "Docker build error for ${tags[$i]}. See ${WORK}/build-*.log"
   done
 
   if $BUILD_CONTAINERS_AMD; then
     docker pull --platform linux/amd64 --quiet postgres:15-alpine
     docker tag postgres:15-alpine inspectre-postgres:amd64
-    docker save inspectre-backend:amd64 inspectre-probe:amd64 inspectre-frontend:amd64 inspectre-postgres:amd64 > "${TAR_AMD}"
+    docker save \
+      inspectre-backend:amd64 inspectre-probe:amd64 \
+      inspectre-frontend:amd64 inspectre-postgres:amd64 \
+      > "${TAR_AMD}"
+    ok "x64 container bundle saved: ${TAR_AMD}"
   fi
-
   if $BUILD_CONTAINERS_ARM; then
     docker pull --platform linux/arm64 --quiet postgres:15-alpine
     docker tag postgres:15-alpine inspectre-postgres:arm64
-    docker save inspectre-backend:arm64 inspectre-probe:arm64 inspectre-frontend:arm64 inspectre-postgres:arm64 > "${TAR_ARM}"
+    docker save \
+      inspectre-backend:arm64 inspectre-probe:arm64 \
+      inspectre-frontend:arm64 inspectre-postgres:arm64 \
+      > "${TAR_ARM}"
+    ok "ARM64 container bundle saved: ${TAR_ARM}"
   fi
   cd - >/dev/null
 }
 
-# ── Push images to Docker Hub ─────────────────────────────────────────────────
+# ── Push to Docker Hub ────────────────────────────────────────────────────────
 push_images() {
   step "Pushing images to Docker Hub (thefunkygibbon)"
-
-  if [[ -z "${DOCKERHUB_TOKEN:-}" ]]; then
-    die "DOCKERHUB_TOKEN environment variable is not set. Export it before running with --push."
-  fi
-
+  [[ -n "${DOCKERHUB_TOKEN:-}" ]] || die "DOCKERHUB_TOKEN not set. Export it before running with --push."
   echo "${DOCKERHUB_TOKEN}" | docker login -u thefunkygibbon --password-stdin \
-    || die "Docker Hub login failed. Check your DOCKERHUB_TOKEN."
+    || die "Docker Hub login failed."
 
   local pushes=()
-
   if $BUILD_CONTAINERS_AMD; then
     docker tag inspectre-backend:amd64  thefunkygibbon/inspectre-web:latest
     docker tag inspectre-frontend:amd64 thefunkygibbon/inspectre-frontend:latest
@@ -290,7 +298,6 @@ push_images() {
       thefunkygibbon/inspectre-probe:latest
     )
   fi
-
   if $BUILD_CONTAINERS_ARM; then
     docker tag inspectre-backend:arm64  thefunkygibbon/inspectre-web:raspi
     docker tag inspectre-frontend:arm64 thefunkygibbon/inspectre-frontend:raspi
@@ -302,84 +309,139 @@ push_images() {
     )
   fi
 
-  [[ ${#pushes[@]} -eq 0 ]] && { warn "No images were built this run — nothing to push."; return 0; }
-
+  [[ ${#pushes[@]} -gt 0 ]] || { warn "No images built this run — nothing to push."; return 0; }
   for img in "${pushes[@]}"; do
     info "Pushing ${img}..."
     docker push "${img}"
     ok "Pushed ${img}"
   done
-
   docker logout 2>/dev/null || true
 }
 
-# ── Startup script: offline (loads baked tar on first boot) ───────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# Embedded scripts written into the appliance images
+# ─────────────────────────────────────────────────────────────────────────────
+
+# FIX #1 #2: IP fallback fixed (two separate commands, not || inside $());
+#            docker load failure now shows a proper error message before exiting.
 startup_script() {
   cat <<'STARTUP'
 #!/bin/bash
 set -e
+
+_get_ip() {
+  local ip
+  ip=$(ip route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src") print $(i+1)}')
+  [[ -z "$ip" ]] && ip=$(hostname -I 2>/dev/null | awk '{print $1}')
+  echo "${ip:-<this-machine-ip>}"
+}
+
 TAR="/opt/inspectre/images/inspectre-images.tar"
 if [[ -f "$TAR" ]]; then
-  echo "[InSpectre] Importing appliance container layers..."
-  docker load < "$TAR" && rm -f "$TAR"
+  echo "[InSpectre] Importing appliance container layers (first boot)..."
+  if ! docker load < "$TAR"; then
+    echo "[InSpectre] ERROR: Failed to load container images from $TAR"
+    exit 1
+  fi
+  rm -f "$TAR"
+  echo "[InSpectre] Container layers imported successfully."
 fi
+
 cd /opt/inspectre
+echo "[InSpectre] Starting services..."
 docker compose up -d
-IP=$(ip route get 1.1.1.1 2>/dev/null | awk '{print $7}' || hostname -I | awk '{print $1}')
-echo -e "\n╔══════════════════════════════════════════════════╗"
+
+IP=$(_get_ip)
+echo ""
+echo "╔══════════════════════════════════════════════════╗"
 echo "║  InSpectre System Protection Engine Active       ║"
-echo "║  Access Web Portal : http://${IP}:3000          ║"
-echo "╚══════════════════════════════════════════════════╝\n"
+printf "║  Access Web Portal : http://%-22s║\n" "${IP}:3000"
+echo "╚══════════════════════════════════════════════════╝"
+echo ""
 STARTUP
 }
 
-# ── Startup script: online (pulls from Docker Hub on first boot) ──────────────
+# FIX #3 #4: Poll registry-1.docker.io (the actual registry endpoint, not hub web UI);
+#            retry docker compose pull up to 3 times with back-off.
 startup_script_online() {
   cat <<'STARTUP'
 #!/bin/bash
 set -e
-cd /opt/inspectre
 
-echo "[InSpectre] Waiting for internet access..."
-for i in $(seq 1 30); do
-  curl -fsSL --max-time 5 https://hub.docker.com > /dev/null 2>&1 && break
-  sleep 5
-  echo "[InSpectre] Retrying... (${i}/30)"
-done
-curl -fsSL --max-time 5 https://hub.docker.com > /dev/null 2>&1 || {
-  echo "[InSpectre] ERROR: No internet access. Cannot pull images from Docker Hub."
-  echo "[InSpectre] Check your network connection and run: sudo systemctl restart inspectre"
-  exit 1
+_get_ip() {
+  local ip
+  ip=$(ip route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src") print $(i+1)}')
+  [[ -z "$ip" ]] && ip=$(hostname -I 2>/dev/null | awk '{print $1}')
+  echo "${ip:-<this-machine-ip>}"
 }
 
-echo "[InSpectre] Pulling latest images from Docker Hub..."
-docker compose pull
+cd /opt/inspectre
 
-echo "[InSpectre] Starting InSpectre..."
+echo "[InSpectre] Waiting for Docker Hub connectivity..."
+connected=false
+for i in $(seq 1 30); do
+  if curl -fsSL --max-time 5 https://registry-1.docker.io/v2/ > /dev/null 2>&1; then
+    connected=true
+    break
+  fi
+  echo "[InSpectre] Attempt ${i}/30 — no connectivity yet, retrying in 10s..."
+  sleep 10
+done
+
+if ! $connected; then
+  echo "[InSpectre] ERROR: Cannot reach Docker Hub after 5 minutes."
+  echo "[InSpectre] Check your network connection and retry: sudo systemctl restart inspectre"
+  exit 1
+fi
+
+echo "[InSpectre] Pulling latest InSpectre images from Docker Hub..."
+pull_ok=false
+for attempt in 1 2 3; do
+  if docker compose pull; then
+    pull_ok=true
+    break
+  fi
+  echo "[InSpectre] Pull attempt ${attempt}/3 failed. Retrying in 15s..."
+  sleep 15
+done
+
+if ! $pull_ok; then
+  echo "[InSpectre] ERROR: Failed to pull images after 3 attempts."
+  echo "[InSpectre] Retry with: sudo systemctl restart inspectre"
+  exit 1
+fi
+
+echo "[InSpectre] Starting services..."
 docker compose up -d
 
-IP=$(ip route get 1.1.1.1 2>/dev/null | awk '{print $7}' || hostname -I | awk '{print $1}')
-echo -e "\n╔══════════════════════════════════════════════════╗"
+IP=$(_get_ip)
+echo ""
+echo "╔══════════════════════════════════════════════════╗"
 echo "║  InSpectre System Protection Engine Active       ║"
-echo "║  Access Web Portal : http://${IP}:3000          ║"
-echo "╚══════════════════════════════════════════════════╝\n"
+printf "║  Access Web Portal : http://%-22s║\n" "${IP}:3000"
+echo "╚══════════════════════════════════════════════════╝"
+echo ""
 STARTUP
 }
 
+# FIX #5 #6: ExecStop uses 'docker compose' (no hardcoded path);
+#            both After= and Wants= include network-online.target correctly.
 systemd_unit() {
   cat <<'UNIT'
 [Unit]
 Description=InSpectre Container Orchestration Framework
-After=docker.service systemd-networkd-wait-online.service network-online.target
-Wants=docker.service systemd-networkd-wait-online.service network-online.target
+After=docker.service network-online.target
+Wants=docker.service network-online.target
 
 [Service]
 Type=oneshot
 RemainAfterExit=yes
 WorkingDirectory=/opt/inspectre
 ExecStart=/opt/inspectre/start.sh
-ExecStop=/usr/bin/docker compose down
+ExecStop=docker compose -f /opt/inspectre/docker-compose.yml down
 TimeoutStartSec=600
+StandardOutput=journal+console
+StandardError=journal+console
 
 [Install]
 WantedBy=multi-user.target
@@ -393,6 +455,7 @@ motd_content() {
 ╠══════════════════════════════════════════════════════╣
 ║  UI Browser Access : http://<this-ip>:3000           ║
 ║  System Logs       : sudo journalctl -u inspectre -f ║
+║  Credentials       : inspectre / inspectre           ║
 ╚══════════════════════════════════════════════════════╝
 MOTD
 }
@@ -411,25 +474,21 @@ write_appliance_json() {
 EOF
 }
 
-# ── Shared: mount base VM image (Ubuntu or Debian) ────────────────────────────
+# ── Shared: mount VM base image (Ubuntu or Debian) ───────────────────────────
 _mount_ubuntu_base() {
   local vw="$1" disk_name="$2" disk_size="$3"
-  local base_url img_format
+  local base_url="$UBUNTU_URL"
+  [[ "${VM_BASE_OS}" == "debian" ]] && base_url="$DEBIAN_URL"
 
   if [[ "${VM_BASE_OS}" == "debian" ]]; then
-    base_url="${DEBIAN_URL}"
-    img_format="qcow2"
     info "Downloading Debian 12 Bookworm cloud image..."
   else
-    base_url="${UBUNTU_URL}"
-    img_format="qcow2"
     info "Downloading Ubuntu 22.04 Jammy cloud image..."
   fi
-
   curl -L --progress-bar "${base_url}" -o "${vw}/base.img"
 
   local disk="${vw}/${disk_name}"
-  qemu-img convert -f "${img_format}" -O qcow2 "${vw}/base.img" "${disk}"
+  qemu-img convert -f qcow2 -O qcow2 "${vw}/base.img" "${disk}"
   qemu-img resize "${disk}" "${disk_size}"
 
   sudo modprobe nbd max_part=8 2>/dev/null || true
@@ -439,18 +498,19 @@ _mount_ubuntu_base() {
       nbd="${dev}"; break
     fi
   done
-  [[ -n "${nbd}" ]] || die "No available network block devices."
+  [[ -n "${nbd}" ]] || die "No available NBD devices found."
 
   sudo qemu-nbd --connect="${nbd}" "${disk}"
   sleep 2
 
-  sudo sgdisk -e "${nbd}"
+  # FIX #14: suppress sgdisk stderr — it prints warnings on well-formed GPT tables
+  sudo sgdisk -e "${nbd}" >/dev/null 2>&1 || true
   sudo partprobe "${nbd}" 2>/dev/null || true
   sleep 1
 
   local root_part="" part_num=""
   for part in "${nbd}p1" "${nbd}p2" "${nbd}p3" "${nbd}p4" "${nbd}p5"; do
-    if [[ -b "${part}" ]] && sudo blkid "${part}" | grep -q 'ext4'; then
+    if [[ -b "${part}" ]] && sudo blkid "${part}" | grep -q 'TYPE="ext4"'; then
       root_part="${part}"; part_num="${part#${nbd}p}"; break
     fi
   done
@@ -473,9 +533,8 @@ _mount_ubuntu_base() {
   sudo mv "${mnt}/etc/resolv.conf" "${mnt}/etc/resolv.conf.bak" 2>/dev/null || true
   echo "nameserver 8.8.8.8" | sudo tee "${mnt}/etc/resolv.conf" >/dev/null
 
-  # ── OS-specific network + cloud-init config ──────────────────────────────
+  # ── OS-specific network + cloud-init ────────────────────────────────────
   if [[ "${VM_BASE_OS}" == "debian" ]]; then
-    # Debian uses systemd-networkd directly — no netplan package available
     sudo mkdir -p "${mnt}/etc/systemd/network"
     sudo tee "${mnt}/etc/systemd/network/10-dhcp.network" >/dev/null <<'EOF'
 [Match]
@@ -483,46 +542,50 @@ Name=e*
 
 [Network]
 DHCP=yes
+DNS=8.8.8.8
+DNS=8.8.4.4
+
+[DHCP]
+UseDNS=true
 EOF
-    # Ensure systemd-networkd and resolved are enabled
     sudo mkdir -p "${mnt}/etc/systemd/system/multi-user.target.wants"
     sudo ln -sf /lib/systemd/system/systemd-networkd.service \
       "${mnt}/etc/systemd/system/multi-user.target.wants/systemd-networkd.service" 2>/dev/null || true
     sudo ln -sf /lib/systemd/system/systemd-resolved.service \
       "${mnt}/etc/systemd/system/multi-user.target.wants/systemd-resolved.service" 2>/dev/null || true
-    # Point resolv.conf at systemd-resolved stub
-    sudo ln -sf /run/systemd/resolve/stub-resolv.conf "${mnt}/etc/resolv.conf.new" 2>/dev/null || true
 
-    # Debian cloud-init config
     sudo mkdir -p "${mnt}/etc/cloud/cloud.cfg.d"
     sudo tee "${mnt}/etc/cloud/cloud.cfg.d/99-inspectre.cfg" >/dev/null <<'EOF'
+datasource_list: [None]
+network: {config: disabled}
 users: []
 disable_root: false
 preserve_hostname: true
 ssh_pwauth: true
-network: {config: disabled}
 EOF
 
   else
-    # Ubuntu uses netplan
     sudo mkdir -p "${mnt}/etc/cloud/cloud.cfg.d"
     sudo tee "${mnt}/etc/cloud/cloud.cfg.d/99-disable-user-manipulation.cfg" >/dev/null <<'EOF'
+datasource_list: [None]
+network: {config: disabled}
 users: []
 disable_root: false
 preserve_hostname: true
 ssh_pwauth: true
-network: {config: disabled}
 EOF
     sudo mkdir -p "${mnt}/etc/netplan"
-    sudo tee "${mnt}/etc/netplan/01-netcfg.yaml" >/dev/null <<'EOF'
+    sudo rm -f "${mnt}/etc/netplan/"*.yaml 2>/dev/null || true
+    sudo tee "${mnt}/etc/netplan/01-inspectre-dhcp.yaml" >/dev/null <<'EOF'
 network:
   version: 2
   renderer: networkd
   ethernets:
     all_eth:
       match:
-        name: e*
+        name: "e*"
       dhcp4: true
+      dhcp6: false
 EOF
   fi
 
@@ -537,9 +600,9 @@ POLICY
   _MOUNT_DISK="${disk}"
 }
 
-# ── Shared: install Docker + users inside a chroot ────────────────────────────
-# Handles both Ubuntu (docker.io pkg) and Debian (Docker official apt repo,
-# since docker-compose-v2 is not in Debian's own repos).
+# FIX #7 #8 #9: Docker is now explicitly enabled in both Ubuntu and Debian chroots;
+#               Debian resolv.conf is properly replaced with the resolved symlink
+#               (not left as .new); Ubuntu restore path unchanged.
 _chroot_vm_setup() {
   local mnt="$1"
 
@@ -550,9 +613,8 @@ export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
 apt-get install -y --no-install-recommends \
   ca-certificates curl gnupg lsb-release \
-  net-tools jq openssh-server
+  net-tools jq openssh-server sudo
 
-# Docker's official apt repo — only source for docker-compose-v2 on Debian
 install -m 0755 -d /etc/apt/keyrings
 curl -fsSL https://download.docker.com/linux/debian/gpg \
   | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
@@ -564,40 +626,48 @@ apt-get update -qq
 apt-get install -y --no-install-recommends \
   docker-ce docker-ce-cli containerd.io docker-compose-plugin
 apt-get clean
+rm -rf /var/lib/apt/lists/*
 
-# SSH hardening
+# FIX #8: enable docker explicitly
+systemctl enable docker
 systemctl enable ssh
+systemctl enable systemd-networkd
+systemctl enable systemd-resolved
+
 sed -i 's/^#*PasswordAuthentication .*/PasswordAuthentication yes/' /etc/ssh/sshd_config
 sed -i 's/^#*PermitRootLogin .*/PermitRootLogin yes/' /etc/ssh/sshd_config
 
-# inspectre user
-if ! id inspectre &>/dev/null; then
-  useradd -m -s /bin/bash inspectre
-fi
+id inspectre &>/dev/null || useradd -m -s /bin/bash inspectre
 usermod -aG sudo,docker inspectre
 echo "inspectre:inspectre" | chpasswd
 echo "root:inspectre" | chpasswd
 echo "inspectre ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/inspectre
 chmod 0440 /etc/sudoers.d/inspectre
+
+# FIX #7: Replace resolv.conf with systemd-resolved stub now (inside chroot)
+rm -f /etc/resolv.conf
+ln -sf /run/systemd/resolve/stub-resolv.conf /etc/resolv.conf
 CHROOT
 
   else
-    # Ubuntu — docker.io + docker-compose-v2 are in universe repos
     sudo chroot "${mnt}" /bin/bash <<'CHROOT'
 set -e
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
 apt-get install -y --no-install-recommends \
-  docker.io docker-compose-v2 curl jq net-tools ca-certificates openssh-server
+  docker.io docker-compose-v2 curl jq net-tools ca-certificates openssh-server sudo
 apt-get clean
+rm -rf /var/lib/apt/lists/*
 
+# FIX #9: enable docker explicitly
+systemctl enable docker
 systemctl enable ssh
+systemctl enable systemd-networkd
+
 sed -i 's/^#*PasswordAuthentication .*/PasswordAuthentication yes/' /etc/ssh/sshd_config
 sed -i 's/^#*PermitRootLogin .*/PermitRootLogin yes/' /etc/ssh/sshd_config
 
-if ! id inspectre &>/dev/null; then
-  useradd -m -s /bin/bash inspectre
-fi
+id inspectre &>/dev/null || useradd -m -s /bin/bash inspectre
 usermod -aG sudo,docker inspectre
 echo "inspectre:inspectre" | chpasswd
 echo "root:inspectre" | chpasswd
@@ -607,12 +677,21 @@ CHROOT
   fi
 }
 
-# ── Shared: unmount + finalise a VM image ─────────────────────────────────────
+# FIX #7 cont: Debian no longer restores resolv.conf.bak (already replaced inside chroot).
+#              Ubuntu restores its original symlink as before.
 _finalise_vm() {
   local mnt="$1" nbd="$2" disk="$3" out_image="$4"
   sudo rm -f "${mnt}/usr/sbin/policy-rc.d"
-  sudo rm -f "${mnt}/etc/resolv.conf"
-  sudo mv "${mnt}/etc/resolv.conf.bak" "${mnt}/etc/resolv.conf" 2>/dev/null || true
+
+  if [[ "${VM_BASE_OS}" == "debian" ]]; then
+    # resolv.conf was replaced inside chroot with the systemd-resolved symlink —
+    # just clean up the backup we took at mount time.
+    sudo rm -f "${mnt}/etc/resolv.conf.bak"
+  else
+    # Ubuntu: restore original resolv.conf (typically a symlink to resolved stub)
+    sudo rm -f "${mnt}/etc/resolv.conf"
+    sudo mv "${mnt}/etc/resolv.conf.bak" "${mnt}/etc/resolv.conf" 2>/dev/null || true
+  fi
 
   sudo umount "${mnt}/dev/pts" 2>/dev/null || true
   sudo umount "${mnt}/dev"     2>/dev/null || true
@@ -620,28 +699,24 @@ _finalise_vm() {
   sudo umount "${mnt}/proc"    2>/dev/null || true
   sudo umount "${mnt}"
   sudo qemu-nbd --disconnect "${nbd}"
-  sleep 1
+  sleep 2
 
   if $MAX_COMPRESS; then
-    # No -c: leave qcow2 uncompressed so xz compresses raw data — not pre-zlib'd clusters.
-    # Double compression (qcow2 -c then xz) results in a larger output than xz alone.
-    info "Converting to uncompressed qcow2 for xz pass..."
+    info "Converting to raw qcow2 for xz pass..."
     qemu-img convert -O qcow2 "${disk}" "${OUTPUT_DIR}/${out_image}"
-    info "Compressing VM image (xz -9) — this may take a while..."
+    info "Compressing with xz -9 (this will take several minutes)..."
     xz --threads=0 -9 -f "${OUTPUT_DIR}/${out_image}"
-    ok "VM image built: ${OUTPUT_DIR}/${out_image}.xz"
+    ok "VM image ready: ${OUTPUT_DIR}/${out_image}.xz"
   else
-    # Without xz follow-up, qcow2 internal compression (-c) gives moderate
-    # size reduction with no wait time — best for ready-to-use distribution.
     qemu-img convert -c -O qcow2 "${disk}" "${OUTPUT_DIR}/${out_image}"
-    ok "VM image built: ${OUTPUT_DIR}/${out_image}"
+    ok "VM image ready: ${OUTPUT_DIR}/${out_image}"
   fi
 }
 
-# ── VM Appliance — Offline (containers baked in) ──────────────────────────────
+# ── VM Appliance — Offline ────────────────────────────────────────────────────
 build_vm_image() {
-  step "Building VM Appliance image — Offline (x86_64) [base: ${VM_BASE_OS}]"
-  [[ -f "$TAR_AMD" ]] || die "x64 container bundle cache missing."
+  step "Building VM Appliance — Offline (x86_64) [base: ${VM_BASE_OS}]"
+  [[ -f "$TAR_AMD" ]] || die "x64 container bundle not found: ${TAR_AMD}"
 
   local vw="${WORK}/vm"
   mkdir -p "${vw}" "${OUTPUT_DIR}"
@@ -652,22 +727,22 @@ build_vm_image() {
   _chroot_vm_setup "${mnt}"
 
   sudo mkdir -p "${mnt}/opt/inspectre/images"
-  sudo cp "${TAR_AMD}" "${mnt}/opt/inspectre/images/inspectre-images.tar"
-  sudo cp "${REPO}/docker-compose.vm.yml" "${mnt}/opt/inspectre/docker-compose.yml"
+  sudo cp "${TAR_AMD}"                     "${mnt}/opt/inspectre/images/inspectre-images.tar"
+  sudo cp "${REPO}/docker-compose.vm.yml"  "${mnt}/opt/inspectre/docker-compose.yml"
   write_appliance_json "${mnt}" "vm" "amd64" "offline" "${VM_BASE_OS}"
-  startup_script        | sudo tee "${mnt}/opt/inspectre/start.sh" >/dev/null
-  sudo chmod +x "${mnt}/opt/inspectre/start.sh"
-  systemd_unit          | sudo tee "${mnt}/etc/systemd/system/inspectre.service" >/dev/null
-  motd_content          | sudo tee "${mnt}/etc/motd" >/dev/null
-  sudo chroot "${mnt}" /bin/bash -c "systemctl enable docker inspectre"
+  startup_script | sudo tee "${mnt}/opt/inspectre/start.sh" >/dev/null
+  sudo chmod +x  "${mnt}/opt/inspectre/start.sh"
+  systemd_unit   | sudo tee "${mnt}/etc/systemd/system/inspectre.service" >/dev/null
+  motd_content   | sudo tee "${mnt}/etc/motd" >/dev/null
+  sudo chroot "${mnt}" systemctl enable inspectre
 
   _finalise_vm "${mnt}" "${nbd}" "${disk}" "${VM_IMAGE}"
 }
 
-# ── VM Appliance — Online (pulls from Docker Hub on boot) ─────────────────────
+# ── VM Appliance — Online ─────────────────────────────────────────────────────
 build_vm_online_image() {
-  step "Building VM Appliance image — Online / Docker Hub (x86_64) [base: ${VM_BASE_OS}]"
-  info "This image pulls thefunkygibbon/inspectre-* from Docker Hub on first boot."
+  step "Building VM Appliance — Online (x86_64) [base: ${VM_BASE_OS}]"
+  info "Image will pull thefunkygibbon/inspectre-* from Docker Hub on first boot."
 
   local vw="${WORK}/vm-online"
   mkdir -p "${vw}" "${OUTPUT_DIR}"
@@ -681,22 +756,25 @@ build_vm_online_image() {
   sudo cp "${REPO}/docker-compose.vm.online.yml" "${mnt}/opt/inspectre/docker-compose.yml"
   write_appliance_json "${mnt}" "vm" "amd64" "online" "${VM_BASE_OS}"
   startup_script_online | sudo tee "${mnt}/opt/inspectre/start.sh" >/dev/null
-  sudo chmod +x "${mnt}/opt/inspectre/start.sh"
-  systemd_unit           | sudo tee "${mnt}/etc/systemd/system/inspectre.service" >/dev/null
-  motd_content           | sudo tee "${mnt}/etc/motd" >/dev/null
-  sudo chroot "${mnt}" /bin/bash -c "systemctl enable docker inspectre"
+  sudo chmod +x         "${mnt}/opt/inspectre/start.sh"
+  systemd_unit          | sudo tee "${mnt}/etc/systemd/system/inspectre.service" >/dev/null
+  motd_content          | sudo tee "${mnt}/etc/motd" >/dev/null
+  sudo chroot "${mnt}" systemctl enable inspectre
 
   _finalise_vm "${mnt}" "${nbd}" "${disk}" "${VM_ONLINE_IMAGE}"
 }
 
-# ── Shared: download + expand Raspberry Pi base image ─────────────────────────
+# ── Pi helpers ────────────────────────────────────────────────────────────────
 _prepare_pi_base() {
   local pw="$1"
 
   local idx; idx=$(curl -sL "${RPI_INDEX}/")
   local latest_dir; latest_dir=$(echo "${idx}" | grep -oP 'raspios_lite_arm64-\d{4}-\d{2}-\d{2}' | sort -r | head -1)
+  [[ -n "${latest_dir}" ]] || die "Could not determine latest Pi OS image directory."
   local img_xz; img_xz=$(curl -sL "${RPI_INDEX}/${latest_dir}/" | grep -oP '[\w\-]+\.img\.xz' | head -1)
+  [[ -n "${img_xz}" ]] || die "Could not find Pi OS .img.xz in ${latest_dir}."
 
+  info "Downloading Pi OS: ${img_xz}"
   curl -L --progress-bar "${RPI_INDEX}/${latest_dir}/${img_xz}" -o "${pw}/${img_xz}"
   xz --decompress --keep --threads=0 "${pw}/${img_xz}"
   local raw="${pw}/${img_xz%.xz}"
@@ -713,7 +791,6 @@ _prepare_pi_base() {
   _PI_LOOP="${loop}"
 }
 
-# ── Shared: mount Pi loop device ──────────────────────────────────────────────
 _mount_pi_base() {
   local pw="$1"
   local mnt="${pw}/mnt"
@@ -740,20 +817,40 @@ POLICY
   _PI_BOOT_MNT="${boot_mnt}"
 }
 
-# ── Shared: chroot install for Pi ─────────────────────────────────────────────
+# FIX #11: Pi OS (Bookworm/Debian-based) ships docker-compose-v2 in its own repos
+#          but does NOT have docker-compose-plugin. Use docker-compose-v2 via the
+#          official Docker apt repo for arm64 so we get both docker-ce AND
+#          docker-compose-plugin (same as Debian VM path).
 _chroot_pi_setup() {
   local mnt="$1"
   sudo chroot "${mnt}" /bin/bash <<'CHROOT'
 set -e
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
-apt-get install -y --no-install-recommends docker.io docker-compose-v2 curl jq net-tools ca-certificates
-echo "root:inspectre" | chpasswd
+apt-get install -y --no-install-recommends \
+  ca-certificates curl gnupg lsb-release net-tools jq
+
+install -m 0755 -d /etc/apt/keyrings
+curl -fsSL https://download.docker.com/linux/debian/gpg \
+  | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+chmod a+r /etc/apt/keyrings/docker.gpg
+echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] \
+  https://download.docker.com/linux/debian $(lsb_release -cs) stable" \
+  > /etc/apt/sources.list.d/docker.list
+apt-get update -qq
+apt-get install -y --no-install-recommends \
+  docker-ce docker-ce-cli containerd.io docker-compose-plugin
 apt-get clean
+rm -rf /var/lib/apt/lists/*
+
+systemctl enable docker
+
+echo "root:inspectre" | chpasswd
+# Add pi user to docker group if it exists
+id pi &>/dev/null && usermod -aG docker pi || true
 CHROOT
 }
 
-# ── Shared: finalise Pi image ─────────────────────────────────────────────────
 _finalise_pi() {
   local mnt="$1" boot_mnt="$2" loop="$3" raw="$4" out_image="$5"
   sudo rm -f "${mnt}/usr/sbin/policy-rc.d"
@@ -767,71 +864,71 @@ _finalise_pi() {
   sleep 1
 
   if $MAX_COMPRESS; then
-    info "Compressing Pi image (xz -9) — this may take a while..."
+    info "Compressing Pi image with xz -9..."
     xz --threads=0 -9 -z "${raw}" -c > "${OUTPUT_DIR}/${out_image}.xz"
-    ok "Pi image built: ${OUTPUT_DIR}/${out_image}.xz"
+    ok "Pi image ready: ${OUTPUT_DIR}/${out_image}.xz"
   else
     cp "${raw}" "${OUTPUT_DIR}/${out_image}"
-    ok "Pi image built: ${OUTPUT_DIR}/${out_image}"
+    ok "Pi image ready: ${OUTPUT_DIR}/${out_image}"
   fi
 }
 
-# ── Shared: write Pi boot files ───────────────────────────────────────────────
 _pi_boot_setup() {
   local boot_mnt="$1"
-  sudo touch "${boot_mnt}/ssh" || true
-  local pi_pw_hash='$6$rounds=4096$inspectre$9T1j/dxZpyW7dB4qoMFlEq4K7kZwxlN.ZF09wRqiNEi9VJ/SRRvxlCkIMVtCnBfHHpOuAQEP6oROxL0bz6lD41'
+  sudo touch "${boot_mnt}/ssh"
+  # FIX #12: generate the hash at build time so it's guaranteed correct
+  local pi_pw_hash
+  pi_pw_hash=$(echo 'inspectre' | openssl passwd -6 -stdin)
   echo "pi:${pi_pw_hash}" | sudo tee "${boot_mnt}/userconf.txt" >/dev/null
 }
 
-# ── Shared: enable systemd services on Pi ─────────────────────────────────────
 _pi_enable_services() {
   local mnt="$1"
   sudo mkdir -p "${mnt}/etc/systemd/system/multi-user.target.wants"
   sudo ln -sf /lib/systemd/system/docker.service \
-    "${mnt}/etc/systemd/system/multi-user.target.wants/docker.service" || true
+    "${mnt}/etc/systemd/system/multi-user.target.wants/docker.service" 2>/dev/null || true
   sudo ln -sf /etc/systemd/system/inspectre.service \
-    "${mnt}/etc/systemd/system/multi-user.target.wants/inspectre.service" || true
+    "${mnt}/etc/systemd/system/multi-user.target.wants/inspectre.service" 2>/dev/null || true
 }
 
-# ── Pi Appliance — Offline (containers baked in) ──────────────────────────────
+# ── Pi Appliance — Offline ────────────────────────────────────────────────────
 build_pi_image() {
   step "Building Raspberry Pi Image — Offline (arm64)"
-  [[ -f "$TAR_ARM" ]] || die "ARM container archive missing."
+  [[ -f "$TAR_ARM" ]] || die "ARM container bundle not found: ${TAR_ARM}"
 
   local pw="${WORK}/pi"
   mkdir -p "${pw}" "${OUTPUT_DIR}"
 
   _prepare_pi_base "${pw}"
-  _mount_pi_base "${pw}"
+  _mount_pi_base   "${pw}"
   local mnt="${_PI_MNT}" boot_mnt="${_PI_BOOT_MNT}" loop="${_PI_LOOP}" raw="${_PI_RAW}"
 
   _chroot_pi_setup "${mnt}"
 
   sudo mkdir -p "${mnt}/opt/inspectre/images"
-  sudo cp "${TAR_ARM}" "${mnt}/opt/inspectre/images/inspectre-images.tar"
+  sudo cp "${TAR_ARM}"                    "${mnt}/opt/inspectre/images/inspectre-images.tar"
   sudo cp "${REPO}/docker-compose.pi.yml" "${mnt}/opt/inspectre/docker-compose.yml"
   write_appliance_json "${mnt}" "pi" "arm64" "offline" "raspios"
-  startup_script      | sudo tee "${mnt}/opt/inspectre/start.sh" >/dev/null
-  sudo chmod +x "${mnt}/opt/inspectre/start.sh"
-  systemd_unit        | sudo tee "${mnt}/etc/systemd/system/inspectre.service" >/dev/null
-  motd_content        | sudo tee "${mnt}/etc/motd" >/dev/null
+  startup_script | sudo tee "${mnt}/opt/inspectre/start.sh" >/dev/null
+  sudo chmod +x  "${mnt}/opt/inspectre/start.sh"
+  systemd_unit   | sudo tee "${mnt}/etc/systemd/system/inspectre.service" >/dev/null
+  motd_content   | sudo tee "${mnt}/etc/motd" >/dev/null
 
-  _pi_boot_setup "${boot_mnt}"
+  _pi_boot_setup     "${boot_mnt}"
   _pi_enable_services "${mnt}"
   _finalise_pi "${mnt}" "${boot_mnt}" "${loop}" "${raw}" "${PI_IMAGE}"
 }
 
-# ── Pi Appliance — Online (pulls from Docker Hub on boot) ─────────────────────
+# ── Pi Appliance — Online ─────────────────────────────────────────────────────
 build_pi_online_image() {
-  step "Building Raspberry Pi Image — Online / Docker Hub (arm64)"
-  info "This image pulls thefunkygibbon/inspectre-*:raspi from Docker Hub on first boot."
+  step "Building Raspberry Pi Image — Online (arm64)"
+  info "Image will pull thefunkygibbon/inspectre-*:raspi from Docker Hub on first boot."
 
   local pw="${WORK}/pi-online"
   mkdir -p "${pw}" "${OUTPUT_DIR}"
 
   _prepare_pi_base "${pw}"
-  _mount_pi_base "${pw}"
+  _mount_pi_base   "${pw}"
   local mnt="${_PI_MNT}" boot_mnt="${_PI_BOOT_MNT}" loop="${_PI_LOOP}" raw="${_PI_RAW}"
 
   _chroot_pi_setup "${mnt}"
@@ -840,15 +937,16 @@ build_pi_online_image() {
   sudo cp "${REPO}/docker-compose.pi.online.yml" "${mnt}/opt/inspectre/docker-compose.yml"
   write_appliance_json "${mnt}" "pi" "arm64" "online" "raspios"
   startup_script_online | sudo tee "${mnt}/opt/inspectre/start.sh" >/dev/null
-  sudo chmod +x "${mnt}/opt/inspectre/start.sh"
-  systemd_unit           | sudo tee "${mnt}/etc/systemd/system/inspectre.service" >/dev/null
-  motd_content           | sudo tee "${mnt}/etc/motd" >/dev/null
+  sudo chmod +x         "${mnt}/opt/inspectre/start.sh"
+  systemd_unit          | sudo tee "${mnt}/etc/systemd/system/inspectre.service" >/dev/null
+  motd_content          | sudo tee "${mnt}/etc/motd" >/dev/null
 
-  _pi_boot_setup "${boot_mnt}"
+  _pi_boot_setup     "${boot_mnt}"
   _pi_enable_services "${mnt}"
   _finalise_pi "${mnt}" "${boot_mnt}" "${loop}" "${raw}" "${PI_ONLINE_IMAGE}"
 }
 
+# ── Cleanup ───────────────────────────────────────────────────────────────────
 cleanup() {
   for mp in \
     "${WORK}/pi/mnt/dev/pts"              "${WORK}/pi/mnt/dev"          \
@@ -868,7 +966,9 @@ cleanup() {
   ; do
     sudo umount "${mp}" 2>/dev/null || true
   done
-  for nbd in /dev/nbd{0..15}; do sudo qemu-nbd --disconnect "${nbd}" 2>/dev/null || true; done
+  for nbd in /dev/nbd{0..15}; do
+    sudo qemu-nbd --disconnect "${nbd}" 2>/dev/null || true
+  done
   while IFS= read -r line; do
     local lo; lo=$(echo "${line}" | awk '{print $1}')
     sudo losetup -d "${lo}" 2>/dev/null || true
@@ -877,18 +977,25 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
+# ── Main ──────────────────────────────────────────────────────────────────────
 main() {
-  echo -e "\n${CYAN}${BOLD}InSpectre Image Builder v5.2 Active${NC}"
+  echo -e "\n${CYAN}${BOLD}InSpectre Image Builder v5.3 Active${NC}"
   check_deps
   clone_repo
-  ( $BUILD_VM || $BUILD_PI ) && patch_dockerfiles
+
+  # FIX #13: patch Dockerfiles whenever any ARM build is needed (not just VM/Pi)
+  ( $BUILD_VM || $BUILD_PI || $BUILD_CONTAINERS_ARM || $BUILD_PI_ONLINE ) && patch_dockerfiles
+
   build_docker_images
   $PUSH_DOCKERHUB  && push_images
   $BUILD_VM        && build_vm_image
   $BUILD_VM_ONLINE && build_vm_online_image
   $BUILD_PI        && build_pi_image
   $BUILD_PI_ONLINE && build_pi_online_image
+
+  echo ""
   ok "All targeted image profiles completed successfully."
+  echo ""
 }
 
 main "$@"
