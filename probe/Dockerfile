@@ -1,6 +1,9 @@
 FROM python:3.12-slim
 
-# Network tools + wget/curl/gnupg/unzip (gnupg needed for Ookla packagecloud key)
+# Expose target architecture for multi-arch binary downloads
+ARG TARGETARCH=amd64
+
+# Network tools
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libpcap-dev gcc \
     avahi-utils \
@@ -16,9 +19,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     unzip \
     && rm -rf /var/lib/apt/lists/*
 
-# Install Nuclei vulnerability scanner (graceful failure — probe handles absence)
+# Install Nuclei vulnerability scanner
 ARG NUCLEI_VERSION=3.3.9
-RUN wget -q "https://github.com/projectdiscovery/nuclei/releases/download/v${NUCLEI_VERSION}/nuclei_${NUCLEI_VERSION}_linux_amd64.zip" \
+RUN wget -q "https://github.com/projectdiscovery/nuclei/releases/download/v${NUCLEI_VERSION}/nuclei_${NUCLEI_VERSION}_linux_${TARGETARCH}.zip" \
          -O /tmp/nuclei.zip \
     && unzip -q /tmp/nuclei.zip -d /tmp/nuclei_unzip \
     && mv /tmp/nuclei_unzip/nuclei /usr/local/bin/nuclei \
@@ -26,9 +29,11 @@ RUN wget -q "https://github.com/projectdiscovery/nuclei/releases/download/v${NUC
     && rm -rf /tmp/nuclei.zip /tmp/nuclei_unzip \
     || echo "[WARN] Nuclei download failed — vulnerability scanning will be unavailable"
 
-# Install Nerva service fingerprinting tool (graceful failure — probe handles absence)
+# Install Nerva service fingerprinting tool
+# Note: Nerva uses "arm64" on GitHub releases for ARM builds
 ARG NERVA_VERSION=1.4.0
-RUN wget -q "https://github.com/praetorian-inc/nerva/releases/download/v${NERVA_VERSION}/nerva-linux-amd64.tar.gz" \
+RUN NERVA_ARCH="${TARGETARCH}" \
+    && wget -q "https://github.com/praetorian-inc/nerva/releases/download/v${NERVA_VERSION}/nerva-linux-${NERVA_ARCH}.tar.gz" \
          -O /tmp/nerva.tar.gz \
     && tar -xzf /tmp/nerva.tar.gz -C /tmp/ \
     && mv /tmp/nerva /usr/local/bin/nerva \
@@ -36,9 +41,7 @@ RUN wget -q "https://github.com/praetorian-inc/nerva/releases/download/v${NERVA_
     && rm -f /tmp/nerva.tar.gz \
     || echo "[WARN] Nerva download failed — service fingerprinting will be skipped"
 
-# Install Ookla speedtest CLI via official packagecloud repo
-# Graceful failure: if Ookla's repo is unreachable the probe still starts;
-# the speedtest endpoint will return an error message to the UI.
+# Install Ookla speedtest CLI
 RUN if curl -s https://packagecloud.io/install/repositories/ookla/speedtest-cli/script.deb.sh | bash \
        && apt-get install -y speedtest; then \
       speedtest --accept-license --accept-gdpr > /dev/null 2>&1 || true; \
@@ -56,8 +59,6 @@ COPY traffic_monitor.py .
 COPY dhcp_classify.py .
 COPY mac-vendors-export.csv .
 
-# Download GeoLite2-Country database if MAXMIND_LICENSE_KEY is provided at build time.
-# Without it, GeoIP lookups are silently skipped.
 ARG MAXMIND_LICENSE_KEY=""
 RUN if [ -n "$MAXMIND_LICENSE_KEY" ]; then \
       mkdir -p /opt/geoip && \

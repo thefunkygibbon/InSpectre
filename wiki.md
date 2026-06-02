@@ -29,6 +29,8 @@
    - 3.14 [Acknowledging New Devices](#314-acknowledging-new-devices)
    - 3.15 [Device Presence Page](#315-device-presence-page)
    - 3.16 [Network Events Page](#316-network-events-page)
+   - 3.17 [Person Presence Page](#317-person-presence-page)
+   - 3.18 [Live Updates (SSE)](#318-live-updates-sse)
 4. [Network Scanning](#4-network-scanning)
    - 4.1 [Port Scanning](#41-port-scanning)
    - 4.2 [OS Detection](#42-os-detection)
@@ -483,6 +485,8 @@ To manually add a device to an existing group:
 
 To remove a device from a group, click the **Remove** button next to that MAC in the same panel. The removed device becomes a standalone device again and will appear separately on the dashboard.
 
+**Manual groups are protected:** any group you create or modify by hand is flagged as manual and is never altered or undone by the automatic hostname-based grouping and cleanup passes. This means InSpectre will not silently merge in, or split out, devices from a group you curated yourself — even if their hostnames would otherwise match the auto-group rules.
+
 ### 3.14 Acknowledging New Devices
 
 When InSpectre sees a device for the first time, it is marked as **new**. By default, new devices float to the top of the device list and are highlighted to draw your attention.
@@ -520,6 +524,53 @@ Access the **Network Events** page from the left navigation menu. This page show
 - **Event stats** — shows total events and counts of online vs offline transitions
 
 This is useful for troubleshooting intermittent connectivity issues or tracking when specific devices were last active.
+
+### 3.17 Person Presence Page
+
+Access the **Person Presence** page from the left navigation menu. Where the dashboard thinks in terms of individual MAC addresses, this page thinks in terms of **people** — group the devices a household member carries (phone, laptop, watch, tablet) under one named person and track whether they are home.
+
+**Creating a person:**
+
+1. Click **Add person**.
+2. Enter a name and, optionally, upload a photo.
+3. Start typing in the device search box to attach devices — the autocomplete matches by name, IP, or MAC.
+4. Click the **star** on any attached device to make it the **primary presence device** (the authoritative indicator for whether the person is home).
+5. Save.
+
+**Reading a person card:**
+
+| Element | Meaning |
+|---|---|
+| **At Home / Away badge** | Shown with a Home or Away icon and a colour-coded accent bar so the state is obvious at a glance. A person is **At Home** when any of their devices (or their primary device, if set) is online. |
+| **Avatar** | The uploaded photo, or initials if none is set |
+| **Primary tag** | Marks which device drives the presence state |
+| **Presence timeline** | A home/away history bar over the selected period, with an at-home percentage |
+| **Block button** | Blocks or unblocks every device belonging to the person in one action |
+
+**Per-person block schedules:**
+
+Each person card includes a **Block Schedules** panel. Add a recurring rule (days of the week, start time, end time) that automatically blocks all of that person's devices during the window — for example, blocking a child's devices every school night. Schedules can be enabled/disabled individually and deleted. These use the same scheduling engine as per-device block schedules (see [6.3](#63-block-schedules)).
+
+**Presence notifications:**
+
+Person Presence integrates with the notification profile system. The following events can be routed to any notification channel (see [Notifications](#9-notifications)):
+
+- **Person Arrived Home** (`person.home`) — one of the person's devices came online
+- **Person Left Home** (`person.away`) — the person's devices all went offline
+- **Person Blocked** (`person.blocked`) — all of a person's devices were blocked
+- **Person Unblocked** (`person.unblocked`) — the person's devices were unblocked
+
+### 3.18 Live Updates (SSE)
+
+InSpectre pushes changes to the UI in real time using **Server-Sent Events (SSE)** rather than relying solely on fixed-interval polling. The browser opens a single long-lived connection to `GET /api/events/stream` (authenticated via a query-string token), and the backend broadcasts lightweight hints on channels such as `devices`, `persons`, and `schedules` whenever something changes.
+
+**What this means for you:**
+
+- Pages refresh the instant something happens — a device going offline, a block being applied, a schedule being created or deleted, or a person's presence changing — instead of after a 10–30 second poll.
+- You no longer lose in-progress work (e.g. while filling in a schedule form) to a disruptive full-page refresh.
+- A slow background poll remains as a safety net if the SSE connection drops, so the UI stays correct even on flaky connections.
+
+No configuration is required. If you run InSpectre behind your own reverse proxy, ensure response buffering is disabled for the `/api/events/stream` path so events are delivered immediately (the bundled nginx config already does this).
 
 ---
 
@@ -700,6 +751,8 @@ To create a block schedule:
 
 The probe checks active schedules on each scan cycle and applies or removes blocks accordingly.
 
+Block schedules can also be attached to a **person** from the Person Presence page, in which case the schedule applies to every device belonging to that person. See [3.17 Person Presence Page](#317-person-presence-page).
+
 ---
 
 ## 7. Traffic Monitor
@@ -835,7 +888,7 @@ Channels are configured in **Settings → Notifications → Channels**. Each cha
 Profiles are configured in **Settings → Notifications → Profiles**. Each profile:
 - Has a display name
 - Is associated with one or more channels
-- Has per-event-type toggles (new device, device offline, watched offline, vulnerability found, port change, device blocked/unblocked)
+- Has per-event-type toggles (new device, device online, device offline, watched offline, vulnerability found, port change, device blocked/unblocked, and the Person Presence events: person arrived home, person left home, person blocked, person unblocked)
 - Can be enabled/disabled as a whole
 
 When an event fires, InSpectre finds all enabled profiles that have that event type enabled and dispatches to all their channels.

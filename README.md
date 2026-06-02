@@ -20,6 +20,7 @@ Check the [Wiki](https://github.com/thefunkygibbon/InSpectre/wiki) for full admi
 
 ### Discovery & Monitoring
 - **Automatic device discovery** — active ARP sweeps + passive packet sniffer detect devices within seconds of them joining the network
+- **Live updates (SSE)** — the UI subscribes to a Server-Sent Events stream and refreshes affected pages the moment something changes (device online/offline, blocks, schedules, presence) instead of waiting for a fixed poll interval; a slow background poll remains as a fallback
 - **Device Presence** — visual online/offline history bars for all devices showing uptime patterns over 7-day, 1-month, or 1-year periods
 - **Network Events** — global online/offline event log across all devices with source attribution (ARP sweep, passive sniffer, or plugin)
 - **Per-device uptime bar** — 7-day presence history visible at a glance in every device drawer
@@ -30,7 +31,17 @@ Check the [Wiki](https://github.com/thefunkygibbon/InSpectre/wiki) for full admi
 - **Watched flag** — star important devices for elevated offline alerts and priority sorting
 - **Ignore flag** — hide known-benign devices from the main view
 - **Notes** — free-text notes attached to any device
-- **Device grouping** — devices sharing the same hostname (e.g. `laptop` and `laptop.lan`) are automatically grouped as a single physical device with multiple interfaces. Grouped devices share a unified event timeline and appear as one card on the dashboard. Manual grouping and ungrouping is available from the device drawer.
+- **Device grouping** — devices sharing the same hostname (e.g. `laptop` and `laptop.lan`) are automatically grouped as a single physical device with multiple interfaces. Grouped devices share a unified event timeline and appear as one card on the dashboard. Manual grouping and ungrouping is available from the device drawer, and **groups you create manually are protected** — they are never altered or undone by the automatic hostname-based grouping/cleanup passes.
+- **Persistent filters & views** — your active filter, smart filter, sort order, and grid/list view choice are saved and restored automatically the next time you open the dashboard.
+
+### Person Presence
+- **People, not just MACs** — group a household member's devices (phone, laptop, watch, etc.) under a named person with an optional photo
+- **Home / Away at a glance** — each person card shows a clear **At Home** / **Away** state with colour-coded accent bars and Home/Away icons, derived from whether any of their devices are currently online
+- **Primary presence device** — nominate one device (e.g. a phone) as the authoritative presence indicator for that person
+- **Presence timeline** — per-person home/away history bars with an at-home percentage over the selected period
+- **Per-person blocking** — block or unblock every device belonging to a person in one action
+- **Per-person block schedules** — recurring time-based block rules attached to a person (e.g. block a child's devices every school night)
+- **Presence notifications** — person arrived home, left home, blocked, and unblocked events feed into the notification profile system (see below)
 
 ### Scanning & Security
 - **Port scanning** — nmap-based TCP port sweep with OS detection and service fingerprinting
@@ -52,6 +63,7 @@ Check the [Wiki](https://github.com/thefunkygibbon/InSpectre/wiki) for full admi
 - **Per-device blocking** — cut any device off from the internet with one click using ARP MITM
 - **Network pause** — block all devices simultaneously
 - **Block schedules** — time-based rules to automatically block devices on a recurring schedule
+- **Per-person blocking & schedules** — block all of a person's devices at once, or attach a recurring block schedule to a person from the Person Presence page
 
 ### Traffic Monitoring
 - **Per-device traffic analysis** — bytes, packets, domains contacted, countries, and unusual port activity
@@ -71,6 +83,7 @@ Check the [Wiki](https://github.com/thefunkygibbon/InSpectre/wiki) for full admi
 - **Gotify** — self-hosted Gotify server support
 - **Webhooks** — generic outbound webhook for any alerting system
 - **Channels & Profiles system** — reusable Notification Channels (each with a service type and credentials) are grouped into Profiles that map specific event types to one or more channels; multiple channels can fire for the same event and one channel can serve multiple profiles
+- **Event coverage** — device new/online/offline, port drift, vulnerability findings, and **Person Presence events** (person arrived home, left home, blocked, unblocked) are all routable through Profiles
 - **Supported channel services** — ntfy, Gotify, Pushbullet, Webhook, Home Assistant (direct REST), Matrix, SMTP (email), Slack, Telegram, Discord, and Apprise generic URL
 - **Per-channel testing** — each channel can be tested individually from the Settings panel
 - **Home Assistant direct notifications** — a `home_assistant` channel type POSTs alerts directly to the HA REST API (`persistent_notification/create` or any custom `domain/service`); configure host, port, long-lived access token, optional notifier path, and TLS toggle
@@ -176,7 +189,7 @@ Browser                 │           Docker Compose             │
                         └─────────────────────────────────────┘
 ```
 
-- **Frontend** — React 18 + Vite + Tailwind CSS single-page app, served by nginx. Polls `/api/devices` every 10 seconds.
+- **Frontend** — React 18 + Vite + Tailwind CSS single-page app, served by nginx. Receives live updates over a Server-Sent Events (SSE) stream from the backend and refreshes affected views instantly, with a slow background poll as a fallback.
 - **Backend** — FastAPI on port 8000. Handles all user-initiated API calls, proxies scan/diagnostic requests to the probe, runs the alert dispatch loop and scheduled vulnerability scans. Connects to Docker hosts and Proxmox VE via SDK/REST API for container monitoring.
 - **Probe** — FastAPI on port 8666, runs on the host network with elevated privileges. The only container with raw network access. Performs ARP sweeps, passive sniffing, nmap scans, Nuclei vulnerability scans, and ARP-based device blocking. Writes device data directly to PostgreSQL.
 
