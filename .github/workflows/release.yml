@@ -1,0 +1,117 @@
+name: Create Release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+jobs:
+  build-and-release:
+    name: Build, push & release
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-qemu-action@v3
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Get version from tag
+        id: ver
+        run: echo "VERSION=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+
+      - name: Build & push backend
+        uses: docker/build-push-action@v5
+        with:
+          context: ./backend
+          platforms: linux/amd64
+          push: true
+          tags: |
+            thefunkygibbon/inspectre-web:${{ steps.ver.outputs.VERSION }}
+            thefunkygibbon/inspectre-web:latest
+
+      - name: Build & push backend (raspi)
+        uses: docker/build-push-action@v5
+        with:
+          context: ./backend
+          platforms: linux/arm64
+          push: true
+          tags: |
+            thefunkygibbon/inspectre-web:${{ steps.ver.outputs.VERSION }}-raspi
+            thefunkygibbon/inspectre-web:raspi
+
+      - name: Build & push probe
+        uses: docker/build-push-action@v5
+        with:
+          context: ./probe
+          platforms: linux/amd64
+          push: true
+          tags: |
+            thefunkygibbon/inspectre-probe:${{ steps.ver.outputs.VERSION }}
+            thefunkygibbon/inspectre-probe:latest
+
+      - name: Build & push probe (raspi)
+        uses: docker/build-push-action@v5
+        with:
+          context: ./probe
+          platforms: linux/arm64
+          push: true
+          tags: |
+            thefunkygibbon/inspectre-probe:${{ steps.ver.outputs.VERSION }}-raspi
+            thefunkygibbon/inspectre-probe:raspi
+
+      - name: Build & push frontend
+        uses: docker/build-push-action@v5
+        with:
+          context: ./frontend
+          platforms: linux/amd64
+          push: true
+          tags: |
+            thefunkygibbon/inspectre-frontend:${{ steps.ver.outputs.VERSION }}
+            thefunkygibbon/inspectre-frontend:latest
+
+      - name: Build & push frontend (raspi)
+        uses: docker/build-push-action@v5
+        with:
+          context: ./frontend
+          platforms: linux/arm64
+          push: true
+          tags: |
+            thefunkygibbon/inspectre-frontend:${{ steps.ver.outputs.VERSION }}-raspi
+            thefunkygibbon/inspectre-frontend:raspi
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: "InSpectre ${{ steps.ver.outputs.VERSION }}"
+          generate_release_notes: true
+          body: |
+            ## InSpectre ${{ steps.ver.outputs.VERSION }}
+
+            ### Docker Images (x64)
+            ```bash
+            docker pull thefunkygibbon/inspectre-web:${{ steps.ver.outputs.VERSION }}
+            docker pull thefunkygibbon/inspectre-probe:${{ steps.ver.outputs.VERSION }}
+            docker pull thefunkygibbon/inspectre-frontend:${{ steps.ver.outputs.VERSION }}
+            ```
+
+            ### Docker Images (Raspberry Pi / ARM64)
+            ```bash
+            docker pull thefunkygibbon/inspectre-web:${{ steps.ver.outputs.VERSION }}-raspi
+            docker pull thefunkygibbon/inspectre-probe:${{ steps.ver.outputs.VERSION }}-raspi
+            docker pull thefunkygibbon/inspectre-frontend:${{ steps.ver.outputs.VERSION }}-raspi
+            ```
+
+            ### Quick Start
+            ```bash
+            curl -fsSL https://raw.githubusercontent.com/thefunkygibbon/InSpectre/main/docker-compose.yml -o docker-compose.yml
+            docker compose up -d
+            ```
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
