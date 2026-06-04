@@ -6,7 +6,7 @@ import {
   ChevronDown, ChevronRight, Square, Tag, CheckCircle2,
   FileText, Star as StarIcon, ShieldAlert, EyeOff, Eye, Layers,
   AlertTriangle, Network, Loader2, GitMerge, Radio, BellOff, Plus, Trash2,
-  TrendingUp, TrendingDown, Power,
+  TrendingUp, TrendingDown, Power, User,
 } from 'lucide-react'
 import { OnlineDot }      from './OnlineDot'
 import { StarButton }     from './StarButton'
@@ -826,35 +826,37 @@ export function DeviceDrawer({ device, onClose, onRename, onResolveName, onRefre
                     ? (localDevice.is_blocked ? 'Unblocking…' : 'Blocking…')
                     : (localDevice.is_blocked ? 'Unblock device' : 'Block internet access')}
                 </button>
-                <button
-                  onClick={handleIgnoreToggle}
-                  disabled={ignoring}
-                  className={`mt-2 w-full flex items-center justify-center gap-2 py-2 rounded-lg
-                             border text-xs font-medium transition-colors duration-150
-                             ${localDevice.is_ignored
-                               ? 'border-brand/40 bg-brand/10 text-brand hover:bg-brand/20'
-                               : 'border-border bg-surface-offset text-text-muted hover:text-text hover:border-border'
-                             }
-                             ${ignoring ? 'opacity-60 cursor-wait' : ''}`}>
-                  {localDevice.is_ignored
-                    ? <><Eye size={12} /> Un-ignore device</>
-                    : <><EyeOff size={12} /> Ignore device</>}
-                </button>
-                <button
-                  onClick={handleSuppressPresenceToggle}
-                  disabled={suppressingPresence}
-                  className={`mt-2 w-full flex items-center justify-center gap-2 py-2 rounded-lg
-                             border text-xs font-medium transition-colors duration-150
-                             ${localDevice.suppress_presence_events
-                               ? 'border-yellow-500/40 bg-yellow-500/10 text-yellow-400 hover:bg-yellow-500/20'
-                               : 'border-border bg-surface-offset text-text-muted hover:text-text hover:border-border'
-                             }
-                             ${suppressingPresence ? 'opacity-60 cursor-wait' : ''}`}>
-                  <BellOff size={12} className={suppressingPresence ? 'animate-pulse' : ''} />
-                  {localDevice.suppress_presence_events
-                    ? 'Resume presence events'
-                    : 'Suppress presence events'}
-                </button>
+                <div className="mt-2 flex items-stretch gap-2">
+                  <button
+                    onClick={handleIgnoreToggle}
+                    disabled={ignoring}
+                    className={`flex-1 flex items-center justify-center gap-2 py-2 rounded-lg
+                               border text-xs font-medium transition-colors duration-150
+                               ${localDevice.is_ignored
+                                 ? 'border-brand/40 bg-brand/10 text-brand hover:bg-brand/20'
+                                 : 'border-border bg-surface-offset text-text-muted hover:text-text hover:border-border'
+                               }
+                               ${ignoring ? 'opacity-60 cursor-wait' : ''}`}>
+                    {localDevice.is_ignored
+                      ? <><Eye size={12} /> Un-ignore</>
+                      : <><EyeOff size={12} /> Ignore</>}
+                  </button>
+                  <button
+                    onClick={handleSuppressPresenceToggle}
+                    disabled={suppressingPresence}
+                    className={`flex-1 flex items-center justify-center gap-2 py-2 rounded-lg
+                               border text-xs font-medium transition-colors duration-150
+                               ${localDevice.suppress_presence_events
+                                 ? 'border-yellow-500/40 bg-yellow-500/10 text-yellow-400 hover:bg-yellow-500/20'
+                                 : 'border-border bg-surface-offset text-text-muted hover:text-text hover:border-border'
+                               }
+                               ${suppressingPresence ? 'opacity-60 cursor-wait' : ''}`}>
+                    <BellOff size={12} className={suppressingPresence ? 'animate-pulse' : ''} />
+                    {localDevice.suppress_presence_events
+                      ? 'Resume presence'
+                      : 'Suppress presence'}
+                  </button>
+                </div>
                 <StreamOutput
                   lines={termLines}
                   running={termRunning}
@@ -913,6 +915,16 @@ export function DeviceDrawer({ device, onClose, onRename, onResolveName, onRefre
                   setLocalDevice(prev => ({ ...prev, zone }))
                   if (onZoneChange) onZoneChange(zone)
                 }} />
+                {localDevice.person_name && (
+                  <Row label="Person assigned"
+                    value={
+                      <span className="flex items-center gap-1.5">
+                        <User size={11} style={{ color: 'var(--color-brand)' }} />
+                        <span>{localDevice.person_name}</span>
+                      </span>
+                    }
+                  />
+                )}
                 {localDevice.miss_count  !== undefined && <Row label="Miss count" value={localDevice.miss_count} />}
               </Collapsible>
 

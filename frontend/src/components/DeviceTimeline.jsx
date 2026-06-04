@@ -95,12 +95,14 @@ function MiniTimelineBar({ mac }) {
 
   const uptime = useMemo(() => {
     if (!data?.segments) return null
-    const totalMs = new Date(data.window_end) - new Date(data.window_start)
-    if (totalMs <= 0) return null
+    const knownMs = data.segments
+      .filter(s => s.status !== 'unknown')
+      .reduce((sum, s) => sum + (new Date(s.to) - new Date(s.from)), 0)
+    if (knownMs <= 0) return null
     const onlineMs = data.segments
       .filter(s => s.status === 'online')
       .reduce((sum, s) => sum + (new Date(s.to) - new Date(s.from)), 0)
-    return Math.round((onlineMs / totalMs) * 100)
+    return Math.round((onlineMs / knownMs) * 100)
   }, [data])
 
   if (!data?.segments?.length) return null
@@ -110,7 +112,7 @@ function MiniTimelineBar({ mac }) {
   return (
     <div className="mb-4 space-y-1">
       <div className="flex items-center justify-between text-[10px]" style={{ color: 'var(--color-text-faint)' }}>
-        <span>7-day uptime</span>
+        <span>uptime (known periods)</span>
         {uptime != null && (
           <span className="font-mono font-semibold"
             style={{ color: uptime >= 90 ? '#10b981' : uptime >= 50 ? '#f59e0b' : '#ef4444' }}>

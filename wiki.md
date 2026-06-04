@@ -8,6 +8,7 @@
    - 1.3 [First Run & Setup Wizard](#13-first-run--setup-wizard)
    - 1.4 [Accessing the UI](#14-accessing-the-ui)
    - 1.5 [Authentication](#15-authentication)
+   - 1.6 [Deploying from Docker Hub](#16-deploying-from-docker-hub)
 2. [Device Discovery](#2-device-discovery)
    - 2.1 [How Discovery Works](#21-how-discovery-works)
    - 2.2 [ARP Sweep vs Passive Sniffer](#22-arp-sweep-vs-passive-sniffer)
@@ -96,6 +97,7 @@
     - 13.6 [LWT (Last Will and Testament)](#136-lwt-last-will-and-testament)
 14. [Troubleshooting](#14-troubleshooting)
 15. [FAQ](#15-faq)
+16. [Plugins](#16-plugins)
 
 ---
 
@@ -185,6 +187,71 @@ After setup, every visit requires logging in with the credentials you created. S
 **Changing your password:**
 
 Go to **Settings → Admin → Change Password** to update your credentials at any time.
+
+---
+
+### 1.6 Deploying from Docker Hub
+
+If you would rather run InSpectre without cloning the repository, you can pull pre-built images directly from Docker Hub.
+
+**Docker Hub images:**
+
+| Image | Purpose |
+|---|---|
+| `thefunkygibbon/inspectre-frontend:latest` | nginx + React SPA |
+| `thefunkygibbon/inspectre-web:latest` | FastAPI backend |
+| `thefunkygibbon/inspectre-probe:latest` | Network probe |
+
+**Quick install (interactive):**
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/thefunkygibbon/InSpectre/main/inspectre-install.sh | bash
+```
+
+The installer checks for Docker, asks for an install directory, generates a secure database password and secret key, optionally lets you set `IP_RANGE` and `INTERFACE`, writes a `.env` file, and starts the stack.
+
+**Manual install:**
+
+1. Download the deploy Compose file:
+
+```bash
+curl -O https://raw.githubusercontent.com/thefunkygibbon/InSpectre/main/docker-compose.deploy.yml
+```
+
+2. Edit the file and replace the two placeholders:
+
+| Variable | What to change |
+|---|---|
+| `POSTGRES_PASSWORD` | Set a strong password for the database — used in both `db` and `web`/`probe` |
+| `SECRET_KEY` | Set a random 64-character hex string for JWT signing |
+
+Generate a secure `SECRET_KEY`:
+
+```bash
+openssl rand -hex 32
+```
+
+3. Optionally override network detection (leave commented out for auto-detection):
+
+```yaml
+# IP_RANGE: "192.168.1.0/24"   # Your LAN subnet
+# INTERFACE: "eth0"             # Network interface to use
+```
+
+4. Start the stack:
+
+```bash
+docker compose -f docker-compose.deploy.yml up -d
+```
+
+5. Open your browser and navigate to **http://localhost:3000** (or the host's IP). Complete the first-run setup wizard to create your admin account and finalise configuration.
+
+**Updating:**
+
+```bash
+docker compose -f docker-compose.deploy.yml pull
+docker compose -f docker-compose.deploy.yml up -d
+```
 
 ---
 
@@ -1578,3 +1645,46 @@ docker compose logs -f probe
 docker compose logs -f backend
 docker compose logs -f frontend
 ```
+
+---
+
+## 16. Plugins
+
+### Overview
+
+InSpectre supports a plugin system that allows the application to be extended with additional functionality beyond what ships in the core. Plugins can provide new device detection sources, custom event processors, additional network tools, or integrations with external services.
+
+The plugin engine is managed from **Settings → Plugins**.
+
+### Built-in Plugins
+
+Built-in plugins ship inside the InSpectre containers and are available immediately after installation. They are maintained by the InSpectre project and receive updates alongside the core application. Built-in plugins cannot be removed, but individual ones can be enabled or disabled from the Plugins tab.
+
+Examples of built-in plugin types include additional device classification sources and supplementary event enrichment logic.
+
+### Community Plugins
+
+Community plugins are created and maintained by third parties. They extend InSpectre's functionality beyond the built-in feature set and are distributed as plugin package files (`.zip` archives containing a manifest and plugin code).
+
+> ⚠️ **Security notice:** Community plugins are **not audited or vetted by the InSpectre project**. Only install community plugins from sources you trust. A malicious plugin running inside the InSpectre backend container has access to your network data and PostgreSQL database. Review the plugin source code before installing.
+
+### Installing a Community Plugin
+
+1. Obtain the plugin `.zip` file from the plugin author.
+2. Open InSpectre and navigate to **Settings → Plugins**.
+3. Click **Upload Plugin**.
+4. Select the `.zip` file and confirm the upload.
+5. The plugin will appear in the Plugins list with its name, version, and author.
+6. Toggle the plugin **Enabled** to activate it. Some plugins may require a restart of the backend container to take effect.
+
+### Removing a Plugin
+
+1. Navigate to **Settings → Plugins**.
+2. Find the plugin in the list and click the **Remove** (trash) icon.
+3. Confirm the deletion. The plugin files are removed immediately.
+
+### Plugin Manifest
+
+Each plugin must include a `plugin.json` manifest in the root of its `.zip` archive. For full details on writing a plugin, see [plugin.md](plugin.md) in the repository root.
+
+---

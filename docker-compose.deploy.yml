@@ -1,0 +1,109 @@
+# ============================================================
+#  InSpectre — Docker Hub deployment file
+#  Pulls pre-built images from Docker Hub (no local build).
+#
+#  BEFORE YOU RUN THIS FILE:
+#  1. Change POSTGRES_PASSWORD (search for CHANGE_ME_DB_PASSWORD)
+#  2. Change SECRET_KEY        (search for CHANGE_ME_SECRET_KEY)
+#     Generate one with:  openssl rand -hex 32
+#  3. Optionally set DATA_DIR, IP_RANGE, and INTERFACE below.
+#
+#  Start:   docker compose -f docker-compose.deploy.yml up -d
+#  Stop:    docker compose -f docker-compose.deploy.yml down
+#  Logs:    docker compose -f docker-compose.deploy.yml logs -f
+#  Update:  docker compose -f docker-compose.deploy.yml pull && \
+#           docker compose -f docker-compose.deploy.yml up -d
+# ============================================================
+
+# Where persistent data is stored on the host.
+# Change this if you want to store data somewhere other than ./data
+x-data-dir: &data-dir ${DATA_DIR:-./data}
+
+services:
+  db:
+    image: postgres:15-alpine
+    container_name: inspectre-db
+    restart: always
+    environment:
+      POSTGRES_USER: admin
+      # ⚠️  MUST CHANGE — set a strong password here
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-CHANGE_ME_DB_PASSWORD}
+      POSTGRES_DB: inspectre
+    ports:
+      - "5432:5432"
+    volumes:
+      - ${DATA_DIR:-./data}/db:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U admin -d inspectre"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+  web:
+    image: thefunkygibbon/inspectre-web:latest
+    container_name: inspectre-web
+    restart: always
+    ports:
+      - "8000:8000"
+    environment:
+      # ⚠️  Keep this in sync with db.POSTGRES_PASSWORD above
+      DATABASE_URL: postgresql://admin:${POSTGRES_PASSWORD:-CHANGE_ME_DB_PASSWORD}@db:5432/inspectre
+      PROBE_API_URL: http://host.docker.internal:8666
+      # ⚠️  MUST CHANGE — generate with: openssl rand -hex 32
+      SECRET_KEY: ${SECRET_KEY:-CHANGE_ME_SECRET_KEY}
+      # Optional: restrict which origins the API allows (comma-separated).
+      # Defaults to localhost:3000 and localhost:5173.
+      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:3000,http://localhost:5173}
+    # Remove or comment out the docker.sock volume if you do not need
+    # Docker container monitoring (or are using a remote TCP host).
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ${DATA_DIR:-./data}/vuln/trivy:/root/.cache/trivy
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      db:
+        condition: service_healthy
+
+  probe:
+    image: thefunkygibbon/inspectre-probe:latest
+    container_name: inspectre-probe
+    network_mode: "host"
+    privileged: true
+    restart: always
+    environment:
+      # ⚠️  Keep this in sync with db.POSTGRES_PASSWORD above.
+      # Note: uses 'localhost' (not 'db') because probe is on the host network.
+      DATABASE_URL: postgresql://admin:${POSTGRES_PASSWORD:-CHANGE_ME_DB_PASSWORD}@localhost:5432/inspectre
+      # Optional: override the network range the probe scans.
+      # Leave commented out to let the probe auto-detect from the routing table.
+      # IP_RANGE: "192.168.1.0/24"
+      # Optional: override the network interface used for scanning and sniffing.
+      # Leave commented out to let the probe auto-detect.
+      # INTERFACE: "eth0"
+      # Optional: set your LAN's DNS server for hostname resolution.
+      # Leave commented out to auto-detect from the gateway.
+      # LAN_DNS_SERVER: "192.168.1.1"
+      SCAN_INTERVAL: "60"
+      NMAP_ARGS: "-sT -O --osscan-limit -T4"
+      PROBE_API_PORT: "8666"
+      PYTHONUNBUFFERED: "1"
+      NMAP_OPTS: ""
+    volumes:
+      - ${DATA_DIR:-./data}/vuln/nuclei:/root/nuclei-templates
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+    depends_on:
+      db:
+        condition: service_healthy
+
+  frontend:
+    image: thefunkygibbon/inspectre-frontend:latest
+    container_name: inspectre-frontend
+    restart: always
+    ports:
+      - "3000:80"
+    depends_on:
+      - web

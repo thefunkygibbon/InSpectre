@@ -4,10 +4,8 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Help &amp; Support — InSpectre</title>
-  <meta name="description" content="Get help with InSpectre. Report bugs, request features, and find answers on the GitHub issues tracker." />
-  <!-- Redirect to GitHub issues after a short delay; link is always available below. -->
-  <meta http-equiv="refresh" content="4; url=https://github.com/thefunkygibbon/InSpectre/issues" />
-  <link rel="icon" type="image/svg+xml" href="assets/logo.svg" />
+  <meta name="description" content="Get help with InSpectre. Contact the team, report bugs, and request features." />
+  <link rel="icon" type="image/svg+xml" href="assets/favicon.svg" />
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet" />
@@ -18,7 +16,7 @@
   <header class="nav">
     <div class="container nav-inner">
       <a href="index.html" class="brand-mark">
-        <img src="assets/logo.svg" alt="" class="logo" />
+        <img src="assets/ghost-logo.svg" alt="" class="logo" />
         <span><span class="in">In</span><span class="spectre">Spectre</span></span>
       </a>
       <button class="nav-toggle" aria-label="Menu">
@@ -42,17 +40,58 @@
       <div class="help-wrap">
         <span class="eyebrow"><span class="dot"></span> Help &amp; Support</span>
         <h1>Need a hand?</h1>
-        <p>Bugs, questions and feature requests all live on the GitHub issue tracker — the fastest way to get a response.</p>
+        <p>Check the docs first, then open an issue on GitHub or send a message below. Response times are best through GitHub.</p>
 
-        <div class="help-card" data-reveal>
-          <div class="spinner" aria-hidden="true"></div>
-          <p style="text-align:center;color:var(--text-muted);margin:0 0 22px;">Redirecting you to the GitHub issues page…</p>
-          <a href="https://github.com/thefunkygibbon/InSpectre/issues" class="btn btn-primary btn-lg" style="width:100%;justify-content:center;" target="_blank" rel="noopener">
-            <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor"><path d="M12 .3a12 12 0 0 0-3.8 23.4c.6.1.8-.3.8-.6v-2c-3.3.7-4-1.6-4-1.6-.6-1.4-1.4-1.8-1.4-1.8-1-.7.1-.7.1-.7 1.2 0 1.8 1.2 1.8 1.2 1 1.8 2.8 1.3 3.5 1 .1-.8.4-1.3.7-1.6-2.7-.3-5.5-1.3-5.5-6 0-1.2.5-2.3 1.3-3.1-.2-.4-.6-1.6 0-3.2 0 0 1-.3 3.3 1.2a11.5 11.5 0 0 1 6 0C17.3 4.7 18.3 5 18.3 5c.6 1.6.2 2.8 0 3.2.8.8 1.3 1.9 1.3 3.1 0 4.7-2.8 5.7-5.5 6 .4.4.8 1.1.8 2.2v3.3c0 .3.2.7.8.6A12 12 0 0 0 12 .3Z"/></svg>
-            Go to GitHub Issues
+        <div style="display:flex;gap:14px;justify-content:center;flex-wrap:wrap;margin-top:24px;">
+          <a href="https://github.com/thefunkygibbon/InSpectre/issues" class="btn btn-primary" target="_blank" rel="noopener">
+            <svg width="17" height="17" viewBox="0 0 24 24" fill="currentColor"><path d="M12 .3a12 12 0 0 0-3.8 23.4c.6.1.8-.3.8-.6v-2c-3.3.7-4-1.6-4-1.6-.6-1.4-1.4-1.8-1.4-1.8-1-.7.1-.7.1-.7 1.2 0 1.8 1.2 1.8 1.2 1 1.8 2.8 1.3 3.5 1 .1-.8.4-1.3.7-1.6-2.7-.3-5.5-1.3-5.5-6 0-1.2.5-2.3 1.3-3.1-.2-.4-.6-1.6 0-3.2 0 0 1-.3 3.3 1.2a11.5 11.5 0 0 1 6 0C17.3 4.7 18.3 5 18.3 5c.6 1.6.2 2.8 0 3.2.8.8 1.3 1.9 1.3 3.1 0 4.7-2.8 5.7-5.5 6 .4.4.8 1.1.8 2.2v3.3c0 .3.2.7.8.6A12 12 0 0 0 12 .3Z"/></svg>
+            GitHub Issues
           </a>
-          <p style="text-align:center;font-size:.85rem;color:var(--text-faint);margin:16px 0 0;">If you're not redirected automatically, click the button above.</p>
+          <a href="https://github.com/thefunkygibbon/InSpectre/discussions" class="btn btn-ghost" target="_blank" rel="noopener">
+            <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>
+            GitHub Discussions
+          </a>
         </div>
+      </div>
+    </div>
+  </section>
+
+  <section style="padding-top:20px;">
+    <div class="container">
+      <div style="max-width:680px;margin:0 auto;">
+        <h2 style="font-size:1.5rem;margin-bottom:22px;">Send a message</h2>
+        <p style="color:var(--text-muted);margin-bottom:24px;">For commercial licensing enquiries or anything not suitable for a public GitHub issue, fill in the form below. It opens your email client with a pre-filled message — no data is sent to any server.</p>
+
+        <form id="contact-form" style="display:flex;flex-direction:column;gap:16px;">
+          <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;">
+            <div>
+              <label style="display:block;font-size:.88rem;color:var(--text-muted);margin-bottom:6px;">Name</label>
+              <input id="cf-name" type="text" placeholder="Your name" style="width:100%;background:var(--surface);border:1px solid var(--border);border-radius:9px;padding:10px 14px;color:var(--text);font-size:.95rem;font-family:var(--font);outline:none;transition:border-color .15s;" />
+            </div>
+            <div>
+              <label style="display:block;font-size:.88rem;color:var(--text-muted);margin-bottom:6px;">Your email (for reply)</label>
+              <input id="cf-email" type="email" placeholder="you@example.com" style="width:100%;background:var(--surface);border:1px solid var(--border);border-radius:9px;padding:10px 14px;color:var(--text);font-size:.95rem;font-family:var(--font);outline:none;transition:border-color .15s;" />
+            </div>
+          </div>
+          <div>
+            <label style="display:block;font-size:.88rem;color:var(--text-muted);margin-bottom:6px;">Subject</label>
+            <select id="cf-subject" style="width:100%;background:var(--surface);border:1px solid var(--border);border-radius:9px;padding:10px 14px;color:var(--text);font-size:.95rem;font-family:var(--font);outline:none;appearance:none;cursor:pointer;">
+              <option value="General Question">General Question</option>
+              <option value="Bug Report">Bug Report</option>
+              <option value="Feature Request">Feature Request</option>
+              <option value="Commercial Licensing">Commercial Licensing</option>
+            </select>
+          </div>
+          <div>
+            <label style="display:block;font-size:.88rem;color:var(--text-muted);margin-bottom:6px;">Message</label>
+            <textarea id="cf-message" rows="6" placeholder="Describe your question or issue in as much detail as possible…" style="width:100%;background:var(--surface);border:1px solid var(--border);border-radius:9px;padding:10px 14px;color:var(--text);font-size:.95rem;font-family:var(--font);outline:none;resize:vertical;line-height:1.6;"></textarea>
+          </div>
+          <button type="submit" class="btn btn-primary" style="width:100%;justify-content:center;">
+            <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 2 11 13M22 2 15 22l-4-9-9-4 20-7Z"/></svg>
+            Open in email client
+          </button>
+          <p style="font-size:.82rem;color:var(--text-faint);text-align:center;margin:0;">This opens your default email app. Alternatively, email us directly at <span id="em-display" style="color:var(--brand-light);font-family:var(--mono);">loading…</span></p>
+        </form>
       </div>
     </div>
   </section>
@@ -83,7 +122,7 @@
     <div class="container">
       <div class="footer-grid">
         <div class="footer-brand">
-          <a href="index.html" class="brand-mark"><img src="assets/logo.svg" alt="" class="logo" /><span><span class="in">In</span><span class="spectre">Spectre</span></span></a>
+          <a href="index.html" class="brand-mark"><img src="assets/ghost-logo.svg" alt="" class="logo" /><span><span class="in">In</span><span class="spectre">Spectre</span></span></a>
           <p>The self-hosted network monitor and security scanner that keeps every byte on your own hardware.</p>
         </div>
         <div class="footer-cols">
@@ -114,6 +153,34 @@
   </footer>
 
   <script>document.getElementById('yr').textContent = new Date().getFullYear();</script>
+  <script>
+    // Obfuscated email assembly — avoids plain text scraping
+    (function() {
+      var p = ['inspectre', '@', 'thefunkygibbon', '.', 'net'];
+      var addr = p.join('');
+      var el = document.getElementById('em-display');
+      if (el) { el.textContent = addr; }
+
+      var form = document.getElementById('contact-form');
+      if (form) {
+        form.addEventListener('submit', function(e) {
+          e.preventDefault();
+          var name    = document.getElementById('cf-name').value.trim();
+          var email   = document.getElementById('cf-email').value.trim();
+          var subject = document.getElementById('cf-subject').value;
+          var message = document.getElementById('cf-message').value.trim();
+          var body = '';
+          if (name)  body += 'From: ' + name + '\n';
+          if (email) body += 'Reply-to: ' + email + '\n';
+          body += '\n' + message;
+          var mailto = 'mailto:' + addr
+            + '?subject=' + encodeURIComponent('[InSpectre] ' + subject)
+            + '&body='    + encodeURIComponent(body);
+          window.location.href = mailto;
+        });
+      }
+    })();
+  </script>
   <script src="assets/main.js"></script>
 </body>
 </html>

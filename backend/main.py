@@ -6933,19 +6933,26 @@ def _person_row_to_dict(row, devices=None, schedules=None) -> dict:
     task = _person_timed_blocks.get(pid)
     if task and not task.done():
         timed_block_remaining = True  # active timed block
+    # Derive last status change from the most recent device status_changed_at
+    status_changed_at = None
+    for d in devs:
+        sc = d.get("status_changed_at")
+        if sc and (status_changed_at is None or sc > status_changed_at):
+            status_changed_at = sc
     return {
-        "id":                   pid,
-        "name":                 row[1],
-        "primary_mac":          primary_mac,
-        "photo":                row[3],
-        "notes":                row[4],
-        "created_at":           row[5].isoformat() if row[5] else None,
-        "updated_at":           row[6].isoformat() if row[6] else None,
-        "is_home":              is_home,
-        "is_blocked":           is_blocked,
-        "has_timed_block":      timed_block_remaining is not None,
-        "devices":              devs,
-        "schedules":            schedules or [],
+        "id":                    pid,
+        "name":                  row[1],
+        "primary_mac":           primary_mac,
+        "photo":                 row[3],
+        "notes":                 row[4],
+        "created_at":            row[5].isoformat() if row[5] else None,
+        "updated_at":            row[6].isoformat() if row[6] else None,
+        "is_home":               is_home,
+        "is_blocked":            is_blocked,
+        "has_timed_block":       timed_block_remaining is not None,
+        "last_status_changed_at": status_changed_at,
+        "devices":               devs,
+        "schedules":             schedules or [],
     }
 
 
@@ -6958,15 +6965,17 @@ def list_persons(db: Session = Depends(get_db)):
     dev_rows = db.execute(text("""
         SELECT pd.person_id::text, d.mac_address, d.is_online,
                COALESCE(d.custom_name, d.hostname, d.ip_address) AS display_name,
-               d.ip_address, d.device_type_override, d.vendor, d.is_blocked
+               d.ip_address, d.device_type_override, d.vendor, d.is_blocked,
+               d.status_changed_at
         FROM person_devices pd
         JOIN devices d ON d.mac_address = pd.mac_address
     """)).fetchall()
     devs_by_person: dict = {}
     for r in dev_rows:
         devs_by_person.setdefault(r[0], []).append({
-            "mac_address":  r[1], "is_online": r[2], "display_name": r[3],
-            "ip_address":   r[4], "device_type": r[5], "vendor": r[6], "is_blocked": bool(r[7]),
+            "mac_address":        r[1], "is_online": r[2], "display_name": r[3],
+            "ip_address":         r[4], "device_type": r[5], "vendor": r[6], "is_blocked": bool(r[7]),
+            "status_changed_at":  r[8].isoformat() if r[8] else None,
         })
     # Fetch person-targeted schedules (both person_id and person_ids)
     try:

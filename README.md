@@ -76,6 +76,9 @@ Check the [Wiki](https://github.com/thefunkygibbon/InSpectre/wiki) for full admi
 - **Infrastructure** — IP Geolocation, WHOIS, BGP/ASN Lookup, Subnet Calculator
 - **Email Tools** — MX/SPF/DMARC/DKIM Checker, SMTP Banner Grab, BIMI Lookup, DNSBL Check
 
+### Extensibility
+- **Plugin system** — extend InSpectre with community plugins; built-in plugins ship with the application, community plugins can be uploaded manually via Settings → Plugins
+
 ### Alerts & Notifications
 - **Toast + browser notifications** — instant in-app and OS-level alerts
 - **Pushbullet** — push notifications to your phone
@@ -131,6 +134,24 @@ Open **http://localhost:3000** in your browser and complete the first-run setup 
 ./inspectre.sh rebuild          # full wipe and rebuild (deletes postgres_data/)
 ./inspectre.sh rebuild keep-data  # rebuild but preserve the database
 ./inspectre.sh logs             # tail logs from all containers
+```
+
+### Using pre-built Docker images (Docker Hub)
+
+If you want to run InSpectre without cloning the repository:
+
+```bash
+curl -O https://raw.githubusercontent.com/thefunkygibbon/InSpectre/main/docker-compose.deploy.yml
+# Edit docker-compose.deploy.yml — change POSTGRES_PASSWORD and SECRET_KEY
+docker compose -f docker-compose.deploy.yml up -d
+```
+
+Open **http://localhost:3000** and complete the setup wizard.
+
+Or use the interactive installer, which handles configuration automatically:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/thefunkygibbon/InSpectre/main/inspectre-install.sh | bash
 ```
 
 ### Using Docker Compose directly
@@ -224,4 +245,4 @@ Contributions are welcome. Please open an issue to discuss a change before submi
 InSpectre is dual-licensed:
 
 - **Open Source (AGPL-3.0)** — Free for personal use, home labs, and open-source projects. See [LICENSE](LICENSE).
-- **Commercial** — Required for embedding in proprietary products or offering as a hosted service. See [LICENSE-COMMERCIAL.md](LICENSE-COMMERCIAL.md) or contact [your-email].
+- **Commercial** — Required for embedding in proprietary products or offering as a hosted service. See [LICENSE-COMMERCIAL.md](LICENSE-COMMERCIAL.md) or contact [inspectre@thefunkygibbon.net](mailto:inspectre@thefunkygibbon.net).

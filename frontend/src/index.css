@@ -17,6 +17,7 @@
   --color-brand:         #0d7a82;
   --color-brand-light:   #1a9ea8;
   --noise-opacity: 0.025;
+  --logo-ghost-color: #1a1714;
 
   /* Toast backgrounds — fully opaque for readability */
   --toast-new-bg:          #e8f6f7;
@@ -38,6 +39,7 @@
   --color-brand:         #4fa8b0;
   --color-brand-light:   #6bbfc7;
   --noise-opacity: 0.015;
+  --logo-ghost-color: #e8e8ea;
 
   /* Toast backgrounds — fully opaque for readability */
   --toast-new-bg:          #152527;
@@ -65,6 +67,7 @@
   --color-brand:         #00ff41;
   --color-brand-light:   #33ff66;
   --noise-opacity: 0.008;
+  --logo-ghost-color: #00ff41;
   color-scheme: dark;
 
   --toast-new-bg:         #021408;
@@ -86,6 +89,7 @@
   --color-brand:         #007a20;
   --color-brand-light:   #009928;
   --noise-opacity: 0.018;
+  --logo-ghost-color: #007a20;
   color-scheme: light;
 
   --toast-new-bg:         #ddf5e2;
@@ -114,7 +118,7 @@
 }
 
 /* Scanlines — replaces the default noise overlay */
-[data-skin="phantom"] .noise-overlay {
+[data-skin="phantom"]:not([data-theme="light"]) .noise-overlay {
   background-image: repeating-linear-gradient(
     0deg,
     rgba(0,0,0,0.22) 0px,
@@ -147,6 +151,11 @@
 [data-skin="phantom"] .input:focus {
   border-color: #00ff41 !important;
   box-shadow: 0 0 0 2px rgba(0,255,65,0.25), 0 0 10px rgba(0,255,65,0.15) !important;
+}
+
+/* Ghost logo glow — only in phantom dark mode */
+[data-skin="phantom"]:not([data-theme="light"]) .ghost-logo {
+  filter: drop-shadow(0 0 6px rgba(0,255,65,0.7)) drop-shadow(0 0 12px rgba(0,255,65,0.35));
 }
 
 /* Scrollbar — flat green tick marks */

@@ -869,8 +869,8 @@ function MainApp({ onLogout }) {
                 </button>
               ) : (
                 <>
-                  <Logo size={22} />
-                  <span style={{ fontSize: '11px', fontWeight: 700, letterSpacing: '0.15em', color: 'var(--color-brand)' }}>INSPECTRE</span>
+                  <Logo size={30} />
+                  <span style={{ fontSize: '11px', fontWeight: 700, letterSpacing: '0.08em', color: 'var(--color-brand)' }}>InSpectre</span>
                 </>
               )}
             </div>
@@ -988,7 +988,7 @@ function MainApp({ onLogout }) {
             fontSize: '9px', color: 'var(--color-text-faint)', letterSpacing: '0.06em',
             fontFamily: 'JetBrains Mono, monospace', display: 'flex', justifyContent: 'space-between', alignItems: 'center',
           }}>
-            <span>// INSPECTRE v{APP_VERSION}</span>
+            <span>// InSpectre v{APP_VERSION}</span>
             <StatusButton />
           </div>
 
@@ -1024,13 +1024,13 @@ function MainApp({ onLogout }) {
           {/* Logo */}
           <div style={{ padding: '18px 16px 14px', borderBottom: '1px solid var(--color-border)' }}>
             <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
-              <Logo size={22} />
+              <Logo size={30} />
               <div>
-                <div style={{ fontSize: '12px', fontWeight: 700, letterSpacing: '0.15em', color: 'var(--color-brand)' }}>
-                  INSPECTRE
+                <div style={{ fontSize: '12px', fontWeight: 700, letterSpacing: '0.08em', color: 'var(--color-brand)' }}>
+                  InSpectre
                 </div>
                 <div style={{ fontSize: '9px', color: 'var(--color-text-faint)', marginTop: '1px' }}>
-                  v{APP_VERSION} // PHANTOM
+                  v{APP_VERSION}
                 </div>
               </div>
             </div>
@@ -1152,7 +1152,7 @@ function MainApp({ onLogout }) {
             fontSize: '9px', color: 'var(--color-text-faint)', letterSpacing: '0.08em',
             fontFamily: 'JetBrains Mono, monospace',
           }}>
-            <span>// INSPECTRE v{APP_VERSION} &copy; {new Date().getFullYear()} thefunkygibbon</span>
+            <span>// InSpectre v{APP_VERSION} &copy; {new Date().getFullYear()} thefunkygibbon</span>
             <StatusButton />
           </div>
         </div>
@@ -1539,6 +1539,7 @@ function ForcePasswordChange({ onDone }) {
 // authState: 'loading' | 'setup' | 'login' | 'change_password' | 'app'
 export default function App() {
   const [authState, setAuthState] = useState('loading')
+  useTheme()  // Ensures theme/skin CSS vars are applied to <html> even on login/setup screens
 
   useEffect(() => {
     async function boot() {

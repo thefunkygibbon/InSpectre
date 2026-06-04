@@ -100,6 +100,8 @@ h1, h2, h3 { line-height: 1.15; margin: 0 0 .5em; font-weight: 700; letter-spaci
 .brand-mark { display: flex; align-items: center; gap: 11px; font-weight: 800; font-size: 1.15rem; letter-spacing: -.03em; color: var(--text); }
 .brand-mark:hover { color: var(--text); }
 .brand-mark .logo { width: 30px; height: 30px; }
+/* Ghost logo: black silhouette visible on dark bg via inversion; white body visible directly */
+.logo { width: 36px; height: 36px; filter: invert(1) sepia(1) saturate(5) hue-rotate(90deg) brightness(0.85); }
 .brand-mark .in { color: var(--text); }
 .brand-mark .spectre { color: var(--brand-light); }
 

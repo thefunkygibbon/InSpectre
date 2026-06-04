@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Downloads — InSpectre</title>
   <meta name="description" content="Download InSpectre as a Docker stack, a ready-to-run virtual machine image, or a Raspberry Pi image. Free and open source." />
-  <link rel="icon" type="image/svg+xml" href="assets/logo.svg" />
+  <link rel="icon" type="image/svg+xml" href="assets/favicon.svg" />
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet" />
@@ -16,7 +16,7 @@
   <header class="nav">
     <div class="container nav-inner">
       <a href="index.html" class="brand-mark">
-        <img src="assets/logo.svg" alt="" class="logo" />
+        <img src="assets/ghost-logo.svg" alt="" class="logo" />
         <span><span class="in">In</span><span class="spectre">Spectre</span></span>
       </a>
       <button class="nav-toggle" aria-label="Menu">
@@ -83,11 +83,57 @@
   <section style="padding-top:20px;">
     <div class="container">
       <div class="section-head">
-        <h2>Quick install (Docker)</h2>
-        <p>You'll need Docker 24+ and Docker Compose v2. That's it.</p>
+        <h2>Quick Install</h2>
+        <p>One command downloads InSpectre and walks you through the setup — no git clone required.</p>
       </div>
 
       <div style="max-width:680px;margin:0 auto;">
+        <div class="code">
+          <div class="code-head"><span>bash — interactive installer (recommended)</span><button data-copy>Copy</button></div>
+          <pre><code><span class="c"># Downloads and starts InSpectre interactively</span>
+<span class="p">curl -fsSL https://raw.githubusercontent.com/thefunkygibbon/InSpectre/main/inspectre-install.sh | bash</span></code></pre>
+        </div>
+        <div class="callout">
+          The installer checks for Docker, asks for an install directory, generates secure passwords and secret keys, optionally lets you set your IP range and interface, then starts the stack automatically.
+        </div>
+
+        <h3 style="margin-top:32px;color:var(--brand-light);font-size:1.1rem;">Or pull manually from Docker Hub</h3>
+        <div class="code">
+          <div class="code-head"><span>bash — manual Docker Hub deploy</span><button data-copy>Copy</button></div>
+          <pre><code><span class="c"># 1. Download the deploy compose file</span>
+curl -O https://raw.githubusercontent.com/thefunkygibbon/InSpectre/main/docker-compose.deploy.yml
+
+<span class="c"># 2. Edit — change POSTGRES_PASSWORD and SECRET_KEY</span>
+<span class="c">#    Generate a key: openssl rand -hex 32</span>
+
+<span class="c"># 3. Start</span>
+<span class="p">docker compose -f docker-compose.deploy.yml up -d</span>
+
+<span class="c"># 4. Open http://localhost:3000 and complete the wizard</span></code></pre>
+        </div>
+
+        <div style="margin-top:24px;">
+          <p style="color:var(--text-muted);font-size:.95rem;margin-bottom:14px;">Docker Hub images:</p>
+          <div class="grid grid-3" style="gap:12px;">
+            <a href="https://hub.docker.com/r/thefunkygibbon/inspectre-frontend" class="card" target="_blank" rel="noopener" style="text-decoration:none;padding:16px 18px;">
+              <div style="font-family:var(--mono);font-size:.8rem;color:var(--accent);margin-bottom:6px;">thefunkygibbon/</div>
+              <strong>inspectre-frontend</strong>
+              <p style="font-size:.85rem;margin:4px 0 0;">nginx + React SPA</p>
+            </a>
+            <a href="https://hub.docker.com/r/thefunkygibbon/inspectre-web" class="card" target="_blank" rel="noopener" style="text-decoration:none;padding:16px 18px;">
+              <div style="font-family:var(--mono);font-size:.8rem;color:var(--accent);margin-bottom:6px;">thefunkygibbon/</div>
+              <strong>inspectre-web</strong>
+              <p style="font-size:.85rem;margin:4px 0 0;">FastAPI backend</p>
+            </a>
+            <a href="https://hub.docker.com/r/thefunkygibbon/inspectre-probe" class="card" target="_blank" rel="noopener" style="text-decoration:none;padding:16px 18px;">
+              <div style="font-family:var(--mono);font-size:.8rem;color:var(--accent);margin-bottom:6px;">thefunkygibbon/</div>
+              <strong>inspectre-probe</strong>
+              <p style="font-size:.85rem;margin:4px 0 0;">Network probe</p>
+            </a>
+          </div>
+        </div>
+
+        <h3 style="margin-top:32px;color:var(--brand-light);font-size:1.1rem;">Or clone from GitHub</h3>
         <div class="code">
           <div class="code-head"><span>recommended — inspectre.sh</span><button data-copy>Copy</button></div>
           <pre><code><span class="c"># 1. Clone the repository</span>
@@ -153,7 +199,7 @@ cd InSpectre
     <div class="container">
       <div class="footer-grid">
         <div class="footer-brand">
-          <a href="index.html" class="brand-mark"><img src="assets/logo.svg" alt="" class="logo" /><span><span class="in">In</span><span class="spectre">Spectre</span></span></a>
+          <a href="index.html" class="brand-mark"><img src="assets/ghost-logo.svg" alt="" class="logo" /><span><span class="in">In</span><span class="spectre">Spectre</span></span></a>
           <p>The self-hosted network monitor and security scanner that keeps every byte on your own hardware.</p>
         </div>
         <div class="footer-cols">

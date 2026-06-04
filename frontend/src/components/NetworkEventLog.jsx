@@ -55,6 +55,8 @@ export function NetworkEventLog({ onDeviceClick }) {
   const [loading, setLoading] = useState(true)
   const [limit, setLimit] = useState(120)
   const [search, setSearch] = useState('')
+  const [typeFilter, setTypeFilter] = useState('all')   // 'all' | 'online' | 'offline'
+  const [sourceFilter, setSourceFilter] = useState('all') // 'all' | source key
 
   useEffect(() => {
     let alive = true
@@ -85,16 +87,41 @@ export function NetworkEventLog({ onDeviceClick }) {
     return () => { clearInterval(id); unsub() }
   }, [limit])
 
+  // Collect unique sources from all events for source filter chips
+  const availableSources = useMemo(() => {
+    if (!events) return []
+    const seen = new Set()
+    events.forEach(e => {
+      let detail = e.detail
+      if (typeof detail === 'string') { try { detail = JSON.parse(detail) } catch { detail = null } }
+      const src = detail?.source || null
+      if (src) seen.add(src)
+    })
+    return Array.from(seen).sort()
+  }, [events])
+
   const filtered = useMemo(() => {
     if (!events) return []
-    if (!search.trim()) return events
-    const q = search.toLowerCase()
-    return events.filter(e =>
-      (e.display_name || '').toLowerCase().includes(q) ||
-      (e.mac_address || '').toLowerCase().includes(q) ||
-      (e.ip_address || '').includes(q)
-    )
-  }, [events, search])
+    return events.filter(e => {
+      // Type filter
+      if (typeFilter !== 'all' && e.type !== typeFilter) return false
+      // Source filter
+      if (sourceFilter !== 'all') {
+        let detail = e.detail
+        if (typeof detail === 'string') { try { detail = JSON.parse(detail) } catch { detail = null } }
+        const src = detail?.source || null
+        if (src !== sourceFilter) return false
+      }
+      // Text search
+      if (search.trim()) {
+        const q = search.toLowerCase()
+        if (!(e.display_name || '').toLowerCase().includes(q) &&
+            !(e.mac_address || '').toLowerCase().includes(q) &&
+            !(e.ip_address || '').includes(q)) return false
+      }
+      return true
+    })
+  }, [events, search, typeFilter, sourceFilter])
 
   const stats = useMemo(() => {
     if (!filtered.length) return null
@@ -103,65 +130,95 @@ export function NetworkEventLog({ onDeviceClick }) {
     return { total: filtered.length, online: onlineCount, offline: offlineCount }
   }, [filtered])
 
+  const FilterChip = ({ active, onClick, children }) => (
+    <button onClick={onClick}
+      className="px-3 py-1.5 rounded-lg text-xs font-medium transition-all"
+      style={active
+        ? { background: 'var(--color-surface-offset)', color: 'var(--color-text)' }
+        : { color: 'var(--color-text-muted)' }}>
+      {children}
+    </button>
+  )
+
   return (
     <div className="max-w-4xl mx-auto">
       {/* Header with controls */}
-      <div className="flex flex-col sm:flex-row gap-3 mb-6 items-start sm:items-center">
-        {/* Limit selector */}
-        <div className="flex items-center gap-1 glass rounded-xl p-1">
-          {LIMITS.map(l => (
-            <button key={l.value}
-              onClick={() => setLimit(l.value)}
-              className="px-3 py-1.5 rounded-lg text-xs font-medium transition-all"
-              style={limit === l.value
-                ? { background: 'var(--color-surface-offset)', color: 'var(--color-text)' }
-                : { color: 'var(--color-text-muted)' }}>
-              {l.label}
-            </button>
-          ))}
+      <div className="flex flex-col gap-3 mb-5">
+
+        {/* Row 1: limit + search */}
+        <div className="flex flex-col sm:flex-row gap-3 items-start sm:items-center">
+          <div className="flex items-center gap-1 glass rounded-xl p-1">
+            {LIMITS.map(l => (
+              <button key={l.value}
+                onClick={() => setLimit(l.value)}
+                className="px-3 py-1.5 rounded-lg text-xs font-medium transition-all"
+                style={limit === l.value
+                  ? { background: 'var(--color-surface-offset)', color: 'var(--color-text)' }
+                  : { color: 'var(--color-text-muted)' }}>
+                {l.label}
+              </button>
+            ))}
+          </div>
+
+          <div className="relative flex-1 max-w-xs">
+            <Search size={13} className="absolute left-3 top-1/2 -translate-y-1/2 pointer-events-none"
+              style={{ color: 'var(--color-text-muted)' }} />
+            <input className="input pl-8 text-xs w-full" placeholder="Filter by device…"
+              value={search} onChange={e => setSearch(e.target.value)} />
+            {search && (
+              <button onClick={() => setSearch('')}
+                className="absolute right-2 top-1/2 -translate-y-1/2 rounded p-0.5 transition-colors hover:opacity-70"
+                style={{ color: 'var(--color-text-muted)' }} aria-label="Clear search">
+                <X size={13} />
+              </button>
+            )}
+          </div>
         </div>
 
-        {/* Search */}
-        <div className="relative flex-1 max-w-xs">
-          <Search size={13} className="absolute left-3 top-1/2 -translate-y-1/2 pointer-events-none"
-            style={{ color: 'var(--color-text-muted)' }} />
-          <input className="input pl-8 text-xs w-full" placeholder="Filter events…"
-            value={search} onChange={e => setSearch(e.target.value)} />
-          {search && (
-            <button onClick={() => setSearch('')}
-              className="absolute right-2 top-1/2 -translate-y-1/2 rounded p-0.5 transition-colors hover:opacity-70"
-              style={{ color: 'var(--color-text-muted)' }} aria-label="Clear search">
-              <X size={13} />
-            </button>
+        {/* Row 2: smart filters */}
+        <div className="flex flex-wrap items-center gap-2">
+          {/* Type filter */}
+          <div className="flex items-center gap-1 glass rounded-xl p-1">
+            <FilterChip active={typeFilter === 'all'} onClick={() => setTypeFilter('all')}>All types</FilterChip>
+            <FilterChip active={typeFilter === 'online'} onClick={() => setTypeFilter('online')}>
+              <span className="flex items-center gap-1"><Wifi size={10} style={{ color: '#10b981' }} />Online</span>
+            </FilterChip>
+            <FilterChip active={typeFilter === 'offline'} onClick={() => setTypeFilter('offline')}>
+              <span className="flex items-center gap-1"><WifiOff size={10} style={{ color: '#ef4444' }} />Offline</span>
+            </FilterChip>
+          </div>
+
+          {/* Source filter — only shown when multiple sources exist */}
+          {availableSources.length > 1 && (
+            <div className="flex items-center gap-1 glass rounded-xl p-1">
+              <FilterChip active={sourceFilter === 'all'} onClick={() => setSourceFilter('all')}>All sources</FilterChip>
+              {availableSources.map(src => (
+                <FilterChip key={src} active={sourceFilter === src} onClick={() => setSourceFilter(src)}>
+                  {formatSource(src)}
+                </FilterChip>
+              ))}
+            </div>
+          )}
+
+          {/* Stats */}
+          {stats && (
+            <div className="flex items-center gap-4 ml-auto text-xs" style={{ color: 'var(--color-text-muted)' }}>
+              <span>{stats.total} event{stats.total !== 1 ? 's' : ''}</span>
+              {typeFilter === 'all' && (
+                <>
+                  <span className="flex items-center gap-1.5">
+                    <span className="w-2 h-2 rounded-full" style={{ background: '#10b981' }} />
+                    {stats.online}
+                  </span>
+                  <span className="flex items-center gap-1.5">
+                    <span className="w-2 h-2 rounded-full" style={{ background: '#ef4444' }} />
+                    {stats.offline}
+                  </span>
+                </>
+              )}
+            </div>
           )}
         </div>
-
-        {/* Stats */}
-        {stats && (
-          <div className="flex items-center gap-4 text-xs" style={{ color: 'var(--color-text-muted)' }}>
-            <span>{stats.total} event{stats.total !== 1 ? 's' : ''}</span>
-            <span className="flex items-center gap-1.5">
-              <span className="w-2 h-2 rounded-full" style={{ background: '#10b981' }} />
-              {stats.online} online
-            </span>
-            <span className="flex items-center gap-1.5">
-              <span className="w-2 h-2 rounded-full" style={{ background: '#ef4444' }} />
-              {stats.offline} offline
-            </span>
-          </div>
-        )}
-      </div>
-
-      {/* Legend */}
-      <div className="flex items-center gap-4 mb-4 text-xs" style={{ color: 'var(--color-text-muted)' }}>
-        <span className="flex items-center gap-1.5">
-          <Wifi size={12} style={{ color: '#10b981' }} />
-          Device came online
-        </span>
-        <span className="flex items-center gap-1.5">
-          <WifiOff size={12} style={{ color: '#ef4444' }} />
-          Device went offline
-        </span>
       </div>
 
       {/* Events */}
@@ -178,7 +235,7 @@ export function NetworkEventLog({ onDeviceClick }) {
           <div className="flex flex-col items-center gap-3 py-16 text-center">
             <Clock size={32} style={{ color: 'var(--color-text-faint)' }} />
             <p className="text-sm" style={{ color: 'var(--color-text-muted)' }}>
-              {search ? 'No events match your search' : 'No events recorded yet'}
+              {search || typeFilter !== 'all' || sourceFilter !== 'all' ? 'No events match your filters' : 'No events recorded yet'}
             </p>
             <p className="text-xs" style={{ color: 'var(--color-text-faint)' }}>
               Online/offline events will appear here as devices connect and disconnect
@@ -189,7 +246,9 @@ export function NetworkEventLog({ onDeviceClick }) {
             {filtered.map(event => {
               const cfg = EVENT_CONFIG[event.type] || EVENT_CONFIG.offline
               const Icon = cfg.icon
-              const detail = statusDetail(event.detail)
+              let parsedDetail = event.detail
+              if (typeof parsedDetail === 'string') { try { parsedDetail = JSON.parse(parsedDetail) } catch { parsedDetail = null } }
+              const detail = statusDetail(parsedDetail)
               return (
                 <div key={event.id} className="flex gap-3 items-start">
                   <div
