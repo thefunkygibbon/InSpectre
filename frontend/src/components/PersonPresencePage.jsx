@@ -667,18 +667,17 @@ function PersonDrawer({ person, onClose }) {
       const personData = data?.persons?.find(p => p.id === person.id)
       if (!personData?.segments) { setEvents([]); setLoading(false); return }
 
-      // Convert segments into meaningful events.
-      // Timeline status values are 'online' (= home) and 'offline' (= away).
+      // Convert segments into meaningful events
       const evts = []
       const segs = personData.segments.filter(s => s.status !== 'unknown').sort((a, b) => new Date(a.from) - new Date(b.from))
       for (let i = 0; i < segs.length; i++) {
         const seg = segs[i]
         const prev = i > 0 ? segs[i - 1] : null
-        if (seg.status === 'online') {
-          const awayDur = prev && prev.status === 'offline' ? fmtDuration(new Date(seg.from) - new Date(prev.from)) : null
+        if (seg.status === 'home') {
+          const awayDur = prev && prev.status === 'away' ? fmtDuration(new Date(seg.from) - new Date(prev.from)) : null
           evts.push({ type: 'arrived', at: seg.from, detail: awayDur ? `Was away for ${awayDur}` : null })
-        } else if (seg.status === 'offline') {
-          const homeDur = prev && prev.status === 'online' ? fmtDuration(new Date(seg.from) - new Date(prev.from)) : null
+        } else if (seg.status === 'away') {
+          const homeDur = prev && prev.status === 'home' ? fmtDuration(new Date(seg.from) - new Date(prev.from)) : null
           evts.push({ type: 'left', at: seg.from, detail: homeDur ? `Was home for ${homeDur}` : null })
         }
       }
@@ -818,7 +817,7 @@ function BlockButton({ person, onUpdated }) {
   )
 }
 
-function PersonCard({ person, allDevices, allPersons, statusSince, onUpdated, onDeleted, onDeviceClick }) {
+function PersonCard({ person, allDevices, allPersons, onUpdated, onDeleted, onDeviceClick }) {
   const [editing, setEditing] = useState(false)
   const [drawerOpen, setDrawerOpen] = useState(false)
 
@@ -896,11 +895,9 @@ function PersonCard({ person, allDevices, allPersons, statusSince, onUpdated, on
                 </div>
               ) : null
             })()}
-            {/* Home/Away duration — prefer timeline-derived since, fall back to server field */}
-            {(() => {
-              const sinceIso = statusSince?.since || person.last_status_changed_at
-              if (!sinceIso) return null
-              const ms = Date.now() - new Date(sinceIso).getTime()
+            {/* Home/Away duration */}
+            {person.last_status_changed_at && (() => {
+              const ms = Date.now() - new Date(person.last_status_changed_at).getTime()
               const dur = fmtDuration(ms)
               return dur ? (
                 <div className="flex items-center gap-1 mt-1.5">
@@ -976,11 +973,11 @@ function PersonRecentEvents({ persons }) {
         for (let i = 0; i < segs.length; i++) {
           const seg = segs[i]
           const prev = i > 0 ? segs[i - 1] : null
-          if (seg.status === 'online') {
-            const awayDur = prev && prev.status === 'offline' ? fmtDuration(new Date(seg.from) - new Date(prev.from)) : null
+          if (seg.status === 'home') {
+            const awayDur = prev && prev.status === 'away' ? fmtDuration(new Date(seg.from) - new Date(prev.from)) : null
             allEvts.push({ personId: p.id, personName: p.name, type: 'arrived', at: seg.from, detail: awayDur ? `Away for ${awayDur}` : null })
-          } else if (seg.status === 'offline') {
-            const homeDur = prev && prev.status === 'online' ? fmtDuration(new Date(seg.from) - new Date(prev.from)) : null
+          } else if (seg.status === 'away') {
+            const homeDur = prev && prev.status === 'home' ? fmtDuration(new Date(seg.from) - new Date(prev.from)) : null
             allEvts.push({ personId: p.id, personName: p.name, type: 'left', at: seg.from, detail: homeDur ? `Home for ${homeDur}` : null })
           }
         }
@@ -1064,13 +1061,13 @@ export function PersonPresencePage({ devices, onDeviceClick }) {
     display_name: d.custom_name || d.hostname || d.ip_address,
   }))
 
-  const loadTimeline = useCallback(async (d) => {
-    setTimelineLoading(true)
+  const loadTimeline = useCallback(async (d, { silent = false } = {}) => {
+    if (!silent) setTimelineLoading(true)
     try {
       const data = await api.getPersonsTimeline(d)
       setTimelineData(data)
     } catch {}
-    finally { setTimelineLoading(false) }
+    finally { if (!silent) setTimelineLoading(false) }
   }, [])
 
   const load = useCallback(async () => {
@@ -1094,7 +1091,7 @@ export function PersonPresencePage({ devices, onDeviceClick }) {
     function doRefresh() {
       const el = document.activeElement
       const busy = el && (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA' || el.tagName === 'SELECT')
-      if (!busy) { load(); loadTimeline(days) }
+      if (!busy) { load(); loadTimeline(days, { silent: true }) }
     }
     function onVisible() { if (document.visibilityState === 'visible') doRefresh() }
     document.addEventListener('visibilitychange', onVisible)
@@ -1142,26 +1139,6 @@ export function PersonPresencePage({ devices, onDeviceClick }) {
   }, [timelineData])
 
   const homeCount = persons.filter(p => p.is_home).length
-
-  // Derive "current status since" timestamp for each person from timeline
-  // segments (status_changed_at is not reliably populated server-side).
-  const statusSinceMap = useMemo(() => {
-    const map = {}
-    if (!timelineData?.persons) return map
-    for (const p of timelineData.persons) {
-      const segs = (p.segments || []).filter(s => s.status !== 'unknown')
-      if (!segs.length) continue
-      const last = segs[segs.length - 1]
-      // Walk backwards while status matches the final (current) status
-      let sinceFrom = last.from
-      for (let i = segs.length - 1; i >= 0; i--) {
-        if (segs[i].status === last.status) sinceFrom = segs[i].from
-        else break
-      }
-      map[p.id] = { since: sinceFrom, status: last.status }
-    }
-    return map
-  }, [timelineData])
 
   return (
     <div className="p-6 max-w-5xl mx-auto">
@@ -1225,7 +1202,6 @@ export function PersonPresencePage({ devices, onDeviceClick }) {
         <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-3 mb-8">
           {persons.map(person => (
             <PersonCard key={person.id} person={person} allDevices={allDevices} allPersons={persons}
-              statusSince={statusSinceMap[person.id]}
               onUpdated={() => load()}
               onDeleted={() => { load(); loadTimeline(days) }}
               onDeviceClick={onDeviceClick} />

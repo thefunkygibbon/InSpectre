@@ -5,7 +5,7 @@ import {
   LayoutGrid, List, Sun, Moon, ChevronDown,
   Bell, X, Layers, Star, ShieldAlert, Wrench, Ban, BarChart2, Clock,
   ArrowLeft, SlidersHorizontal, LogOut, Eye, EyeOff, Box, Download, Sparkles,
-  Users,
+  Users, MonitorSmartphone,
 } from 'lucide-react'
 import { TrafficPage } from './components/TrafficPage'
 import { ContainersPage } from './components/ContainersPage'
@@ -330,6 +330,14 @@ function MainApp({ onLogout }) {
   const [showFilters,      setShowFilters]      = useState(false)
   const [containerToOpen,  setContainerToOpen]  = useState(null)
   const [isNarrow,         setIsNarrow]         = useState(() => window.innerWidth < 768)
+  const [installPrompt,    setInstallPrompt]    = useState(null)
+  const [installDismissed, setInstallDismissed] = useState(() => !!localStorage.getItem('pwa-dismissed'))
+
+  useEffect(() => {
+    function onBeforeInstall(e) { e.preventDefault(); setInstallPrompt(e) }
+    window.addEventListener('beforeinstallprompt', onBeforeInstall)
+    return () => window.removeEventListener('beforeinstallprompt', onBeforeInstall)
+  }, [])
 
   useEffect(() => {
     function onResize() { setIsNarrow(window.innerWidth < 768) }
@@ -1331,6 +1339,19 @@ function MainApp({ onLogout }) {
                 title={isDark ? 'Switch to light mode' : 'Switch to dark mode'}>
                 {isDark ? <Sun size={16} /> : <Moon size={16} />}
               </button>
+
+              {installPrompt && !installDismissed && (
+                <button
+                  onClick={() => {
+                    installPrompt.prompt()
+                    installPrompt.userChoice.then(() => setInstallPrompt(null))
+                  }}
+                  className="btn-ghost p-2 flex items-center gap-1.5 text-xs"
+                  title="Install InSpectre as an app">
+                  <MonitorSmartphone size={16} />
+                  <span className="hidden sm:inline">Install</span>
+                </button>
+              )}
 
               <button onClick={() => setShowSettings(true)} className="btn-ghost p-2"
                 aria-label="Settings" title="Settings">

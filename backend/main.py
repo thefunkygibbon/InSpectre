@@ -7096,22 +7096,30 @@ def get_persons_timeline(days: int = Query(7, ge=1, le=365), db: Session = Depen
         ss      = window_start
         st      = initial
         home_ms = 0.0
+        known_ms = 0.0
 
         for ev in evts:
             se = ev["ts"]
             if se > ss:
                 segs.append({"from": ss.isoformat(), "to": se.isoformat(), "status": st})
+                dur = (se - ss).total_seconds() * 1000
                 if st == "online":
-                    home_ms += (se - ss).total_seconds() * 1000
+                    home_ms += dur
+                if st != "unknown":
+                    known_ms += dur
             ss = se
             st = "online" if ev["type"] in ("online", "joined") else "offline"
 
         segs.append({"from": ss.isoformat(), "to": now.isoformat(), "status": st})
+        final_dur = (now - ss).total_seconds() * 1000
         if st == "online":
-            home_ms += (now - ss).total_seconds() * 1000
+            home_ms += final_dur
+        if st != "unknown":
+            known_ms += final_dur
 
-        total_ms   = (now - window_start).total_seconds() * 1000
-        home_pct   = round((home_ms / total_ms) * 100) if total_ms > 0 else 0
+        # Percentage is computed over the period we actually have data for
+        # (i.e. since the device/person was first known), not the whole window.
+        home_pct   = round((home_ms / known_ms) * 100) if known_ms > 0 else 0
         return segs, home_pct
 
     result = []
