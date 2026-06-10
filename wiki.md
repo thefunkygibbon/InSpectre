@@ -514,34 +514,50 @@ Enter your API key in **Settings → Scanner → Device Identification → Finge
 
 ### 3.13 Device Grouping
 
-Many devices appear on the network with more than one MAC address — typically a laptop or desktop with both a wired Ethernet port and a Wi-Fi adapter. Without grouping, these show as two separate unknown devices. InSpectre automatically detects this pattern and merges them.
+Many devices appear on the network with more than one MAC address — typically a laptop or desktop with both a wired Ethernet port and a Wi-Fi adapter, or a server with a real NIC plus a Docker **macvlan shim** interface. Without grouping, these show as two separate devices. InSpectre automatically detects this pattern and merges them.
 
 **How auto-grouping works:**
 
-When a newly discovered device has a hostname that matches an existing device's hostname (after stripping domain suffixes like `.lan` or `.local` and ignoring case), the two devices are automatically placed in the same group. The matching logic:
+When two or more devices share the same hostname (after stripping domain suffixes like `.lan` or `.local` and ignoring case), they are placed in the same group. The matching logic:
 
 - Strips domain suffixes: `andrewlaptop.lan` and `andrewLAPTOP` both resolve to base label `andrewlaptop`
 - Case-insensitive: `AndrewLaptop` == `andrewlaptop`
 - Generic hostnames are excluded (Android-*, iPhone, localhost, etc.) to avoid false merges
+- **IP-literal hostnames are excluded** — names that merely echo the address back (e.g. `192-168-0-180.lan`, or a bare numeric label) carry no identity, so unrelated devices that lack a real DNS name are never wrongly merged
 
-**Backfill on startup:**
+**Self-healing (retroactive) grouping:**
 
-When InSpectre starts, a background process scans all existing devices and retroactively groups any that match by hostname. You do not need to delete and rediscover devices — existing records are updated automatically.
+Grouping does not only happen the instant a device is first seen. A periodic pass runs on every scan cycle and merges any matching devices — including ones discovered long ago and ones that are currently online. You never need to delete and rediscover devices; existing records are grouped automatically as soon as their hostnames match.
+
+**How the primary interface is chosen:**
+
+When the group is formed automatically, InSpectre picks the most "real" interface as the primary, in this priority order:
+
+1. A globally-unique **hardware** MAC beats a locally-administered/virtual MAC (so a physical Dell NIC wins over a `02:…` macvlan shim)
+2. An **online** member beats an offline one
+3. The **lowest IP** breaks any remaining tie
+
+The choice is deterministic, so the primary never flaps. You can override it at any time (see below).
 
 **Disabling auto-grouping:**
 
-If you prefer to manage grouping manually, go to **Settings → Scanner → Advanced → Auto-group by Hostname** and disable the toggle. With auto-grouping off, InSpectre flags devices with matching hostnames but does not merge them automatically.
+If you prefer to manage grouping manually, go to **Settings → Scanner → Auto-group by Hostname** and disable the toggle. With auto-grouping off, InSpectre flags devices with matching hostnames (writing a suggestion event) but does not merge them automatically.
 
 **What changes when devices are grouped:**
 
 | Aspect | Behaviour |
 |---|---|
-| **Dashboard card** | Only one card is shown — the representative interface. If one interface is online, that one is the representative. If multiple are online, the primary member is used. If all are offline, the primary is used. |
+| **Dashboard card** | Only one card is shown — the representative interface, which is the user-selected/auto-chosen primary. The card reports **online if *any* member interface is online**, so it won't flap offline when the host switches interfaces. |
 | **Card footer — Interfaces row** | Lists all member interfaces with their online status dots and display names |
-| **Overview tab** | "Grouped Interfaces" panel shows all members |
-| **Timeline** | Shows events from all member MACs in a single unified timeline. Events from a different MAC than the one whose drawer you have open are labelled with the source MAC. |
+| **Overview tab** | "Grouped Interfaces" panel shows all members, their IPs, and which is primary |
+| **Timeline** | Shows events from all member MACs in a single unified timeline, plus per-member uptime bars. Events from a different MAC than the one whose drawer you have open are labelled with the source interface. |
+| **Scanning** | By default only the **primary** interface is port- and vulnerability-scanned, since grouped interfaces are the same physical host. Enable **Settings → Scanner → Scan grouped members** to scan every interface IP separately. |
 | **Event type** | New interfaces added to an existing group write an `interface_joined` event instead of a `joined` event |
-| **Admin tab** | Device Grouping section allows adding, removing, and setting primary interface |
+| **Admin tab** | Device Grouping section allows adding, removing, and setting the primary interface |
+
+**Setting the primary interface:**
+
+Open the group's drawer → **Admin** tab → **Device Grouping**, and click **Set primary** next to the interface you want to represent the group. The primary's name, IP, and MAC are what appear on the dashboard card.
 
 **Manual grouping:**
 
@@ -550,9 +566,34 @@ To manually add a device to an existing group:
 2. Enter the MAC address of the other device in the "Add by MAC" field.
 3. Click **Add**.
 
-To remove a device from a group, click the **Remove** button next to that MAC in the same panel. The removed device becomes a standalone device again and will appear separately on the dashboard.
+To remove a device from a group, click the **Remove** button next to that MAC in the same panel. The removed device becomes a standalone device again and appears separately on the dashboard.
 
-**Manual groups are protected:** any group you create or modify by hand is flagged as manual and is never altered or undone by the automatic hostname-based grouping and cleanup passes. This means InSpectre will not silently merge in, or split out, devices from a group you curated yourself — even if their hostnames would otherwise match the auto-group rules.
+**Manual groups are protected:** any group you create or modify by hand is flagged as manual and is never altered or undone by the automatic passes. In addition, **a device you deliberately ungroup is remembered** — the self-healing pass will not silently re-merge it even if its hostname still matches. (Manually adding it back to a group clears this opt-out.)
+
+### 3.13.1 Primary IP & Multi-Homed Hosts
+
+A single device can answer on more than one IP address from the **same** MAC — for example a server with two addresses on one NIC, or a bridge. Previously this caused the device's displayed IP to "flap" back and forth every scan cycle, spamming `ip_change` events.
+
+InSpectre now pins a **stable primary IP** for each device and treats any other address it answers on as a **secondary IP**:
+
+- The dashboard and drawer show the primary IP; secondary IPs are listed separately (and on the device card).
+- A passive secondary sighting no longer writes an `ip_change` event — only a genuine primary change does (and is recorded as `primary_ip_changed`).
+- If the primary address genuinely goes away (not seen for several scan cycles) and the device is unlocked, a newly-seen address is promoted to primary automatically.
+
+**Pinning a primary IP manually:**
+
+Open the device drawer → **IP History** panel. Each address shows a role badge (Current, Secondary, Pinned, etc.). Click **Set primary** on the address you want to fix. This pins it permanently — the probe will never auto-change it (a small **pinned ✕** badge appears next to the IP; click it to unpin). This is the most reliable way to control which address represents a multi-homed host.
+
+The auto-update behaviour is governed by **Settings → Scanner → Primary IP Mode** (see Settings Reference):
+
+- **locked** (default) — respects the per-device pin; pinned devices never have their primary auto-changed.
+- **dynamic** — always adopts the current IP as primary when a device returns from offline.
+
+### 3.13.2 Host-Aware Presence
+
+The probe runs in the Docker **host's network namespace**, so it shares the host's own IP addresses — its primary NIC, any macvlan shim interfaces, bridges, etc. A host does not answer ARP for its own addresses the way a remote device does, so such interfaces could previously be marked falsely "offline" even though they are trivially reachable.
+
+InSpectre now enumerates the host's own IPv4 addresses each cycle and treats any device holding one of them as **always present**. This fixes the common case where the Docker host itself (or its macvlan shim) showed as offline while still pinging perfectly.
 
 ### 3.14 Acknowledging New Devices
 
@@ -657,6 +698,20 @@ Port scanning is performed by **nmap** inside the probe container. Each device c
 - OS detection results
 
 **Scheduled port scans** run automatically at the interval configured in Settings → Scanner → Scan Interval. The nightly scan window setting lets you restrict heavy scans to overnight hours to avoid impacting network performance during the day.
+
+**When scans are triggered, and which IP is used:**
+
+A port/service scan can be triggered three ways. All three run the identical scan and always target the device's **primary IP** (see [3.13.1](#3131-primary-ip--multi-homed-hosts)), so multi-homed and grouped hosts are scanned consistently:
+
+| Trigger | When | Notes |
+|---|---|---|
+| **First seen** | The first time a brand-new device is discovered (if *Auto-scan new devices* is on) | Establishes the initial port set |
+| **Reconnect** | A device comes back online after being offline longer than the *Offline rescan hours* threshold | Re-scans to catch changes that happened while it was away |
+| **Manual** | The **Rescan** button in the device drawer's Actions tab | On-demand; always runs regardless of schedule |
+
+A device that reconnects after only a *short* offline period is **not** re-scanned.
+
+**Grouped devices:** by default only the group's **primary** interface is scanned, since grouped interfaces belong to the same physical host. Set **Settings → Scanner → Scan grouped members** to scan every interface IP in the group separately. (Manual per-device scans from the drawer always run, regardless of this setting, because they reflect explicit user intent.)
 
 ### 4.2 OS Detection
 
@@ -1032,7 +1087,11 @@ Access settings via the gear icon in the main navigation bar. Settings are organ
 | **Auto-scan new devices** | When enabled, a vulnerability scan is triggered automatically the first time a new device is discovered. |
 | **Nuclei Template Update Interval** | How often Nuclei templates are refreshed from the upstream template repository, in hours. Default: 24. |
 | **Fingerbank API Key** | Free API key from [fingerbank.org](https://fingerbank.org/). When set, DHCP fingerprint data is sent to Fingerbank for cloud device identification. Leave blank to disable. Results appear in the DHCP Fingerprint section of each device drawer. |
-| **Auto-group by Hostname** | When enabled, devices that share the same base hostname (ignoring domain suffixes and case) are automatically grouped as a single physical device with multiple interfaces. Disable to manage grouping manually. |
+| **Auto-group by Hostname** | When enabled, devices that share the same base hostname (ignoring domain suffixes and case) are automatically grouped as a single physical device with multiple interfaces. A periodic self-healing pass merges matches discovered at any time. Disable to manage grouping manually (a suggestion event is written instead of merging). |
+| **Scan grouped members** | When enabled, every interface IP in a device group is port- and vulnerability-scanned. When disabled (default), only the group's primary interface is scanned, since grouped interfaces belong to the same physical host. |
+| **Primary IP Mode** | Controls how the probe updates a device's primary IP for multi-homed hosts. `locked` (default) respects the per-device IP pin — pinned devices never have their primary auto-changed. `dynamic` always adopts the current IP as primary when a device returns from offline. |
+| **Offline miss threshold** | Number of consecutive missed sweeps before a device is marked offline. Default: 3. Raise it to reduce false-offline flapping on flaky networks. |
+| **Offline rescan hours** | How long a device must have been offline before a port/service rescan is triggered when it reconnects. Default: 24. |
 
 ### 10.2 Notification Settings
 
@@ -1479,6 +1538,17 @@ InSpectre publishes `online` to `inspectre/system/status` on connect and configu
 - Some devices, especially iOS and newer Android devices, use MAC address randomisation. A randomised MAC appears as a new unknown device. Check Settings → Scanner and look for "Use stable MAC" guidance for your device type (varies by OS).
 - The device may be on a different VLAN or subnet not covered by `IP_RANGE`.
 - Devices in deep sleep may not respond to ARP requests. Wait until the device wakes up.
+
+**The Docker host itself (or its macvlan shim) shows as offline even though it's reachable**
+
+- This is handled automatically: the probe shares the host's network namespace and now treats the host's own IP addresses (NIC, macvlan shims, bridges) as always present. A host does not ARP-reply for its own addresses, which previously caused a false offline.
+- If you still see it after upgrading, run `./inspectre.sh rebuild keep-data` so the updated probe is deployed, then wait one scan cycle.
+
+**A device's IP keeps "flapping" between two addresses / repeated `ip_change` events**
+
+- This happens with multi-homed hosts that answer on more than one IP. InSpectre now pins a stable **primary IP** and records the others as secondary IPs without writing `ip_change` events.
+- To force a specific address as primary, open the device drawer → **IP History** → **Set primary** on the address you want. This pins it permanently (see [3.13.1](#3131-primary-ip--multi-homed-hosts)).
+- If a host has a real NIC plus a Docker **macvlan shim** with a different MAC, group them (auto-grouping does this by hostname) and pick the real NIC as the primary interface.
 
 **Port scans are not running**
 

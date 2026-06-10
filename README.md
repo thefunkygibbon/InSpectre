@@ -31,7 +31,9 @@ Check the [Wiki](https://github.com/thefunkygibbon/InSpectre/wiki) for full admi
 - **Watched flag** — star important devices for elevated offline alerts and priority sorting
 - **Ignore flag** — hide known-benign devices from the main view
 - **Notes** — free-text notes attached to any device
-- **Device grouping** — devices sharing the same hostname (e.g. `laptop` and `laptop.lan`) are automatically grouped as a single physical device with multiple interfaces. Grouped devices share a unified event timeline and appear as one card on the dashboard. Manual grouping and ungrouping is available from the device drawer, and **groups you create manually are protected** — they are never altered or undone by the automatic hostname-based grouping/cleanup passes.
+- **Device grouping** — devices sharing the same hostname (e.g. `laptop` and `laptop.lan`, or a server's real NIC plus a Docker macvlan shim) are automatically grouped as a single physical device with multiple interfaces. Grouping is **self-healing**: a periodic pass merges matching devices discovered at any time, not just at first sight, and picks the most "real" interface (hardware NIC over a virtual/macvlan MAC, online over offline, lowest IP) as the primary. Grouped devices share a unified event timeline and appear as one card on the dashboard. You can override the primary at any time, and by default only the primary interface is port/vuln-scanned (toggle with **Scan grouped members**). Manual grouping and ungrouping is available from the device drawer; **groups you create manually are protected**, and a device you deliberately ungroup is never silently re-merged by the automatic passes.
+- **Primary IP & multi-homed hosts** — a device with more than one IP on a single MAC (multi-homed NIC, bridge) no longer flaps between addresses: the probe pins a stable primary IP and tracks the rest as **secondary IPs**. You can pin a specific address as primary from the device drawer's IP History panel, and the probe will keep it permanently.
+- **Host-aware presence** — the probe runs in the host's network namespace, so the Docker host's own IPs (its NIC, macvlan shims, bridges) are always treated as present — they can't be marked falsely offline just because a host doesn't ARP for its own addresses.
 - **Persistent filters & views** — your active filter, smart filter, sort order, and grid/list view choice are saved and restored automatically the next time you open the dashboard.
 
 ### Person Presence
@@ -44,7 +46,7 @@ Check the [Wiki](https://github.com/thefunkygibbon/InSpectre/wiki) for full admi
 - **Presence notifications** — person arrived home, left home, blocked, and unblocked events feed into the notification profile system (see below)
 
 ### Scanning & Security
-- **Port scanning** — nmap-based TCP port sweep with OS detection and service fingerprinting
+- **Port scanning** — nmap-based TCP port sweep with OS detection and service fingerprinting. Scans always target a device's pinned **primary IP** — whether triggered on first discovery, on reconnect after a long offline period, or manually from the drawer — so multi-homed and grouped hosts are scanned consistently on the same address.
 - **Baseline tracking** — detects port drift and raises alerts when a device's open ports change
 - **Vulnerability scanning** — Nuclei-based CVE scanning with per-service template routing; findings shown by severity (critical, high, medium, low)
 - **Scheduled scans** — configurable nightly scan window with per-device auto-scan triggers
