@@ -70,6 +70,9 @@
     "headers": {
       "Content-Type": "application/json",
       "Accept": "application/json"
+    },
+    "session_headers": {
+      "access_token": "X-FTL-SID"
     }
   },
   "actions": {
@@ -146,7 +149,9 @@
       "path": "/api/clients/{ip}",
       "body": {
         "comment": "Blocked by InSpectre",
-        "groups": [1]
+        "groups": [
+          1
+        ]
       }
     },
     "unblock_client": {
@@ -156,7 +161,9 @@
       "path": "/api/clients/{ip}",
       "body": {
         "comment": "Managed by InSpectre",
-        "groups": [0]
+        "groups": [
+          0
+        ]
       }
     }
   },
@@ -165,7 +172,10 @@
     "tag_fields": []
   },
   "polling": {
-    "actions": ["get_dhcp_leases", "get_static_dhcp_leases"],
+    "actions": [
+      "get_dhcp_leases",
+      "get_static_dhcp_leases"
+    ],
     "interval_seconds": 120,
     "run_on_startup": true
   }

@@ -69,14 +69,14 @@
     "get_arp_table": {
       "description": "Fetch the ARP table via pfSense-API. Returns all known hosts with IP, MAC, and interface.",
       "method": "GET",
-      "path": "/api/v1/diagnostics/arp",
+      "path": "/api/v1/system/arp",
       "response_mapping": {
         "root_path": "data",
         "fields": {
-          "mac-address": "mac_address",
-          "ip-address": "ip_address",
+          "mac": "mac_address",
+          "ip": "ip_address",
           "hostname": "hostname",
-          "interface-name": "vlan"
+          "interface": "vlan"
         }
       }
     },
@@ -104,7 +104,9 @@
       "path": "/api/v1/firewall/alias/entry",
       "body": {
         "name": "{block_alias}",
-        "address": ["{ip}"]
+        "address": [
+          "{ip}"
+        ]
       }
     },
     "unblock_client": {
@@ -113,7 +115,9 @@
       "path": "/api/v1/firewall/alias/entry",
       "body": {
         "name": "{block_alias}",
-        "address": ["{ip}"]
+        "address": [
+          "{ip}"
+        ]
       }
     },
     "test_connection": {
