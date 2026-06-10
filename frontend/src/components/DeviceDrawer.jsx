@@ -88,21 +88,27 @@ function Collapsible({ title, icon: Icon, defaultOpen = false, children }) {
 function IpHistorySection({ mac, primaryIp, primaryIpLocked, currentIp, onPrimaryChanged }) {
   const [history,  setHistory]  = useState(null)
   const [error,    setError]    = useState(null)
-  const [loaded,   setLoaded]   = useState(false)
+  const [reloadKey, setReloadKey] = useState(0)
   const [setting,  setSetting]  = useState(null) // IP being set as primary
 
+  // Re-fetch whenever the device (mac) changes or a manual reload is requested.
+  // Previously a `loaded` flag could stick across mac changes, showing stale data.
   useEffect(() => {
-    if (loaded) return
-    setLoaded(true)
-    api.getIpHistory(mac).then(setHistory).catch(e => { setError(e.message); setHistory([]) })
-  }, [mac, loaded])
+    let cancelled = false
+    setHistory(null)
+    setError(null)
+    api.getIpHistory(mac)
+      .then(h => { if (!cancelled) setHistory(h) })
+      .catch(e => { if (!cancelled) { setError(e.message); setHistory([]) } })
+    return () => { cancelled = true }
+  }, [mac, reloadKey])
 
   async function handleSetPrimary(ip) {
     setSetting(ip)
     try {
       const res = await api.setPrimaryIp(mac, ip)
       if (onPrimaryChanged) onPrimaryChanged(res.device)
-      setLoaded(false) // force refresh
+      setReloadKey(k => k + 1) // force refresh
     } catch (e) {
       alert('Failed to set primary IP: ' + e.message)
     } finally {
@@ -521,9 +527,11 @@ function DhcpFingerprintPanel({ localDevice, mac, setLocalDevice }) {
 // Main component
 // ---------------------------------------------------------------------------
 export function DeviceDrawer({ device, onClose, onRename, onResolveName, onRefresh, onStarToggle, onMetadataUpdate, onZoneChange, vulnScanState, onVulnScanChange, initialTab }) {
-  if (!device) return null
-
-  const [localDevice,  setLocalDevice]  = useState(device)
+  // NOTE: hooks must run unconditionally. `device` is always provided by the
+  // caller (rendered only when a device is selected); `safeDevice` guards the
+  // brief transition when it is briefly null without short-circuiting hooks.
+  const safeDevice = device || {}
+  const [localDevice,  setLocalDevice]  = useState(safeDevice)
   const [resolving,    setResolving]    = useState(false)
   const [rescanning,   setRescanning]   = useState(false)
   const [activeAction, setActiveAction] = useState(null)  // 'ping' | 'traceroute' | 'rescan'
@@ -556,7 +564,7 @@ export function DeviceDrawer({ device, onClose, onRename, onResolveName, onRefre
     }
   }
 
-  useEffect(() => { setLocalDevice(device) }, [device])
+  useEffect(() => { setLocalDevice(safeDevice) }, [device])
 
   const stream = useStreamAction()
 
@@ -1105,7 +1113,7 @@ export function DeviceDrawer({ device, onClose, onRename, onResolveName, onRefre
                 <Clock size={14} className="text-brand" />
                 <h3 className="text-xs font-semibold text-text-muted uppercase tracking-wider">Event Timeline</h3>
               </div>
-              <DeviceTimeline mac={mac} />
+              <DeviceTimeline mac={mac} groupMembers={localDevice.group_members} />
             </>
           )}
 

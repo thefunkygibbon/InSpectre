@@ -15,6 +15,19 @@ function relativeTime(iso) {
   return `${Math.floor(diff / 86400)}d ago`
 }
 
+// Plugin manifests are user-supplied; guard URLs against javascript:/unknown
+// schemes before using them as link hrefs or image sources.
+function safePluginHref(url) {
+  if (!url) return null
+  const raw = String(url).trim()
+  return /^https?:/i.test(raw) ? raw : null
+}
+function safeIconSrc(url) {
+  if (!url) return null
+  const raw = String(url).trim()
+  return /^(https?:|data:image\/)/i.test(raw) ? raw : null
+}
+
 // ── Capability badge colours ──────────────────────────────────────────────────
 const CAP_COLORS = {
   export:       { bg: 'rgba(59,130,246,0.15)',  color: '#60a5fa' },
@@ -49,9 +62,10 @@ function StatusDot({ status }) {
 }
 
 function PluginIcon({ manifest }) {
-  if (manifest.icon) {
+  const iconSrc = safeIconSrc(manifest.icon)
+  if (iconSrc) {
     return (
-      <img src={manifest.icon} alt="" className="w-10 h-10 rounded-lg object-contain"
+      <img src={iconSrc} alt="" className="w-10 h-10 rounded-lg object-contain"
         style={{ background: 'var(--color-surface-offset)' }} />
     )
   }
@@ -318,8 +332,8 @@ function PluginConfigPanel({ plugin, config, onChange, onSave, onTest, onPoll, o
       {/* Capabilities + homepage */}
       <div className="flex flex-wrap items-center gap-2">
         {(manifest.capabilities || []).map(c => <CapBadge key={c} cap={c} />)}
-        {manifest.homepage && (
-          <a href={manifest.homepage} target="_blank" rel="noopener noreferrer"
+        {safePluginHref(manifest.homepage) && (
+          <a href={safePluginHref(manifest.homepage)} target="_blank" rel="noopener noreferrer"
             className="flex items-center gap-1 text-xs"
             style={{ color: 'var(--color-brand)' }}
             onClick={e => e.stopPropagation()}>

@@ -52,6 +52,7 @@ services:
       PROBE_API_URL: http://host.docker.internal:8666
       # ⚠️  MUST CHANGE — generate with: openssl rand -hex 32
       SECRET_KEY: ${SECRET_KEY:-CHANGE_ME_SECRET_KEY}
+      PROBE_API_SECRET: ${PROBE_API_SECRET:-c31106d3c582c5f6ea86edb5bd8c86037ec063e47eb319326ea6fd6e195fb195}
       # Optional: restrict which origins the API allows (comma-separated).
       # Defaults to localhost:3000 and localhost:5173.
       CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:3000,http://localhost:5173}
@@ -89,6 +90,7 @@ services:
       NMAP_ARGS: "-sT -O --osscan-limit -T4"
       PROBE_API_PORT: "8666"
       PYTHONUNBUFFERED: "1"
+      PROBE_API_SECRET: ${PROBE_API_SECRET:-c31106d3c582c5f6ea86edb5bd8c86037ec063e47eb319326ea6fd6e195fb195}
       NMAP_OPTS: ""
     volumes:
       - ${DATA_DIR:-./data}/vuln/nuclei:/root/nuclei-templates

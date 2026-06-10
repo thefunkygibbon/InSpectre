@@ -26,9 +26,18 @@ export function useDevices(intervalMs = 10000, { onAlert } = {}) {
   const onAlertRef    = useRef(onAlert)
   useEffect(() => { onAlertRef.current = onAlert }, [onAlert])
 
+  // Monotonic request id. The interval poll and the SSE-driven refresh can run
+  // concurrently; without this guard a slower/older response could resolve last
+  // and overwrite newer data (and re-fire alerts). Only the most recent request
+  // is allowed to commit state.
+  const reqSeqRef = useRef(0)
+
   const fetchData = useCallback(async () => {
+    const seq = ++reqSeqRef.current
     try {
       const [rawList, st] = await Promise.all([api.getDevices(), api.getStats()])
+      // A newer fetch started while we were awaiting — discard this stale result.
+      if (seq !== reqSeqRef.current) return
       const devList = rawList.map(enrich)
 
       // New device detection
@@ -77,9 +86,9 @@ export function useDevices(intervalMs = 10000, { onAlert } = {}) {
       setError(null)
       setLastRefresh(new Date())
     } catch (e) {
-      setError(e.message)
+      if (seq === reqSeqRef.current) setError(e.message)
     } finally {
-      setLoading(false)
+      if (seq === reqSeqRef.current) setLoading(false)
     }
   }, [])
 

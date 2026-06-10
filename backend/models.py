@@ -69,6 +69,9 @@ class Device(Base):
     # True when the group was created/edited by the user (manual grouping).
     # Auto-grouping by hostname leaves this False; cleanup never touches manual groups.
     group_manual  = Column(Boolean, server_default='false', nullable=False)
+    # True when the user manually ungrouped this device; the probe's retroactive
+    # hostname auto-grouping must never re-merge it.
+    auto_group_optout = Column(Boolean, server_default='false', nullable=False)
 
     # Phase 10 — device acknowledgement
     is_acknowledged = Column(Boolean, server_default='false', nullable=False)

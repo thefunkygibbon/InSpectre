@@ -129,6 +129,8 @@ const SETTING_META = {
   // Phase 9 — device grouping
   auto_group_by_hostname: { label: 'Auto-group by Hostname', type: 'toggle', tab: 'scanner',
     description: 'Automatically group devices with the same hostname as the same physical device on a different interface (e.g. laptop on WiFi vs Ethernet). When disabled, a suggestion event is written instead and grouping can be done manually in the device admin panel.' },
+  scan_grouped_members: { label: 'Scan All Grouped Interfaces', type: 'toggle', tab: 'scanner',
+    description: 'By default only a group\'s primary interface is port-scanned and vulnerability-scanned, since grouped interfaces belong to the same physical host. Enable to scan every grouped interface IP separately.' },
 
   // Here Be Dragons — advanced probe pipeline controls
   enable_arp_sweep: { label: 'Enable Active ARP Sweep', type: 'toggle', tab: 'scanner',
@@ -742,7 +744,7 @@ export function SettingsPanel({ onClose, onSettingChange }) {
                   ))}
 
                   <p className="text-xs font-semibold" style={{ color: 'var(--color-text-muted)', paddingTop: '4px' }}>Device Grouping</p>
-                  {settingsByKeys(['auto_group_by_hostname']).map(s => (
+                  {settingsByKeys(['auto_group_by_hostname','scan_grouped_members']).map(s => (
                     <SettingRow key={s.key} s={s} dirty={dirty} onchange={handleChange} />
                   ))}
 

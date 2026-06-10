@@ -129,6 +129,7 @@ ENABLE_MDNS                   = _env_bool("ENABLE_MDNS")
 ENABLE_NIGHTLY_SCAN           = _env_bool("ENABLE_NIGHTLY_SCAN")
 ENABLE_UNSCANNED_RETRY        = _env_bool("ENABLE_UNSCANNED_RETRY")
 AUTO_GROUP_BY_HOSTNAME        = _env_bool("AUTO_GROUP_BY_HOSTNAME")
+SCAN_GROUPED_MEMBERS          = _env_bool("SCAN_GROUPED_MEMBERS", default=False)
 
 # In-memory absent-port counters for baseline drift detection (resets on restart — acceptable)
 # { mac: { port: consecutive_absent_count } }
@@ -152,7 +153,7 @@ def _load_settings_from_db() -> None:
     global NIGHTLY_SCAN_START, NIGHTLY_SCAN_END, OFFLINE_RESCAN_HOURS, BASELINE_SCAN_COUNT_THRESHOLD, HOSTNAME_COOLDOWN_HOURS
     global ENABLE_ARP_SWEEP, ENABLE_PASSIVE_SNIFFER, ENABLE_HOSTNAME_RESOLUTION, ENABLE_PORT_SCANNING
     global ENABLE_SERVICE_FINGERPRINTING, ENABLE_MDNS, ENABLE_NIGHTLY_SCAN, ENABLE_UNSCANNED_RETRY
-    global AUTO_GROUP_BY_HOSTNAME
+    global AUTO_GROUP_BY_HOSTNAME, SCAN_GROUPED_MEMBERS
     global _DNS_SERVER
     try:
         session = Session()
@@ -191,10 +192,14 @@ def _load_settings_from_db() -> None:
         ENABLE_NIGHTLY_SCAN           = _pb("enable_nightly_scan")
         ENABLE_UNSCANNED_RETRY        = _pb("enable_unscanned_retry")
         AUTO_GROUP_BY_HOSTNAME        = _pb("auto_group_by_hostname")
-        # dns_server from DB overrides ENV-based detection
+        SCAN_GROUPED_MEMBERS          = _pb("scan_grouped_members", False)
+        # dns_server from DB overrides ENV-based detection.
+        # Validate strictly to prevent argument-injection into dig/host/nslookup argv.
         ds = db.get("dns_server", "").strip()
-        if ds:
+        if ds and _is_valid_dns_server(ds):
             _DNS_SERVER = ds
+        elif ds:
+            print(f"[settings] Ignoring invalid dns_server value: {ds!r}", flush=True)
         # probe_interface: if set in UI, use it; otherwise write auto-detected value back so UI can display it
         pi = db.get("probe_interface", "").strip()
         if pi:
@@ -234,7 +239,7 @@ def apply_runtime_config(payload: dict) -> dict:
     global SCAN_INTERVAL, IP_RANGE, INTERFACE, PORT_SCAN_WORKERS, GATEWAY_SCAN_WORKERS, PORT_SCAN_METHOD, OS_CONFIDENCE_THRESHOLD, OFFLINE_MISS_THRESHOLD, SNIFFER_WORKERS, ARP_SCAN_RETRY, PRIMARY_IP_MODE, SNIFFER_SUBNET_FILTER, NUCLEI_TEMPLATE_UPDATE_INTERVAL
     global HOSTNAME_COOLDOWN_HOURS, ENABLE_ARP_SWEEP, ENABLE_PASSIVE_SNIFFER, ENABLE_HOSTNAME_RESOLUTION, ENABLE_PORT_SCANNING
     global ENABLE_SERVICE_FINGERPRINTING, ENABLE_MDNS, ENABLE_NIGHTLY_SCAN, ENABLE_UNSCANNED_RETRY
-    global AUTO_GROUP_BY_HOSTNAME
+    global AUTO_GROUP_BY_HOSTNAME, SCAN_GROUPED_MEMBERS
     global _DNS_SERVER
 
     changes = {}
@@ -299,6 +304,7 @@ def apply_runtime_config(payload: dict) -> dict:
     if "enable_nightly_scan"           in payload: ENABLE_NIGHTLY_SCAN           = _abool(payload["enable_nightly_scan"]);           changes["enable_nightly_scan"]           = ENABLE_NIGHTLY_SCAN
     if "enable_unscanned_retry"        in payload: ENABLE_UNSCANNED_RETRY        = _abool(payload["enable_unscanned_retry"]);        changes["enable_unscanned_retry"]        = ENABLE_UNSCANNED_RETRY
     if "auto_group_by_hostname"        in payload: AUTO_GROUP_BY_HOSTNAME        = _abool(payload["auto_group_by_hostname"]);        changes["auto_group_by_hostname"]        = AUTO_GROUP_BY_HOSTNAME
+    if "scan_grouped_members"          in payload: SCAN_GROUPED_MEMBERS          = _abool(payload["scan_grouped_members"]);          changes["scan_grouped_members"]          = SCAN_GROUPED_MEMBERS
     if "nuclei_template_update_interval" in payload:
         NUCLEI_TEMPLATE_UPDATE_INTERVAL = str(payload["nuclei_template_update_interval"]).strip()
         changes["nuclei_template_update_interval"] = NUCLEI_TEMPLATE_UPDATE_INTERVAL
@@ -335,6 +341,27 @@ def _is_valid_ip(ip: str) -> bool:
         )
     except ValueError:
         return False
+
+
+def _is_valid_dns_server(value: str) -> bool:
+    """Validate a user-supplied DNS server address (from the settings UI).
+
+    Accepts a literal IPv4/IPv6 address or a conservative hostname. Rejects
+    anything that could be interpreted as a CLI flag (leading '-') or that
+    contains whitespace, preventing argument injection into dig/host/nslookup.
+    """
+    if not value:
+        return False
+    value = value.strip()
+    if not value or value[0] == "-" or any(c.isspace() for c in value):
+        return False
+    import ipaddress as _ipa
+    try:
+        _ipa.ip_address(value)
+        return True
+    except ValueError:
+        pass
+    return bool(re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9.\-]{0,253}[A-Za-z0-9])?", value))
 
 # ---------------------------------------------------------------------------
 # SQLAlchemy models
@@ -445,6 +472,7 @@ def init_db() -> None:
             conn.execute(text("ALTER TABLE devices ADD COLUMN IF NOT EXISTS primary_ip_locked BOOLEAN NOT NULL DEFAULT FALSE"))
             conn.execute(text("ALTER TABLE devices ADD COLUMN IF NOT EXISTS suppress_presence_events BOOLEAN NOT NULL DEFAULT FALSE"))
             conn.execute(text("ALTER TABLE devices ADD COLUMN IF NOT EXISTS group_manual BOOLEAN NOT NULL DEFAULT FALSE"))
+            conn.execute(text("ALTER TABLE devices ADD COLUMN IF NOT EXISTS auto_group_optout BOOLEAN NOT NULL DEFAULT FALSE"))
             conn.commit()
         except Exception as e:
             print(f"[DB] Column migration note: {e}", flush=True)
@@ -555,6 +583,34 @@ def record_ip(mac: str, ip: str, seen_while_online: bool = False) -> bool:
         return False
     finally:
         session.close()
+
+def _primary_ip_is_stale(mac: str, primary_ip: str) -> bool:
+    """
+    Return True when the device's current primary IP has not been observed for
+    several sweep cycles — i.e. the host has genuinely moved off it rather than
+    just being multi-homed.  Used to decide whether a newly-seen IP should be
+    promoted to primary (real move) or treated as a passive secondary (dual-homed
+    host).  A missing history row is treated as NOT stale so a transient gap can
+    never trigger ip_address flapping for an always-on multi-homed server.
+    """
+    if not primary_ip or not _is_valid_ip(primary_ip):
+        return False
+    threshold = max(SCAN_INTERVAL * 3, 180)
+    s = Session()
+    try:
+        row = s.execute(
+            text("SELECT last_seen FROM ip_history WHERE mac_address = :m AND ip_address = :ip"),
+            {"m": mac, "ip": primary_ip},
+        ).fetchone()
+        if not row or not row[0]:
+            return False
+        age = (datetime.now(timezone.utc) - row[0]).total_seconds()
+        return age > threshold
+    except Exception:
+        return False
+    finally:
+        s.close()
+
 
 # ---------------------------------------------------------------------------
 # Event writing
@@ -1341,13 +1397,20 @@ def _scapy_syn_scan(ip: str, workers: int | None = None) -> list[int]:
     try:
         from scapy.all import conf as scapy_conf
         scapy_conf.verb = 0
-        pkts = [IP(dst=ip) / TCP(dport=p, flags='S') for p in range(1, 65536)]
-        answered, _ = sr(pkts, timeout=3, verbose=0)
-        return sorted(
-            snt[TCP].dport
-            for snt, rcv in answered
-            if rcv.haslayer(TCP) and (rcv[TCP].flags & 0x12) == 0x12
-        )
+        # Build/send in batches to bound peak memory (65k Packet objects at once
+        # is expensive); results are identical to a single large send.
+        open_ports: list[int] = []
+        batch = 4096
+        for start in range(1, 65536, batch):
+            end = min(start + batch, 65536)
+            pkts = [IP(dst=ip) / TCP(dport=p, flags='S') for p in range(start, end)]
+            answered, _ = sr(pkts, timeout=3, verbose=0)
+            open_ports.extend(
+                snt[TCP].dport
+                for snt, rcv in answered
+                if rcv.haslayer(TCP) and (rcv[TCP].flags & 0x12) == 0x12
+            )
+        return sorted(set(open_ports))
     except Exception as exc:
         print(f"[scan] Scapy SYN sweep error for {ip}: {exc}", flush=True)
         return []
@@ -1555,6 +1618,13 @@ def trigger_deep_scan(ip: str, mac: str) -> None:
             _dev = _s.get(Device, mac)
             if _dev and getattr(_dev, 'is_ignored', False):
                 return
+            # Skip non-primary members of a device group: grouped interfaces
+            # belong to the same physical host, so scanning the primary alone is
+            # sufficient. Override with the scan_grouped_members setting.
+            if (_dev and getattr(_dev, 'group_id', None)
+                    and not getattr(_dev, 'group_primary', False)
+                    and not SCAN_GROUPED_MEMBERS):
+                return
         finally:
             _s.close()
     except Exception:
@@ -1588,7 +1658,160 @@ def _is_generic_hostname(hostname: str) -> bool:
     base = _hostname_base(hostname)
     if not base or len(base) < 3:
         return True
+    # IP-literal hostnames (reverse-DNS echoing the address back, e.g.
+    # "192-168-0-180.lan" or a bare numeric label) carry no identity — two
+    # unrelated devices that lack real DNS names must never merge on them.
+    if re.match(r'^\d{1,3}-\d{1,3}-\d{1,3}-\d{1,3}$', base) or re.match(r'^\d+$', base):
+        return True
     return bool(_GENERIC_HOSTNAME_RE.match(base))
+
+
+_host_ips_cache: tuple = (0.0, set())
+_host_ips_lock = threading.Lock()
+
+
+def _get_host_ipv4s(ttl: int = 120) -> set:
+    """
+    IPv4 addresses bound to the probe host's own interfaces (cached `ttl`s).
+
+    The probe runs in the host network namespace, so these are the Docker host's
+    own addresses (its primary NIC, macvlan shims, bridges, etc.). A host never
+    answers ARP for its own IPs the way a remote device does, so such devices can
+    never be confirmed "online" via the ARP sweep — yet they are, by definition,
+    always reachable. Presence treats any device holding one of these IPs as
+    online, which fixes the "host shows offline but pings fine" case.
+    """
+    global _host_ips_cache
+    now = time.time()
+    with _host_ips_lock:
+        ts, cached = _host_ips_cache
+        if cached and (now - ts) < ttl:
+            return cached
+    ips: set = set()
+    try:
+        from scapy.all import get_if_list, get_if_addr
+        for iface in get_if_list():
+            try:
+                a = get_if_addr(iface)
+                if a and a != "0.0.0.0" and _is_valid_ip(a):
+                    ips.add(a)
+            except Exception:
+                continue
+    except Exception:
+        pass
+    if not ips:
+        try:
+            out = subprocess.run(["ip", "-4", "-o", "addr", "show"],
+                                 capture_output=True, text=True, timeout=5).stdout
+            for line in out.splitlines():
+                parts = line.split()
+                for i, tok in enumerate(parts):
+                    if tok == "inet" and i + 1 < len(parts):
+                        cand = parts[i + 1].split("/")[0]
+                        if _is_valid_ip(cand):
+                            ips.add(cand)
+        except Exception:
+            pass
+    ips.discard("127.0.0.1")
+    with _host_ips_lock:
+        _host_ips_cache = (now, ips)
+    return ips
+
+
+def _is_locally_administered(mac: str) -> bool:
+    """True for software/virtual MACs (locally-administered bit set), e.g. macvlan
+    shims and bridges — used to prefer real hardware NICs as the group primary."""
+    try:
+        return bool(int(mac.split(":")[0], 16) & 0x02)
+    except Exception:
+        return False
+
+
+def _ip_sort_key(ip: str):
+    try:
+        return tuple(int(o) for o in ip.split("."))
+    except Exception:
+        return (999, 999, 999, 999)
+
+
+def _choose_group_primary(members) -> str:
+    """Pick the most "real" interface as the group's primary: a globally-unique
+    (hardware) MAC beats a locally-administered one, an online member beats an
+    offline one, then the lowest IP. Deterministic, so the primary never flaps."""
+    def keyf(m):
+        ip = (getattr(m, "primary_ip", None) or m.ip_address or "")
+        return (
+            0 if not _is_locally_administered(m.mac_address) else 1,
+            0 if m.is_online else 1,
+            _ip_sort_key(ip),
+        )
+    return min(members, key=keyf).mac_address
+
+
+def retroactive_auto_group() -> None:
+    """
+    Periodically merge already-known devices that share the same base DNS hostname
+    into a single group (one physical host, several interfaces — e.g. a server's
+    real NIC plus a macvlan shim, or a laptop's wired + wireless NICs).
+
+    Complements _try_auto_group_by_hostname, which only fires at first discovery
+    against an *offline* peer. This pass also groups devices discovered long ago and
+    matches online peers, so identical-hostname interfaces self-heal into one entity.
+    It never disturbs a manually-curated group (group_manual) and skips any device
+    the user has explicitly ungrouped (auto_group_optout).
+    """
+    if not AUTO_GROUP_BY_HOSTNAME:
+        return
+    import uuid as _uuid
+    from collections import defaultdict
+    s = Session()
+    try:
+        rows = s.execute(text("""
+            SELECT mac_address, hostname, group_id, group_primary, group_manual,
+                   is_online, ip_address, primary_ip
+            FROM devices
+            WHERE hostname IS NOT NULL AND hostname != ''
+              AND COALESCE(auto_group_optout, false) = false
+        """)).fetchall()
+
+        buckets = defaultdict(list)
+        for r in rows:
+            base = _hostname_base(r.hostname)
+            if not base or _is_generic_hostname(r.hostname):
+                continue
+            buckets[base].append(r)
+
+        for base, members in buckets.items():
+            if len(members) < 2:
+                continue
+            # Never touch a group the user built by hand.
+            if any(m.group_manual for m in members):
+                continue
+            existing = {str(m.group_id) for m in members if m.group_id}
+            gid = next(iter(existing)) if len(existing) == 1 else str(_uuid.uuid4())
+            primary_mac = _choose_group_primary(members)
+
+            already = (
+                all(m.group_id and str(m.group_id) == gid for m in members)
+                and sum(1 for m in members if m.group_primary) == 1
+                and any(m.group_primary and m.mac_address == primary_mac for m in members)
+            )
+            if already:
+                continue
+
+            for m in members:
+                s.execute(
+                    text("UPDATE devices SET group_id = :g, group_primary = :p WHERE mac_address = :m"),
+                    {"g": gid, "p": (m.mac_address == primary_mac), "m": m.mac_address},
+                )
+            s.commit()
+            print(f"[group] Auto-grouped {[m.mac_address for m in members]} "
+                  f"(base hostname='{base}', primary={primary_mac})", flush=True)
+    except Exception as exc:
+        s.rollback()
+        print(f"[group] Retroactive auto-group error: {exc}", flush=True)
+    finally:
+        s.close()
 
 
 def _try_auto_group_by_hostname(mac: str, hostname: str) -> bool:
@@ -1624,6 +1847,7 @@ def _try_auto_group_by_hostname(mac: str, hostname: str) -> bool:
                   AND LOWER(SPLIT_PART(hostname, '.', 1)) = :base
                   AND mac_address != :mac
                   AND is_online = false
+                  AND COALESCE(auto_group_optout, false) = false
                 LIMIT 1
             """),
             {"base": base, "mac": mac},
@@ -1640,6 +1864,12 @@ def _try_auto_group_by_hostname(mac: str, hostname: str) -> bool:
             {"m": mac},
         ).scalar()
         if cur_manual:
+            return False
+        cur_optout = sess.execute(
+            text("SELECT COALESCE(auto_group_optout, false) FROM devices WHERE mac_address = :m"),
+            {"m": mac},
+        ).scalar()
+        if cur_optout:
             return False
 
         if not AUTO_GROUP_BY_HOSTNAME:
@@ -1812,11 +2042,40 @@ def upsert_seen_device(mac: str, ip: str, source: str) -> None:
                     )
                 )
             else:
+                # ── Sticky-primary / multi-homed handling ────────────────────
+                # A single MAC can answer ARP for several IPs at once (a server
+                # with two addresses on one NIC, a bridge, etc.). Without this,
+                # every sweep overwrites ip_address with whichever IP was seen
+                # last and emits an ip_change event, so the device's IP appears
+                # to flap between its addresses forever. Resolve the primary in
+                # Python (we already hold the per-MAC lock) and pin ip_address to
+                # it; non-primary sightings become passive secondary IPs.
+                cur_primary = existing.primary_ip or old_ip
+                locked      = bool(getattr(existing, "primary_ip_locked", False))
+                if PRIMARY_IP_MODE == "dynamic":
+                    new_primary = ip if not was_online else (cur_primary or ip)
+                else:
+                    if locked and cur_primary:
+                        new_primary = cur_primary
+                    elif not was_online:
+                        new_primary = ip
+                    else:
+                        new_primary = cur_primary or ip
+                # While online, any IP other than the primary is a secondary
+                # interface — unless the primary itself has gone stale, meaning
+                # the host really moved and the new IP should take over.
+                is_secondary_sighting = bool(was_online and ip != new_primary)
+                if (is_secondary_sighting and not locked
+                        and _primary_ip_is_stale(mac, new_primary)):
+                    new_primary           = ip
+                    is_secondary_sighting = False
+                ip_to_store = new_primary if is_secondary_sighting else ip
+
                 stmt = (
                     pg_insert(Device)
                     .values(
                         mac_address  = mac,
-                        ip_address   = ip,
+                        ip_address   = ip_to_store,
                         primary_ip   = existing.primary_ip or ip,
                         hostname     = hostname_val or None,
                         vendor       = vendor,
@@ -1831,8 +2090,8 @@ def upsert_seen_device(mac: str, ip: str, source: str) -> None:
                     .on_conflict_do_update(
                         index_elements=["mac_address"],
                         set_=dict(
-                            ip_address = ip,
-                            primary_ip = text(_existing_primary_ip_case),
+                            ip_address = ip_to_store,
+                            primary_ip = new_primary,
                             is_online  = True,
                             last_seen  = text("CASE WHEN devices.is_online = false THEN NOW() ELSE devices.last_seen END"),
                             miss_count = 0,
@@ -1848,7 +2107,21 @@ def upsert_seen_device(mac: str, ip: str, source: str) -> None:
                 print(f"[+] New device via {source}: {ip} ({mac}) hostname={hostname} vendor={vendor}", flush=True)
                 grouped = _try_auto_group_by_hostname(mac, hostname_val)
                 _write_event(mac, "interface_joined" if grouped else "joined", {"ip": ip, "vendor": vendor or "Unknown"})
-                trigger_deep_scan(ip, mac)
+                # Prefer the resolved primary IP for consistency with the
+                # reconnect and manual-rescan paths — important for multi-homed
+                # or grouped hosts where the just-seen IP may be a secondary.
+                _scan_ip = ip
+                try:
+                    _ns = Session()
+                    try:
+                        _nd = _ns.get(Device, mac)
+                        if _nd and getattr(_nd, "primary_ip", None) and _is_valid_ip(_nd.primary_ip):
+                            _scan_ip = _nd.primary_ip
+                    finally:
+                        _ns.close()
+                except Exception:
+                    pass
+                trigger_deep_scan(_scan_ip, mac)
             else:
                 if not was_online:
                     print(f"[~] Back online via {source}: {ip} ({mac})", flush=True)
@@ -1860,18 +2133,17 @@ def upsert_seen_device(mac: str, ip: str, source: str) -> None:
                     if not getattr(existing, "suppress_presence_events", False):
                         _write_event(mac, "online", {"ip": ip, "source": source})
                 if ip_changed:
-                    primary = existing.primary_ip or old_ip
-                    if ip == primary or not was_online:
-                        # Device came back from offline at new IP → primary updated to new IP
-                        if not was_online and ip != primary:
-                            print(f"[~] Primary IP updated {primary} → {ip} for {mac} (came back from offline)", flush=True)
-                            _write_event(mac, "primary_ip_changed", {"old_ip": primary, "new_ip": ip})
-                        else:
-                            print(f"[~] IP reverted to primary {ip} for {mac}", flush=True)
-                    else:
-                        print(f"[~] Secondary IP seen {ip} for {mac} (primary={primary}, source={source})", flush=True)
-                    _write_event(mac, "ip_change", {"old_ip": old_ip, "new_ip": ip,
-                                                     "primary_ip": ip if not was_online else primary})
+                    if is_secondary_sighting:
+                        # Multi-homed host answering on a non-primary IP. This is
+                        # NOT an IP change — record it as a passive secondary and
+                        # emit no event, so the timeline no longer flaps.
+                        print(f"[~] Secondary IP {ip} for {mac} (primary stays {new_primary}, source={source})", flush=True)
+                    elif new_primary != cur_primary:
+                        # Genuine primary change: offline-return at a new IP, or the
+                        # old primary went stale and this IP took over.
+                        print(f"[~] Primary IP {cur_primary} → {new_primary} for {mac} (source={source})", flush=True)
+                        _write_event(mac, "primary_ip_changed", {"old_ip": cur_primary, "new_ip": new_primary})
+                    # else: ip_address realigned to an unchanged primary — no event.
 
         except Exception as e:
             session.rollback()
@@ -2241,8 +2513,16 @@ def update_presence_from_sweep(session, active_macs: set) -> None:
     with _sniffer_seen_lock:
         seen_this_cycle = active_macs | _sniffer_seen_this_interval.copy()
 
+    # The probe shares the host's network namespace, so the host's own IPs (its
+    # NIC, macvlan shims, bridges) never show up in the ARP sweep — a host doesn't
+    # ARP for itself. Treat any device holding one of these as always-present so
+    # the Docker host and its shim interfaces don't get marked offline despite
+    # being trivially reachable.
+    own_ips = _get_host_ipv4s()
+
     for dev in session.query(Device).all():
-        if dev.mac_address in seen_this_cycle:
+        dev_ip = (getattr(dev, "primary_ip", None) or dev.ip_address or "")
+        if dev.mac_address in seen_this_cycle or (dev_ip and dev_ip in own_ips):
             dev.is_online = True
             dev.miss_count = 0
             continue
@@ -2623,18 +2903,40 @@ probe_api = FastAPI(
     docs_url=None,
     redoc_url=None,
 )
+# CORS: the probe API is normally called server-side by the backend (httpx), not
+# by browsers. Origins can be locked down via PROBE_ALLOWED_ORIGINS (comma-separated);
+# defaults to "*" to preserve existing behaviour for direct/diagnostic access.
+_PROBE_ALLOWED_ORIGINS = [
+    o.strip() for o in os.environ.get("PROBE_ALLOWED_ORIGINS", "*").split(",") if o.strip()
+] or ["*"]
 probe_api.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=_PROBE_ALLOWED_ORIGINS,
     allow_methods=["GET", "POST"],
     allow_headers=["*"],
 )
+
+# Shared-secret authentication for backend -> probe calls. Enforced only when
+# PROBE_API_SECRET is set (shared with the backend container). When unset, the
+# probe accepts requests unauthenticated for backward compatibility. /health is
+# always public so container healthchecks keep working.
+PROBE_API_SECRET = os.environ.get("PROBE_API_SECRET", "").strip()
+_PROBE_PUBLIC_PATHS = {"/health"}
+
+@probe_api.middleware("http")
+async def _probe_auth_middleware(request, call_next):
+    if PROBE_API_SECRET and request.url.path not in _PROBE_PUBLIC_PATHS:
+        if request.headers.get("X-Probe-Secret") != PROBE_API_SECRET:
+            from fastapi.responses import JSONResponse
+            return JSONResponse({"detail": "unauthorized"}, status_code=401)
+    return await call_next(request)
 
 def _sse_line(data: str) -> str:
     safe = data.replace("\n", " ").replace("\r", "")
     return f"data: {safe}\n\n"
 
 def _stream_subprocess(cmd: list[str]):
+    proc = None
     try:
         proc = subprocess.Popen(
             cmd,
@@ -2656,6 +2958,18 @@ def _stream_subprocess(cmd: list[str]):
     except Exception as e:
         yield _sse_line(f"ERROR: {e}")
         yield "event: done\ndata: {}\n\n"
+    finally:
+        # If the client disconnected (GeneratorExit) or an error occurred while the
+        # child is still running, terminate it so we don't leak long-running processes.
+        if proc is not None and proc.poll() is None:
+            try:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=2)
+                except Exception:
+                    proc.kill()
+            except Exception:
+                pass
 
 
 @probe_api.get("/health")
@@ -2794,11 +3108,15 @@ def stream_tools_portscan(host: str = Query(...), ports: str = Query("1-1024")):
         out: list[int] = []
         for part in spec.split(','):
             part = part.strip()
+            if not part:
+                continue
             if '-' in part:
                 a, b = part.split('-', 1)
                 out.extend(range(max(1, int(a)), min(65535, int(b)) + 1))
             else:
-                out.append(int(part))
+                pnum = int(part)
+                if 1 <= pnum <= 65535:
+                    out.append(pnum)
         return sorted(set(out))
 
     def _tcp_portscan_stream():
@@ -2974,22 +3292,99 @@ def get_arp_table():
 @probe_api.post("/tools/wake-on-lan")
 async def wake_on_lan(body: dict):
     mac = body.get("mac", "").strip()
-    broadcast = body.get("broadcast", "255.255.255.255")
+    broadcast = (body.get("broadcast") or "255.255.255.255").strip()
     if not mac:
         raise HTTPException(400, "mac required")
+    # Validate broadcast target: must be a literal IPv4 address (limited or
+    # subnet broadcast). Prevents sending magic packets to arbitrary hosts.
+    import ipaddress as _ipa
+    try:
+        _ipa.IPv4Address(broadcast)
+    except Exception:
+        raise HTTPException(400, "Invalid broadcast address")
     # Normalise MAC and build magic packet
     import re, socket
     mac_clean = re.sub(r"[^0-9a-fA-F]", "", mac)
     if len(mac_clean) != 12:
         raise HTTPException(400, "Invalid MAC address")
     magic = bytes.fromhex("FF" * 6 + mac_clean * 16)
+
+    # Build the set of broadcast targets. The global broadcast 255.255.255.255 is
+    # frequently not routed to the correct NIC, so we ALSO send to the subnet-
+    # directed broadcast derived from the probe's configured IP_RANGE (e.g.
+    # 192.168.0.255). Magic packets go out on both common WoL ports (9 and 7).
+    targets = [broadcast]
     try:
-        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
-            s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-            s.sendto(magic, (broadcast, 9))
-        return {"ok": True, "mac": mac}
+        net = _ipa.ip_network(IP_RANGE, strict=False)
+        sub_bcast = str(net.broadcast_address)
+        if sub_bcast not in targets:
+            targets.append(sub_bcast)
+    except Exception:
+        pass
+
+    _SO_BINDTODEVICE = getattr(socket, "SO_BINDTODEVICE", 25)
+    sent, errors = [], []
+    for tgt in targets:
+        for port in (9, 7):
+            try:
+                with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+                    s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+                    # Bind to the probe interface so the broadcast egresses the
+                    # LAN NIC rather than whatever the default route points at.
+                    try:
+                        s.setsockopt(socket.SOL_SOCKET, _SO_BINDTODEVICE, INTERFACE.encode())
+                    except Exception:
+                        pass
+                    s.sendto(magic, (tgt, port))
+                sent.append(f"{tgt}:{port}")
+            except Exception as exc:
+                errors.append(f"{tgt}:{port} -> {exc}")
+
+    # Raw Layer-2 magic packets (etherwake style). Many NIC/BIOS WoL
+    # implementations only wake on an Ethernet frame addressed directly to the
+    # target MAC (EtherType 0x0842), NOT on a UDP/IP broadcast. We send both a
+    # directed frame (dst = target MAC) and an L2 broadcast frame. This is the
+    # key behaviour that makes dedicated WoL tools (e.g. Fing) succeed where a
+    # plain UDP broadcast fails. Requires CAP_NET_RAW (granted to the probe).
+    l2_sent, l2_errors = [], []
+    src_mac = None
+    try:
+        from scapy.all import Ether, Raw, sendp, get_if_hwaddr
+        target_mac = ":".join(mac_clean[i:i+2] for i in range(0, 12, 2))
+        # CRITICAL: set a valid source MAC. If left unset, scapy may emit an
+        # all-zero source MAC (00:00:00:00:00:00), which switches treat as a
+        # malformed frame and silently drop — so the magic packet never reaches
+        # the target. Use the probe interface's real hardware address.
+        src_mac = _PROBE_OWN_MAC or _get_own_mac(INTERFACE)
+        if not src_mac or src_mac == "00:00:00:00:00:00":
+            try:
+                src_mac = get_if_hwaddr(INTERFACE)
+            except Exception:
+                src_mac = None
+        for dst in (target_mac, "ff:ff:ff:ff:ff:ff"):
+            try:
+                eth = Ether(dst=dst, type=0x0842)
+                if src_mac:
+                    eth.src = src_mac
+                frame = eth / Raw(load=magic)
+                # Burst the frame: a sleeping NIC's PHY may run at reduced link
+                # speed and miss the first frame while it powers up the receiver.
+                sendp(frame, iface=INTERFACE, count=5, inter=0.12, verbose=0)
+                l2_sent.append(f"L2:{dst}")
+            except Exception as exc:
+                l2_errors.append(f"L2:{dst} -> {exc}")
     except Exception as exc:
-        raise HTTPException(500, str(exc))
+        l2_errors.append(f"scapy unavailable: {exc}")
+
+    sent.extend(l2_sent)
+    errors.extend(l2_errors)
+
+    print(f"[wol] mac={mac} iface={INTERFACE} src_mac={src_mac} ip_range={IP_RANGE} "
+          f"sent={sent} errors={errors}", flush=True)
+
+    if not sent:
+        raise HTTPException(500, "; ".join(errors) or "Failed to send magic packet")
+    return {"ok": True, "mac": mac, "sent_to": sent}
 
 
 @probe_api.get("/stream/vuln-scan/{ip}")
@@ -3330,13 +3725,12 @@ def nuclei_status():
     }
 
 
-_nuclei_updating = False
+_nuclei_update_lock = asyncio.Lock()
 
 
 @probe_api.get("/nuclei/update")
 async def nuclei_update_stream():
     """SSE stream that triggers a Nuclei template update."""
-    global _nuclei_updating
     if not shutil.which("nuclei"):
         async def _no_bin():
             yield "data: [ERROR] Nuclei binary not found in container.\n\n"
@@ -3345,33 +3739,31 @@ async def nuclei_update_stream():
                                  headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
     async def _stream():
-        global _nuclei_updating, _last_nuclei_template_update
-        if _nuclei_updating:
+        global _last_nuclei_template_update
+        if _nuclei_update_lock.locked():
             yield "data: [INFO] Update already in progress — please wait.\n\n"
             yield "data: NUCLEI_UPDATE_DONE\n\n"
             return
-        _nuclei_updating = True
-        try:
-            yield "data: [INFO] Starting Nuclei template update…\n\n"
-            proc = await asyncio.create_subprocess_exec(
-                "nuclei", "-update-templates",
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.STDOUT,
-            )
-            async for raw in proc.stdout:
-                line = raw.decode(errors="replace").rstrip()
-                if line:
-                    yield f"data: {line}\n\n"
-            await proc.wait()
-            if proc.returncode == 0:
-                _last_nuclei_template_update = datetime.now(timezone.utc)
-                yield "data: [INFO] Templates updated successfully.\n\n"
-            else:
-                yield f"data: [ERROR] nuclei exited with code {proc.returncode}\n\n"
-        except Exception as exc:
-            yield f"data: [ERROR] {exc}\n\n"
-        finally:
-            _nuclei_updating = False
+        async with _nuclei_update_lock:
+            try:
+                yield "data: [INFO] Starting Nuclei template update…\n\n"
+                proc = await asyncio.create_subprocess_exec(
+                    "nuclei", "-update-templates",
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.STDOUT,
+                )
+                async for raw in proc.stdout:
+                    line = raw.decode(errors="replace").rstrip()
+                    if line:
+                        yield f"data: {line}\n\n"
+                await proc.wait()
+                if proc.returncode == 0:
+                    _last_nuclei_template_update = datetime.now(timezone.utc)
+                    yield "data: [INFO] Templates updated successfully.\n\n"
+                else:
+                    yield f"data: [ERROR] nuclei exited with code {proc.returncode}\n\n"
+            except Exception as exc:
+                yield f"data: [ERROR] {exc}\n\n"
         yield "data: NUCLEI_UPDATE_DONE\n\n"
 
     return StreamingResponse(_stream(), media_type="text/event-stream",
@@ -3400,6 +3792,12 @@ def _startup_nerva_backfill() -> None:
     now = datetime.now(timezone.utc)
     backfill_threshold = now - timedelta(hours=24)
     active = {t.name for t in threading.enumerate()}
+    _nerva_backfill_sem = threading.Semaphore(3)
+
+    def _run_nerva_fingerprint_limited(scan_ip, mac, ports):
+        with _nerva_backfill_sem:
+            _run_nerva_fingerprint(scan_ip, mac, ports)
+
     session = Session()
     count = 0
     try:
@@ -3443,7 +3841,7 @@ def _startup_nerva_backfill() -> None:
                 continue
 
             threading.Thread(
-                target=_run_nerva_fingerprint,
+                target=_run_nerva_fingerprint_limited,
                 args=(scan_ip, dev.mac_address, ports),
                 daemon=True,
                 name=f"nerva-backfill-{dev.mac_address}",
@@ -3708,6 +4106,10 @@ def main() -> None:
                 print(f"[*] Sweep done -- {len(active_macs)} online", flush=True)
             else:
                 print("[*] ARP sweep disabled — skipping active sweep", flush=True)
+
+            # Self-healing: merge same-hostname interfaces (real NIC + macvlan shim,
+            # wired + wireless, etc.) discovered at any time into one device entity.
+            retroactive_auto_group()
 
             # Retry any online devices that never got a completed deep scan
             if ENABLE_UNSCANNED_RETRY:

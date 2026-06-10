@@ -29,6 +29,14 @@ _SEV_RANK = {"critical": 5, "high": 4, "medium": 3, "low": 2, "info": 1, "clean"
 DEFAULT_TEMPLATES = "cve,exposure,misconfig,default-login,network"
 DEFAULT_SEVERITY  = "critical,high,medium,low"
 
+# Hard upper bound on a single nuclei phase. Prevents a stuck/hung nuclei process
+# from blocking the single-worker probe API indefinitely. Generous by default so
+# legitimate large scans are not cut short; override via NUCLEI_PHASE_TIMEOUT.
+try:
+    _NUCLEI_PHASE_TIMEOUT = float(os.environ.get("NUCLEI_PHASE_TIMEOUT", "3600"))
+except (TypeError, ValueError):
+    _NUCLEI_PHASE_TIMEOUT = 3600.0
+
 _HTTPS_PORTS = {443, 8443, 4443, 9443}
 _HTTP_PORTS  = {80, 8080, 8000, 8008, 8888, 9000, 9090, 3000, 7080}
 
@@ -577,6 +585,8 @@ async def run_vuln_scan(
         stdout_chunks: list[str] = []
         stderr_lines: list[str] = []
 
+        devnull_in = None
+        proc = None
         try:
             devnull_in = open(os.devnull, "rb")
             proc = await asyncio.create_subprocess_exec(
@@ -597,18 +607,39 @@ async def run_vuln_scan(
             stdout_task = asyncio.create_task(_collect_stdout())
 
             assert proc.stderr
+            _loop = asyncio.get_event_loop()
+            _deadline = _loop.time() + _NUCLEI_PHASE_TIMEOUT
+            _timed_out = False
             async for raw in proc.stderr:
                 line = raw.decode(errors="replace").rstrip()
-                if not line or _NOISE_RE.search(line):
-                    continue
-                stderr_lines.append(line)
-                yield f"[NUCLEI] {line}"
+                if line and not _NOISE_RE.search(line):
+                    stderr_lines.append(line)
+                    yield f"[NUCLEI] {line}"
+                if _loop.time() > _deadline:
+                    _timed_out = True
+                    yield f"[WARN] nuclei phase exceeded {int(_NUCLEI_PHASE_TIMEOUT)}s — terminating: {job['label']}"
+                    try:
+                        proc.terminate()
+                    except Exception:
+                        pass
+                    break
 
-            await stdout_task
-            await proc.wait()
-            devnull_in.close()
+            # Bounded waits so a wedged process can't block the event loop forever.
+            try:
+                await asyncio.wait_for(stdout_task, timeout=15)
+            except (asyncio.TimeoutError, asyncio.CancelledError):
+                stdout_task.cancel()
+            except Exception:
+                pass
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=15)
+            except asyncio.TimeoutError:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
 
-            if proc.returncode not in (0, 1):
+            if not _timed_out and proc.returncode not in (0, 1):
                 yield f"[WARN] nuclei exited {proc.returncode} for: {job['label']}"
                 for err_line in "".join(stdout_chunks).splitlines():
                     s = err_line.strip()
@@ -622,6 +653,17 @@ async def run_vuln_scan(
         except Exception as exc:
             yield f"[ERROR] Phase failed ({job['label']}): {exc}"
             continue
+        finally:
+            if devnull_in is not None:
+                try:
+                    devnull_in.close()
+                except Exception:
+                    pass
+            if proc is not None and proc.returncode is None:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
 
         raw_text = "".join(stdout_chunks)
         # Combine stderr progress lines + stdout JSONL findings for a useful raw log
