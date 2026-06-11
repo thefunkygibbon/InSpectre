@@ -28,6 +28,7 @@ import bcrypt as _bcrypt
 from jose import JWTError, jwt
 
 from models import Base, Device, DeviceEvent, FingerprintEntry, Setting, TrafficStat, VulnReport
+from _version import __version__ as VERSION
 from plugin_engine import (
     PluginRegistry, PluginRunner, PluginEventBus, PluginScheduler,
     validate_manifest, PluginValidationError,
@@ -2777,7 +2778,7 @@ def _add_event(db: Session, mac: str, event_type: str, detail: dict = None):
 # ---------------------------------------------------------------------------
 @app.get("/")
 def root():
-    return {"message": "InSpectre API", "version": "1.0.0"}
+    return {"message": "InSpectre API", "version": VERSION}
 
 
 # ---------------------------------------------------------------------------

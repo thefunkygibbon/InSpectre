@@ -31,9 +31,9 @@ import traffic_monitor as _tm
 import dhcp_classify as _dhcp_cls
 
 # ---------------------------------------------------------------------------
-# Version
+# Version (single source of truth: repo-root VERSION → probe/_version.py)
 # ---------------------------------------------------------------------------
-VERSION = "1.0.0"
+from _version import __version__ as VERSION
 
 # ---------------------------------------------------------------------------
 # ---------------------------------------------------------------------------

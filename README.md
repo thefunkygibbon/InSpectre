@@ -240,6 +240,30 @@ Full user documentation is available in [wiki.md](wiki.md), covering:
 
 Contributions are welcome. Please open an issue to discuss a change before submitting a pull request. All development work targets the `InSpectre-test` branch — do not submit pull requests against `InSpectre-main`.
 
+### Versioning
+
+The project version lives in a single file — **`VERSION`** at the repo root — and everything else is derived from it. The backend, probe and frontend each read an auto-generated version module that is stamped from `VERSION`; never edit those generated files by hand:
+
+- `backend/_version.py`, `probe/_version.py`, `frontend/src/version.js`, and the `version` field in `frontend/package.json`
+
+Useful commands:
+
+```bash
+scripts/sync-version.sh            # re-stamp all components from VERSION
+scripts/bump-version.sh patch      # 1.2.0 -> 1.2.1  (default)
+scripts/bump-version.sh minor      # 1.2.0 -> 1.3.0
+scripts/bump-version.sh major      # 1.2.0 -> 2.0.0
+scripts/bump-version.sh set 2.1.0  # set an explicit version
+```
+
+**Automatic bumping:** a git pre-commit hook keeps the version moving forward so it never goes stale again. Enable it once per clone:
+
+```bash
+git config core.hooksPath .githooks
+```
+
+With the hook active, every commit auto-increments the **patch** number and re-stamps the derived files. To cut a `minor`/`major` release instead, run `scripts/bump-version.sh minor` (or `major`) and stage `VERSION` before committing — the hook detects the manual bump and only syncs. Set `INSPECTRE_NO_VERSION_BUMP=1` to skip bumping for a single commit. `./inspectre.sh rebuild` also re-stamps from `VERSION` before building, so deployed images always carry the correct version.
+
 ---
 
 ## Licence
