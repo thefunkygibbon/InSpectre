@@ -79,7 +79,7 @@ Check the [Wiki](https://github.com/thefunkygibbon/InSpectre/wiki) for full admi
 - **Email Tools** — MX/SPF/DMARC/DKIM Checker, SMTP Banner Grab, BIMI Lookup, DNSBL Check
 
 ### Extensibility
-- **Plugin system** — extend InSpectre with community plugins; built-in plugins ship with the application, community plugins can be uploaded manually via Settings → Plugins
+- **Plugin system** — integrate external services (DNS servers, firewalls, controllers, DHCP sources) for device discovery, enrichment, presence, and blocking. Plugins are simple declarative JSON/YAML manifests (no code) uploaded via Settings → Plugins. Built-in plugins ship for AdGuard Home, Pi-hole, TP-Link Omada, Home Assistant, OPNsense, and pfSense. See the [Plugin Developer Guide](plugin.md) and [`examples/plugins/`](examples/plugins/) to write your own.
 
 ### Alerts & Notifications
 - **Toast + browser notifications** — instant in-app and OS-level alerts
@@ -233,6 +233,9 @@ Full user documentation is available in [wiki.md](wiki.md), covering:
 - Settings reference
 - Backup, restore, and data management
 - Troubleshooting and FAQ
+
+For extending InSpectre, see the **[Plugin Developer Guide](plugin.md)** and the
+ready-to-copy examples in [`examples/plugins/`](examples/plugins/).
 
 ---
 

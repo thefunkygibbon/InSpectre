@@ -1716,45 +1716,85 @@ docker compose logs -f backend
 docker compose logs -f frontend
 ```
 
+**Q: How do I write my own plugin / integration?**
+
+Plugins are single declarative manifest files (JSON or YAML) — no coding
+required. Copy one of the templates in [`examples/plugins/`](examples/plugins/)
+(start with `TEMPLATE.yaml`), adapt the endpoints and field mappings to your
+device's API, and upload it via **Settings → Plugins → Upload Plugin**. The full
+API reference is in the [Plugin Developer Guide](plugin.md).
+
 ---
 
 ## 16. Plugins
 
 ### Overview
 
-InSpectre supports a plugin system that allows the application to be extended with additional functionality beyond what ships in the core. Plugins can provide new device detection sources, custom event processors, additional network tools, or integrations with external services.
+InSpectre supports a plugin system that lets you integrate external services —
+DNS servers, firewalls, controllers, DHCP sources — as additional device
+discovery, enrichment, presence, and **blocking** sources.
+
+Plugins are **declarative manifests** (a single JSON or YAML file): there is no
+plugin code to write or run. You describe the HTTP / file / SNMP calls and how
+to map their responses, and the InSpectre plugin engine performs them on a
+schedule or in response to events. This keeps shared plugins safe — a manifest
+can only make the calls it declares, using the credentials you enter.
 
 The plugin engine is managed from **Settings → Plugins**.
 
 ### Built-in Plugins
 
-Built-in plugins ship inside the InSpectre containers and are available immediately after installation. They are maintained by the InSpectre project and receive updates alongside the core application. Built-in plugins cannot be removed, but individual ones can be enabled or disabled from the Plugins tab.
+Built-in plugins ship inside the InSpectre containers and are available
+immediately after installation. They are maintained by the InSpectre project and
+receive updates alongside the core application. Built-in plugins cannot be
+removed, but individual ones can be enabled or disabled from the Plugins tab.
 
-Examples of built-in plugin types include additional device classification sources and supplementary event enrichment logic.
+Built-in plugins include **AdGuard Home**, **Pi-hole**, **TP-Link Omada**,
+**Home Assistant**, **OPNsense**, and **pfSense**. Their manifests live in
+`backend/plugins/builtin/` and double as real-world examples.
 
 ### Community Plugins
 
-Community plugins are created and maintained by third parties. They extend InSpectre's functionality beyond the built-in feature set and are distributed as plugin package files (`.zip` archives containing a manifest and plugin code).
+Community plugins are created and maintained by third parties. They are
+distributed as a single manifest file (`.json` or `.yaml`).
 
-> ⚠️ **Security notice:** Community plugins are **not audited or vetted by the InSpectre project**. Only install community plugins from sources you trust. A malicious plugin running inside the InSpectre backend container has access to your network data and PostgreSQL database. Review the plugin source code before installing.
+> ⚠️ **Security notice:** Community plugins are **not audited or vetted by the
+> InSpectre project**. A plugin acts with the credentials you give it and can
+> reach the services it declares. Only install plugins from sources you trust,
+> and review the manifest (it is human-readable) before uploading.
 
 ### Installing a Community Plugin
 
-1. Obtain the plugin `.zip` file from the plugin author.
+1. Obtain the plugin manifest file (`.json` or `.yaml`) from the author.
 2. Open InSpectre and navigate to **Settings → Plugins**.
 3. Click **Upload Plugin**.
-4. Select the `.zip` file and confirm the upload.
-5. The plugin will appear in the Plugins list with its name, version, and author.
-6. Toggle the plugin **Enabled** to activate it. Some plugins may require a restart of the backend container to take effect.
+4. Select the manifest file and confirm the upload.
+5. The plugin appears in the list with its name, version, and author.
+6. Open it, fill in the config fields, and click **Test Connection**.
+7. Toggle the plugin **Enabled** to activate it. Polling plugins begin on the
+   next cycle; blocking plugins become selectable under **Settings → Security
+   Responses → Blocking Method**.
 
 ### Removing a Plugin
 
 1. Navigate to **Settings → Plugins**.
 2. Find the plugin in the list and click the **Remove** (trash) icon.
-3. Confirm the deletion. The plugin files are removed immediately.
+3. Confirm the deletion. Uploaded plugins are removed immediately; removing one
+   that overrode a built-in restores the built-in.
 
-### Plugin Manifest
+### Writing a Plugin
 
-Each plugin must include a `plugin.json` manifest in the root of its `.zip` archive. For full details on writing a plugin, see [plugin.md](plugin.md) in the repository root.
+A plugin is a single manifest describing its capabilities, config fields,
+endpoints, actions, event hooks, and (optionally) a polling schedule. Full
+details — including authentication, dependency chains, response mapping, the
+blocking contract, and event hooks — are in the
+**[Plugin Developer Guide](plugin.md)** in the repository root.
+
+To get started quickly, copy one of the ready-made examples in
+[`examples/plugins/`](examples/plugins/):
+
+- `TEMPLATE.yaml` — an annotated skeleton with every field explained inline.
+- `hello-world.json` — a minimal discovery plugin (polls a JSON API for DHCP leases).
+- `example-firewall.json` — a blocking plugin with a login→action auth chain.
 
 ---
