@@ -1,0 +1,244 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Plugins — InSpectre</title>
+  <meta name="description" content="Write InSpectre plugins with a single declarative YAML/JSON manifest — no code. Add discovery, presence, DNS, traffic and blocking integrations. Developer guide and reference." />
+  <meta property="og:title" content="InSpectre Plugins — declarative, no-code integrations" />
+  <meta property="og:description" content="Extend InSpectre with a single manifest file. Discovery, presence, DNS, traffic, blocking and notification capabilities — safe to share." />
+  <meta property="og:type" content="website" />
+  <meta property="og:url" content="https://www.inspectre.cc/plugins.html" />
+  <link rel="icon" type="image/svg+xml" href="assets/favicon.svg" />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="assets/style.css" />
+</head>
+<body>
+
+  <header class="statusbar">
+    <div class="sb-inner">
+      <a href="index.html" class="sb-session"><img src="assets/ghost-logo.svg" alt="" class="logo" /><span class="sb-name">inspectre</span></a>
+      <button class="nav-toggle" aria-label="Menu">[≡]</button>
+      <nav class="sb-windows">
+        <a href="index.html">0:home</a>
+        <a href="downloads.html">1:downloads</a>
+        <a href="docs.html">2:docs</a>
+        <a href="plugins.html" class="active">3:plugins</a>
+        <a href="help.html">4:help</a>
+        <a href="https://github.com/thefunkygibbon/InSpectre" target="_blank" rel="noopener">5:github↗</a>
+      </nav>
+      <span class="sb-clock"><span class="blink">●</span> <span id="clock">--:--:--</span></span>
+    </div>
+  </header>
+
+  <main class="container">
+
+    <section class="page-head">
+      <p class="crumb"><span class="dollar">$</span> cat plugin.md | less</p>
+      <h1>Build a <span class="hl">plugin</span></h1>
+      <p>An InSpectre plugin is a <strong>single declarative manifest</strong> — JSON or YAML. There is no plugin code to write, compile or execute: the manifest <em>declares</em> HTTP / file / SNMP operations, and the InSpectre plugin engine runs them on a schedule (or in response to events), then maps the results into your device inventory.</p>
+    </section>
+
+    <div class="docs-layout">
+
+      <!-- side nav -->
+      <aside class="docs-nav">
+        <h4>guide</h4>
+        <a href="#concept">Declarative concept</a>
+        <a href="#quickstart">Quick start</a>
+        <a href="#manifest">Manifest</a>
+        <a href="#capabilities">Capabilities</a>
+        <a href="#config">Config schema</a>
+        <a href="#hooks">Event hooks</a>
+        <a href="#polling">Polling</a>
+        <a href="#blocking">Blocking contract</a>
+        <h4>reference</h4>
+        <a href="#builtin">Built-in plugins</a>
+        <a href="#install">Install &amp; test</a>
+        <a href="#safety">Safety</a>
+      </aside>
+
+      <div class="docs-content">
+
+        <h2 id="concept">Plugins are declarative</h2>
+        <p>If you have used other monitoring tools you may expect imperative code hooks like <code class="mono">on_device_discovered()</code> or <code class="mono">on_scan_complete()</code>. InSpectre's equivalent is the declarative <strong>event-hooks</strong> map: you bind an InSpectre event to a named <strong>action</strong> the engine runs. This keeps community plugins <strong>safe to share</strong> — a manifest can only make the network calls it declares, against credentials the user explicitly enters.</p>
+        <table>
+          <thead><tr><th>Imperative hook you might expect</th><th>InSpectre event key</th></tr></thead>
+          <tbody>
+            <tr><td><code class="mono">on_device_discovered</code></td><td><code class="mono">device.new</code></td></tr>
+            <tr><td><code class="mono">on_device_online</code></td><td><code class="mono">device.online</code></td></tr>
+            <tr><td><code class="mono">on_device_offline</code></td><td><code class="mono">device.offline</code></td></tr>
+            <tr><td><code class="mono">on_port_opened</code> / <code class="mono">on_scan_complete</code></td><td><code class="mono">port.opened</code></td></tr>
+            <tr><td><code class="mono">on_vulnerability_found</code></td><td><code class="mono">vuln.found</code> (+ <code class="mono">vuln.critical</code>, <code class="mono">vuln.high</code>)</td></tr>
+            <tr><td><code class="mono">on_device_blocked</code> / <code class="mono">on_device_unblocked</code></td><td><code class="mono">device.blocked</code> / <code class="mono">device.unblocked</code></td></tr>
+          </tbody>
+        </table>
+
+        <h2 id="quickstart">Quick start</h2>
+        <ul>
+          <li>Copy <code class="mono">examples/plugins/TEMPLATE.yaml</code> (or the JSON <code class="mono">hello-world.json</code>).</li>
+          <li>Set a unique lowercase <code class="mono">id</code>, then edit <code class="mono">config_schema</code>, <code class="mono">endpoints</code> and <code class="mono">actions</code> to match your target API.</li>
+          <li>In InSpectre: <strong>Settings → Plugins → Upload Plugin</strong>, choose your file.</li>
+          <li>Open the plugin, fill in config, click <strong>Test Connection</strong>.</li>
+          <li>Toggle <strong>Enabled</strong>. Polling starts on the next cycle; blocking plugins become selectable under <strong>Settings → Security Responses → Blocking Method</strong>.</li>
+        </ul>
+        <p>A minimal discovery plugin is just an endpoint, one action, and a polling block:</p>
+        <div class="code">
+          <div class="code-head"><span>my-router.json — minimal discovery plugin</span><button data-copy>copy</button></div>
+          <pre><code>{
+  <span class="p">"id"</span>: "my-router",
+  <span class="p">"name"</span>: "My Router",
+  <span class="p">"version"</span>: "1.0.0",
+  <span class="p">"capabilities"</span>: ["discovery"],
+  <span class="p">"config_schema"</span>: [
+    { "key": "host", "label": "Base URL", "type": "url", "default": "http://192.168.0.1", "required": true },
+    { "key": "api_key", "label": "API Key", "type": "password", "default": "", "required": true }
+  ],
+  <span class="p">"endpoints"</span>: { "base_url": "{host}", "auth": "api-key-header", "api_key_header": "X-API-Key" },
+  <span class="p">"actions"</span>: {
+    "get_leases": {
+      "method": "GET",
+      "path": "/api/dhcp/leases",
+      "response_mapping": { "root_path": "leases",
+        "fields": { "mac": "mac_address", "ip": "ip_address", "name": "hostname" } }
+    }
+  },
+  <span class="p">"polling"</span>: { "action": "get_leases", "interval_seconds": 120 }
+}</code></pre>
+        </div>
+
+        <h2 id="manifest">Manifest reference</h2>
+        <table>
+          <thead><tr><th>Field</th><th>Req</th><th>Description</th></tr></thead>
+          <tbody>
+            <tr><td><code class="mono">id</code></td><td>✅</td><td>Unique slug — lowercase letters, digits, hyphens.</td></tr>
+            <tr><td><code class="mono">name</code></td><td>✅</td><td>Display name.</td></tr>
+            <tr><td><code class="mono">version</code></td><td>✅</td><td>SemVer, e.g. <code class="mono">1.0.0</code>.</td></tr>
+            <tr><td><code class="mono">capabilities</code></td><td>✅</td><td>What the plugin does — see below.</td></tr>
+            <tr><td><code class="mono">config_schema</code></td><td>✅</td><td>User-configurable fields. May be empty.</td></tr>
+            <tr><td><code class="mono">endpoints</code></td><td></td><td>Base URL, auth, headers. Required for HTTP/SNMP plugins.</td></tr>
+            <tr><td><code class="mono">actions</code></td><td></td><td>Named operations the engine can run.</td></tr>
+            <tr><td><code class="mono">event_hooks</code></td><td></td><td>Map InSpectre event → action name.</td></tr>
+            <tr><td><code class="mono">polling</code></td><td></td><td>Scheduled action(s).</td></tr>
+            <tr><td><code class="mono">data_mapping</code></td><td></td><td><code class="mono">tag_fields</code> to promote onto device tags.</td></tr>
+          </tbody>
+        </table>
+
+        <h2 id="capabilities">Capabilities</h2>
+        <p>Declare what your plugin genuinely does — the engine uses these to decide which flows it joins. Only <code class="mono">discovery</code>/<code class="mono">presence</code> plugins have poll results written to the inventory; only <code class="mono">blocking</code> plugins appear as block methods.</p>
+        <div class="cap-grid">
+          <div><code>discovery</code><p>MAC/IP/hostname rows for the inventory.</p></div>
+          <div><code>enrichment</code><p>Adds vendor, type, tags to known devices.</p></div>
+          <div><code>presence</code><p>Reports whether a device is online.</p></div>
+          <div><code>dns</code><p>Is a DNS server/resolver (AdGuard, Pi-hole).</p></div>
+          <div><code>traffic</code><p>Provides DNS query logs / flow data.</p></div>
+          <div><code>blocking</code><p>Can enforce per-device blocks.</p></div>
+          <div><code>firewall</code><p>Controls a stateful firewall.</p></div>
+          <div><code>export</code><p>Sends InSpectre state to an external system.</p></div>
+          <div><code>notification</code><p>Delivers alerts.</p></div>
+        </div>
+
+        <h2 id="config">Config schema</h2>
+        <p>Each entry renders a field in the plugin's config form. Values become <code class="mono">{key}</code> placeholders usable in <code class="mono">endpoints</code> and <code class="mono">actions</code>.</p>
+        <p><strong>Field types:</strong> <code class="mono">string</code>, <code class="mono">password</code>, <code class="mono">integer</code>, <code class="mono">boolean</code>, <code class="mono">select</code>, <code class="mono">multiline</code>, <code class="mono">url</code>, <code class="mono">filepath</code>.</p>
+        <ul>
+          <li><code class="mono">password</code> values are <strong>encrypted at rest</strong> (Fernet, derived from the server <code class="mono">SECRET_KEY</code>) and shown as <code class="mono">**redacted**</code> when reading config back via the API.</li>
+          <li><code class="mono">multiline</code> renders a textarea (e.g. a newline-separated keyword list).</li>
+          <li><code class="mono">filepath</code> is a <strong>container-internal</strong> path — mount the file into the backend container via <code class="mono">volumes:</code>.</li>
+        </ul>
+
+        <h2 id="hooks">Event hooks</h2>
+        <p>Bind an InSpectre event to an action. When the event fires, the engine runs the action <strong>asynchronously (fire-and-forget)</strong> for every enabled plugin that declares a matching hook.</p>
+        <div class="code">
+          <div class="code-head"><span>event_hooks</span><button data-copy>copy</button></div>
+          <pre><code><span class="p">"event_hooks"</span>: {
+  "device.new":     "notify_action",
+  "vuln.critical":  "notify_action",
+  "device.offline": "notify_action"
+}</code></pre>
+        </div>
+        <table>
+          <thead><tr><th>Event</th><th>Fires when</th><th>Context</th></tr></thead>
+          <tbody>
+            <tr><td><code class="mono">device.new</code></td><td>A device (or new interface) is first seen</td><td><code class="mono">mac, name, ip</code></td></tr>
+            <tr><td><code class="mono">device.online</code></td><td>A device comes back online</td><td><code class="mono">mac, name, ip</code></td></tr>
+            <tr><td><code class="mono">device.offline</code></td><td>A device goes offline</td><td><code class="mono">mac, name, ip</code></td></tr>
+            <tr><td><code class="mono">port.opened</code></td><td>A new open port is detected</td><td><code class="mono">mac, name, ip, ports</code></td></tr>
+            <tr><td><code class="mono">vuln.found</code></td><td>A vuln scan finds issues</td><td><code class="mono">mac, name, ip, vulns</code></td></tr>
+            <tr><td><code class="mono">device.blocked</code></td><td>A device was blocked</td><td><code class="mono">mac, ip</code></td></tr>
+            <tr><td><code class="mono">device.unblocked</code></td><td>A device was unblocked</td><td><code class="mono">mac, ip</code></td></tr>
+          </tbody>
+        </table>
+        <div class="callout warn"><strong>Don't</strong> hook a blocking plugin's own <code class="mono">device.blocked → block_client</code> — the blocking coordinator already calls it directly; hooking it again would double-fire. Event hooks are for <em>reacting</em> to events (e.g. sending a notification).</div>
+
+        <h2 id="polling">Polling</h2>
+        <p>Run action(s) on a schedule. Results are upserted into the inventory when the plugin has <code class="mono">discovery</code> or <code class="mono">presence</code> capability.</p>
+        <table>
+          <thead><tr><th>Key</th><th>Description</th></tr></thead>
+          <tbody>
+            <tr><td><code class="mono">action</code></td><td>Single action name to poll.</td></tr>
+            <tr><td><code class="mono">actions</code></td><td>Array of action names (results merged, last write wins per MAC).</td></tr>
+            <tr><td><code class="mono">interval_seconds</code></td><td>Poll interval. Default 300.</td></tr>
+            <tr><td><code class="mono">run_on_startup</code></td><td>Polling begins after a ~30 s startup grace.</td></tr>
+            <tr><td><code class="mono">max_rate_per_minute</code></td><td>Optional per-action rate cap.</td></tr>
+          </tbody>
+        </table>
+
+        <h2 id="blocking">The blocking contract</h2>
+        <p>A <code class="mono">blocking</code> plugin must declare <code class="mono">block_client</code> and <code class="mono">unblock_client</code> actions. Once enabled, it becomes selectable under <strong>Settings → Security Responses → Blocking Method</strong>, and the blocking coordinator calls those actions directly when you block or unblock a device. Blocking actions emit <code class="mono">device.blocked</code> / <code class="mono">device.unblocked</code> events on success, and may use read-modify-write <em>list directives</em> for APIs that take an allow/deny list.</p>
+
+        <h2 id="builtin">Built-in plugins</h2>
+        <p>The shipped manifests in <code class="mono">backend/plugins/builtin/</code> are the best real-world examples — read them alongside this guide.</p>
+        <table>
+          <thead><tr><th>Plugin</th><th>ID</th><th>Capabilities</th></tr></thead>
+          <tbody>
+            <tr><td>AdGuard Home</td><td><code class="mono">adguard-home</code></td><td>discovery, enrichment, dns, traffic, blocking</td></tr>
+            <tr><td>Pi-hole</td><td><code class="mono">pihole</code></td><td>discovery, enrichment, dns, traffic, blocking</td></tr>
+            <tr><td>TP-Link Omada</td><td><code class="mono">tplink-omada</code></td><td>discovery, presence, blocking, enrichment</td></tr>
+            <tr><td>Home Assistant</td><td><code class="mono">home-assistant</code></td><td>export, notification</td></tr>
+            <tr><td>OPNsense</td><td><code class="mono">opnsense</code></td><td>discovery, enrichment, blocking, firewall</td></tr>
+            <tr><td>pfSense</td><td><code class="mono">pfsense</code></td><td>discovery, enrichment, blocking, firewall</td></tr>
+          </tbody>
+        </table>
+
+        <h2 id="install">Install &amp; test</h2>
+        <div class="flow">
+          <div class="step"><div class="no">01</div><h4>Author</h4><p>Copy the template, set <code>id</code> &amp; config.</p></div>
+          <div class="step"><div class="no">02</div><h4>Upload</h4><p>Settings → Plugins → Upload.</p></div>
+          <div class="step"><div class="no">03</div><h4>Configure</h4><p>Fill fields, Test Connection.</p></div>
+          <div class="step"><div class="no">04</div><h4>Enable</h4><p>Toggle on; polling starts next cycle.</p></div>
+          <div class="step"><div class="no">05</div><h4>Use</h4><p>Discovery feeds inventory; blocking appears as a method.</p></div>
+        </div>
+        <div class="callout">The full manifest reference — template substitution, dependency chains, session extraction, response mapping, file &amp; SNMP plugins and webhook-triggered actions — lives in <a href="https://github.com/thefunkygibbon/InSpectre/blob/main/plugin.md" target="_blank" rel="noopener">plugin.md</a> with annotated examples in <a href="https://github.com/thefunkygibbon/InSpectre/tree/main/examples/plugins" target="_blank" rel="noopener">examples/plugins/</a>.</div>
+
+        <h2 id="safety">A note on safety</h2>
+        <p>Because a plugin is just a manifest, it can only perform the network operations it declares, against the endpoints and credentials you enter. There is no arbitrary code execution inside the backend. That said, community plugins are <strong>not audited</strong> by the InSpectre project — review a manifest before uploading it, the same way you would any config that holds your credentials.</p>
+
+      </div>
+    </div>
+
+  </main>
+
+  <footer class="footer">
+    <div class="foot-inner">
+      <div class="foot-cols">
+        <a href="index.html" class="sb-session"><img src="assets/ghost-logo.svg" alt="" class="logo" /><span class="sb-name">inspectre</span></a>
+        <div class="foot-links">
+          <a href="downloads.html">downloads</a>
+          <a href="docs.html">docs</a>
+          <a href="plugins.html">plugins</a>
+          <a href="https://github.com/thefunkygibbon/InSpectre/wiki" target="_blank" rel="noopener">wiki↗</a>
+          <a href="help.html">help</a>
+          <a href="https://github.com/thefunkygibbon/InSpectre/blob/main/LICENSE" target="_blank" rel="noopener">AGPL-3.0</a>
+          <a href="https://github.com/thefunkygibbon/InSpectre/blob/main/LICENSE-COMMERCIAL.md" target="_blank" rel="noopener">commercial</a>
+        </div>
+      </div>
+      <p class="foot-status">— © <span id="yr"></span> InSpectre · dual-licensed AGPL-3.0 / Commercial · made for people who like to know what's on their network —</p>
+    </div>
+  </footer>
+
+  <script src="assets/main.js"></script>
+</body>
+</html>
