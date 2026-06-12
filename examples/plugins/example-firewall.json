@@ -1,0 +1,98 @@
+{
+  "id": "example-firewall",
+  "name": "Example Firewall (Blocking)",
+  "version": "1.0.0",
+  "author": "InSpectre Community",
+  "description": "Example of a blocking-capable plugin for a generic firewall/router with a token-authenticated REST API. Demonstrates a login -> action dependency chain, bearer-token session extraction, and the required block_client / unblock_client actions. Select this plugin under Settings -> Security Responses -> Blocking Method once enabled and configured.",
+  "homepage": "https://github.com/thefunkygibbon/InSpectre",
+  "min_inspectre_version": "1.2.0",
+  "capabilities": [
+    "blocking",
+    "firewall"
+  ],
+  "config_schema": [
+    {
+      "key": "host",
+      "label": "Firewall Base URL",
+      "type": "url",
+      "default": "https://192.168.0.1",
+      "required": true,
+      "help": "Base URL of the firewall REST API. No trailing slash."
+    },
+    {
+      "key": "user",
+      "label": "Username",
+      "type": "string",
+      "default": "admin",
+      "required": true
+    },
+    {
+      "key": "password",
+      "label": "Password",
+      "type": "password",
+      "default": "",
+      "required": true
+    },
+    {
+      "key": "verify_ssl",
+      "label": "Verify SSL Certificate",
+      "type": "boolean",
+      "default": false,
+      "required": false,
+      "help": "Most firewalls use self-signed certificates; leave disabled unless you have installed a trusted cert."
+    }
+  ],
+  "endpoints": {
+    "base_url": "{host}",
+    "auth": "bearer",
+    "headers": {
+      "Content-Type": "application/json"
+    }
+  },
+  "actions": {
+    "login": {
+      "description": "Authenticate and obtain a bearer token. The token is stored in the session and auto-injected as 'Authorization: Bearer <token>' on later calls.",
+      "method": "POST",
+      "path": "/api/v1/auth/login",
+      "body": {
+        "username": "{user}",
+        "password": "{password}"
+      },
+      "session_extract": {
+        "from": "response_body",
+        "json_path": "data.token",
+        "store_as": "token",
+        "ttl_field": "expires_in"
+      }
+    },
+    "block_client": {
+      "description": "Create a firewall rule blocking the device by MAC (and IP if known).",
+      "depends_on": "login",
+      "method": "POST",
+      "path": "/api/v1/firewall/block",
+      "body": {
+        "mac": "{mac}",
+        "ip": "{ip}",
+        "comment": "Blocked by InSpectre"
+      }
+    },
+    "unblock_client": {
+      "description": "Remove the block rule for the device.",
+      "depends_on": "login",
+      "method": "POST",
+      "path": "/api/v1/firewall/unblock",
+      "body": {
+        "mac": "{mac}",
+        "ip": "{ip}"
+      }
+    },
+    "test_connection": {
+      "description": "Used by the 'Test Connection' button. Verifies credentials by logging in and reading system status.",
+      "depends_on": "login",
+      "method": "GET",
+      "path": "/api/v1/system/status"
+    }
+  },
+  "event_hooks": {},
+  "polling": null
+}

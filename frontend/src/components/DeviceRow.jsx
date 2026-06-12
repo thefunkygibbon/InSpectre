@@ -1,3 +1,4 @@
+import { memo } from 'react'
 import { X } from 'lucide-react'
 import { OnlineDot } from './OnlineDot'
 import { StarButton } from './StarButton'
@@ -26,7 +27,7 @@ function isNewDevice(device) {
   return Date.now() - new Date(device.first_seen).getTime() < NEW_DEVICE_DAYS * 24 * 60 * 60 * 1000
 }
 
-export function DeviceRow({ device, onClick, striped, onStarToggle, isVulnScanning, isAcknowledged, onAcknowledge }) {
+function DeviceRowBase({ device, onClick, striped, onStarToggle, isVulnScanning, isAcknowledged, onAcknowledge }) {
   const name    = device.custom_name || device.hostname || device.ip_address || device.mac_address
   const isNew   = isNewDevice(device)
   const showNew = isNew && !isAcknowledged
@@ -101,3 +102,5 @@ export function DeviceRow({ device, onClick, striped, onStarToggle, isVulnScanni
     </div>
   )
 }
+
+export const DeviceRow = memo(DeviceRowBase)

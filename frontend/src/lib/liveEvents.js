@@ -5,20 +5,23 @@
 // the underlying data changes.  Components subscribe to the channels they care
 // about and re-fetch on demand, instead of polling on a timer.
 //
-// One EventSource is shared across the whole app (browsers cap concurrent
-// connections per origin, so we must not open one per component).  The browser
-// reconnects automatically; pages also keep a slow fallback poll as a safety
-// net in case the stream drops.
+// One stream is shared across the whole app.  We use fetch() (not EventSource)
+// so the auth token travels in the Authorization header rather than the URL —
+// URLs leak into server/proxy logs and browser history.  fetch() does not
+// auto-reconnect, so we implement a small reconnect loop ourselves.
 // ---------------------------------------------------------------------------
 import { getToken } from '../api'
 
 const BASE = import.meta.env.VITE_API_URL || '/api'
 
-// Known channels we addEventListener for. 'ready' fires on (re)connect.
-const CHANNELS = ['ready', 'devices', 'persons', 'schedules', 'message']
+// Known channels we dispatch. 'ready' fires on (re)connect.
+const CHANNELS = new Set(['ready', 'devices', 'persons', 'schedules', 'message'])
 
-let source = null
+let controller = null          // AbortController for the active fetch stream
 let connectedToken = null
+let reconnectTimer = null
+let generation = 0             // bumped on every (re)connect to invalidate stale loops
+
 // channel -> Set<callback>
 const listeners = new Map()
 // callbacks subscribed to every channel
@@ -30,34 +33,91 @@ function emit(channel, data) {
   for (const cb of [...wildcard]) { try { cb(channel, data) } catch { /* ignore */ } }
 }
 
-function handle(channel) {
-  return (ev) => {
-    let data = {}
-    try { data = ev.data ? JSON.parse(ev.data) : {} } catch { /* ignore */ }
-    emit(channel, data)
+function dispatchEvent(eventName, dataStr) {
+  const channel = CHANNELS.has(eventName) ? eventName : 'message'
+  let data = {}
+  try { data = dataStr ? JSON.parse(dataStr) : {} } catch { /* ignore */ }
+  emit(channel, data)
+}
+
+async function runStream(token, myGen) {
+  let res
+  try {
+    res = await fetch(`${BASE}/events/stream`, {
+      headers: { Authorization: `Bearer ${token}` },
+      signal: controller.signal,
+    })
+  } catch {
+    scheduleReconnect(myGen)
+    return
   }
+  if (!res.ok || !res.body) {
+    scheduleReconnect(myGen)
+    return
+  }
+
+  const reader  = res.body.getReader()
+  const decoder = new TextDecoder()
+  let buf = ''
+  let eventName = 'message'
+  let dataLines = []
+
+  try {
+    while (true) {
+      const { done, value } = await reader.read()
+      if (done) break
+      buf += decoder.decode(value, { stream: true })
+      let idx
+      while ((idx = buf.indexOf('\n')) !== -1) {
+        let line = buf.slice(0, idx)
+        buf = buf.slice(idx + 1)
+        if (line.endsWith('\r')) line = line.slice(0, -1)
+        if (line === '') {
+          // End of an SSE event block — dispatch it.
+          if (dataLines.length) dispatchEvent(eventName, dataLines.join('\n'))
+          eventName = 'message'
+          dataLines = []
+        } else if (line.startsWith('event:')) {
+          eventName = line.slice(6).trim()
+        } else if (line.startsWith('data:')) {
+          dataLines.push(line.slice(5).replace(/^ /, ''))
+        }
+        // ':' comment lines and other fields are ignored.
+      }
+    }
+  } catch {
+    // network error / aborted — fall through to reconnect logic
+  }
+  // Stream ended: reconnect unless this generation was superseded/aborted.
+  scheduleReconnect(myGen)
+}
+
+function scheduleReconnect(myGen) {
+  if (myGen !== generation) return            // superseded by a newer connect/disconnect
+  if (reconnectTimer) return
+  reconnectTimer = setTimeout(() => {
+    reconnectTimer = null
+    if (myGen !== generation) return
+    ensureConnected()
+  }, 3000)
 }
 
 function connect() {
   const token = getToken()
-  if (!token) return                       // not logged in yet
-  if (source && connectedToken === token) return
+  if (!token) return                          // not logged in yet
+  if (controller && connectedToken === token) return
   disconnect()
   connectedToken = token
-  const url = `${BASE}/events/stream?token=${encodeURIComponent(token)}`
-  try {
-    source = new EventSource(url)
-  } catch {
-    source = null
-    return
-  }
-  for (const ch of CHANNELS) source.addEventListener(ch, handle(ch))
-  // EventSource auto-reconnects on error; nothing else to do here.
+  const myGen = ++generation
+  controller = new AbortController()
+  runStream(token, myGen)
 }
 
 function disconnect() {
-  if (source) { try { source.close() } catch { /* ignore */ } }
-  source = null
+  generation++                                // invalidate any in-flight reconnect loops
+  if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null }
+  if (controller) { try { controller.abort() } catch { /* ignore */ } }
+  controller = null
   connectedToken = null
 }
 
@@ -66,7 +126,7 @@ function ensureConnected() {
   // the token changed.
   const token = getToken()
   if (!token) { disconnect(); return }
-  if (!source || connectedToken !== token) connect()
+  if (!controller || connectedToken !== token) connect()
 }
 
 /**

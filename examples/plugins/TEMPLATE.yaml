@@ -1,0 +1,161 @@
+# =============================================================================
+# InSpectre plugin manifest — ANNOTATED TEMPLATE
+# =============================================================================
+# A plugin is a single declarative manifest. There is NO plugin code: the
+# InSpectre engine reads this file and performs HTTP / file / SNMP calls on your
+# behalf, mapping the responses into the device inventory and event system.
+#
+# You can upload this file as-is via Settings -> Plugins -> Upload Plugin
+# (YAML and JSON are both accepted), or convert it to JSON. Delete the optional
+# blocks you do not need. See ../../plugin.md for the full reference.
+# =============================================================================
+
+# ── Identity (required) ──────────────────────────────────────────────────────
+id: my-plugin                 # lowercase letters, digits and hyphens only; must be unique
+name: My Plugin               # human-readable display name
+version: 1.0.0                # semver
+author: Your Name             # optional
+description: One-line summary shown in the Plugins UI.   # optional
+homepage: https://example.com # optional
+min_inspectre_version: 1.2.0  # optional; advisory only
+
+# ── Capabilities (required) ──────────────────────────────────────────────────
+# Pick the ones your plugin actually fulfils. Valid values:
+#   discovery     provides MAC/IP/hostname rows for the inventory
+#   enrichment    adds metadata (vendor, type, tags) to known devices
+#   presence      reports whether a device is online (sets is_online)
+#   dns           is a DNS server/resolver
+#   traffic       provides DNS query logs / flow data
+#   blocking      can enforce per-device blocks (see Blocking Contract in plugin.md)
+#   firewall      controls a stateful firewall (combine with blocking)
+#   export        sends InSpectre state to an external system
+#   notification  delivers alerts
+capabilities:
+  - discovery
+  - enrichment
+
+# ── Config schema (required) ─────────────────────────────────────────────────
+# Fields rendered in the plugin's config form. Values are available as {key}
+# placeholders in endpoints/actions. 'password' fields are encrypted at rest.
+# Valid types: string, password, integer, boolean, select, multiline, url, filepath
+config_schema:
+  - key: host
+    label: API Base URL
+    type: url
+    default: http://192.168.0.1
+    required: true
+    help: Base URL of the device API. No trailing slash.
+  - key: api_key
+    label: API Key
+    type: password
+    default: ""
+    required: true
+    help: Secret token; stored encrypted.
+  - key: verify_ssl
+    label: Verify SSL Certificate
+    type: boolean
+    default: true
+    required: false
+  # A 'select' field offers a fixed choice list:
+  # - key: mode
+  #   label: Mode
+  #   type: select
+  #   options: ["fast", "thorough"]
+  #   default: fast
+
+# ── Endpoints (required for HTTP/SNMP plugins) ───────────────────────────────
+endpoints:
+  base_url: "{host}"          # prepended to every action's path; may use {config_key}
+  # auth: none | basic | bearer | cookie | api-key-header | api-key-param
+  auth: api-key-header
+  api_key_header: X-API-Key   # header name for api-key-header auth (value = {api_key})
+  headers:                    # static headers sent on every request
+    Accept: application/json
+  verify_ssl: true            # default SSL behaviour (config 'verify_ssl' overrides per-call)
+  # For APIs that always return HTTP 200 and signal errors in the body:
+  # error_check:
+  #   json_path: errorCode
+  #   success_value: 0
+  #   message_path: msg
+  # Inject a captured session value as a header on every call:
+  # session_headers:
+  #   access_token: X-FTL-SID
+
+# ── Actions (named operations) ───────────────────────────────────────────────
+# Each action is one HTTP request (or file/SNMP read). Placeholders:
+#   {config_key}      a config field value
+#   {mac} {mac_dash} {ip}   provided by blocking + event contexts
+#   {dep_action.field}      a field from a depends_on action's response
+actions:
+
+  get_devices:
+    description: Fetch the device/lease list.
+    method: GET
+    path: /api/devices
+    # response_mapping turns the JSON response into InSpectre device rows.
+    response_mapping:
+      root_path: result.devices   # dotted path to the array (omit if response is already an array)
+      # root_paths: [a.list, b.list]   # OR merge several arrays
+      fields:                     # source field (in the API) -> InSpectre field
+        mac: mac_address          # REQUIRED; auto-normalised to aa:bb:cc:dd:ee:ff
+        ip: ip_address
+        name: hostname
+        vendor: vendor
+        online: is_online         # truthy/"online"/"connected"/1 -> true
+
+  test_connection:
+    description: Used by the "Test Connection" button.
+    method: GET
+    path: /api/status
+
+  # ── Auth chain example (delete if auth is none/basic/api-key) ──────────────
+  # login:
+  #   method: POST
+  #   path: /api/auth
+  #   body: { username: "{user}", password: "{password}" }
+  #   session_extract:           # store a value from the response for later calls
+  #     from: response_body      # response_body | response_headers | response_cookies
+  #     json_path: data.token
+  #     store_as: token          # bearer auth auto-uses a value stored as the token
+  #     ttl_field: expires_in    # optional token lifetime (seconds)
+  # get_secure_data:
+  #   depends_on: login          # engine runs 'login' first, reuses the session
+  #   method: GET
+  #   path: /api/secure
+
+  # ── Blocking actions (only if capability includes 'blocking') ──────────────
+  # block_client:
+  #   depends_on: login
+  #   method: POST
+  #   path: /api/firewall/block
+  #   body: { mac: "{mac}", ip: "{ip}" }
+  # unblock_client:
+  #   depends_on: login
+  #   method: POST
+  #   path: /api/firewall/unblock
+  #   body: { mac: "{mac}", ip: "{ip}" }
+
+# ── Event hooks (optional) ───────────────────────────────────────────────────
+# Run an action when an InSpectre event fires. This is the closest thing to the
+# "on_device_discovered" style hooks. Valid event keys:
+#   device.new device.online device.offline
+#   port.opened vuln.found vuln.critical vuln.high
+#   device.blocked device.unblocked
+# Each hook receives a context: {mac, name, ip, ports?, vulns?}
+event_hooks: {}
+# event_hooks:
+#   device.new: notify_action
+#   vuln.critical: notify_action
+
+# ── Polling (optional) ───────────────────────────────────────────────────────
+# Run action(s) on a schedule. Results are upserted into the inventory if the
+# plugin has 'discovery' or 'presence' capability.
+polling:
+  action: get_devices           # or: actions: [get_a, get_b]
+  interval_seconds: 120
+  run_on_startup: true
+
+# ── Data mapping (optional) ──────────────────────────────────────────────────
+# Promote extra mapped fields onto the device's tags.
+data_mapping:
+  tag_fields: []                # e.g. ["device_type", "wireless"]

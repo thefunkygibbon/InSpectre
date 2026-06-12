@@ -1,0 +1,41 @@
+#!/usr/bin/env bash
+#
+# InSpectre pre-commit hook — keeps the version moving forward automatically.
+#
+# Behaviour:
+#   * If VERSION is staged in this commit, the user is bumping it manually:
+#     we only re-sync the derived files so they match.
+#   * Otherwise we auto-bump the PATCH number, so every commit advances the
+#     version without anyone having to remember.
+#
+# Escape hatches:
+#   * INSPECTRE_NO_VERSION_BUMP=1 git commit ...   → skip entirely
+#   * To do a minor/major release bump, run scripts/bump-version.sh minor|major
+#     and stage VERSION before committing; the hook will then just sync.
+#
+# Enable once per clone with:
+#   git config core.hooksPath .githooks
+#
+set -Eeuo pipefail
+
+if [[ "${INSPECTRE_NO_VERSION_BUMP:-}" == "1" ]]; then
+  exit 0
+fi
+
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+cd "$REPO_ROOT"
+
+# Nothing to do if the version tooling is missing.
+if [[ ! -x scripts/sync-version.sh || ! -x scripts/bump-version.sh ]]; then
+  exit 0
+fi
+
+if git diff --cached --name-only | grep -qx "VERSION"; then
+  # Manual version change in progress — just regenerate derived files.
+  ./scripts/sync-version.sh >/dev/null
+else
+  ./scripts/bump-version.sh patch >/dev/null
+fi
+
+git add VERSION backend/_version.py probe/_version.py frontend/src/version.js frontend/package.json
+exit 0

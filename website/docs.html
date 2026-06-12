@@ -3,224 +3,350 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Documentation — InSpectre</title>
-  <meta name="description" content="How to install, configure and use InSpectre — the self-hosted network monitor and security scanner." />
-  <link rel="icon" type="image/svg+xml" href="assets/logo.svg" />
+  <title>Docs — InSpectre</title>
+  <meta name="description" content="Install, configure and master InSpectre. A summary of the full Wiki covering discovery, scanning, blocking, presence, traffic, notifications, plugins and more." />
+  <link rel="icon" type="image/svg+xml" href="assets/favicon.svg" />
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet" />
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet" />
   <link rel="stylesheet" href="assets/style.css" />
 </head>
 <body>
 
-  <header class="nav">
-    <div class="container nav-inner">
-      <a href="index.html" class="brand-mark">
-        <img src="assets/logo.svg" alt="" class="logo" />
-        <span><span class="in">In</span><span class="spectre">Spectre</span></span>
-      </a>
-      <button class="nav-toggle" aria-label="Menu">
-        <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 6h18M3 12h18M3 18h18"/></svg>
-      </button>
-      <nav class="nav-links">
-        <a href="index.html">Home</a>
-        <a href="downloads.html">Downloads</a>
-        <a href="docs.html" class="active">Docs</a>
-        <a href="help.html">Help</a>
-        <a href="https://github.com/thefunkygibbon/InSpectre" class="gh" target="_blank" rel="noopener">
-          <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="M12 .3a12 12 0 0 0-3.8 23.4c.6.1.8-.3.8-.6v-2c-3.3.7-4-1.6-4-1.6-.6-1.4-1.4-1.8-1.4-1.8-1-.7.1-.7.1-.7 1.2 0 1.8 1.2 1.8 1.2 1 1.8 2.8 1.3 3.5 1 .1-.8.4-1.3.7-1.6-2.7-.3-5.5-1.3-5.5-6 0-1.2.5-2.3 1.3-3.1-.2-.4-.6-1.6 0-3.2 0 0 1-.3 3.3 1.2a11.5 11.5 0 0 1 6 0C17.3 4.7 18.3 5 18.3 5c.6 1.6.2 2.8 0 3.2.8.8 1.3 1.9 1.3 3.1 0 4.7-2.8 5.7-5.5 6 .4.4.8 1.1.8 2.2v3.3c0 .3.2.7.8.6A12 12 0 0 0 12 .3Z"/></svg>
-          GitHub
-        </a>
+  <header class="statusbar">
+    <div class="sb-inner">
+      <a href="index.html" class="sb-session"><img src="assets/ghost-logo.svg" alt="" class="logo" /><span class="sb-name">inspectre</span></a>
+      <button class="nav-toggle" aria-label="Menu">[≡]</button>
+      <nav class="sb-windows">
+        <a href="index.html">0:home</a>
+        <a href="downloads.html">1:downloads</a>
+        <a href="docs.html" class="active">2:docs</a>
+        <a href="plugins.html">3:plugins</a>
+        <a href="help.html">4:help</a>
+        <a href="https://github.com/thefunkygibbon/InSpectre" target="_blank" rel="noopener">5:github↗</a>
       </nav>
+      <span class="sb-clock"><span class="blink">●</span> <span id="clock">--:--:--</span></span>
     </div>
   </header>
 
-  <section class="page-head">
-    <div class="container">
-      <span class="eyebrow"><span class="dot"></span> Documentation</span>
-      <h1>Get up and running</h1>
+  <main class="container">
+
+    <section class="page-head">
+      <p class="crumb"><span class="dollar">$</span> man inspectre</p>
+      <h1>Get up and <span class="hl">running</span></h1>
       <p>Everything you need to install, configure and make the most of InSpectre. For the complete reference, see the <a href="https://github.com/thefunkygibbon/InSpectre/wiki" target="_blank" rel="noopener">full Wiki</a>.</p>
-    </div>
-  </section>
+    </section>
 
-  <section style="padding-top:20px;">
-    <div class="container">
-      <div class="docs-layout">
+    <div class="docs-layout">
 
-        <!-- Side nav -->
-        <aside class="docs-nav">
-          <h4>Getting started</h4>
-          <a href="#requirements">Requirements</a>
-          <a href="#install">Installation</a>
-          <a href="#firstrun">First run &amp; wizard</a>
-          <a href="#commands">Helper commands</a>
-          <h4>Using InSpectre</h4>
-          <a href="#discovery">Device discovery</a>
-          <a href="#scanning">Scanning &amp; security</a>
-          <a href="#blocking">Blocking</a>
-          <a href="#presence">Person presence</a>
-          <a href="#notifications">Notifications</a>
-          <a href="#config">Configuration</a>
-          <h4>More</h4>
-          <a href="#backup">Backup &amp; restore</a>
-          <a href="#architecture">Architecture</a>
-        </aside>
+      <aside class="docs-nav">
+        <h4>getting started</h4>
+        <a href="#requirements">Requirements</a>
+        <a href="#install">Installation</a>
+        <a href="#dockerhub">Docker Hub deploy</a>
+        <a href="#firstrun">First run &amp; wizard</a>
+        <a href="#commands">Helper commands</a>
+        <h4>devices</h4>
+        <a href="#discovery">Device discovery</a>
+        <a href="#management">Device management</a>
+        <a href="#presence">Person presence</a>
+        <a href="#fingerprinting">Fingerprinting</a>
+        <h4>security</h4>
+        <a href="#scanning">Port scanning</a>
+        <a href="#vulns">Vulnerability scanning</a>
+        <a href="#blocking">Blocking &amp; schedules</a>
+        <h4>monitoring</h4>
+        <a href="#traffic">Traffic monitor</a>
+        <a href="#speedtest">Speed test</a>
+        <a href="#containers">Container monitoring</a>
+        <h4>tools &amp; alerts</h4>
+        <a href="#nettools">Network tools</a>
+        <a href="#notifications">Notifications</a>
+        <h4>reference</h4>
+        <a href="#settings">Settings</a>
+        <a href="#backup">Backup &amp; restore</a>
+        <a href="#plugins">Plugins</a>
+        <a href="#config">Config overrides</a>
+        <a href="#architecture">Architecture</a>
+      </aside>
 
-        <!-- Content -->
-        <div class="docs-content">
+      <div class="docs-content">
 
-          <h2 id="requirements">Requirements</h2>
-          <ul>
-            <li><strong>Docker</strong> 24 or newer</li>
-            <li><strong>Docker Compose</strong> v2 (the <code class="mono">docker compose</code> plugin)</li>
-            <li>A 64-bit Linux host on the network you want to monitor</li>
-            <li>A flat Layer-2 LAN for full ARP discovery and blocking</li>
-          </ul>
+        <h2 id="requirements">Requirements</h2>
+        <ul>
+          <li><strong>Docker</strong> 24 or newer</li>
+          <li><strong>Docker Compose</strong> v2 (the <code class="mono">docker compose</code> plugin)</li>
+          <li>A 64-bit Linux host on the network you want to monitor</li>
+          <li>A flat Layer-2 LAN for full ARP discovery and blocking</li>
+        </ul>
 
-          <h2 id="install">Installation</h2>
-          <p>Clone the repository and bring the stack up with the bundled helper script:</p>
-          <div class="code">
-            <div class="code-head"><span>bash</span><button data-copy>Copy</button></div>
-            <pre><code>git clone https://github.com/thefunkygibbon/InSpectre.git
+        <h2 id="install">Installation (from GitHub)</h2>
+        <p>Clone the repository and bring the stack up with the bundled helper script:</p>
+        <div class="code">
+          <div class="code-head"><span>bash</span><button data-copy>copy</button></div>
+          <pre><code>git clone https://github.com/thefunkygibbon/InSpectre.git
 cd InSpectre
 <span class="p">./inspectre.sh up</span></code></pre>
-          </div>
-          <p>Prefer raw Compose? <code class="mono">docker compose up -d</code> works too. Once the containers are healthy, open <strong>http://localhost:3000</strong> (or the host's IP) in your browser.</p>
+        </div>
+        <p>Prefer raw Compose? <code class="mono">docker compose up -d</code> works too. Once the containers are healthy, open <strong>http://localhost:3000</strong> (or the host's IP) in your browser.</p>
 
-          <h2 id="firstrun">First run &amp; setup wizard</h2>
-          <p>On first launch InSpectre walks you through a guided 7-step wizard — no file editing required. You'll configure:</p>
-          <ul>
-            <li>An admin <strong>username and password</strong> (JWT-backed login, with an optional 30-day "remember me")</li>
-            <li><strong>Network settings</strong> — scan range and DNS (auto-detected from the host's routing table)</li>
-            <li><strong>Vulnerability scanning</strong> behaviour and the nightly scan window</li>
-            <li><strong>Notifications</strong> — channels and profiles</li>
-            <li><strong>Container hosts</strong> (Docker / Proxmox) and <strong>Fingerbank</strong> device identification</li>
-          </ul>
-          <div class="callout"><strong>Tip.</strong> You can restore a previous backup directly from the wizard — handy when migrating to a new host.</div>
+        <h2 id="dockerhub">Deploying from Docker Hub</h2>
+        <p>Run InSpectre without cloning the repository by pulling pre-built images directly from Docker Hub.</p>
+        <h3>Interactive installer (recommended)</h3>
+        <div class="code">
+          <div class="code-head"><span>bash</span><button data-copy>copy</button></div>
+          <pre><code><span class="p">curl -fsSL https://raw.githubusercontent.com/thefunkygibbon/InSpectre/main/inspectre-install.sh | bash</span></code></pre>
+        </div>
+        <p>The installer checks prerequisites, prompts for an install directory, generates secure passwords and a secret key, optionally lets you set <code class="mono">IP_RANGE</code> and <code class="mono">INTERFACE</code>, then starts the stack.</p>
+        <h3>Manual Docker Hub deploy</h3>
+        <div class="code">
+          <div class="code-head"><span>bash</span><button data-copy>copy</button></div>
+          <pre><code><span class="c"># 1. Download the deploy compose file</span>
+curl -O https://raw.githubusercontent.com/thefunkygibbon/InSpectre/main/docker-compose.deploy.yml
 
-          <h2 id="commands">Helper commands</h2>
-          <table>
-            <thead><tr><th>Command</th><th>What it does</th></tr></thead>
-            <tbody>
-              <tr><td class="mono">./inspectre.sh up</td><td>Start all containers</td></tr>
-              <tr><td class="mono">./inspectre.sh down</td><td>Stop all containers</td></tr>
-              <tr><td class="mono">./inspectre.sh rebuild</td><td>Full wipe &amp; rebuild (deletes the database)</td></tr>
-              <tr><td class="mono">./inspectre.sh rebuild keep-data</td><td>Rebuild but preserve the database</td></tr>
-              <tr><td class="mono">./inspectre.sh logs</td><td>Tail logs from all containers</td></tr>
-            </tbody>
-          </table>
+<span class="c"># 2. Edit — change POSTGRES_PASSWORD and SECRET_KEY</span>
+<span class="c">#    Generate a key: openssl rand -hex 32</span>
 
-          <h2 id="discovery">Device discovery</h2>
-          <p>The privileged <strong>probe</strong> container discovers devices two ways at once:</p>
-          <ul>
-            <li><strong>Active ARP sweeps</strong> across your subnet on a configurable interval</li>
-            <li><strong>Passive packet sniffing</strong> that catches devices the moment they talk on the wire</li>
-          </ul>
-          <p>New devices surface within seconds and float to the top of the dashboard with a <strong>NEW</strong> badge until you acknowledge them. Devices sharing a hostname are automatically grouped as one physical device with multiple interfaces — and any group you create or edit by hand is <strong>protected</strong> from the automatic grouping passes.</p>
+<span class="c"># 3. Start</span>
+<span class="p">docker compose -f docker-compose.deploy.yml up -d</span></code></pre>
+        </div>
+        <table>
+          <thead><tr><th>Variable</th><th>Required</th><th>Notes</th></tr></thead>
+          <tbody>
+            <tr><td><code class="mono">POSTGRES_PASSWORD</code></td><td>✅ Must change</td><td>Internal DB password — set the same value in both db and web/probe sections</td></tr>
+            <tr><td><code class="mono">SECRET_KEY</code></td><td>✅ Must change</td><td>JWT signing key — generate with <code class="mono">openssl rand -hex 32</code></td></tr>
+            <tr><td><code class="mono">IP_RANGE</code></td><td>Optional</td><td>Leave commented out for auto-detection</td></tr>
+            <tr><td><code class="mono">INTERFACE</code></td><td>Optional</td><td>Leave commented out for auto-detection</td></tr>
+            <tr><td><code class="mono">DATA_DIR</code></td><td>Optional</td><td>Where to store persistent data (default: <code class="mono">./data</code>)</td></tr>
+          </tbody>
+        </table>
+        <h3>Updating</h3>
+        <div class="code">
+          <div class="code-head"><span>bash</span><button data-copy>copy</button></div>
+          <pre><code>docker compose -f docker-compose.deploy.yml pull
+<span class="p">docker compose -f docker-compose.deploy.yml up -d</span></code></pre>
+        </div>
 
-          <h2 id="scanning">Scanning &amp; security</h2>
-          <ul>
-            <li><strong>Port scanning</strong> — nmap TCP sweeps with OS detection and service fingerprinting, on demand or scheduled</li>
-            <li><strong>Baseline drift</strong> — InSpectre alerts when a device's open ports change from its known baseline</li>
-            <li><strong>Vulnerability scanning</strong> — Nuclei-based CVE scanning with per-service template routing, surfaced by severity</li>
-            <li><strong>Security dashboard</strong> — a network-wide view of findings grouped by severity, including container-image CVEs</li>
-          </ul>
+        <h2 id="firstrun">First run &amp; setup wizard</h2>
+        <p>On first launch InSpectre walks you through a guided wizard — no file editing required. You'll configure:</p>
+        <ul>
+          <li>An admin <strong>username and password</strong> (JWT-backed login, with an optional 30-day "remember me")</li>
+          <li><strong>Network settings</strong> — scan range and DNS (auto-detected from the host's routing table)</li>
+          <li><strong>Vulnerability scanning</strong> behaviour and the nightly scan window</li>
+          <li><strong>Notifications</strong> — channels and profiles</li>
+          <li><strong>Container hosts</strong> (Docker / Proxmox) and <strong>Fingerbank</strong> device identification</li>
+        </ul>
+        <div class="callout"><strong>Tip.</strong> You can restore a previous backup directly from the wizard — handy when migrating to a new host.</div>
 
-          <h2 id="blocking">Blocking</h2>
-          <p>InSpectre blocks devices using ARP MITM — no inline gateway required on a typical home network.</p>
-          <ul>
-            <li><strong>Per-device</strong> — block/unblock from the device card or its Actions tab</li>
-            <li><strong>Network pause</strong> — cut every device off at once from the toolbar</li>
-            <li><strong>Block schedules</strong> — recurring time windows (e.g. 22:00–07:00) per device <em>or</em> per person</li>
-          </ul>
-          <div class="callout"><strong>Note.</strong> ARP blocking works on flat home networks. It may not apply where Dynamic ARP Inspection is enforced on managed switches.</div>
+        <h2 id="commands">Helper commands</h2>
+        <table>
+          <thead><tr><th>Command</th><th>What it does</th></tr></thead>
+          <tbody>
+            <tr><td><code class="mono">./inspectre.sh up</code></td><td>Start all containers</td></tr>
+            <tr><td><code class="mono">./inspectre.sh down</code></td><td>Stop all containers</td></tr>
+            <tr><td><code class="mono">./inspectre.sh rebuild</code></td><td>Full wipe &amp; rebuild (deletes the database)</td></tr>
+            <tr><td><code class="mono">./inspectre.sh rebuild keep-data</code></td><td>Rebuild but preserve the database</td></tr>
+            <tr><td><code class="mono">./inspectre.sh logs</code></td><td>Tail logs from all containers</td></tr>
+          </tbody>
+        </table>
 
-          <h2 id="presence">Person presence</h2>
-          <p>The <strong>Person Presence</strong> page groups a household member's devices under one named person:</p>
-          <ul>
-            <li>Add a person, upload a photo, and attach their devices via autocomplete</li>
-            <li>Star one device as the <strong>primary</strong> presence indicator</li>
-            <li>See a clear, colour-coded <strong>At Home / Away</strong> state plus a presence-history timeline</li>
-            <li>Block all of a person's devices in one action, or attach recurring per-person block schedules</li>
-            <li>Route <strong>arrived-home</strong>, <strong>left-home</strong>, <strong>blocked</strong> and <strong>unblocked</strong> events to notifications</li>
-          </ul>
+        <h2 id="discovery">Device discovery</h2>
+        <p>The privileged <strong>probe</strong> container discovers devices two ways at once:</p>
+        <ul>
+          <li><strong>Active ARP sweeps</strong> across your subnet on a configurable interval (default: every 60 s)</li>
+          <li><strong>Passive packet sniffing</strong> that catches devices the moment they talk on the wire — no wait for the next cycle</li>
+        </ul>
+        <p>New devices surface within seconds and float to the top of the dashboard with a <strong>NEW</strong> badge until you acknowledge them. Devices sharing a hostname are automatically grouped as one physical device with multiple interfaces — and any group you create or edit by hand is <strong>protected</strong> from the automatic grouping passes.</p>
+        <p>For each discovered device, the probe attempts hostname resolution via <strong>reverse DNS</strong>, <strong>mDNS/Bonjour</strong>, <strong>NetBIOS</strong>, and <strong>DHCP Option 12</strong>.</p>
 
-          <h2 id="notifications">Notifications</h2>
-          <p>Notifications use a <strong>Channels &amp; Profiles</strong> model. A channel is a reusable connection (service type + credentials); a profile maps event types to one or more channels.</p>
-          <p><strong>Supported channels:</strong> ntfy, Gotify, Pushbullet, Webhook, Home Assistant (direct REST), Matrix, SMTP email, Slack, Telegram, Discord, and Apprise generic URL.</p>
-          <p><strong>Event types</strong> include new device, device online/offline, watched-device offline, port drift, vulnerability found, device blocked/unblocked, and the person-presence events. Each channel has a one-click <strong>Test</strong> button.</p>
-          <p>InSpectre can also publish entities to <strong>Home Assistant via MQTT auto-discovery</strong> — a system device plus per-client presence, new-device, IP, open-port and vulnerability sensors.</p>
+        <h2 id="management">Device management</h2>
+        <p>The main dashboard offers three layout views: <strong>Grid</strong>, <strong>List</strong>, and <strong>Category</strong> (devices grouped by automatically detected type). Your preference is saved across sessions.</p>
+        <p>Click any device to open its <strong>drawer</strong> with tabs for Overview, Actions, Vulnerabilities, Traffic, Timeline, and Admin. From here you can:</p>
+        <ul>
+          <li>Set a custom name, device type, vendor, location, tags, and zone</li>
+          <li>Star devices as <strong>Watched</strong> for elevated offline alerts</li>
+          <li><strong>Ignore</strong> benign devices to hide them from the main view</li>
+          <li>Add free-text <strong>Notes</strong></li>
+          <li>View full IP history and event timeline</li>
+          <li>Manage device grouping and group membership</li>
+        </ul>
+        <p>The <strong>Device Presence</strong> page shows multi-device uptime history bars over 7 days, 1 month, or 1 year. The <strong>Network Events</strong> page shows a chronological log of all online/offline transitions across every device.</p>
 
-          <h2 id="config">Configuration</h2>
-          <p>Almost everything is configured from the in-app <strong>Settings</strong> panel at runtime — no restarts needed. The probe re-reads scan settings each cycle. If interface auto-detection picks the wrong NIC, override it in <code class="mono">docker-compose.yml</code>:</p>
-          <div class="code">
-            <div class="code-head"><span>docker-compose.yml</span><button data-copy>Copy</button></div>
-            <pre><code><span class="c"># Uncomment to override auto-detection</span>
+        <h2 id="presence">Person presence</h2>
+        <p>The <strong>Person Presence</strong> page groups a household member's devices under one named person:</p>
+        <ul>
+          <li>Add a person, upload a photo, and attach their devices via autocomplete</li>
+          <li>Star one device as the <strong>primary</strong> presence indicator</li>
+          <li>See a clear, colour-coded <strong>At Home / Away</strong> state plus a presence-history timeline</li>
+          <li>Block all of a person's devices in one action, or attach recurring per-person block schedules</li>
+          <li>Route <strong>arrived-home</strong>, <strong>left-home</strong>, <strong>blocked</strong> and <strong>unblocked</strong> events to notifications</li>
+        </ul>
+
+        <h2 id="fingerprinting">Fingerprinting &amp; identity</h2>
+        <p>InSpectre classifies devices using a layered fingerprinting approach:</p>
+        <ul>
+          <li><strong>OUI lookup</strong> — MAC vendor resolution from the IEEE OUI database</li>
+          <li><strong>DHCP passive capture</strong> — hostname (Option 12), vendor class ID (Option 60), and parameter request list (Option 55) from DHCP broadcasts</li>
+          <li><strong>Local DHCP classification</strong> — known vendor class patterns matched locally without sending data anywhere</li>
+          <li><strong>Port pattern matching</strong> — device type inferred from open port signature</li>
+          <li><strong>Fingerbank cloud lookup</strong> — optional; sends DHCP fingerprint data to <a href="https://fingerbank.org/" target="_blank" rel="noopener">fingerbank.org</a> for deeper identification (free, 600 lookups/hour)</li>
+        </ul>
+
+        <h2 id="scanning">Port scanning &amp; baseline tracking</h2>
+        <ul>
+          <li><strong>Port scanning</strong> — nmap TCP sweeps with OS detection and service fingerprinting, on demand or scheduled</li>
+          <li><strong>Baseline drift</strong> — InSpectre alerts when a device's open ports change from its known baseline</li>
+          <li>Configure nmap arguments, scan interval, and scheduled scan window from <strong>Settings → Scanner</strong></li>
+        </ul>
+
+        <h2 id="vulns">Vulnerability scanning</h2>
+        <ul>
+          <li><strong>Nuclei + nmap CVE scanning</strong> — nmap <code class="mono">-sV</code> fingerprints services, then Nuclei templates are routed per service; findings surface by severity (Critical / High / Medium / Low)</li>
+          <li><strong>Scheduled scans</strong> — configurable nightly window or manual trigger per device</li>
+          <li><strong>Security dashboard</strong> — network-wide view of findings grouped by severity, including container image CVEs from Trivy</li>
+        </ul>
+        <div class="callout"><strong>Tip.</strong> Use the Settings cog in the Security Dashboard to configure scan behaviour without leaving the page.</div>
+
+        <h2 id="blocking">Device blocking &amp; schedules</h2>
+        <p>InSpectre blocks devices using ARP MITM — no inline gateway required on a typical home network.</p>
+        <ul>
+          <li><strong>Per-device</strong> — block/unblock from the device card or its Actions tab</li>
+          <li><strong>Network pause</strong> — cut every device off at once from the toolbar</li>
+          <li><strong>Block schedules</strong> — recurring time windows (e.g. 22:00–07:00) per device <em>or</em> per person</li>
+        </ul>
+        <div class="callout warn"><strong>Note.</strong> ARP blocking works on flat home networks. It may not apply where Dynamic ARP Inspection is enforced on managed switches.</div>
+
+        <h2 id="traffic">Traffic monitor</h2>
+        <p>The Traffic Monitor uses ARP MITM to intercept and analyse traffic for a specific device — packets are forwarded to their destination, only observed. Open the device drawer → Traffic tab → <strong>Start monitoring</strong>.</p>
+        <table>
+          <thead><tr><th>Metric</th><th>Description</th></tr></thead>
+          <tbody>
+            <tr><td>Bytes in/out</td><td>Total data received and sent during the session</td></tr>
+            <tr><td>Packets in/out</td><td>Total packet counts</td></tr>
+            <tr><td>Domains</td><td>Hostnames resolved from DNS queries in the traffic stream</td></tr>
+            <tr><td>Countries</td><td>GeoIP lookup of destination IPs</td></tr>
+            <tr><td>Unusual ports</td><td>Destination ports outside the expected list — potential anomalies</td></tr>
+          </tbody>
+        </table>
+
+        <h2 id="speedtest">Speed test</h2>
+        <p>The <strong>Speed Test</strong> panel (Traffic page → Speed Test section) runs the Ookla Speedtest CLI from the probe and reports download/upload speeds and ping. Results reflect the speed available to the InSpectre host.</p>
+        <ul>
+          <li><strong>Server selector</strong> — optionally pick a specific test server; closest servers are shown first</li>
+          <li><strong>Scheduled auto-runs</strong> — every 30 min, hourly, every 6 h, or daily — set via the gear icon (⚙)</li>
+          <li><strong>History</strong> — all results stored and displayed with timestamp, server, ping, download, and upload; included in full JSON backups</li>
+        </ul>
+
+        <h2 id="containers">Container monitoring</h2>
+        <p>InSpectre can monitor Docker hosts and Proxmox VE nodes alongside your network devices. Configure hosts at <strong>Settings → Container Hosts</strong>.</p>
+        <ul>
+          <li><strong>Multi-host support</strong> — local Docker socket, remote TCP, and Proxmox VE nodes simultaneously</li>
+          <li><strong>Container management</strong> — view running/stopped containers, start/stop/restart with one click</li>
+          <li><strong>Log streaming</strong> — live container log tailing directly from the UI</li>
+          <li><strong>Image vulnerability scanning</strong> — Trivy-based CVE scanner; findings grouped by severity with CVSS scores and NVD links</li>
+          <li><strong>Host filter</strong> — filter the container list by configured host</li>
+        </ul>
+
+        <h2 id="nettools">Network tools</h2>
+        <p>The <strong>Network Tools</strong> page provides 25 diagnostic utilities that run from the probe container — giving you the perspective of a device on your LAN.</p>
+        <table>
+          <thead><tr><th>Category</th><th>Tools</th></tr></thead>
+          <tbody>
+            <tr><td><strong>IP Tools</strong></td><td>Ping, Traceroute, Port Scan, Reverse DNS, ARP Lookup, Wake-on-LAN</td></tr>
+            <tr><td><strong>DNS Tools</strong></td><td>Record Lookup, DNS Propagation, DoH Tester, DNSSEC Validator, Reverse DNS Bulk</td></tr>
+            <tr><td><strong>Web Tools</strong></td><td>HTTP Headers, SSL/TLS Certificate, Redirect Chain, TLS Versions, HTTP Timing</td></tr>
+            <tr><td><strong>Infrastructure</strong></td><td>IP Geolocation, WHOIS, BGP/ASN Lookup</td></tr>
+            <tr><td><strong>Email Tools</strong></td><td>MX/SPF/DMARC/DKIM Checker, SMTP Banner, BIMI Lookup, DNSBL Check</td></tr>
+            <tr><td><strong>Connectivity</strong></td><td>Speed Test, Speed Test Servers</td></tr>
+          </tbody>
+        </table>
+
+        <h2 id="notifications">Notifications</h2>
+        <p>Notifications use a <strong>profiles</strong> model: a channel is a reusable connection (service type + credentials); a notification profile maps event types to one or more channels.</p>
+        <p><strong>Supported channel types (16):</strong> ntfy, Gotify, Pushbullet, Pushover, Slack, Telegram, Discord, Email (SMTP), Matrix, Microsoft Teams, Signal, WhatsApp, MQTT, IFTTT, Webhook, and Home Assistant.</p>
+        <p><strong>Event types</strong> include new device, device online/offline, watched-device offline, port drift, vulnerability found, device blocked/unblocked, and the person-presence events (arrived home, left home). Each channel has a one-click <strong>Test</strong> button.</p>
+        <p>InSpectre can also publish entities to <strong>Home Assistant via MQTT auto-discovery</strong> — a system device plus per-client presence, new-device, IP, open-port and vulnerability sensors.</p>
+
+        <h2 id="settings">Settings reference</h2>
+        <table>
+          <thead><tr><th>Tab</th><th>Key settings</th></tr></thead>
+          <tbody>
+            <tr><td><strong>Scanner</strong></td><td>IP range, interface, scan interval, nmap args, nightly scan window, vulnerability scan toggle</td></tr>
+            <tr><td><strong>Notifications</strong></td><td>Toast, browser, channel &amp; profile management</td></tr>
+            <tr><td><strong>Data</strong></td><td>Offline threshold, device auto-prune, backup &amp; restore, CSV export, fingerprint database</td></tr>
+            <tr><td><strong>Home Assistant</strong></td><td>MQTT broker, discovery prefix, per-entity toggles, HA direct notification credentials</td></tr>
+            <tr><td><strong>Admin</strong></td><td>Change password, CORS origins, theme, UI preferences</td></tr>
+            <tr><td><strong>Container Hosts</strong></td><td>Add/remove Docker and Proxmox hosts, set socket or TCP endpoint</td></tr>
+            <tr><td><strong>Plugins</strong></td><td>Enable/disable built-in plugins, upload community plugins</td></tr>
+          </tbody>
+        </table>
+        <p>Almost everything is configured from the Settings panel at runtime — no restarts needed. The probe re-reads scan settings each cycle.</p>
+
+        <h2 id="backup">Backup &amp; restore</h2>
+        <p>Export a full JSON backup covering devices, events, vuln reports, speed-test history, settings, users, fingerprints, block schedules and saved views. Backups can be <strong>AES-256-GCM encrypted</strong> with a password, and restored from either the setup wizard or the Settings panel.</p>
+        <ul>
+          <li>Go to <strong>Settings → Data → Backup</strong> to download a backup</li>
+          <li>Go to <strong>Settings → Data → Restore</strong> or use the setup wizard to import a backup</li>
+          <li>Speed test history and person presence data are included in the backup</li>
+        </ul>
+
+        <h2 id="plugins">Plugins</h2>
+        <p>InSpectre supports a declarative plugin system for extending functionality beyond the built-in feature set. Manage plugins at <strong>Settings → Plugins</strong>.</p>
+        <ul>
+          <li><strong>Built-in plugins</strong> — ship with InSpectre; maintained by the project; can be enabled/disabled but not removed (AdGuard Home, Pi-hole, TP-Link Omada, Home Assistant, OPNsense, pfSense)</li>
+          <li><strong>Community plugins</strong> — third-party manifests; upload via Settings → Plugins → Upload Plugin</li>
+        </ul>
+        <div class="callout">A plugin is a single JSON/YAML manifest — no code. See the dedicated <a href="plugins.html">Plugin developer guide</a> for the full API surface, capabilities, event hooks and the blocking contract.</div>
+
+        <h2 id="config">Configuration overrides</h2>
+        <p>Almost everything is configured at runtime via the Settings panel. If interface auto-detection picks the wrong NIC, override it in <code class="mono">docker-compose.yml</code> (or <code class="mono">docker-compose.deploy.yml</code>):</p>
+        <div class="code">
+          <div class="code-head"><span>docker-compose.yml — probe environment</span><button data-copy>copy</button></div>
+          <pre><code><span class="c"># Uncomment to override auto-detection</span>
 IP_RANGE: <span class="p">"192.168.1.0/24"</span>
 INTERFACE: <span class="p">"eth0"</span>
 LAN_DNS_SERVER: <span class="p">"192.168.1.1"</span></code></pre>
-          </div>
-          <p>The UI updates live over a Server-Sent Events stream, so changes appear instantly without a full-page refresh.</p>
-
-          <h2 id="backup">Backup &amp; restore</h2>
-          <p>Export a full JSON backup covering devices, events, vuln reports, speed-test history, settings, users, fingerprints, block schedules and saved views. Backups can be <strong>AES-256-GCM encrypted</strong> with a password, and restored from either the setup wizard or the Settings panel.</p>
-
-          <h2 id="architecture">Architecture</h2>
-          <p>InSpectre runs as three coordinated containers:</p>
-          <table>
-            <thead><tr><th>Container</th><th>Role</th></tr></thead>
-            <tbody>
-              <tr><td><strong>frontend</strong> :3000</td><td>React + Vite SPA served by nginx; reverse-proxies the API and SSE stream</td></tr>
-              <tr><td><strong>backend</strong> :8000</td><td>FastAPI gateway — user actions, alert dispatch, scheduled scans, container/Proxmox integration</td></tr>
-              <tr><td><strong>probe</strong> :8666</td><td>Privileged, host-network — ARP sweeps, sniffing, nmap/Nuclei, ARP block/unblock</td></tr>
-            </tbody>
-          </table>
-          <p>State lives in <strong>PostgreSQL</strong>. Nothing leaves your LAN unless you enable an outbound integration (e.g. Fingerbank or a notification channel).</p>
-
-          <div class="callout" style="margin-top:36px;">
-            Looking for more detail? The <a href="https://github.com/thefunkygibbon/InSpectre/wiki" target="_blank" rel="noopener">complete Wiki</a> covers every page, setting and tool. Stuck? Head to the <a href="help.html">Help</a> page.
-          </div>
-
         </div>
+        <p>The UI updates live over a Server-Sent Events stream (backed by polling), so most changes appear without a full-page refresh.</p>
+
+        <h2 id="architecture">Architecture</h2>
+        <p>InSpectre runs as four coordinated containers:</p>
+        <table>
+          <thead><tr><th>Container</th><th>Role</th></tr></thead>
+          <tbody>
+            <tr><td><strong>frontend</strong> :3000</td><td>React + Vite SPA served by nginx; reverse-proxies the API and SSE stream</td></tr>
+            <tr><td><strong>backend</strong> :8000</td><td>FastAPI gateway — user actions, alert dispatch, scheduled scans, container/Proxmox integration</td></tr>
+            <tr><td><strong>probe</strong> :8666</td><td>Privileged, host-network — ARP sweeps, sniffing, nmap/Nuclei, ARP block/unblock</td></tr>
+            <tr><td><strong>db</strong> :5432</td><td>PostgreSQL 15 — stores all device, event, vuln, settings and user state</td></tr>
+          </tbody>
+        </table>
+        <p>Nothing leaves your LAN unless you enable an outbound integration (e.g. Fingerbank or a notification channel).</p>
+
+        <div class="callout" style="margin-top:32px;">Looking for more detail? The <a href="https://github.com/thefunkygibbon/InSpectre/wiki" target="_blank" rel="noopener">complete Wiki</a> covers every page, setting and tool. Stuck? Head to the <a href="help.html">Help</a> page.</div>
+
       </div>
     </div>
-  </section>
+
+  </main>
 
   <footer class="footer">
-    <div class="container">
-      <div class="footer-grid">
-        <div class="footer-brand">
-          <a href="index.html" class="brand-mark"><img src="assets/logo.svg" alt="" class="logo" /><span><span class="in">In</span><span class="spectre">Spectre</span></span></a>
-          <p>The self-hosted network monitor and security scanner that keeps every byte on your own hardware.</p>
-        </div>
-        <div class="footer-cols">
-          <div class="footer-col">
-            <h5>Product</h5>
-            <a href="index.html">Features</a>
-            <a href="downloads.html">Downloads</a>
-            <a href="docs.html">Documentation</a>
-          </div>
-          <div class="footer-col">
-            <h5>Resources</h5>
-            <a href="https://github.com/thefunkygibbon/InSpectre" target="_blank" rel="noopener">GitHub</a>
-            <a href="https://github.com/thefunkygibbon/InSpectre/wiki" target="_blank" rel="noopener">Wiki</a>
-            <a href="help.html">Help &amp; Support</a>
-          </div>
-          <div class="footer-col">
-            <h5>Legal</h5>
-            <a href="https://github.com/thefunkygibbon/InSpectre/blob/main/LICENSE" target="_blank" rel="noopener">AGPL-3.0 Licence</a>
-            <a href="https://github.com/thefunkygibbon/InSpectre/blob/main/LICENSE-COMMERCIAL.md" target="_blank" rel="noopener">Commercial Licence</a>
-          </div>
+    <div class="foot-inner">
+      <div class="foot-cols">
+        <a href="index.html" class="sb-session"><img src="assets/ghost-logo.svg" alt="" class="logo" /><span class="sb-name">inspectre</span></a>
+        <div class="foot-links">
+          <a href="downloads.html">downloads</a>
+          <a href="docs.html">docs</a>
+          <a href="plugins.html">plugins</a>
+          <a href="https://github.com/thefunkygibbon/InSpectre/wiki" target="_blank" rel="noopener">wiki↗</a>
+          <a href="help.html">help</a>
+          <a href="https://github.com/thefunkygibbon/InSpectre/blob/main/LICENSE" target="_blank" rel="noopener">AGPL-3.0</a>
+          <a href="https://github.com/thefunkygibbon/InSpectre/blob/main/LICENSE-COMMERCIAL.md" target="_blank" rel="noopener">commercial</a>
         </div>
       </div>
-      <div class="footer-bottom">
-        <span>© <span id="yr"></span> InSpectre. Dual-licensed AGPL-3.0 / Commercial.</span>
-        <span>Made for people who like to know what's on their network.</span>
-      </div>
+      <p class="foot-status">— © <span id="yr"></span> InSpectre · dual-licensed AGPL-3.0 / Commercial · made for people who like to know what's on their network —</p>
     </div>
   </footer>
 
-  <script>document.getElementById('yr').textContent = new Date().getFullYear();</script>
   <script src="assets/main.js"></script>
 </body>
 </html>

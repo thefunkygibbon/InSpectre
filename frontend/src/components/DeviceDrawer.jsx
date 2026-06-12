@@ -6,7 +6,7 @@ import {
   ChevronDown, ChevronRight, Square, Tag, CheckCircle2,
   FileText, Star as StarIcon, ShieldAlert, EyeOff, Eye, Layers,
   AlertTriangle, Network, Loader2, GitMerge, Radio, BellOff, Plus, Trash2,
-  TrendingUp, TrendingDown, Power,
+  TrendingUp, TrendingDown, Power, User,
 } from 'lucide-react'
 import { OnlineDot }      from './OnlineDot'
 import { StarButton }     from './StarButton'
@@ -88,21 +88,27 @@ function Collapsible({ title, icon: Icon, defaultOpen = false, children }) {
 function IpHistorySection({ mac, primaryIp, primaryIpLocked, currentIp, onPrimaryChanged }) {
   const [history,  setHistory]  = useState(null)
   const [error,    setError]    = useState(null)
-  const [loaded,   setLoaded]   = useState(false)
+  const [reloadKey, setReloadKey] = useState(0)
   const [setting,  setSetting]  = useState(null) // IP being set as primary
 
+  // Re-fetch whenever the device (mac) changes or a manual reload is requested.
+  // Previously a `loaded` flag could stick across mac changes, showing stale data.
   useEffect(() => {
-    if (loaded) return
-    setLoaded(true)
-    api.getIpHistory(mac).then(setHistory).catch(e => { setError(e.message); setHistory([]) })
-  }, [mac, loaded])
+    let cancelled = false
+    setHistory(null)
+    setError(null)
+    api.getIpHistory(mac)
+      .then(h => { if (!cancelled) setHistory(h) })
+      .catch(e => { if (!cancelled) { setError(e.message); setHistory([]) } })
+    return () => { cancelled = true }
+  }, [mac, reloadKey])
 
   async function handleSetPrimary(ip) {
     setSetting(ip)
     try {
       const res = await api.setPrimaryIp(mac, ip)
       if (onPrimaryChanged) onPrimaryChanged(res.device)
-      setLoaded(false) // force refresh
+      setReloadKey(k => k + 1) // force refresh
     } catch (e) {
       alert('Failed to set primary IP: ' + e.message)
     } finally {
@@ -521,9 +527,11 @@ function DhcpFingerprintPanel({ localDevice, mac, setLocalDevice }) {
 // Main component
 // ---------------------------------------------------------------------------
 export function DeviceDrawer({ device, onClose, onRename, onResolveName, onRefresh, onStarToggle, onMetadataUpdate, onZoneChange, vulnScanState, onVulnScanChange, initialTab }) {
-  if (!device) return null
-
-  const [localDevice,  setLocalDevice]  = useState(device)
+  // NOTE: hooks must run unconditionally. `device` is always provided by the
+  // caller (rendered only when a device is selected); `safeDevice` guards the
+  // brief transition when it is briefly null without short-circuiting hooks.
+  const safeDevice = device || {}
+  const [localDevice,  setLocalDevice]  = useState(safeDevice)
   const [resolving,    setResolving]    = useState(false)
   const [rescanning,   setRescanning]   = useState(false)
   const [activeAction, setActiveAction] = useState(null)  // 'ping' | 'traceroute' | 'rescan'
@@ -556,7 +564,7 @@ export function DeviceDrawer({ device, onClose, onRename, onResolveName, onRefre
     }
   }
 
-  useEffect(() => { setLocalDevice(device) }, [device])
+  useEffect(() => { setLocalDevice(safeDevice) }, [device])
 
   const stream = useStreamAction()
 
@@ -826,35 +834,37 @@ export function DeviceDrawer({ device, onClose, onRename, onResolveName, onRefre
                     ? (localDevice.is_blocked ? 'Unblocking…' : 'Blocking…')
                     : (localDevice.is_blocked ? 'Unblock device' : 'Block internet access')}
                 </button>
-                <button
-                  onClick={handleIgnoreToggle}
-                  disabled={ignoring}
-                  className={`mt-2 w-full flex items-center justify-center gap-2 py-2 rounded-lg
-                             border text-xs font-medium transition-colors duration-150
-                             ${localDevice.is_ignored
-                               ? 'border-brand/40 bg-brand/10 text-brand hover:bg-brand/20'
-                               : 'border-border bg-surface-offset text-text-muted hover:text-text hover:border-border'
-                             }
-                             ${ignoring ? 'opacity-60 cursor-wait' : ''}`}>
-                  {localDevice.is_ignored
-                    ? <><Eye size={12} /> Un-ignore device</>
-                    : <><EyeOff size={12} /> Ignore device</>}
-                </button>
-                <button
-                  onClick={handleSuppressPresenceToggle}
-                  disabled={suppressingPresence}
-                  className={`mt-2 w-full flex items-center justify-center gap-2 py-2 rounded-lg
-                             border text-xs font-medium transition-colors duration-150
-                             ${localDevice.suppress_presence_events
-                               ? 'border-yellow-500/40 bg-yellow-500/10 text-yellow-400 hover:bg-yellow-500/20'
-                               : 'border-border bg-surface-offset text-text-muted hover:text-text hover:border-border'
-                             }
-                             ${suppressingPresence ? 'opacity-60 cursor-wait' : ''}`}>
-                  <BellOff size={12} className={suppressingPresence ? 'animate-pulse' : ''} />
-                  {localDevice.suppress_presence_events
-                    ? 'Resume presence events'
-                    : 'Suppress presence events'}
-                </button>
+                <div className="mt-2 flex items-stretch gap-2">
+                  <button
+                    onClick={handleIgnoreToggle}
+                    disabled={ignoring}
+                    className={`flex-1 flex items-center justify-center gap-2 py-2 rounded-lg
+                               border text-xs font-medium transition-colors duration-150
+                               ${localDevice.is_ignored
+                                 ? 'border-brand/40 bg-brand/10 text-brand hover:bg-brand/20'
+                                 : 'border-border bg-surface-offset text-text-muted hover:text-text hover:border-border'
+                               }
+                               ${ignoring ? 'opacity-60 cursor-wait' : ''}`}>
+                    {localDevice.is_ignored
+                      ? <><Eye size={12} /> Un-ignore</>
+                      : <><EyeOff size={12} /> Ignore</>}
+                  </button>
+                  <button
+                    onClick={handleSuppressPresenceToggle}
+                    disabled={suppressingPresence}
+                    className={`flex-1 flex items-center justify-center gap-2 py-2 rounded-lg
+                               border text-xs font-medium transition-colors duration-150
+                               ${localDevice.suppress_presence_events
+                                 ? 'border-yellow-500/40 bg-yellow-500/10 text-yellow-400 hover:bg-yellow-500/20'
+                                 : 'border-border bg-surface-offset text-text-muted hover:text-text hover:border-border'
+                               }
+                               ${suppressingPresence ? 'opacity-60 cursor-wait' : ''}`}>
+                    <BellOff size={12} className={suppressingPresence ? 'animate-pulse' : ''} />
+                    {localDevice.suppress_presence_events
+                      ? 'Resume presence'
+                      : 'Suppress presence'}
+                  </button>
+                </div>
                 <StreamOutput
                   lines={termLines}
                   running={termRunning}
@@ -913,6 +923,16 @@ export function DeviceDrawer({ device, onClose, onRename, onResolveName, onRefre
                   setLocalDevice(prev => ({ ...prev, zone }))
                   if (onZoneChange) onZoneChange(zone)
                 }} />
+                {localDevice.person_name && (
+                  <Row label="Person assigned"
+                    value={
+                      <span className="flex items-center gap-1.5">
+                        <User size={11} style={{ color: 'var(--color-brand)' }} />
+                        <span>{localDevice.person_name}</span>
+                      </span>
+                    }
+                  />
+                )}
                 {localDevice.miss_count  !== undefined && <Row label="Miss count" value={localDevice.miss_count} />}
               </Collapsible>
 
@@ -1093,7 +1113,7 @@ export function DeviceDrawer({ device, onClose, onRename, onResolveName, onRefre
                 <Clock size={14} className="text-brand" />
                 <h3 className="text-xs font-semibold text-text-muted uppercase tracking-wider">Event Timeline</h3>
               </div>
-              <DeviceTimeline mac={mac} />
+              <DeviceTimeline mac={mac} groupMembers={localDevice.group_members} />
             </>
           )}
 

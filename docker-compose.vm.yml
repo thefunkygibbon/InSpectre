@@ -29,6 +29,7 @@ services:
     environment:
       - DATABASE_URL=postgresql://${POSTGRES_USER:-inspectre}:${POSTGRES_PASSWORD:-inspectre}@db:5432/${POSTGRES_DB:-inspectre}
       - SECRET_KEY=${SECRET_KEY:-your-secret-key}
+      - PROBE_API_SECRET=${PROBE_API_SECRET:-c31106d3c582c5f6ea86edb5bd8c86037ec063e47eb319326ea6fd6e195fb195}
       - ENVIRONMENT=${ENVIRONMENT:-production}
       - PROBE_API_URL=http://host.docker.internal:8666
       - CORS_ORIGINS=${CORS_ORIGINS:-http://localhost:3000}
@@ -61,6 +62,7 @@ services:
       - NMAP_ARGS=${NMAP_ARGS:--sT -O --osscan-limit -T4}
       - PROBE_API_PORT=${PROBE_API_PORT:-8666}
       - PYTHONUNBUFFERED=1
+      - PROBE_API_SECRET=${PROBE_API_SECRET:-c31106d3c582c5f6ea86edb5bd8c86037ec063e47eb319326ea6fd6e195fb195}
       - NMAP_OPTS=
     volumes:
       - ./data/vuln/nuclei:/root/nuclei-templates

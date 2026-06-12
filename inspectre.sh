@@ -56,6 +56,13 @@ log() {
   echo "[InSpectre] $*"
 }
 
+sync_version() {
+  if [[ -x "$SCRIPT_DIR/scripts/sync-version.sh" ]]; then
+    log "Stamping version from VERSION file into all components..."
+    "$SCRIPT_DIR/scripts/sync-version.sh" || log "WARN: version sync failed (continuing)."
+  fi
+}
+
 remove_project_images() {
   log "Removing local project images if present..."
   docker image rm "${PROJECT_NAME}-probe" "${PROJECT_NAME}-web" "${PROJECT_NAME}-backend" 2>/dev/null || true
@@ -66,7 +73,6 @@ remove_project_images() {
 
 full_rebuild() {
   local keep_data="${1:-false}"
-
   log "Working directory: $SCRIPT_DIR"
   log "This rebuild uses the LOCAL files currently in this folder."
   log "No git fetch/pull/reset will be performed."
@@ -102,6 +108,7 @@ full_rebuild() {
   docker builder prune -af || true
 
   log "Rebuilding from LOCAL source with no cache..."
+  sync_version
   "${COMPOSE_CMD[@]}" build --no-cache --pull
 
   log "Starting fresh stack..."

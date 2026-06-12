@@ -2,7 +2,7 @@ from fastapi import FastAPI, HTTPException, Depends, UploadFile, File, Query, Se
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, Response, JSONResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from sqlalchemy import create_engine, text
+from sqlalchemy import create_engine, text, or_
 from sqlalchemy.orm import sessionmaker, Session
 from pydantic import BaseModel
 from typing import Optional, List
@@ -28,6 +28,7 @@ import bcrypt as _bcrypt
 from jose import JWTError, jwt
 
 from models import Base, Device, DeviceEvent, FingerprintEntry, Setting, TrafficStat, VulnReport
+from _version import __version__ as VERSION
 from plugin_engine import (
     PluginRegistry, PluginRunner, PluginEventBus, PluginScheduler,
     validate_manifest, PluginValidationError,
@@ -44,10 +45,42 @@ PROBE_URL    = (
     or "http://host.docker.internal:8666"
 )
 
+# Shared secret used to authenticate backend -> probe API calls. When set (via the
+# PROBE_API_SECRET env var, which is shared with the probe container), the backend
+# attaches it as an X-Probe-Secret header on every probe request. When unset, no
+# header is sent and the probe accepts requests unauthenticated (backward compatible).
+PROBE_API_SECRET = os.environ.get("PROBE_API_SECRET", "").strip()
+
+def _probe_headers(extra: Optional[dict] = None) -> dict:
+    """Return headers for a backend->probe request, including the shared secret."""
+    headers = dict(extra) if extra else {}
+    if PROBE_API_SECRET:
+        headers["X-Probe-Secret"] = PROBE_API_SECRET
+    return headers
+
+def _probe_client(**kwargs):
+    """httpx.AsyncClient pre-configured with the probe shared-secret header.
+
+    Use this for ALL backend->probe calls so the X-Probe-Secret header is sent
+    automatically. Never use it for calls to external/third-party services.
+    """
+    if PROBE_API_SECRET:
+        headers = dict(kwargs.pop("headers", {}) or {})
+        headers.setdefault("X-Probe-Secret", PROBE_API_SECRET)
+        kwargs["headers"] = headers
+    return httpx.AsyncClient(**kwargs)
+
 # ---------------------------------------------------------------------------
 # Auth configuration
 # ---------------------------------------------------------------------------
-SECRET_KEY   = os.environ.get("SECRET_KEY", "CHANGE_ME_IN_PRODUCTION_use_a_long_random_string")
+_DEFAULT_SECRET_KEY = "CHANGE_ME_IN_PRODUCTION_use_a_long_random_string"
+SECRET_KEY   = os.environ.get("SECRET_KEY", _DEFAULT_SECRET_KEY)
+if SECRET_KEY == _DEFAULT_SECRET_KEY:
+    raise RuntimeError(
+        "SECRET_KEY is set to the insecure default placeholder. Refusing to start. "
+        "Set the SECRET_KEY environment variable to a long, random secret "
+        "(e.g. `openssl rand -hex 32`)."
+    )
 ALGORITHM    = "HS256"
 TOKEN_EXPIRE_DEFAULT  = 60 * 24       # minutes — 24 hours
 TOKEN_EXPIRE_REMEMBER = 60 * 24 * 30  # minutes — 30 days
@@ -488,6 +521,7 @@ def _migrate(db: Session):
         "ALTER TABLE devices ADD COLUMN IF NOT EXISTS group_id      UUID",
         "ALTER TABLE devices ADD COLUMN IF NOT EXISTS group_primary BOOLEAN NOT NULL DEFAULT FALSE",
         "ALTER TABLE devices ADD COLUMN IF NOT EXISTS group_manual  BOOLEAN NOT NULL DEFAULT FALSE",
+        "ALTER TABLE devices ADD COLUMN IF NOT EXISTS auto_group_optout BOOLEAN NOT NULL DEFAULT FALSE",
         "CREATE INDEX IF NOT EXISTS ix_devices_group_id ON devices(group_id)",
         # Phase 10 — device acknowledgement
         "ALTER TABLE devices ADD COLUMN IF NOT EXISTS is_acknowledged BOOLEAN NOT NULL DEFAULT FALSE",
@@ -620,6 +654,7 @@ DEFAULT_SETTINGS = {
     "block_plugin_id": ("",    "Plugin ID used for blocking when block_method is not arp. Must be an enabled plugin with blocking capability and block_client/unblock_client actions defined."),
     # Phase 9 — device grouping
     "auto_group_by_hostname":    ("true",  "Automatically group devices with the same hostname as the same physical device on a different interface (e.g. laptop switching between WiFi and Ethernet). When disabled, a suggestion event is written instead."),
+    "scan_grouped_members":      ("false", "Also port-scan and vulnerability-scan the IP of every interface in a device group. By default only the group's primary interface is scanned, since grouped interfaces belong to the same physical host. Enable to scan each interface IP separately."),
     # Network / probe identity
     "dns_server":                ("",      "LAN DNS server IP (auto-detected if blank). Set this to your router's IP for best hostname resolution."),
     "probe_interface":           ("",      "Network interface the probe uses for scanning (e.g. eth0, eno1). Auto-detected on startup if blank; changes apply immediately via Settings → Apply."),
@@ -748,7 +783,7 @@ async def _run_single_vuln_scan(mac: str, ip: str, scripts: str):
     probe_url = f"{PROBE_URL}/stream/vuln-scan/{ip}"
     params    = {"templates": scripts} if scripts else {}
     try:
-        async with httpx.AsyncClient(timeout=None) as client:
+        async with _probe_client(timeout=None) as client:
             async with client.stream("GET", probe_url, params=params) as resp:
                 if resp.status_code != 200:
                     print(f"[scheduler] Vuln scan {ip} HTTP {resp.status_code}", flush=True)
@@ -769,6 +804,20 @@ async def _run_single_vuln_scan(mac: str, ip: str, scripts: str):
         print(f"[scheduler] Scan error {ip}: {exc}", flush=True)
 
 
+def _scan_grouped_members_enabled(db) -> bool:
+    """True when grouped (non-primary) interface IPs should also be scanned."""
+    s = db.get(Setting, "scan_grouped_members")
+    return bool(s and (s.value or "").strip().lower() in ("true", "1", "yes"))
+
+
+def _exclude_grouped_secondaries(q, db):
+    """Filter out non-primary group members from a Device query unless the
+    scan_grouped_members setting is enabled (grouped interfaces share a host)."""
+    if _scan_grouped_members_enabled(db):
+        return q
+    return q.filter(or_(Device.group_id == None, Device.group_primary == True))
+
+
 async def _run_scheduled_vuln_scans():
     db = SessionLocal()
     try:
@@ -779,6 +828,7 @@ async def _run_scheduled_vuln_scans():
         q = db.query(Device).filter(Device.is_online == True, Device.ip_address != None, Device.is_ignored == False)
         if targets == "important":
             q = q.filter(Device.is_important == True)
+        q = _exclude_grouped_secondaries(q, db)
         devices = [(d.mac_address, d.ip_address) for d in q.all()]
     finally:
         db.close()
@@ -800,6 +850,7 @@ async def _run_scheduled_vuln_scans_for_day(day_of_week: int):
         q = db.query(Device).filter(Device.is_online == True, Device.ip_address != None, Device.is_ignored == False)
         if targets == "important":
             q = q.filter(Device.is_important == True)
+        q = _exclude_grouped_secondaries(q, db)
         all_devices = [(d.mac_address, d.ip_address) for d in q.all()]
     finally:
         db.close()
@@ -820,12 +871,11 @@ async def _run_all_vuln_scans():
     try:
         settings_s = db.get(Setting, "vuln_scan_templates")
         scripts    = (settings_s.value or "").strip() if settings_s else ""
-        devices    = [(d.mac_address, d.ip_address)
-                      for d in db.query(Device)
-                                 .filter(Device.is_online == True,
+        _q_all = db.query(Device).filter(Device.is_online == True,
                                          Device.ip_address != None,
                                          Device.is_ignored == False)
-                                 .all()]
+        _q_all = _exclude_grouped_secondaries(_q_all, db)
+        devices    = [(d.mac_address, d.ip_address) for d in _q_all.all()]
     finally:
         db.close()
 
@@ -1672,7 +1722,7 @@ async def _traffic_flush_loop():
     await asyncio.sleep(60)  # startup grace
     while True:
         try:
-            async with httpx.AsyncClient(timeout=10.0) as client:
+            async with _probe_client(timeout=10.0) as client:
                 resp = await client.get(f"{PROBE_URL}/traffic/stats")
                 if resp.status_code == 200:
                     data = resp.json()
@@ -1744,7 +1794,7 @@ async def _run_speedtest_and_save():
     try:
         result: dict = {}
         raw_lines: list[str] = []
-        async with httpx.AsyncClient(timeout=180) as client:
+        async with _probe_client(timeout=180) as client:
             async with client.stream("GET", f"{PROBE_URL}/stream/tools/speedtest") as resp:
                 async for line in resp.aiter_lines():
                     if line.startswith("data: RESULT:"):
@@ -2728,7 +2778,7 @@ def _add_event(db: Session, mac: str, event_type: str, detail: dict = None):
 # ---------------------------------------------------------------------------
 @app.get("/")
 def root():
-    return {"message": "InSpectre API", "version": "1.0.0"}
+    return {"message": "InSpectre API", "version": VERSION}
 
 
 # ---------------------------------------------------------------------------
@@ -2766,7 +2816,7 @@ async def health_check(db: Session = Depends(get_db)):
 
     # Check probe
     try:
-        async with httpx.AsyncClient(timeout=5.0) as client:
+        async with _probe_client(timeout=5.0) as client:
             resp = await client.get(f"{PROBE_URL}/health")
             if resp.status_code == 200:
                 probe_data = resp.json()
@@ -2899,7 +2949,7 @@ async def setup_network_info():
     """Proxy network detection to the probe — it runs on the host network so its
     interface/route/IP info reflects the real LAN, not the Docker bridge."""
     try:
-        async with httpx.AsyncClient(timeout=5.0) as client:
+        async with _probe_client(timeout=5.0) as client:
             r = await client.get(f"{PROBE_URL}/network/info")
             r.raise_for_status()
             return r.json()
@@ -3114,18 +3164,21 @@ def list_devices(
             group_map.setdefault(str(gid), []).append(d)
 
     group_representative: dict[str, str] = {}  # group_id_str -> mac
+    group_any_online:      dict[str, bool] = {}  # group_id_str -> any member online
     for gid_str, members in group_map.items():
         online_members  = [m for m in members if m.is_online]
         primary_members = [m for m in members if getattr(m, "group_primary", False)]
-        if len(online_members) == 1:
-            rep = online_members[0].mac_address
-        elif len(online_members) > 1:
-            rep = primary_members[0].mac_address if primary_members else online_members[0].mac_address
-        elif primary_members:
+        # The user-selected primary always represents the group, so its
+        # name / IP / MAC are what appear in the device list. Fall back to an
+        # online member, then to any member, when no primary is set.
+        if primary_members:
             rep = primary_members[0].mac_address
+        elif online_members:
+            rep = online_members[0].mac_address
         else:
             rep = members[0].mac_address
         group_representative[gid_str] = rep
+        group_any_online[gid_str]     = bool(online_members)
 
     hidden_macs: set = {
         m.mac_address
@@ -3170,6 +3223,10 @@ def list_devices(
             ]
             dct["group_size"]              = len(members)
             dct["is_group_representative"] = True
+            # A grouped device is one physical host on multiple interfaces, so it
+            # is "online" whenever ANY member interface is up — this prevents the
+            # representative flapping offline when the host switches interfaces.
+            dct["is_online"] = group_any_online.get(gid_str, dct.get("is_online"))
         pid = dct.get("person_id")
         if pid:
             dct["person_name"] = person_name_map.get(pid)
@@ -3297,7 +3354,7 @@ async def resolve_name(mac: str, db: Session = Depends(get_db)):
     name = None
     if ip:
         try:
-            async with httpx.AsyncClient(timeout=15.0) as client:
+            async with _probe_client(timeout=15.0) as client:
                 r = await client.get(f"{PROBE_URL}/resolve/{ip}")
                 if r.status_code == 200:
                     name = r.json().get("hostname")
@@ -3318,7 +3375,7 @@ async def resolve_all_names(db: Session = Depends(get_db)):
     ).all()
     updated = 0
     failed = 0
-    async with httpx.AsyncClient(timeout=15.0) as client:
+    async with _probe_client(timeout=15.0) as client:
         for d in devices:
             ip = d.ip_address
             if not ip:
@@ -3345,7 +3402,7 @@ async def rescan_device(mac: str, db: Session = Depends(get_db)):
     db.commit()
     # Ask the probe to start scanning immediately rather than waiting for the next sweep
     try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
+        async with _probe_client(timeout=10.0) as client:
             await client.post(f"{PROBE_URL}/rescan/{mac.lower()}")
     except Exception:
         pass  # probe will pick it up on next sweep if unreachable
@@ -3452,7 +3509,7 @@ def set_primary_ip(mac: str, payload: PrimaryIPUpdate, db: Session = Depends(get
     db.refresh(d)
 
     try:
-        httpx.post(f"{PROBE_URL}/rescan/{mac.lower()}", timeout=10.0)
+        httpx.post(f"{PROBE_URL}/rescan/{mac.lower()}", timeout=10.0, headers=_probe_headers())
     except Exception:
         pass
 
@@ -3607,7 +3664,7 @@ def add_to_group(mac: str, body: GroupAddRequest, db: Session = Depends(get_db))
     # Mark the whole group as manually curated so auto-grouping cleanup never
     # dissolves it (manual groups may legitimately span different DNS hostnames).
     db.execute(
-        text("UPDATE devices SET group_manual = true WHERE group_id = :gid"),
+        text("UPDATE devices SET group_manual = true, auto_group_optout = false WHERE group_id = :gid"),
         {"gid": new_gid},
     )
     db.commit()
@@ -3624,7 +3681,7 @@ def remove_from_group(mac: str, db: Session = Depends(get_db)):
     if not group_id:
         return {"ok": True}
     db.execute(
-        text("UPDATE devices SET group_id = NULL, group_primary = FALSE, group_manual = FALSE WHERE mac_address = :mac"),
+        text("UPDATE devices SET group_id = NULL, group_primary = FALSE, group_manual = FALSE, auto_group_optout = TRUE WHERE mac_address = :mac"),
         {"mac": mac_lower},
     )
     # If only one member remains, dissolve the group
@@ -3712,7 +3769,7 @@ async def stream_vuln_scan(mac: str, db: Session = Depends(get_db)):
                     await sub_q.put(line)
 
             try:
-                async with httpx.AsyncClient(timeout=None) as client:
+                async with _probe_client(timeout=None) as client:
                     async with client.stream("GET", probe_url, params=params) as resp:
                         if resp.status_code != 200:
                             body = await resp.aread()
@@ -3958,7 +4015,7 @@ async def refresh_device_mdns(mac: str, db: Session = Depends(get_db)):
     if not d:
         raise HTTPException(404, "Device not found")
     try:
-        async with httpx.AsyncClient(timeout=35.0) as client:
+        async with _probe_client(timeout=35.0) as client:
             resp = await client.post(f"{PROBE_URL}/mdns/refresh")
             resp.raise_for_status()
     except httpx.ConnectError:
@@ -3974,7 +4031,7 @@ async def refresh_device_mdns(mac: str, db: Session = Depends(get_db)):
 async def network_mdns_scan():
     """Trigger a network-wide active mDNS browse."""
     try:
-        async with httpx.AsyncClient(timeout=25.0) as client:
+        async with _probe_client(timeout=25.0) as client:
             resp = await client.post(f"{PROBE_URL}/mdns/refresh")
             resp.raise_for_status()
             return resp.json()
@@ -3988,7 +4045,7 @@ async def network_mdns_scan():
 async def network_ssdp_scan():
     """Trigger a network-wide active SSDP M-SEARCH."""
     try:
-        async with httpx.AsyncClient(timeout=20.0) as client:
+        async with _probe_client(timeout=20.0) as client:
             resp = await client.post(f"{PROBE_URL}/ssdp/refresh")
             resp.raise_for_status()
             return resp.json()
@@ -4504,13 +4561,13 @@ async def apply_settings(db: Session = Depends(get_db)):
         "enable_service_fingerprinting", "enable_mdns",
         "enable_nightly_scan", "enable_unscanned_retry",
         "probe_interface", "dns_server",
-        "auto_group_by_hostname",
+        "auto_group_by_hostname", "scan_grouped_members",
     ):
         if key in settings:
             payload[key] = settings[key]
 
     try:
-        async with httpx.AsyncClient(timeout=15.0) as client:
+        async with _probe_client(timeout=15.0) as client:
             resp = await client.post(f"{PROBE_URL}/config/reload", json=payload)
             body = resp.json() if resp.headers.get("content-type", "").startswith("application/json") else {"raw": resp.text}
             if resp.status_code >= 400:
@@ -4524,7 +4581,7 @@ async def apply_settings(db: Session = Depends(get_db)):
 async def restart_probe(username: str = Depends(get_current_user)):
     """Tell the probe to exit — Docker restart policy brings it back."""
     try:
-        async with httpx.AsyncClient(timeout=5.0) as client:
+        async with _probe_client(timeout=5.0) as client:
             r = await client.post(f"{PROBE_URL}/restart")
             r.raise_for_status()
             return {"ok": True}
@@ -4631,7 +4688,7 @@ async def _execute_block(mac: str, ip: Optional[str], db: Session, action: str) 
 
     if method == "arp":
         try:
-            async with httpx.AsyncClient(timeout=15.0) as client:
+            async with _probe_client(timeout=15.0) as client:
                 if action == "block":
                     resp = await client.post(f"{PROBE_URL}/block/{mac.lower()}")
                 else:
@@ -4673,7 +4730,7 @@ async def _execute_block_bg(mac: str, ip: Optional[str], action: str) -> None:
 
     if method == "arp":
         try:
-            async with httpx.AsyncClient(timeout=10) as c:
+            async with _probe_client(timeout=10) as c:
                 if action == "block":
                     await c.post(f"{PROBE_URL}/block/{mac.lower()}")
                 else:
@@ -5990,7 +6047,7 @@ async def stream_ping(mac: str, db: Session = Depends(get_db)):
 
     async def _gen():
         try:
-            async with httpx.AsyncClient(timeout=None) as client:
+            async with _probe_client(timeout=None) as client:
                 async with client.stream("GET", f"{PROBE_URL}/stream/ping/{target_ip}") as resp:
                     async for line in resp.aiter_lines():
                         yield f"{line}\n"
@@ -6039,7 +6096,7 @@ async def stream_traceroute(mac: str, db: Session = Depends(get_db)):
 
     async def _gen():
         try:
-            async with httpx.AsyncClient(timeout=None) as client:
+            async with _probe_client(timeout=None) as client:
                 async with client.stream("GET", f"{PROBE_URL}/stream/traceroute/{trace_ip}") as resp:
                     async for line in resp.aiter_lines():
                         yield f"{line}\n"
@@ -6068,11 +6125,43 @@ def _validate_tool_host(host: str):
         raise HTTPException(400, "Invalid host")
 
 
+def _reject_ssrf_target(host: str):
+    """Block SSRF to dangerous local ranges (loopback, link-local incl. cloud
+    metadata 169.254.169.254, multicast, reserved). Private/LAN ranges remain
+    allowed because inspecting LAN hosts is a core feature of this tool."""
+    if not host:
+        raise HTTPException(400, "Invalid host")
+    candidates = []
+    try:
+        candidates = [_ipaddress.ip_address(host)]
+    except ValueError:
+        try:
+            infos = socket.getaddrinfo(host, None)
+            for info in infos:
+                try:
+                    candidates.append(_ipaddress.ip_address(info[4][0]))
+                except ValueError:
+                    continue
+        except socket.gaierror:
+            return  # let the actual request surface the DNS error
+    for addr in candidates:
+        if (addr.is_loopback or addr.is_link_local or addr.is_multicast
+                or addr.is_reserved or addr.is_unspecified):
+            raise HTTPException(400, "Refusing to connect to a restricted address")
+
+
 def _validate_tool_url(url: str):
     if not url or not (url.startswith("http://") or url.startswith("https://")):
         raise HTTPException(400, "URL must start with http:// or https://")
     if len(url) > 2048:
         raise HTTPException(400, "URL too long")
+    try:
+        parsed = urlparse(url)
+    except Exception:
+        raise HTTPException(400, "Invalid URL")
+    if not parsed.hostname:
+        raise HTTPException(400, "Invalid URL host")
+    _reject_ssrf_target(parsed.hostname)
 
 
 @app.get("/tools/ping")
@@ -6081,7 +6170,7 @@ async def tools_ping(host: str = Query(...)):
 
     async def _gen():
         try:
-            async with httpx.AsyncClient(timeout=None) as client:
+            async with _probe_client(timeout=None) as client:
                 async with client.stream("GET", f"{PROBE_URL}/stream/tools/ping",
                                          params={"host": host}) as resp:
                     async for line in resp.aiter_lines():
@@ -6101,7 +6190,7 @@ async def tools_traceroute(host: str = Query(...)):
 
     async def _gen():
         try:
-            async with httpx.AsyncClient(timeout=None) as client:
+            async with _probe_client(timeout=None) as client:
                 async with client.stream("GET", f"{PROBE_URL}/stream/tools/traceroute",
                                          params={"host": host}) as resp:
                     async for line in resp.aiter_lines():
@@ -6123,7 +6212,7 @@ async def tools_portscan(host: str = Query(...), ports: str = Query("1-1024")):
 
     async def _gen():
         try:
-            async with httpx.AsyncClient(timeout=None) as client:
+            async with _probe_client(timeout=None) as client:
                 async with client.stream("GET", f"{PROBE_URL}/stream/tools/portscan",
                                          params={"host": host, "ports": ports}) as resp:
                     async for line in resp.aiter_lines():
@@ -6356,7 +6445,7 @@ async def tools_email(domain: str = Query(...)):
 @app.get("/tools/arp-lookup")
 async def tools_arp_lookup(query: str = Query(...)):
     try:
-        async with httpx.AsyncClient(timeout=10) as client:
+        async with _probe_client(timeout=10) as client:
             resp = await client.get(f"{PROBE_URL}/tools/arp-table")
             data = resp.json()
         entries = data.get("entries", [])
@@ -6374,7 +6463,7 @@ class WolPayload(BaseModel):
 @app.post("/tools/wake-on-lan")
 async def tools_wake_on_lan(payload: WolPayload):
     try:
-        async with httpx.AsyncClient(timeout=10) as client:
+        async with _probe_client(timeout=10) as client:
             resp = await client.post(f"{PROBE_URL}/tools/wake-on-lan",
                                      json={"mac": payload.mac, "broadcast": payload.broadcast})
             return resp.json()
@@ -6740,7 +6829,7 @@ async def stream_speedtest_proxy(server_id: str = ""):
 
     async def _gen():
         try:
-            async with httpx.AsyncClient(timeout=None) as client:
+            async with _probe_client(timeout=None) as client:
                 async with client.stream("GET", probe_url, params=params) as resp:
                     if resp.status_code != 200:
                         yield f"data: ERROR Probe returned {resp.status_code}\n\n"
@@ -6786,7 +6875,7 @@ async def stream_speedtest_proxy(server_id: str = ""):
 @app.get("/tools/speedtest-servers")
 async def get_speedtest_servers():
     try:
-        async with httpx.AsyncClient(timeout=60) as client:
+        async with _probe_client(timeout=60) as client:
             resp = await client.get(f"{PROBE_URL}/tools/speedtest-servers")
             return resp.json()
     except Exception as exc:
@@ -6933,19 +7022,26 @@ def _person_row_to_dict(row, devices=None, schedules=None) -> dict:
     task = _person_timed_blocks.get(pid)
     if task and not task.done():
         timed_block_remaining = True  # active timed block
+    # Derive last status change from the most recent device status_changed_at
+    status_changed_at = None
+    for d in devs:
+        sc = d.get("status_changed_at")
+        if sc and (status_changed_at is None or sc > status_changed_at):
+            status_changed_at = sc
     return {
-        "id":                   pid,
-        "name":                 row[1],
-        "primary_mac":          primary_mac,
-        "photo":                row[3],
-        "notes":                row[4],
-        "created_at":           row[5].isoformat() if row[5] else None,
-        "updated_at":           row[6].isoformat() if row[6] else None,
-        "is_home":              is_home,
-        "is_blocked":           is_blocked,
-        "has_timed_block":      timed_block_remaining is not None,
-        "devices":              devs,
-        "schedules":            schedules or [],
+        "id":                    pid,
+        "name":                  row[1],
+        "primary_mac":           primary_mac,
+        "photo":                 row[3],
+        "notes":                 row[4],
+        "created_at":            row[5].isoformat() if row[5] else None,
+        "updated_at":            row[6].isoformat() if row[6] else None,
+        "is_home":               is_home,
+        "is_blocked":            is_blocked,
+        "has_timed_block":       timed_block_remaining is not None,
+        "last_status_changed_at": status_changed_at,
+        "devices":               devs,
+        "schedules":             schedules or [],
     }
 
 
@@ -6958,15 +7054,17 @@ def list_persons(db: Session = Depends(get_db)):
     dev_rows = db.execute(text("""
         SELECT pd.person_id::text, d.mac_address, d.is_online,
                COALESCE(d.custom_name, d.hostname, d.ip_address) AS display_name,
-               d.ip_address, d.device_type_override, d.vendor, d.is_blocked
+               d.ip_address, d.device_type_override, d.vendor, d.is_blocked,
+               d.status_changed_at
         FROM person_devices pd
         JOIN devices d ON d.mac_address = pd.mac_address
     """)).fetchall()
     devs_by_person: dict = {}
     for r in dev_rows:
         devs_by_person.setdefault(r[0], []).append({
-            "mac_address":  r[1], "is_online": r[2], "display_name": r[3],
-            "ip_address":   r[4], "device_type": r[5], "vendor": r[6], "is_blocked": bool(r[7]),
+            "mac_address":        r[1], "is_online": r[2], "display_name": r[3],
+            "ip_address":         r[4], "device_type": r[5], "vendor": r[6], "is_blocked": bool(r[7]),
+            "status_changed_at":  r[8].isoformat() if r[8] else None,
         })
     # Fetch person-targeted schedules (both person_id and person_ids)
     try:
@@ -7087,22 +7185,30 @@ def get_persons_timeline(days: int = Query(7, ge=1, le=365), db: Session = Depen
         ss      = window_start
         st      = initial
         home_ms = 0.0
+        known_ms = 0.0
 
         for ev in evts:
             se = ev["ts"]
             if se > ss:
                 segs.append({"from": ss.isoformat(), "to": se.isoformat(), "status": st})
+                dur = (se - ss).total_seconds() * 1000
                 if st == "online":
-                    home_ms += (se - ss).total_seconds() * 1000
+                    home_ms += dur
+                if st != "unknown":
+                    known_ms += dur
             ss = se
             st = "online" if ev["type"] in ("online", "joined") else "offline"
 
         segs.append({"from": ss.isoformat(), "to": now.isoformat(), "status": st})
+        final_dur = (now - ss).total_seconds() * 1000
         if st == "online":
-            home_ms += (now - ss).total_seconds() * 1000
+            home_ms += final_dur
+        if st != "unknown":
+            known_ms += final_dur
 
-        total_ms   = (now - window_start).total_seconds() * 1000
-        home_pct   = round((home_ms / total_ms) * 100) if total_ms > 0 else 0
+        # Percentage is computed over the period we actually have data for
+        # (i.e. since the device/person was first known), not the whole window.
+        home_pct   = round((home_ms / known_ms) * 100) if known_ms > 0 else 0
         return segs, home_pct
 
     result = []
@@ -7335,7 +7441,7 @@ async def network_pause(db: Session = Depends(get_db)):
     errors = []
     async def _block_one(mac: str, ip: str):
         try:
-            async with httpx.AsyncClient(timeout=10.0) as client:
+            async with _probe_client(timeout=10.0) as client:
                 await client.post(f"{PROBE_URL}/block/{mac.lower()}")
         except Exception as e:
             errors.append(str(e))
@@ -7358,7 +7464,7 @@ async def network_resume(db: Session = Depends(get_db)):
     errors = []
     async def _unblock_one(mac: str):
         try:
-            async with httpx.AsyncClient(timeout=10.0) as client:
+            async with _probe_client(timeout=10.0) as client:
                 await client.delete(f"{PROBE_URL}/block/{mac.lower()}")
         except Exception as e:
             errors.append(str(e))
@@ -7700,7 +7806,7 @@ async def traffic_start(mac: str, db: Session = Depends(get_db)):
     max_s = db.get(Setting, "traffic_max_sessions")
     max_sessions = int(max_s.value) if max_s and max_s.value else 10
     try:
-        async with httpx.AsyncClient(timeout=5.0) as client:
+        async with _probe_client(timeout=5.0) as client:
             active_resp = await client.get(f"{PROBE_URL}/traffic/stats")
         if active_resp.status_code == 200:
             active_count = len(active_resp.json().get("sessions", []))
@@ -7709,7 +7815,7 @@ async def traffic_start(mac: str, db: Session = Depends(get_db)):
     except (httpx.ConnectError, httpx.TimeoutException):
         pass
     try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
+        async with _probe_client(timeout=10.0) as client:
             resp = await client.post(f"{PROBE_URL}/traffic/start/{ip}")
         if resp.status_code == 409:
             raise HTTPException(409, resp.json().get("detail", "Conflict"))
@@ -7732,7 +7838,7 @@ async def traffic_stop(mac: str, db: Session = Depends(get_db)):
     if not ip:
         return {"ok": True, "was_monitoring": False}
     try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
+        async with _probe_client(timeout=10.0) as client:
             resp = await client.delete(f"{PROBE_URL}/traffic/stop/{ip}")
         if resp.status_code not in (200, 204):
             raise HTTPException(502, f"Probe returned {resp.status_code}")
@@ -7746,7 +7852,7 @@ async def traffic_stop(mac: str, db: Session = Depends(get_db)):
 @app.get("/traffic/active")
 async def traffic_active():
     try:
-        async with httpx.AsyncClient(timeout=8.0) as client:
+        async with _probe_client(timeout=8.0) as client:
             resp = await client.get(f"{PROBE_URL}/traffic/stats")
         if resp.status_code != 200:
             return {"sessions": []}
@@ -7762,7 +7868,7 @@ async def traffic_live(mac: str, db: Session = Depends(get_db)):
     if not device:
         raise HTTPException(404, "Device not found")
     try:
-        async with httpx.AsyncClient(timeout=8.0) as client:
+        async with _probe_client(timeout=8.0) as client:
             resp = await client.get(f"{PROBE_URL}/traffic/stats/{mac}")
         if resp.status_code == 404:
             raise HTTPException(404, "No active monitor for this device")
@@ -7841,7 +7947,7 @@ async def traffic_summary(db: Session = Depends(get_db)):
     ).fetchone()
     active_count = 0
     try:
-        async with httpx.AsyncClient(timeout=5.0) as client:
+        async with _probe_client(timeout=5.0) as client:
             r = await client.get(f"{PROBE_URL}/traffic/stats")
             if r.status_code == 200:
                 active_count = len(r.json().get("sessions", []))
@@ -7866,7 +7972,7 @@ async def traffic_stream(mac: str):
 
     async def _generate():
         try:
-            async with httpx.AsyncClient(timeout=None) as client:
+            async with _probe_client(timeout=None) as client:
                 async with client.stream("GET", f"{PROBE_URL}/traffic/stream/{mac}") as resp:
                     if resp.status_code != 200:
                         yield f"data: {{\"error\": \"probe {resp.status_code}\"}}\n\n"
@@ -8941,7 +9047,7 @@ async def stream_docker_trivy_scan(container_id: str, db: Session = Depends(get_
 # ---------------------------------------------------------------------------
 _TRIVY_DB_META = "/root/.cache/trivy/db/metadata.json"
 _TRIVY_FREQ_SECONDS = {"1d": 86400, "2d": 172800, "7d": 604800, "30d": 2592000}
-_trivy_db_updating = False
+_trivy_db_update_lock = asyncio.Lock()
 
 
 def _trivy_db_status() -> dict:
@@ -8961,30 +9067,27 @@ def _trivy_db_status() -> dict:
 
 async def _run_trivy_db_download():
     """Download/refresh the Trivy DB, streaming output to callers via an asyncio.Queue."""
-    global _trivy_db_updating
-    if _trivy_db_updating or not shutil.which("trivy"):
+    if _trivy_db_update_lock.locked() or not shutil.which("trivy"):
         return
-    _trivy_db_updating = True
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            "trivy", "image", "--download-db-only",
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.STDOUT,
-        )
-        if proc.stdout:
-            async for raw in proc.stdout:
-                line = raw.decode(errors="replace").rstrip()
-                if line:
-                    print(f"[trivy_db] {line}", flush=True)
-        await proc.wait()
-        if proc.returncode == 0:
-            print("[trivy_db] Vulnerability DB updated.", flush=True)
-        else:
-            print(f"[trivy_db] Update exited with code {proc.returncode}.", flush=True)
-    except Exception as exc:
-        print(f"[trivy_db] Update failed: {exc}", flush=True)
-    finally:
-        _trivy_db_updating = False
+    async with _trivy_db_update_lock:
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "trivy", "image", "--download-db-only",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+            )
+            if proc.stdout:
+                async for raw in proc.stdout:
+                    line = raw.decode(errors="replace").rstrip()
+                    if line:
+                        print(f"[trivy_db] {line}", flush=True)
+            await proc.wait()
+            if proc.returncode == 0:
+                print("[trivy_db] Vulnerability DB updated.", flush=True)
+            else:
+                print(f"[trivy_db] Update exited with code {proc.returncode}.", flush=True)
+        except Exception as exc:
+            print(f"[trivy_db] Update failed: {exc}", flush=True)
 
 
 def _schedule_trivy_db_download_if_missing():
@@ -9026,7 +9129,7 @@ async def _trivy_db_update_loop():
 @app.get("/trivy/db-status")
 async def trivy_db_status_endpoint(_user: str = Depends(get_current_user)):
     status = _trivy_db_status()
-    status["updating"] = _trivy_db_updating
+    status["updating"] = _trivy_db_update_lock.locked()
     return status
 
 
@@ -9041,33 +9144,30 @@ async def trivy_db_update_stream(_user: str = Depends(get_current_user)):
                                  headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
     async def _stream():
-        global _trivy_db_updating
-        if _trivy_db_updating:
+        if _trivy_db_update_lock.locked():
             yield "data: [INFO] Update already in progress — please wait.\n\n"
             yield "data: TRIVY_DB_DONE\n\n"
             return
-        _trivy_db_updating = True
-        try:
-            yield "data: [INFO] Starting Trivy vulnerability DB download…\n\n"
-            proc = await asyncio.create_subprocess_exec(
-                "trivy", "image", "--download-db-only",
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.STDOUT,
-            )
-            if proc.stdout:
-                async for raw in proc.stdout:
-                    line = raw.decode(errors="replace").rstrip()
-                    if line:
-                        yield f"data: {line}\n\n"
-            await proc.wait()
-            if proc.returncode == 0:
-                yield "data: [INFO] Trivy DB updated successfully.\n\n"
-            else:
-                yield f"data: [ERROR] Update exited with code {proc.returncode}.\n\n"
-        except Exception as exc:
-            yield f"data: [ERROR] {exc}\n\n"
-        finally:
-            _trivy_db_updating = False
+        async with _trivy_db_update_lock:
+            try:
+                yield "data: [INFO] Starting Trivy vulnerability DB download…\n\n"
+                proc = await asyncio.create_subprocess_exec(
+                    "trivy", "image", "--download-db-only",
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.STDOUT,
+                )
+                if proc.stdout:
+                    async for raw in proc.stdout:
+                        line = raw.decode(errors="replace").rstrip()
+                        if line:
+                            yield f"data: {line}\n\n"
+                await proc.wait()
+                if proc.returncode == 0:
+                    yield "data: [INFO] Trivy DB updated successfully.\n\n"
+                else:
+                    yield f"data: [ERROR] Update exited with code {proc.returncode}.\n\n"
+            except Exception as exc:
+                yield f"data: [ERROR] {exc}\n\n"
         yield "data: TRIVY_DB_DONE\n\n"
 
     return StreamingResponse(_stream(), media_type="text/event-stream",
@@ -9080,7 +9180,7 @@ async def trivy_db_update_stream(_user: str = Depends(get_current_user)):
 @app.get("/nuclei/template-status")
 async def nuclei_template_status(_user: str = Depends(get_current_user)):
     try:
-        async with httpx.AsyncClient(timeout=10) as client:
+        async with _probe_client(timeout=10) as client:
             r = await client.get(f"{PROBE_URL}/nuclei/status")
             return r.json()
     except Exception:
@@ -9092,7 +9192,7 @@ async def nuclei_template_update_stream(_user: str = Depends(get_current_user)):
     """SSE proxy: streams Nuclei template update output from the probe."""
     async def _proxy():
         try:
-            async with httpx.AsyncClient(timeout=None) as client:
+            async with _probe_client(timeout=None) as client:
                 async with client.stream("GET", f"{PROBE_URL}/nuclei/update") as r:
                     async for line in r.aiter_lines():
                         if line:

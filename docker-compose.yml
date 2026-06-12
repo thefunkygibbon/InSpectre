@@ -28,6 +28,8 @@ services:
       DATABASE_URL: postgresql://admin:2bffaeae7a209b178854078631c5b136@db:5432/inspectre
       PROBE_API_URL: http://host.docker.internal:8666
       SECRET_KEY: d3689ad87d9ee61a507399d6224c5c1039d7eaddedc1eea2d80b92e68130b4c6
+      # Shared secret authenticating backend -> probe API calls (must match the probe service)
+      PROBE_API_SECRET: ${PROBE_API_SECRET:-c31106d3c582c5f6ea86edb5bd8c86037ec063e47eb319326ea6fd6e195fb195}
       # Comma-separated list of allowed frontend origins
       CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:3000,http://localhost:5173}
     # Remove or comment this out if you are monitoring a remote Docker host via TCP
@@ -57,6 +59,8 @@ services:
       NMAP_ARGS: "-sT -O --osscan-limit -T4"
       PROBE_API_PORT: "8666"
       PYTHONUNBUFFERED: "1"
+      # Shared secret authenticating backend -> probe API calls (must match the web service)
+      PROBE_API_SECRET: ${PROBE_API_SECRET:-c31106d3c582c5f6ea86edb5bd8c86037ec063e47eb319326ea6fd6e195fb195}
       # Prevent any host NMAP_OPTS from leaking in and creating a duplicate -p flag
       NMAP_OPTS: ""
       # ── DNS / Hostname resolution ──────────────────────────────────────────

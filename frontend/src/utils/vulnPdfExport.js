@@ -54,6 +54,16 @@ function esc(s) {
     .replace(/>/g, '&gt;').replace(/"/g, '&quot;')
 }
 
+// Only allow safe URL schemes in generated href attributes. Anything else
+// (e.g. javascript:, data:) is neutralised to '#' to prevent script execution
+// when the exported report is opened.
+function safeHref(s) {
+  if (s == null) return '#'
+  const raw = String(s).trim()
+  if (/^(https?:|mailto:)/i.test(raw)) return esc(raw)
+  return '#'
+}
+
 function fmt(iso) {
   if (!iso) return 'Unknown'
   try {
@@ -140,7 +150,7 @@ function renderFindingCard(f) {
   if (refs.length)
     rows.push(`<div style="display:flex;gap:8px;margin-bottom:5px;align-items:flex-start">
       <span style="font-weight:700;color:#64748b;min-width:80px;font-size:10px;text-transform:uppercase;letter-spacing:0.4px;flex-shrink:0;margin-top:1px">References</span>
-      <span>${refs.map(r => `<a href="${esc(r)}" style="display:block;font-size:10px;color:#0d9488;word-break:break-all">${esc(r)}</a>`).join('')}</span>
+      <span>${refs.map(r => `<a href="${safeHref(r)}" rel="noopener noreferrer" style="display:block;font-size:10px;color:#0d9488;word-break:break-all">${esc(r)}</a>`).join('')}</span>
     </div>`)
 
   const body = rows.join('')

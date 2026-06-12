@@ -1,0 +1,29 @@
+node_modules/
+.git/
+dist/
+build/
+data/
+# temp files
+tmp/
+temp/
+*.tmp
+
+# db files
+*.db
+*.sqlite
+*.sqlite3
+
+# app-specific runtime dirs
+data/
+var/
+.cache/
+postgres_data/
+postgres_dataold/
+postgres_dataold2/
+.vscode
+/frontend/node_modules/
+/backend/node_modules/
+/backend/dist/
+/dist/
+/frontend/dist/
+/data/

@@ -84,7 +84,12 @@ export function useStreamAction() {
             if (line.startsWith('data:')) {
               const text = line.slice(5).trim()
               if (text && text !== '{}') {
-                setLines(prev => [...prev, text])
+                // Cap retained lines to avoid unbounded memory growth on very
+                // long-running streams; keep the most recent 2000 lines.
+                setLines(prev => {
+                  const next = [...prev, text]
+                  return next.length > 2000 ? next.slice(next.length - 2000) : next
+                })
               }
             }
           }

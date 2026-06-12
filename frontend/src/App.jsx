@@ -5,7 +5,7 @@ import {
   LayoutGrid, List, Sun, Moon, ChevronDown,
   Bell, X, Layers, Star, ShieldAlert, Wrench, Ban, BarChart2, Clock,
   ArrowLeft, SlidersHorizontal, LogOut, Eye, EyeOff, Box, Download, Sparkles,
-  Users,
+  Users, MonitorSmartphone,
 } from 'lucide-react'
 import { TrafficPage } from './components/TrafficPage'
 import { ContainersPage } from './components/ContainersPage'
@@ -31,7 +31,7 @@ import { SetupWizard }         from './components/SetupWizard'
 import { StatusButton }        from './components/StatusButton'
 import { PersonPresencePage }  from './components/PersonPresencePage'
 
-const APP_VERSION = '1.1.0'
+import { APP_VERSION } from './version'
 
 const SORT_OPTIONS = [
   { value: 'last_seen_desc', label: 'Last changed (newest)' },
@@ -330,6 +330,14 @@ function MainApp({ onLogout }) {
   const [showFilters,      setShowFilters]      = useState(false)
   const [containerToOpen,  setContainerToOpen]  = useState(null)
   const [isNarrow,         setIsNarrow]         = useState(() => window.innerWidth < 768)
+  const [installPrompt,    setInstallPrompt]    = useState(null)
+  const [installDismissed, setInstallDismissed] = useState(() => !!localStorage.getItem('pwa-dismissed'))
+
+  useEffect(() => {
+    function onBeforeInstall(e) { e.preventDefault(); setInstallPrompt(e) }
+    window.addEventListener('beforeinstallprompt', onBeforeInstall)
+    return () => window.removeEventListener('beforeinstallprompt', onBeforeInstall)
+  }, [])
 
   useEffect(() => {
     function onResize() { setIsNarrow(window.innerWidth < 768) }
@@ -869,8 +877,8 @@ function MainApp({ onLogout }) {
                 </button>
               ) : (
                 <>
-                  <Logo size={22} />
-                  <span style={{ fontSize: '11px', fontWeight: 700, letterSpacing: '0.15em', color: 'var(--color-brand)' }}>INSPECTRE</span>
+                  <Logo size={30} />
+                  <span style={{ fontSize: '11px', fontWeight: 700, letterSpacing: '0.08em', color: 'var(--color-brand)' }}>InSpectre</span>
                 </>
               )}
             </div>
@@ -988,7 +996,7 @@ function MainApp({ onLogout }) {
             fontSize: '9px', color: 'var(--color-text-faint)', letterSpacing: '0.06em',
             fontFamily: 'JetBrains Mono, monospace', display: 'flex', justifyContent: 'space-between', alignItems: 'center',
           }}>
-            <span>// INSPECTRE v{APP_VERSION}</span>
+            <span>// InSpectre v{APP_VERSION}</span>
             <StatusButton />
           </div>
 
@@ -1024,13 +1032,13 @@ function MainApp({ onLogout }) {
           {/* Logo */}
           <div style={{ padding: '18px 16px 14px', borderBottom: '1px solid var(--color-border)' }}>
             <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
-              <Logo size={22} />
+              <Logo size={30} />
               <div>
-                <div style={{ fontSize: '12px', fontWeight: 700, letterSpacing: '0.15em', color: 'var(--color-brand)' }}>
-                  INSPECTRE
+                <div style={{ fontSize: '12px', fontWeight: 700, letterSpacing: '0.08em', color: 'var(--color-brand)' }}>
+                  InSpectre
                 </div>
                 <div style={{ fontSize: '9px', color: 'var(--color-text-faint)', marginTop: '1px' }}>
-                  v{APP_VERSION} // PHANTOM
+                  v{APP_VERSION}
                 </div>
               </div>
             </div>
@@ -1152,7 +1160,7 @@ function MainApp({ onLogout }) {
             fontSize: '9px', color: 'var(--color-text-faint)', letterSpacing: '0.08em',
             fontFamily: 'JetBrains Mono, monospace',
           }}>
-            <span>// INSPECTRE v{APP_VERSION} &copy; {new Date().getFullYear()} thefunkygibbon</span>
+            <span>// InSpectre v{APP_VERSION} &copy; {new Date().getFullYear()} thefunkygibbon</span>
             <StatusButton />
           </div>
         </div>
@@ -1331,6 +1339,19 @@ function MainApp({ onLogout }) {
                 title={isDark ? 'Switch to light mode' : 'Switch to dark mode'}>
                 {isDark ? <Sun size={16} /> : <Moon size={16} />}
               </button>
+
+              {installPrompt && !installDismissed && (
+                <button
+                  onClick={() => {
+                    installPrompt.prompt()
+                    installPrompt.userChoice.then(() => setInstallPrompt(null))
+                  }}
+                  className="btn-ghost p-2 flex items-center gap-1.5 text-xs"
+                  title="Install InSpectre as an app">
+                  <MonitorSmartphone size={16} />
+                  <span className="hidden sm:inline">Install</span>
+                </button>
+              )}
 
               <button onClick={() => setShowSettings(true)} className="btn-ghost p-2"
                 aria-label="Settings" title="Settings">
@@ -1539,6 +1560,7 @@ function ForcePasswordChange({ onDone }) {
 // authState: 'loading' | 'setup' | 'login' | 'change_password' | 'app'
 export default function App() {
   const [authState, setAuthState] = useState('loading')
+  useTheme()  // Ensures theme/skin CSS vars are applied to <html> even on login/setup screens
 
   useEffect(() => {
     async function boot() {

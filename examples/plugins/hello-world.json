@@ -1,0 +1,78 @@
+{
+  "id": "hello-world",
+  "name": "Hello World (Discovery)",
+  "version": "1.0.0",
+  "author": "InSpectre Community",
+  "description": "Minimal example plugin. Polls a generic JSON HTTP endpoint that returns a list of DHCP leases and feeds them into the InSpectre device inventory. Copy this file and adapt the endpoint, auth, and field mapping to your own device's API.",
+  "homepage": "https://github.com/thefunkygibbon/InSpectre",
+  "min_inspectre_version": "1.2.0",
+  "icon": null,
+  "capabilities": [
+    "discovery",
+    "enrichment"
+  ],
+  "config_schema": [
+    {
+      "key": "host",
+      "label": "API Base URL",
+      "type": "url",
+      "default": "http://192.168.0.1",
+      "required": true,
+      "help": "Base URL of the device/API exposing the lease list. No trailing slash."
+    },
+    {
+      "key": "api_key",
+      "label": "API Key",
+      "type": "password",
+      "default": "",
+      "required": true,
+      "help": "Sent in the X-API-Key header on every request."
+    },
+    {
+      "key": "verify_ssl",
+      "label": "Verify SSL Certificate",
+      "type": "boolean",
+      "default": true,
+      "required": false,
+      "help": "Disable for self-signed HTTPS certificates."
+    }
+  ],
+  "endpoints": {
+    "base_url": "{host}",
+    "auth": "api-key-header",
+    "api_key_header": "X-API-Key",
+    "headers": {
+      "Accept": "application/json"
+    }
+  },
+  "actions": {
+    "get_leases": {
+      "description": "Fetch the current DHCP lease table.",
+      "method": "GET",
+      "path": "/api/dhcp/leases",
+      "response_mapping": {
+        "root_path": "leases",
+        "fields": {
+          "mac": "mac_address",
+          "ip": "ip_address",
+          "name": "hostname",
+          "vendor": "vendor"
+        }
+      }
+    },
+    "test_connection": {
+      "description": "Used by the 'Test Connection' button in the UI.",
+      "method": "GET",
+      "path": "/api/status"
+    }
+  },
+  "event_hooks": {},
+  "data_mapping": {
+    "tag_fields": []
+  },
+  "polling": {
+    "action": "get_leases",
+    "interval_seconds": 120,
+    "run_on_startup": true
+  }
+}

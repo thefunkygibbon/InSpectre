@@ -86,7 +86,7 @@ function eventDetail(event) {
 
 const STATUS_COLORS = { online: '#10b981', offline: '#ef4444', unknown: '#374151' }
 
-function MiniTimelineBar({ mac }) {
+function MiniTimelineBar({ mac, label }) {
   const [data, setData] = useState(null)
 
   useEffect(() => {
@@ -95,12 +95,14 @@ function MiniTimelineBar({ mac }) {
 
   const uptime = useMemo(() => {
     if (!data?.segments) return null
-    const totalMs = new Date(data.window_end) - new Date(data.window_start)
-    if (totalMs <= 0) return null
+    const knownMs = data.segments
+      .filter(s => s.status !== 'unknown')
+      .reduce((sum, s) => sum + (new Date(s.to) - new Date(s.from)), 0)
+    if (knownMs <= 0) return null
     const onlineMs = data.segments
       .filter(s => s.status === 'online')
       .reduce((sum, s) => sum + (new Date(s.to) - new Date(s.from)), 0)
-    return Math.round((onlineMs / totalMs) * 100)
+    return Math.round((onlineMs / knownMs) * 100)
   }, [data])
 
   if (!data?.segments?.length) return null
@@ -109,8 +111,14 @@ function MiniTimelineBar({ mac }) {
 
   return (
     <div className="mb-4 space-y-1">
+      {label && (
+        <div className="flex items-center gap-1.5 text-[11px] font-medium" style={{ color: 'var(--color-text-muted)' }}>
+          <GitMerge size={11} className="opacity-70" />
+          <span className="truncate">{label}</span>
+        </div>
+      )}
       <div className="flex items-center justify-between text-[10px]" style={{ color: 'var(--color-text-faint)' }}>
-        <span>7-day uptime</span>
+        <span>uptime (known periods)</span>
         {uptime != null && (
           <span className="font-mono font-semibold"
             style={{ color: uptime >= 90 ? '#10b981' : uptime >= 50 ? '#f59e0b' : '#ef4444' }}>
@@ -142,10 +150,22 @@ function MiniTimelineBar({ mac }) {
   )
 }
 
-export function DeviceTimeline({ mac }) {
+export function DeviceTimeline({ mac, groupMembers }) {
   const [events,  setEvents]  = useState(null)
   const [error,   setError]   = useState(null)
   const [loaded,  setLoaded]  = useState(false)
+
+  // Grouped devices are one physical host on multiple interfaces. Show a
+  // separate uptime bar per interface, and label merged events by interface.
+  const members = (groupMembers && groupMembers.length > 1) ? groupMembers : null
+  const memberLabel = useMemo(() => {
+    const map = {}
+    for (const m of (groupMembers || [])) {
+      const name = m.display_name || m.hostname || m.custom_name || m.ip_address || m.mac_address
+      map[(m.mac_address || '').toLowerCase()] = m.ip_address ? `${name} · ${m.ip_address}` : name
+    }
+    return map
+  }, [groupMembers])
 
   useEffect(() => {
     if (loaded) return
@@ -181,7 +201,15 @@ export function DeviceTimeline({ mac }) {
 
   return (
     <div>
-      <MiniTimelineBar mac={mac} />
+      {members
+        ? members.map(m => (
+            <MiniTimelineBar
+              key={m.mac_address}
+              mac={m.mac_address}
+              label={memberLabel[(m.mac_address || '').toLowerCase()]}
+            />
+          ))
+        : <MiniTimelineBar mac={mac} />}
     <div className="relative">
       {/* Vertical line */}
       <div
@@ -193,7 +221,13 @@ export function DeviceTimeline({ mac }) {
           const cfg    = EVENT_CONFIG[event.type] || { icon: Clock, color: 'var(--color-text-faint)', label: event.type }
           const Icon   = cfg.icon
           const detail = eventDetail(event)
-          const isCrossDevice = event.mac_address && event.mac_address !== mac
+          const evMac = (event.mac_address || '').toLowerCase()
+          // In a group, label every event with its interface so each IP is
+          // clearly identified; otherwise only label genuine cross-device events.
+          const crossLabel = memberLabel[evMac] || event.mac_address
+          const showVia = members
+            ? !!memberLabel[evMac]
+            : (event.mac_address && evMac !== (mac || '').toLowerCase())
           return (
             <div key={event.id} className="flex gap-3 items-start relative">
               {/* Icon bubble */}
@@ -213,9 +247,9 @@ export function DeviceTimeline({ mac }) {
                     {relativeTime(event.created_at)}
                   </span>
                 </div>
-                {isCrossDevice && (
-                  <p className="text-[10px] mt-0.5 font-mono" style={{ color: 'var(--color-text-faint)' }}>
-                    via {event.mac_address}
+                {showVia && (
+                  <p className="text-[10px] mt-0.5" style={{ color: 'var(--color-text-faint)' }}>
+                    {members ? '' : 'via '}{crossLabel}
                   </p>
                 )}
                 {detail && (

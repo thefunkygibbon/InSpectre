@@ -1,6 +1,7 @@
 import { useState, useEffect, useCallback, useMemo } from 'react'
 import { Loader, Wifi, WifiOff, Clock, Search, Box, History } from 'lucide-react'
 import { api } from '../api'
+import { subscribeLive } from '../lib/liveEvents'
 
 const PERIODS = [
   { label: '7 days',  days: 7   },
@@ -400,8 +401,8 @@ export function NetworkTimeline({ onDeviceClick }) {
   const [search,  setSearch]  = useState('')
   const [view,    setView]    = useState('devices')
 
-  const load = useCallback(async (d) => {
-    setLoading(true)
+  const load = useCallback(async (d, { silent = false } = {}) => {
+    if (!silent) setLoading(true)
     setError(null)
     try {
       const result = await api.getTimeline(d)
@@ -409,16 +410,19 @@ export function NetworkTimeline({ onDeviceClick }) {
     } catch (e) {
       setError(e.message)
     } finally {
-      setLoading(false)
+      if (!silent) setLoading(false)
     }
   }, [])
 
   useEffect(() => { load(days) }, [days, load])
 
-  // Auto-refresh every 30s
+  // Live updates: refresh in the background when the backend signals a device
+  // change (SSE), plus a slow fallback poll in case the stream drops. Both use
+  // silent mode so the timeline data updates in place without a loading flash.
   useEffect(() => {
-    const id = setInterval(() => load(days), 30000)
-    return () => clearInterval(id)
+    const unsub = subscribeLive('devices', () => load(days, { silent: true }))
+    const id = setInterval(() => load(days, { silent: true }), 60000)
+    return () => { unsub(); clearInterval(id) }
   }, [days, load])
 
   function changeDays(d) {
@@ -435,13 +439,16 @@ export function NetworkTimeline({ onDeviceClick }) {
     }
     return data.devices.map(d => {
       let onlineMs = 0
+      let knownMs = 0
       const renderSegments = (d.segments || []).map(seg => {
         const rawStart = new Date(seg.from).getTime()
         const rawEnd = new Date(seg.to).getTime()
         const segStart = Math.max(rawStart, windowStartMs)
         const segEnd = Math.min(rawEnd, windowEndMs)
         if (segEnd <= segStart) return null
-        if (seg.status === 'online') onlineMs += (segEnd - segStart)
+        const dur = segEnd - segStart
+        if (seg.status === 'online') onlineMs += dur
+        if (seg.status !== 'unknown') knownMs += dur
         return {
           status: seg.status,
           from: seg.from,
@@ -450,7 +457,9 @@ export function NetworkTimeline({ onDeviceClick }) {
           widthPct: ((segEnd - segStart) / totalMs) * 100,
         }
       }).filter(Boolean)
-      const onlinePct = Math.round((onlineMs / totalMs) * 100)
+      // Uptime is measured over the period the device has been known to the
+      // system (since first detection), not the full selected window.
+      const onlinePct = knownMs > 0 ? Math.round((onlineMs / knownMs) * 100) : 0
       return { ...d, renderSegments, onlinePct }
     })
   }, [data])

@@ -1,29 +1,47 @@
 // InSpectre site — tiny progressive-enhancement helpers (no dependencies)
 (function () {
-  // Enable JS-only enhancements (e.g. reveal-on-scroll hiding)
   document.documentElement.classList.add('js');
 
-  // Mobile nav toggle
+  // Mobile window-list toggle
   var toggle = document.querySelector('.nav-toggle');
-  var links = document.querySelector('.nav-links');
+  var links = document.querySelector('.sb-windows');
   if (toggle && links) {
-    toggle.addEventListener('click', function () {
-      links.classList.toggle('open');
+    toggle.addEventListener('click', function () { links.classList.toggle('open'); });
+  }
+
+  // Copy-to-clipboard — hero/CTA install blocks (.copy-btn → .install code)
+  document.querySelectorAll('.copy-btn[data-copy]').forEach(function (btn) {
+    btn.addEventListener('click', function () {
+      var code = btn.closest('.term').querySelector('.install code');
+      copy(btn, code);
+    });
+  });
+
+  // Copy-to-clipboard — content code blocks (.code-head button → .code code)
+  document.querySelectorAll('.code-head button[data-copy]').forEach(function (btn) {
+    btn.addEventListener('click', function () {
+      var code = btn.closest('.code').querySelector('code');
+      copy(btn, code);
+    });
+  });
+
+  function copy(btn, code) {
+    var text = code ? code.innerText : '';
+    navigator.clipboard.writeText(text).then(function () {
+      var old = btn.textContent;
+      btn.textContent = 'copied!';
+      setTimeout(function () { btn.textContent = old; }, 1500);
     });
   }
 
-  // Copy-to-clipboard for code blocks
-  document.querySelectorAll('.code-head button[data-copy]').forEach(function (btn) {
-    btn.addEventListener('click', function () {
-      var pre = btn.closest('.code').querySelector('code');
-      var text = pre ? pre.innerText : '';
-      navigator.clipboard.writeText(text).then(function () {
-        var old = btn.textContent;
-        btn.textContent = 'Copied!';
-        setTimeout(function () { btn.textContent = old; }, 1500);
-      });
-    });
-  });
+  // Live clock in the status bar
+  var clock = document.getElementById('clock');
+  function tick() { if (clock) clock.textContent = new Date().toTimeString().slice(0, 8); }
+  tick(); setInterval(tick, 1000);
+
+  // Year in footer
+  var yr = document.getElementById('yr');
+  if (yr) yr.textContent = new Date().getFullYear();
 
   // Reveal-on-scroll
   var io = new IntersectionObserver(function (entries) {

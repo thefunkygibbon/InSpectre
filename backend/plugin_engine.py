@@ -561,7 +561,7 @@ class PluginRunner:
         elif auth_method == "bearer" and session and session.bearer_token:
             headers["Authorization"] = f"Bearer {session.bearer_token}"
         else:
-            self._apply_auth(headers, auth_method, config, session)
+            self._apply_auth(headers, auth_method, config, session, endpoints, sub_ctx)
 
         # Inject session extras as custom headers per manifest session_headers map
         # e.g. {"loginToken": "Csrf-Token"} injects session.extras["loginToken"] as "Csrf-Token"
@@ -1145,19 +1145,40 @@ class PluginRunner:
     # ── Auth helpers ──────────────────────────────────────────────────────────
 
     @staticmethod
-    def _apply_auth(headers: dict, method: str, config: dict, session: Optional[PluginSession] = None):
+    def _apply_auth(
+        headers: dict,
+        method: str,
+        config: dict,
+        session: Optional[PluginSession] = None,
+        endpoints: Optional[dict] = None,
+        sub_ctx: Optional[dict] = None,
+    ):
+        endpoints = endpoints or {}
         if method == "basic":
-            import base64 as _b64
-            creds = _b64.b64encode(
-                f"{config.get('user', '')}:{config.get('password', '')}".encode()
-            ).decode()
+            # Honour manifest-declared field names so a plugin can map its own
+            # config keys (e.g. OPNsense uses api_key / api_secret) onto HTTP
+            # Basic auth. Falls back to the canonical user / password keys.
+            user_field = endpoints.get("username_field", "user")
+            pass_field = endpoints.get("password_field", "password")
+            user = config.get(user_field, "")
+            pwd  = config.get(pass_field, "")
+            creds = base64.b64encode(f"{user}:{pwd}".encode()).decode()
             headers["Authorization"] = f"Basic {creds}"
         elif method == "bearer":
             token = (session.bearer_token if session else None) or config.get("token", "")
             headers["Authorization"] = f"Bearer {token}"
         elif method == "api-key-header":
-            key_name = config.get("api_key_header", "X-API-Key")
-            headers[key_name] = config.get("api_key", "")
+            # Header name may be declared in endpoints (preferred) or as a config
+            # field. The value may be a template (api_key_value) substituted with
+            # config — letting a plugin compose a header from multiple fields
+            # (e.g. pfSense: "<client-id> <client-token>"). Falls back to the
+            # single api_key config value for simple key-in-header schemes.
+            key_name = endpoints.get("api_key_header") or config.get("api_key_header", "X-API-Key")
+            value_tpl = endpoints.get("api_key_value")
+            if value_tpl is not None:
+                headers[key_name] = PluginRunner._sub(str(value_tpl), config, sub_ctx)
+            else:
+                headers[key_name] = config.get("api_key", "")
 
 
 # ---------------------------------------------------------------------------

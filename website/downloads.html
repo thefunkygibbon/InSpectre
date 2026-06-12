@@ -5,92 +5,108 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Downloads — InSpectre</title>
   <meta name="description" content="Download InSpectre as a Docker stack, a ready-to-run virtual machine image, or a Raspberry Pi image. Free and open source." />
-  <link rel="icon" type="image/svg+xml" href="assets/logo.svg" />
+  <link rel="icon" type="image/svg+xml" href="assets/favicon.svg" />
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet" />
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet" />
   <link rel="stylesheet" href="assets/style.css" />
 </head>
 <body>
 
-  <header class="nav">
-    <div class="container nav-inner">
-      <a href="index.html" class="brand-mark">
-        <img src="assets/logo.svg" alt="" class="logo" />
-        <span><span class="in">In</span><span class="spectre">Spectre</span></span>
-      </a>
-      <button class="nav-toggle" aria-label="Menu">
-        <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 6h18M3 12h18M3 18h18"/></svg>
-      </button>
-      <nav class="nav-links">
-        <a href="index.html">Home</a>
-        <a href="downloads.html" class="active">Downloads</a>
-        <a href="docs.html">Docs</a>
-        <a href="help.html">Help</a>
-        <a href="https://github.com/thefunkygibbon/InSpectre" class="gh" target="_blank" rel="noopener">
-          <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="M12 .3a12 12 0 0 0-3.8 23.4c.6.1.8-.3.8-.6v-2c-3.3.7-4-1.6-4-1.6-.6-1.4-1.4-1.8-1.4-1.8-1-.7.1-.7.1-.7 1.2 0 1.8 1.2 1.8 1.2 1 1.8 2.8 1.3 3.5 1 .1-.8.4-1.3.7-1.6-2.7-.3-5.5-1.3-5.5-6 0-1.2.5-2.3 1.3-3.1-.2-.4-.6-1.6 0-3.2 0 0 1-.3 3.3 1.2a11.5 11.5 0 0 1 6 0C17.3 4.7 18.3 5 18.3 5c.6 1.6.2 2.8 0 3.2.8.8 1.3 1.9 1.3 3.1 0 4.7-2.8 5.7-5.5 6 .4.4.8 1.1.8 2.2v3.3c0 .3.2.7.8.6A12 12 0 0 0 12 .3Z"/></svg>
-          GitHub
-        </a>
+  <header class="statusbar">
+    <div class="sb-inner">
+      <a href="index.html" class="sb-session"><img src="assets/ghost-logo.svg" alt="" class="logo" /><span class="sb-name">inspectre</span></a>
+      <button class="nav-toggle" aria-label="Menu">[≡]</button>
+      <nav class="sb-windows">
+        <a href="index.html">0:home</a>
+        <a href="downloads.html" class="active">1:downloads</a>
+        <a href="docs.html">2:docs</a>
+        <a href="plugins.html">3:plugins</a>
+        <a href="help.html">4:help</a>
+        <a href="https://github.com/thefunkygibbon/InSpectre" target="_blank" rel="noopener">5:github↗</a>
       </nav>
+      <span class="sb-clock"><span class="blink">●</span> <span id="clock">--:--:--</span></span>
     </div>
   </header>
 
-  <section class="page-head">
-    <div class="container">
-      <span class="eyebrow"><span class="dot"></span> Free &amp; open source</span>
-      <h1>Download InSpectre</h1>
+  <main class="container">
+
+    <section class="page-head">
+      <p class="crumb"><span class="dollar">$</span> cd ~/inspectre &amp;&amp; ls dist/</p>
+      <h1>Download <span class="hl">InSpectre</span></h1>
       <p>Pick the format that suits your setup. Docker is the recommended path; VM and Raspberry Pi images are on the way for plug-and-play deployments.</p>
-    </div>
-  </section>
+    </section>
 
-  <section style="padding-top:30px;">
-    <div class="container">
+    <section class="section" data-reveal>
       <div class="dl-grid">
-
-        <!-- Docker -->
-        <div class="dl-card" data-reveal>
-          <div class="ic"><svg width="26" height="26" viewBox="0 0 24 24" fill="currentColor"><path d="M13 6h2v2h-2zM10 6h2v2h-2zM7 6h2v2H7zM10 3h2v2h-2zM13 9h2v2h-2zM10 9h2v2h-2zM7 9h2v2H7zM4 9h2v2H4z"/><path d="M22 10c-.5-.3-1.6-.4-2.4-.2-.1-.8-.6-1.5-1.3-2l-.5-.3-.3.5c-.4.6-.5 1.5-.2 2.2-.3.2-.8.3-1.3.3H1.5l-.1.5c-.2 1.6.2 3.3 1.2 4.5 1 1.1 2.5 1.7 4.5 1.7 4.3 0 7.5-2 9-5.6.6 0 1.9 0 2.6-1.3l.2-.3-.4-.3z"/></svg></div>
-          <span class="badge ready">Available now</span>
+        <div class="dl-card">
+          <span class="badge ready">available now</span>
           <h3>Docker</h3>
-          <p>The full three-container stack via Docker Compose. The recommended way to run InSpectre on any Linux host, NAS, or home server.</p>
-          <a href="https://github.com/thefunkygibbon/InSpectre" class="btn btn-primary" target="_blank" rel="noopener">Get from GitHub</a>
-          <a href="https://hub.docker.com/u/thefunkygibbon" class="btn btn-ghost" target="_blank" rel="noopener" style="margin-top:10px;">Docker Hub images</a>
+          <p>The full four-container stack (frontend · backend · probe · postgres) via Docker Compose. The recommended way to run InSpectre on any Linux host, NAS, or home server.</p>
+          <a href="https://github.com/thefunkygibbon/InSpectre" class="btn btn-primary" target="_blank" rel="noopener">get from github</a>
+          <a href="https://hub.docker.com/u/thefunkygibbon" class="btn btn-ghost" target="_blank" rel="noopener">docker hub images</a>
         </div>
-
-        <!-- VM -->
-        <div class="dl-card" data-reveal>
-          <div class="ic"><svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="3" width="20" height="14" rx="2"/><path d="M8 21h8m-4-4v4"/></svg></div>
-          <span class="badge soon">Coming soon</span>
+        <div class="dl-card">
+          <span class="badge soon">coming soon</span>
           <h3>Virtual Machine</h3>
           <p>A self-contained VM appliance (OVA / qcow2) with InSpectre pre-installed. Import into VirtualBox, VMware, or Proxmox and boot straight into the setup wizard.</p>
-          <a href="#notify" class="btn btn-ghost" disabled aria-disabled="true">Coming soon</a>
+          <a href="#notify" class="btn btn-ghost" aria-disabled="true">coming soon</a>
         </div>
-
-        <!-- Raspberry Pi -->
-        <div class="dl-card" data-reveal>
-          <div class="ic"><svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="4" y="4" width="16" height="16" rx="2"/><path d="M9 9h6v6H9zM9 2v2M15 2v2M9 20v2M15 20v2M2 9h2M2 15h2M20 9h2M20 15h2"/></svg></div>
-          <span class="badge soon">Coming soon</span>
+        <div class="dl-card">
+          <span class="badge soon">coming soon</span>
           <h3>Raspberry Pi</h3>
           <p>A flashable Raspberry Pi OS image with InSpectre baked in. Write it to an SD card, power on your Pi, and your network monitor is live.</p>
-          <a href="#notify" class="btn btn-ghost" disabled aria-disabled="true">Coming soon</a>
+          <a href="#notify" class="btn btn-ghost" aria-disabled="true">coming soon</a>
         </div>
-
       </div>
-    </div>
-  </section>
+    </section>
 
-  <!-- Quick install -->
-  <section style="padding-top:20px;">
-    <div class="container">
+    <section class="section" data-reveal>
       <div class="section-head">
-        <h2>Quick install (Docker)</h2>
-        <p>You'll need Docker 24+ and Docker Compose v2. That's it.</p>
+        <h2><span class="prefix">#</span> Quick install</h2>
+        <p>One command downloads InSpectre and walks you through the setup — no git clone required.</p>
       </div>
 
-      <div style="max-width:680px;margin:0 auto;">
-        <div class="code">
-          <div class="code-head"><span>recommended — inspectre.sh</span><button data-copy>Copy</button></div>
-          <pre><code><span class="c"># 1. Clone the repository</span>
+      <div class="code">
+        <div class="code-head"><span>bash — interactive installer (recommended)</span><button data-copy>copy</button></div>
+        <pre><code><span class="c"># Downloads and starts InSpectre interactively</span>
+<span class="p">curl -fsSL https://raw.githubusercontent.com/thefunkygibbon/InSpectre/main/inspectre-install.sh | bash</span></code></pre>
+      </div>
+      <div class="callout">The installer checks for Docker, asks for an install directory, generates secure passwords and secret keys, optionally lets you set your IP range and interface, then starts the stack automatically.</div>
+
+      <h3 style="color:var(--brand-light);margin-top:28px;">Or pull manually from Docker Hub</h3>
+      <div class="code">
+        <div class="code-head"><span>bash — manual Docker Hub deploy</span><button data-copy>copy</button></div>
+        <pre><code><span class="c"># 1. Download the deploy compose file</span>
+curl -O https://raw.githubusercontent.com/thefunkygibbon/InSpectre/main/docker-compose.deploy.yml
+
+<span class="c"># 2. Edit — change POSTGRES_PASSWORD and SECRET_KEY</span>
+<span class="c">#    Generate a key: openssl rand -hex 32</span>
+
+<span class="c"># 3. Start</span>
+<span class="p">docker compose -f docker-compose.deploy.yml up -d</span>
+
+<span class="c"># 4. Open http://localhost:3000 and complete the wizard</span></code></pre>
+      </div>
+
+      <p class="comment" style="margin-top:22px;"># docker hub images</p>
+      <div class="hub-grid">
+        <a href="https://hub.docker.com/r/thefunkygibbon/inspectre-frontend" class="hub-card" target="_blank" rel="noopener">
+          <div class="ns">thefunkygibbon/</div><strong>inspectre-frontend</strong><p>nginx + React SPA</p>
+        </a>
+        <a href="https://hub.docker.com/r/thefunkygibbon/inspectre-web" class="hub-card" target="_blank" rel="noopener">
+          <div class="ns">thefunkygibbon/</div><strong>inspectre-web</strong><p>FastAPI backend</p>
+        </a>
+        <a href="https://hub.docker.com/r/thefunkygibbon/inspectre-probe" class="hub-card" target="_blank" rel="noopener">
+          <div class="ns">thefunkygibbon/</div><strong>inspectre-probe</strong><p>Network probe</p>
+        </a>
+      </div>
+      <p class="comment" style="margin-top:10px;">The PostgreSQL database uses the official <code>postgres:15-alpine</code> image — no custom build.</p>
+
+      <h3 style="color:var(--brand-light);margin-top:28px;">Or clone from GitHub</h3>
+      <div class="code">
+        <div class="code-head"><span>recommended — inspectre.sh</span><button data-copy>copy</button></div>
+        <pre><code><span class="c"># 1. Clone the repository</span>
 git clone https://github.com/thefunkygibbon/InSpectre.git
 cd InSpectre
 
@@ -99,91 +115,54 @@ cd InSpectre
 
 <span class="c"># 3. Open the UI and finish the setup wizard</span>
 <span class="c"># → http://localhost:3000</span></code></pre>
-        </div>
-
-        <div class="code">
-          <div class="code-head"><span>or — docker compose directly</span><button data-copy>Copy</button></div>
-          <pre><code>docker compose up -d</code></pre>
-        </div>
-
-        <div class="callout">
-          <strong>Helper commands.</strong> <code class="mono">./inspectre.sh up</code> · <code class="mono">down</code> · <code class="mono">rebuild</code> · <code class="mono">rebuild keep-data</code> · <code class="mono">logs</code> — see the <a href="docs.html">docs</a> for details.
-        </div>
       </div>
-    </div>
-  </section>
+      <div class="callout"><strong>Helper commands.</strong> <code class="mono">./inspectre.sh up</code> · <code class="mono">down</code> · <code class="mono">rebuild</code> · <code class="mono">rebuild keep-data</code> · <code class="mono">logs</code> — see the <a href="docs.html">docs</a> for details.</div>
+    </section>
 
-  <!-- Requirements -->
-  <section style="padding-top:0;">
-    <div class="container">
-      <div class="grid grid-3">
-        <div class="card" data-reveal>
-          <div class="ic"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="3" width="20" height="14" rx="2"/><path d="M8 21h8"/></svg></div>
-          <h3>Host</h3>
-          <p>Any 64-bit Linux host with access to the network you want to monitor. The probe runs on the host network.</p>
-        </div>
-        <div class="card" data-reveal>
-          <div class="ic"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M20 7 12 3 4 7m16 0-8 4m8-4v10l-8 4m0-14L4 7m8 4v10M4 7v10l8 4"/></svg></div>
-          <h3>Software</h3>
-          <p>Docker Engine 24+ and the Docker Compose v2 plugin. No other dependencies to install.</p>
-        </div>
-        <div class="card" data-reveal>
-          <div class="ic"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M2 12h20M12 2a15 15 0 0 1 0 20 15 15 0 0 1 0-20Z"/></svg></div>
-          <h3>Network</h3>
-          <p>A flat Layer-2 LAN for full ARP discovery &amp; blocking. The probe auto-detects your interface and subnet.</p>
-        </div>
+    <section class="section" data-reveal>
+      <div class="section-head"><h2><span class="prefix">#</span> Requirements</h2></div>
+      <div class="req-grid">
+        <div><h3>host</h3><p>Any 64-bit Linux host with access to the network you want to monitor. The probe runs on the host network.</p></div>
+        <div><h3>software</h3><p>Docker Engine 24+ and the Docker Compose v2 plugin. No other dependencies to install.</p></div>
+        <div><h3>network</h3><p>A flat Layer-2 LAN for full ARP discovery &amp; blocking. The probe auto-detects your interface and subnet.</p></div>
       </div>
-    </div>
-  </section>
+    </section>
 
-  <section id="notify">
-    <div class="container">
-      <div class="cta" data-reveal>
-        <h2>VM &amp; Raspberry Pi images are coming</h2>
-        <p>Prefer a flash-and-go appliance? Pre-built VM and Pi images are in the works. Watch the repository to be the first to know when they land.</p>
-        <div class="hero-actions">
-          <a href="https://github.com/thefunkygibbon/InSpectre" class="btn btn-primary btn-lg" target="_blank" rel="noopener">Watch on GitHub</a>
-          <a href="docs.html" class="btn btn-ghost btn-lg">Read the docs</a>
-        </div>
+    <section class="term cta-term" id="notify" data-reveal>
+      <div class="term-bar">
+        <span class="term-dot"></span><span class="term-dot"></span><span class="term-dot"></span>
+        <span class="term-title">roadmap — vm &amp; pi</span>
       </div>
-    </div>
-  </section>
+      <div class="term-body">
+        <h2 class="cta-h">VM &amp; Raspberry Pi images are coming.</h2>
+        <p class="lead">Prefer a flash-and-go appliance? Pre-built VM and Pi images are in the works. Watch the repository to be the first to know when they land.</p>
+        <p class="actions">
+          <a href="https://github.com/thefunkygibbon/InSpectre" class="btn btn-primary" target="_blank" rel="noopener">▸ watch on github</a>
+          <a href="docs.html" class="btn btn-ghost">▸ read the docs</a>
+        </p>
+      </div>
+    </section>
+
+  </main>
 
   <footer class="footer">
-    <div class="container">
-      <div class="footer-grid">
-        <div class="footer-brand">
-          <a href="index.html" class="brand-mark"><img src="assets/logo.svg" alt="" class="logo" /><span><span class="in">In</span><span class="spectre">Spectre</span></span></a>
-          <p>The self-hosted network monitor and security scanner that keeps every byte on your own hardware.</p>
-        </div>
-        <div class="footer-cols">
-          <div class="footer-col">
-            <h5>Product</h5>
-            <a href="index.html">Features</a>
-            <a href="downloads.html">Downloads</a>
-            <a href="docs.html">Documentation</a>
-          </div>
-          <div class="footer-col">
-            <h5>Resources</h5>
-            <a href="https://github.com/thefunkygibbon/InSpectre" target="_blank" rel="noopener">GitHub</a>
-            <a href="https://github.com/thefunkygibbon/InSpectre/wiki" target="_blank" rel="noopener">Wiki</a>
-            <a href="help.html">Help &amp; Support</a>
-          </div>
-          <div class="footer-col">
-            <h5>Legal</h5>
-            <a href="https://github.com/thefunkygibbon/InSpectre/blob/main/LICENSE" target="_blank" rel="noopener">AGPL-3.0 Licence</a>
-            <a href="https://github.com/thefunkygibbon/InSpectre/blob/main/LICENSE-COMMERCIAL.md" target="_blank" rel="noopener">Commercial Licence</a>
-          </div>
+    <div class="foot-inner">
+      <div class="foot-cols">
+        <a href="index.html" class="sb-session"><img src="assets/ghost-logo.svg" alt="" class="logo" /><span class="sb-name">inspectre</span></a>
+        <div class="foot-links">
+          <a href="downloads.html">downloads</a>
+          <a href="docs.html">docs</a>
+          <a href="plugins.html">plugins</a>
+          <a href="https://github.com/thefunkygibbon/InSpectre/wiki" target="_blank" rel="noopener">wiki↗</a>
+          <a href="help.html">help</a>
+          <a href="https://github.com/thefunkygibbon/InSpectre/blob/main/LICENSE" target="_blank" rel="noopener">AGPL-3.0</a>
+          <a href="https://github.com/thefunkygibbon/InSpectre/blob/main/LICENSE-COMMERCIAL.md" target="_blank" rel="noopener">commercial</a>
         </div>
       </div>
-      <div class="footer-bottom">
-        <span>© <span id="yr"></span> InSpectre. Dual-licensed AGPL-3.0 / Commercial.</span>
-        <span>Made for people who like to know what's on their network.</span>
-      </div>
+      <p class="foot-status">— © <span id="yr"></span> InSpectre · dual-licensed AGPL-3.0 / Commercial · made for people who like to know what's on their network —</p>
     </div>
   </footer>
 
-  <script>document.getElementById('yr').textContent = new Date().getFullYear();</script>
   <script src="assets/main.js"></script>
 </body>
 </html>

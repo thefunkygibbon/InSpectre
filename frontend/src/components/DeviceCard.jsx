@@ -1,3 +1,4 @@
+import { memo } from 'react'
 import {
   Wifi, Laptop, Smartphone, Server, Printer, Tv,
   HelpCircle, Camera, Gamepad2, Cpu, Router,
@@ -95,7 +96,7 @@ function isNewDevice(device) {
   return Date.now() - new Date(device.first_seen).getTime() < NEW_DEVICE_DAYS * 24 * 60 * 60 * 1000
 }
 
-export function DeviceCard({ device, onClick, onStarToggle, isVulnScanning, isAcknowledged, onAcknowledge }) {
+function DeviceCardBase({ device, onClick, onStarToggle, isVulnScanning, isAcknowledged, onAcknowledge }) {
   const name     = deviceDisplayName(device)
   const vendor   = cleanVendor(device.vendor_override || device.vendor || device.vendor_inferred)
   const DevIcon  = getDeviceIcon(device)
@@ -278,3 +279,5 @@ export function DeviceCard({ device, onClick, onStarToggle, isVulnScanning, isAc
     </button>
   )
 }
+
+export const DeviceCard = memo(DeviceCardBase)

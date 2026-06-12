@@ -1,5 +1,5 @@
 import { useState, useCallback } from 'react'
-import { Wifi, Globe, Shield, Server, Mail, ChevronRight, Loader, Menu, X } from 'lucide-react'
+import { Wifi, Globe, Shield, Server, Mail, ChevronRight, Loader } from 'lucide-react'
 import { useStreamAction } from '../hooks/useStreamAction'
 import { StreamOutput } from './StreamOutput'
 import { api } from '../api'
@@ -1296,75 +1296,55 @@ const SECTIONS = [
 ]
 
 export function NetworkTools() {
-  const [section,      setSection]      = useState('ip')
-  const [sidebarOpen,  setSidebarOpen]  = useState(false)
+  const [section, setSection] = useState('ip')
 
   const activeSection = SECTIONS.find(s => s.id === section)
 
-  function selectSection(id) {
-    setSection(id)
-    setSidebarOpen(false)
-  }
-
   return (
-    <div className="flex gap-0 sm:gap-6 min-h-[60vh]">
+    <div className="flex flex-col min-h-[60vh]">
 
-      {/* Mobile nav toggle */}
-      <div className="sm:hidden mb-4 flex items-center gap-3">
-        <button onClick={() => setSidebarOpen(v => !v)}
-          className="btn-ghost p-2 flex items-center gap-2 text-xs"
-          aria-label="Toggle tool categories">
-          <Menu size={16} />
-          <span>{activeSection?.label}</span>
-        </button>
-      </div>
-
-      {/* Sidebar — hidden on mobile unless open */}
-      <div className={`
-        sm:block w-48 shrink-0
-        ${sidebarOpen ? 'fixed inset-0 z-40 flex items-start pt-16 bg-black/60' : 'hidden sm:block'}
-      `}
-        onClick={e => { if (e.target === e.currentTarget) setSidebarOpen(false) }}>
-        <div className={`
-          ${sidebarOpen ? 'w-56 rounded-xl mx-4 shadow-2xl' : 'w-48'}
-          border rounded-xl overflow-hidden
-        `} style={{ background: 'var(--color-surface)', borderColor: 'var(--color-border)' }}>
-          <div className="px-4 py-3 border-b border-[var(--color-border)] flex items-center justify-between">
-            <div>
-              <p className="text-xs font-semibold" style={{ color: 'var(--color-text)' }}>Network Tools</p>
-              <p className="text-[10px] mt-0.5 text-[var(--color-text-muted)]">Diagnostics & analysis</p>
-            </div>
-            {sidebarOpen && (
-              <button onClick={() => setSidebarOpen(false)} className="p-1 text-[var(--color-text-muted)]"><X size={14} /></button>
-            )}
-          </div>
-          <nav className="p-2 space-y-0.5">
-            {SECTIONS.map(s => (
-              <button key={s.id}
-                onClick={() => selectSection(s.id)}
-                className="w-full flex items-center gap-2.5 px-3 py-2.5 rounded-lg text-left transition-colors"
-                style={section === s.id
-                  ? { background: 'var(--color-brand)', color: 'white' }
-                  : { color: 'var(--color-text-muted)' }}>
-                <s.Icon size={14} className="shrink-0" />
-                <span className="text-xs font-medium">{s.label}</span>
-              </button>
-            ))}
-          </nav>
+      {/* Top tab bar — scrollable on mobile, full row on desktop */}
+      <div className="mb-5">
+        {/* Desktop: full tab bar */}
+        <div className="hidden sm:flex gap-1 border-b"
+          style={{ borderColor: 'var(--color-border)' }}>
+          {SECTIONS.map(s => (
+            <button key={s.id}
+              onClick={() => setSection(s.id)}
+              className="flex items-center gap-2 px-4 py-2.5 text-xs font-medium transition-colors relative"
+              style={section === s.id
+                ? { color: 'var(--color-brand)', borderBottom: '2px solid var(--color-brand)', marginBottom: '-1px' }
+                : { color: 'var(--color-text-muted)' }}>
+              <s.Icon size={13} className="shrink-0" />
+              {s.label}
+            </button>
+          ))}
         </div>
+
+        {/* Mobile: scrollable tab strip */}
+        <div className="sm:hidden flex gap-1 overflow-x-auto pb-0 border-b scrollbar-hide"
+          style={{ borderColor: 'var(--color-border)' }}>
+          {SECTIONS.map(s => (
+            <button key={s.id}
+              onClick={() => setSection(s.id)}
+              className="flex items-center gap-1.5 px-3 py-2 text-xs font-medium whitespace-nowrap transition-colors shrink-0 relative"
+              style={section === s.id
+                ? { color: 'var(--color-brand)', borderBottom: '2px solid var(--color-brand)', marginBottom: '-1px' }
+                : { color: 'var(--color-text-muted)' }}>
+              <s.Icon size={12} className="shrink-0" />
+              {s.label}
+            </button>
+          ))}
+        </div>
+
+        {/* Section description */}
+        <p className="text-[10px] mt-2.5" style={{ color: 'var(--color-text-faint)' }}>
+          {activeSection?.desc}
+        </p>
       </div>
 
       {/* Content area */}
       <div className="flex-1 min-w-0">
-        <div className="mb-4 hidden sm:block">
-          <p className="text-sm font-semibold" style={{ color: 'var(--color-text)' }}>
-            {activeSection?.label}
-          </p>
-          <p className="text-[10px] mt-0.5" style={{ color: 'var(--color-text-faint)' }}>
-            {activeSection?.desc}
-          </p>
-        </div>
-
         {section === 'ip' && (
           <>
             <PingTool />

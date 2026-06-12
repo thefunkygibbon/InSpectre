@@ -2,7 +2,8 @@ import { useState, useEffect, useRef, useCallback, useMemo } from 'react'
 import {
   UserPlus, User, Edit2, Trash2, X, Check,
   Smartphone, Plus, Shield, Camera, ShieldOff, ShieldCheck, ChevronDown,
-  AlertTriangle, Star, Loader, ToggleRight, ToggleLeft, Home, MapPin,
+  AlertTriangle, Star, Loader, ToggleRight, ToggleLeft, Home, MapPin, History,
+  LogIn, LogOut, WifiOff,
 } from 'lucide-react'
 import { api } from '../api'
 import { subscribeLive } from '../lib/liveEvents'
@@ -46,8 +47,19 @@ function fmtDateTime(iso) {
   return new Date(iso).toLocaleString()
 }
 
-// ---------------------------------------------------------------------------
-// Shared UI atoms
+function fmtDuration(ms) {
+  if (!ms || ms < 0) return null
+  const mins = Math.floor(ms / 60000)
+  if (mins < 1)   return 'just now'
+  if (mins < 60)  return `${mins}m`
+  const hrs = Math.floor(mins / 60)
+  if (hrs < 24)   return `${hrs}h ${mins % 60 > 0 ? `${mins % 60}m` : ''}`
+  const days = Math.floor(hrs / 24)
+  if (days < 7)   return `${days}d ${hrs % 24 > 0 ? `${hrs % 24}h` : ''}`
+  return `${days}d`
+}
+
+
 // ---------------------------------------------------------------------------
 
 function Avatar({ photo, name, size = 48, className = '' }) {
@@ -461,7 +473,7 @@ function PersonScheduleManager({ person, onScheduleChanged }) {
 // Person form (add / edit)
 // ---------------------------------------------------------------------------
 
-function PersonForm({ person, allDevices, onSave, onCancel, onDelete }) {
+function PersonForm({ person, allDevices, allPersons, onSave, onCancel, onDelete }) {
   const isNew = !person
   const [name,       setName]       = useState(person?.name       || '')
   const [notes,      setNotes]      = useState(person?.notes      || '')
@@ -494,6 +506,21 @@ function PersonForm({ person, allDevices, onSave, onCancel, onDelete }) {
 
   async function handleSave() {
     if (!name.trim()) { setError('Name is required'); return }
+    // Unique name check
+    const dupName = (allPersons || []).find(p => p.name.trim().toLowerCase() === name.trim().toLowerCase() && p.id !== person?.id)
+    if (dupName) { setError(`"${name.trim()}" is already used by another person`); return }
+    // Must have at least one device
+    if (devices.length === 0) { setError('Please add at least one device'); return }
+    // Check no device is already assigned to someone else
+    const usedElsewhere = devices.find(d => {
+      const owner = (allPersons || []).find(p => p.id !== person?.id && p.devices?.some(pd => pd.mac_address === d.mac_address))
+      return owner ? owner.name : null
+    })
+    if (usedElsewhere) {
+      const owner = (allPersons || []).find(p => p.id !== person?.id && p.devices?.some(pd => pd.mac_address === usedElsewhere.mac_address))
+      setError(`Device "${usedElsewhere.display_name || usedElsewhere.mac_address}" is already assigned to ${owner?.name}`)
+      return
+    }
     setSaving(true); setError(null)
     try {
       await onSave({ name, notes, photo, primary_mac: primaryMac, devices, existingPerson: person })
@@ -627,6 +654,94 @@ function PersonForm({ person, allDevices, onSave, onCancel, onDelete }) {
 }
 
 // ---------------------------------------------------------------------------
+// Person drawer — activity history panel
+// ---------------------------------------------------------------------------
+
+function PersonDrawer({ person, onClose }) {
+  const [events, setEvents] = useState(null)
+  const [loading, setLoading] = useState(true)
+
+  useEffect(() => {
+    // Derive activity from person timeline (last 7 days)
+    api.getPersonsTimeline(7).then(data => {
+      const personData = data?.persons?.find(p => p.id === person.id)
+      if (!personData?.segments) { setEvents([]); setLoading(false); return }
+
+      // Convert segments into meaningful events
+      const evts = []
+      const segs = personData.segments.filter(s => s.status !== 'unknown').sort((a, b) => new Date(a.from) - new Date(b.from))
+      for (let i = 0; i < segs.length; i++) {
+        const seg = segs[i]
+        const prev = i > 0 ? segs[i - 1] : null
+        if (seg.status === 'home') {
+          const awayDur = prev && prev.status === 'away' ? fmtDuration(new Date(seg.from) - new Date(prev.from)) : null
+          evts.push({ type: 'arrived', at: seg.from, detail: awayDur ? `Was away for ${awayDur}` : null })
+        } else if (seg.status === 'away') {
+          const homeDur = prev && prev.status === 'home' ? fmtDuration(new Date(seg.from) - new Date(prev.from)) : null
+          evts.push({ type: 'left', at: seg.from, detail: homeDur ? `Was home for ${homeDur}` : null })
+        }
+      }
+      setEvents(evts.reverse().slice(0, 30))
+      setLoading(false)
+    }).catch(() => { setEvents([]); setLoading(false) })
+  }, [person.id])
+
+  const EVENT_ICON = {
+    arrived: { Icon: LogIn,   color: '#10b981', label: 'Arrived home' },
+    left:    { Icon: LogOut,  color: '#94a3b8', label: 'Left home' },
+    blocked: { Icon: WifiOff, color: '#ef4444', label: 'Internet blocked' },
+  }
+
+  return (
+    <div className="mt-3 border-t pt-3" style={{ borderColor: 'var(--color-border)' }}>
+      <div className="flex items-center justify-between mb-3">
+        <span className="text-xs font-semibold uppercase tracking-wider" style={{ color: 'var(--color-text-muted)' }}>
+          Activity History
+        </span>
+        <button onClick={onClose} className="p-0.5 rounded hover:opacity-70">
+          <X size={12} style={{ color: 'var(--color-text-muted)' }} />
+        </button>
+      </div>
+      {loading ? (
+        <div className="flex items-center justify-center py-4">
+          <Loader size={16} className="animate-spin" style={{ color: 'var(--color-text-faint)' }} />
+        </div>
+      ) : !events?.length ? (
+        <p className="text-xs italic py-2" style={{ color: 'var(--color-text-faint)' }}>
+          No activity recorded yet
+        </p>
+      ) : (
+        <div className="space-y-2 max-h-48 overflow-y-auto">
+          {events.map((e, i) => {
+            const cfg = EVENT_ICON[e.type] || EVENT_ICON.arrived
+            const { Icon } = cfg
+            const ms = Date.now() - new Date(e.at).getTime()
+            const ago = fmtDuration(ms)
+            return (
+              <div key={i} className="flex items-start gap-2">
+                <div className="w-5 h-5 rounded-full flex items-center justify-center shrink-0 mt-0.5"
+                  style={{ background: `${cfg.color}20`, border: `1px solid ${cfg.color}40` }}>
+                  <Icon size={10} style={{ color: cfg.color }} />
+                </div>
+                <div className="min-w-0">
+                  <div className="flex items-baseline gap-1.5">
+                    <span className="text-xs font-medium" style={{ color: 'var(--color-text)' }}>{cfg.label}</span>
+                    <span className="text-[10px]" style={{ color: 'var(--color-text-muted)' }}>{ago ? `${ago} ago` : ''}</span>
+                  </div>
+                  {e.detail && (
+                    <p className="text-[10px]" style={{ color: 'var(--color-text-faint)' }}>{e.detail}</p>
+                  )}
+                </div>
+              </div>
+            )
+          })}
+        </div>
+      )}
+    </div>
+  )
+}
+
+// ---------------------------------------------------------------------------
 // Person card
 // ---------------------------------------------------------------------------
 
@@ -702,8 +817,9 @@ function BlockButton({ person, onUpdated }) {
   )
 }
 
-function PersonCard({ person, allDevices, onUpdated, onDeleted, onDeviceClick }) {
+function PersonCard({ person, allDevices, allPersons, onUpdated, onDeleted, onDeviceClick }) {
   const [editing, setEditing] = useState(false)
+  const [drawerOpen, setDrawerOpen] = useState(false)
 
   async function handleSave({ name, notes, photo, primary_mac, devices, existingPerson }) {
     await api.updatePerson(existingPerson.id, { name, notes, photo, primary_mac })
@@ -726,7 +842,7 @@ function PersonCard({ person, allDevices, onUpdated, onDeleted, onDeviceClick })
 
   if (editing) {
     return (
-      <PersonForm person={person} allDevices={allDevices}
+      <PersonForm person={person} allDevices={allDevices} allPersons={allPersons}
         onSave={handleSave}
         onCancel={() => setEditing(false)}
         onDelete={async id => { await api.deletePerson(id); onDeleted() }} />
@@ -779,13 +895,37 @@ function PersonCard({ person, allDevices, onUpdated, onDeleted, onDeviceClick })
                 </div>
               ) : null
             })()}
+            {/* Home/Away duration */}
+            {person.last_status_changed_at && (() => {
+              const ms = Date.now() - new Date(person.last_status_changed_at).getTime()
+              const dur = fmtDuration(ms)
+              return dur ? (
+                <div className="flex items-center gap-1 mt-1.5">
+                  <Home size={10} style={{ color: person.is_home ? '#10b981' : 'var(--color-text-faint)' }} />
+                  <span className="text-[10px] font-medium"
+                    style={{ color: person.is_home ? '#10b981' : 'var(--color-text-muted)' }}>
+                    {person.is_home ? `Home for ${dur}` : `Away for ${dur}`}
+                  </span>
+                </div>
+              ) : null
+            })()}
           </div>
-          <button onClick={() => setEditing(true)}
-            className="p-1.5 rounded-lg hover:bg-surface-hover transition-colors flex-shrink-0"
-            title="Edit person">
-            <Edit2 size={13} style={{ color: 'var(--color-text-muted)' }} />
-          </button>
+          <div className="flex items-center gap-1 flex-shrink-0">
+            <button onClick={() => setDrawerOpen(v => !v)}
+              className="p-1.5 rounded-lg hover:bg-surface-hover transition-colors"
+              title="View activity">
+              <History size={13} style={{ color: drawerOpen ? 'var(--color-brand)' : 'var(--color-text-muted)' }} />
+            </button>
+            <button onClick={() => setEditing(true)}
+              className="p-1.5 rounded-lg hover:bg-surface-hover transition-colors"
+              title="Edit person">
+              <Edit2 size={13} style={{ color: 'var(--color-text-muted)' }} />
+            </button>
+          </div>
         </div>
+
+        {/* Person activity drawer */}
+        {drawerOpen && <PersonDrawer person={person} onClose={() => setDrawerOpen(false)} />}
 
         {/* Devices */}
         {person.devices.length > 0 && (
@@ -816,6 +956,94 @@ function PersonCard({ person, allDevices, onUpdated, onDeleted, onDeviceClick })
 }
 
 // ---------------------------------------------------------------------------
+// Person recent events (all people, last 24h)
+// ---------------------------------------------------------------------------
+
+function PersonRecentEvents({ persons }) {
+  const [events, setEvents] = useState(null)
+  const [loading, setLoading] = useState(true)
+
+  useEffect(() => {
+    api.getPersonsTimeline(1).then(data => {
+      if (!data?.persons) { setEvents([]); setLoading(false); return }
+      const allEvts = []
+      for (const p of data.persons) {
+        if (!p.segments) continue
+        const segs = p.segments.filter(s => s.status !== 'unknown').sort((a, b) => new Date(a.from) - new Date(b.from))
+        for (let i = 0; i < segs.length; i++) {
+          const seg = segs[i]
+          const prev = i > 0 ? segs[i - 1] : null
+          if (seg.status === 'home') {
+            const awayDur = prev && prev.status === 'away' ? fmtDuration(new Date(seg.from) - new Date(prev.from)) : null
+            allEvts.push({ personId: p.id, personName: p.name, type: 'arrived', at: seg.from, detail: awayDur ? `Away for ${awayDur}` : null })
+          } else if (seg.status === 'away') {
+            const homeDur = prev && prev.status === 'home' ? fmtDuration(new Date(seg.from) - new Date(prev.from)) : null
+            allEvts.push({ personId: p.id, personName: p.name, type: 'left', at: seg.from, detail: homeDur ? `Home for ${homeDur}` : null })
+          }
+        }
+      }
+      allEvts.sort((a, b) => new Date(b.at) - new Date(a.at))
+      setEvents(allEvts.slice(0, 50))
+      setLoading(false)
+    }).catch(() => { setEvents([]); setLoading(false) })
+  }, [])
+
+  if (!loading && !events?.length) return null
+
+  const EVENT_CFG = {
+    arrived: { Icon: LogIn,  color: '#10b981', label: 'Arrived home' },
+    left:    { Icon: LogOut, color: '#94a3b8', label: 'Left home' },
+  }
+
+  // Group by person for avatar colour (use initials as colour hint)
+  const personMap = Object.fromEntries(persons.map(p => [p.id, p]))
+
+  return (
+    <div className="rounded-xl border overflow-hidden mb-8"
+      style={{ borderColor: 'var(--color-border)', background: 'var(--color-surface)' }}>
+      <div className="px-5 py-3 border-b flex items-center gap-2"
+        style={{ borderColor: 'var(--color-border)', background: 'var(--color-surface-offset)' }}>
+        <History size={13} style={{ color: 'var(--color-text-muted)' }} />
+        <span className="text-xs font-semibold uppercase tracking-wider" style={{ color: 'var(--color-text-muted)' }}>
+          Recent Activity — All People (last 24h)
+        </span>
+      </div>
+      {loading ? (
+        <div className="flex items-center justify-center py-6">
+          <Loader size={18} className="animate-spin" style={{ color: 'var(--color-text-faint)' }} />
+        </div>
+      ) : (
+        <div className="px-5 py-3 space-y-2.5">
+          {events.map((e, i) => {
+            const cfg = EVENT_CFG[e.type] || EVENT_CFG.arrived
+            const { Icon } = cfg
+            const p = personMap[e.personId]
+            const ms = Date.now() - new Date(e.at).getTime()
+            const ago = fmtDuration(ms)
+            return (
+              <div key={i} className="flex items-center gap-3">
+                <div className="w-6 h-6 rounded-full flex items-center justify-center shrink-0"
+                  style={{ background: `${cfg.color}20`, border: `1px solid ${cfg.color}40` }}>
+                  <Icon size={11} style={{ color: cfg.color }} />
+                </div>
+                <div className="flex items-baseline gap-2 min-w-0 flex-1">
+                  <span className="text-xs font-semibold shrink-0" style={{ color: 'var(--color-text)' }}>{e.personName}</span>
+                  <span className="text-xs" style={{ color: 'var(--color-text-muted)' }}>{cfg.label}</span>
+                  {e.detail && <span className="text-[10px]" style={{ color: 'var(--color-text-faint)' }}>· {e.detail}</span>}
+                </div>
+                <span className="text-[10px] shrink-0" style={{ color: 'var(--color-text-faint)' }}>
+                  {ago ? `${ago} ago` : ''}
+                </span>
+              </div>
+            )
+          })}
+        </div>
+      )}
+    </div>
+  )
+}
+
+// ---------------------------------------------------------------------------
 // Main page
 // ---------------------------------------------------------------------------
 
@@ -833,13 +1061,13 @@ export function PersonPresencePage({ devices, onDeviceClick }) {
     display_name: d.custom_name || d.hostname || d.ip_address,
   }))
 
-  const loadTimeline = useCallback(async (d) => {
-    setTimelineLoading(true)
+  const loadTimeline = useCallback(async (d, { silent = false } = {}) => {
+    if (!silent) setTimelineLoading(true)
     try {
       const data = await api.getPersonsTimeline(d)
       setTimelineData(data)
     } catch {}
-    finally { setTimelineLoading(false) }
+    finally { if (!silent) setTimelineLoading(false) }
   }, [])
 
   const load = useCallback(async () => {
@@ -863,7 +1091,7 @@ export function PersonPresencePage({ devices, onDeviceClick }) {
     function doRefresh() {
       const el = document.activeElement
       const busy = el && (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA' || el.tagName === 'SELECT')
-      if (!busy) { load(); loadTimeline(days) }
+      if (!busy) { load(); loadTimeline(days, { silent: true }) }
     }
     function onVisible() { if (document.visibilityState === 'visible') doRefresh() }
     document.addEventListener('visibilitychange', onVisible)
@@ -931,16 +1159,18 @@ export function PersonPresencePage({ devices, onDeviceClick }) {
         </div>
         <button onClick={() => setShowForm(v => !v)}
           className="flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-medium transition-colors"
-          style={{ background: 'var(--color-brand)', color: 'black' }}>
-          <UserPlus size={15} />
-          Add Person
+          style={showForm
+            ? { background: 'var(--color-surface-offset)', color: 'var(--color-text-muted)', border: '1px solid var(--color-border)' }
+            : { background: 'var(--color-brand)', color: 'black' }}>
+          {showForm ? <X size={15} /> : <UserPlus size={15} />}
+          {showForm ? 'Cancel' : 'Add Person'}
         </button>
       </div>
 
       {/* Add form */}
       {showForm && (
         <div className="mb-6">
-          <PersonForm allDevices={allDevices} onSave={handleCreate} onCancel={() => setShowForm(false)} />
+          <PersonForm allDevices={allDevices} allPersons={persons} onSave={handleCreate} onCancel={() => setShowForm(false)} />
         </div>
       )}
 
@@ -971,12 +1201,17 @@ export function PersonPresencePage({ devices, onDeviceClick }) {
       {!loading && persons.length > 0 && (
         <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-3 mb-8">
           {persons.map(person => (
-            <PersonCard key={person.id} person={person} allDevices={allDevices}
+            <PersonCard key={person.id} person={person} allDevices={allDevices} allPersons={persons}
               onUpdated={() => load()}
               onDeleted={() => { load(); loadTimeline(days) }}
               onDeviceClick={onDeviceClick} />
           ))}
         </div>
+      )}
+
+      {/* Recent Person Events */}
+      {!loading && persons.length > 0 && (
+        <PersonRecentEvents persons={persons} />
       )}
 
       {/* Presence Timeline section */}

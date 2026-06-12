@@ -31,7 +31,9 @@ Check the [Wiki](https://github.com/thefunkygibbon/InSpectre/wiki) for full admi
 - **Watched flag** — star important devices for elevated offline alerts and priority sorting
 - **Ignore flag** — hide known-benign devices from the main view
 - **Notes** — free-text notes attached to any device
-- **Device grouping** — devices sharing the same hostname (e.g. `laptop` and `laptop.lan`) are automatically grouped as a single physical device with multiple interfaces. Grouped devices share a unified event timeline and appear as one card on the dashboard. Manual grouping and ungrouping is available from the device drawer, and **groups you create manually are protected** — they are never altered or undone by the automatic hostname-based grouping/cleanup passes.
+- **Device grouping** — devices sharing the same hostname (e.g. `laptop` and `laptop.lan`, or a server's real NIC plus a Docker macvlan shim) are automatically grouped as a single physical device with multiple interfaces. Grouping is **self-healing**: a periodic pass merges matching devices discovered at any time, not just at first sight, and picks the most "real" interface (hardware NIC over a virtual/macvlan MAC, online over offline, lowest IP) as the primary. Grouped devices share a unified event timeline and appear as one card on the dashboard. You can override the primary at any time, and by default only the primary interface is port/vuln-scanned (toggle with **Scan grouped members**). Manual grouping and ungrouping is available from the device drawer; **groups you create manually are protected**, and a device you deliberately ungroup is never silently re-merged by the automatic passes.
+- **Primary IP & multi-homed hosts** — a device with more than one IP on a single MAC (multi-homed NIC, bridge) no longer flaps between addresses: the probe pins a stable primary IP and tracks the rest as **secondary IPs**. You can pin a specific address as primary from the device drawer's IP History panel, and the probe will keep it permanently.
+- **Host-aware presence** — the probe runs in the host's network namespace, so the Docker host's own IPs (its NIC, macvlan shims, bridges) are always treated as present — they can't be marked falsely offline just because a host doesn't ARP for its own addresses.
 - **Persistent filters & views** — your active filter, smart filter, sort order, and grid/list view choice are saved and restored automatically the next time you open the dashboard.
 
 ### Person Presence
@@ -44,7 +46,7 @@ Check the [Wiki](https://github.com/thefunkygibbon/InSpectre/wiki) for full admi
 - **Presence notifications** — person arrived home, left home, blocked, and unblocked events feed into the notification profile system (see below)
 
 ### Scanning & Security
-- **Port scanning** — nmap-based TCP port sweep with OS detection and service fingerprinting
+- **Port scanning** — nmap-based TCP port sweep with OS detection and service fingerprinting. Scans always target a device's pinned **primary IP** — whether triggered on first discovery, on reconnect after a long offline period, or manually from the drawer — so multi-homed and grouped hosts are scanned consistently on the same address.
 - **Baseline tracking** — detects port drift and raises alerts when a device's open ports change
 - **Vulnerability scanning** — Nuclei-based CVE scanning with per-service template routing; findings shown by severity (critical, high, medium, low)
 - **Scheduled scans** — configurable nightly scan window with per-device auto-scan triggers
@@ -75,6 +77,9 @@ Check the [Wiki](https://github.com/thefunkygibbon/InSpectre/wiki) for full admi
 - **Web Tools** — HTTP Headers, SSL/TLS Certificate, Redirect Chain, TLS Version Matrix, HTTP Timing
 - **Infrastructure** — IP Geolocation, WHOIS, BGP/ASN Lookup, Subnet Calculator
 - **Email Tools** — MX/SPF/DMARC/DKIM Checker, SMTP Banner Grab, BIMI Lookup, DNSBL Check
+
+### Extensibility
+- **Plugin system** — integrate external services (DNS servers, firewalls, controllers, DHCP sources) for device discovery, enrichment, presence, and blocking. Plugins are simple declarative JSON/YAML manifests (no code) uploaded via Settings → Plugins. Built-in plugins ship for AdGuard Home, Pi-hole, TP-Link Omada, Home Assistant, OPNsense, and pfSense. See the [Plugin Developer Guide](plugin.md) and [`examples/plugins/`](examples/plugins/) to write your own.
 
 ### Alerts & Notifications
 - **Toast + browser notifications** — instant in-app and OS-level alerts
@@ -131,6 +136,24 @@ Open **http://localhost:3000** in your browser and complete the first-run setup 
 ./inspectre.sh rebuild          # full wipe and rebuild (deletes postgres_data/)
 ./inspectre.sh rebuild keep-data  # rebuild but preserve the database
 ./inspectre.sh logs             # tail logs from all containers
+```
+
+### Using pre-built Docker images (Docker Hub)
+
+If you want to run InSpectre without cloning the repository:
+
+```bash
+curl -O https://raw.githubusercontent.com/thefunkygibbon/InSpectre/main/docker-compose.deploy.yml
+# Edit docker-compose.deploy.yml — change POSTGRES_PASSWORD and SECRET_KEY
+docker compose -f docker-compose.deploy.yml up -d
+```
+
+Open **http://localhost:3000** and complete the setup wizard.
+
+Or use the interactive installer, which handles configuration automatically:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/thefunkygibbon/InSpectre/main/inspectre-install.sh | bash
 ```
 
 ### Using Docker Compose directly
@@ -211,11 +234,38 @@ Full user documentation is available in [wiki.md](wiki.md), covering:
 - Backup, restore, and data management
 - Troubleshooting and FAQ
 
+For extending InSpectre, see the **[Plugin Developer Guide](plugin.md)** and the
+ready-to-copy examples in [`examples/plugins/`](examples/plugins/).
+
 ---
 
 ## Contributing
 
 Contributions are welcome. Please open an issue to discuss a change before submitting a pull request. All development work targets the `InSpectre-test` branch — do not submit pull requests against `InSpectre-main`.
+
+### Versioning
+
+The project version lives in a single file — **`VERSION`** at the repo root — and everything else is derived from it. The backend, probe and frontend each read an auto-generated version module that is stamped from `VERSION`; never edit those generated files by hand:
+
+- `backend/_version.py`, `probe/_version.py`, `frontend/src/version.js`, and the `version` field in `frontend/package.json`
+
+Useful commands:
+
+```bash
+scripts/sync-version.sh            # re-stamp all components from VERSION
+scripts/bump-version.sh patch      # 1.2.0 -> 1.2.1  (default)
+scripts/bump-version.sh minor      # 1.2.0 -> 1.3.0
+scripts/bump-version.sh major      # 1.2.0 -> 2.0.0
+scripts/bump-version.sh set 2.1.0  # set an explicit version
+```
+
+**Automatic bumping:** a git pre-commit hook keeps the version moving forward so it never goes stale again. Enable it once per clone:
+
+```bash
+git config core.hooksPath .githooks
+```
+
+With the hook active, every commit auto-increments the **patch** number and re-stamps the derived files. To cut a `minor`/`major` release instead, run `scripts/bump-version.sh minor` (or `major`) and stage `VERSION` before committing — the hook detects the manual bump and only syncs. Set `INSPECTRE_NO_VERSION_BUMP=1` to skip bumping for a single commit. `./inspectre.sh rebuild` also re-stamps from `VERSION` before building, so deployed images always carry the correct version.
 
 ---
 
@@ -224,4 +274,4 @@ Contributions are welcome. Please open an issue to discuss a change before submi
 InSpectre is dual-licensed:
 
 - **Open Source (AGPL-3.0)** — Free for personal use, home labs, and open-source projects. See [LICENSE](LICENSE).
-- **Commercial** — Required for embedding in proprietary products or offering as a hosted service. See [LICENSE-COMMERCIAL.md](LICENSE-COMMERCIAL.md) or contact [your-email].
+- **Commercial** — Required for embedding in proprietary products or offering as a hosted service. See [LICENSE-COMMERCIAL.md](LICENSE-COMMERCIAL.md) or contact [inspectre@thefunkygibbon.net](mailto:inspectre@thefunkygibbon.net).
