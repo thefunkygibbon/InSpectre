@@ -73,7 +73,7 @@
         <pre><code><span class="c"># Downloads and starts InSpectre interactively</span>
 <span class="p">curl -fsSL https://raw.githubusercontent.com/thefunkygibbon/InSpectre/main/inspectre-install.sh | bash</span></code></pre>
       </div>
-      <div class="callout">The installer checks for Docker, asks for an install directory, generates secure passwords and secret keys, optionally lets you set your IP range and interface, then starts the stack automatically.</div>
+      <div class="callout">The installer checks all prerequisites (Docker, Docker Compose v2, curl, openssl), asks whether you're installing on <strong>x64</strong> or <strong>Raspberry&nbsp;Pi</strong> and pulls the matching images, asks for an install directory, generates secure passwords and secret keys, optionally lets you set your IP range and interface, then starts the stack automatically — no git clone and no building required.</div>
 
       <h3 style="color:var(--brand-light);margin-top:28px;">Or pull manually from Docker Hub</h3>
       <div class="code">
@@ -104,7 +104,7 @@ curl -O https://raw.githubusercontent.com/thefunkygibbon/InSpectre/main/docker-c
       </div>
       <p class="comment" style="margin-top:10px;">The PostgreSQL database uses the official <code>postgres:15-alpine</code> image — no custom build.</p>
 
-      <h3 style="color:var(--brand-light);margin-top:28px;">Or clone from GitHub</h3>
+      <h3 style="color:var(--brand-light);margin-top:28px;">Or clone from GitHub (developers / building from source)</h3>
       <div class="code">
         <div class="code-head"><span>recommended — inspectre.sh</span><button data-copy>copy</button></div>
         <pre><code><span class="c"># 1. Clone the repository</span>

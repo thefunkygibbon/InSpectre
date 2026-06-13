@@ -43,7 +43,7 @@
         <h4>getting started</h4>
         <a href="#requirements">Requirements</a>
         <a href="#install">Installation</a>
-        <a href="#dockerhub">Docker Hub deploy</a>
+        <a href="#dockerhub">Manual deploy</a>
         <a href="#firstrun">First run &amp; wizard</a>
         <a href="#commands">Helper commands</a>
         <h4>devices</h4>
@@ -74,45 +74,50 @@
 
         <h2 id="requirements">Requirements</h2>
         <ul>
-          <li><strong>Docker</strong> 24 or newer</li>
+          <li><strong>Docker</strong> 24 or newer (with the daemon running)</li>
           <li><strong>Docker Compose</strong> v2 (the <code class="mono">docker compose</code> plugin)</li>
-          <li>A 64-bit Linux host on the network you want to monitor</li>
+          <li><strong>curl</strong> and <strong>openssl</strong> (used by the installer to download the compose file and generate secure keys)</li>
+          <li>A Linux host on the network you want to monitor — <strong>x86-64</strong> or <strong>ARM64 (Raspberry Pi 3/4/5, 64-bit)</strong></li>
           <li>A flat Layer-2 LAN for full ARP discovery and blocking</li>
         </ul>
 
-        <h2 id="install">Installation (from GitHub)</h2>
-        <p>Clone the repository and bring the stack up with the bundled helper script:</p>
+        <h2 id="install">Installation (recommended)</h2>
+        <p>The fastest way to install InSpectre is the one-line installer. It simply downloads and runs <code class="mono">inspectre-install.sh</code> — there is <strong>no need to clone the repository or build anything</strong>. The script pulls the pre-built images straight from Docker Hub.</p>
         <div class="code">
-          <div class="code-head"><span>bash</span><button data-copy>copy</button></div>
-          <pre><code>git clone https://github.com/thefunkygibbon/InSpectre.git
-cd InSpectre
-<span class="p">./inspectre.sh up</span></code></pre>
-        </div>
-        <p>Prefer raw Compose? <code class="mono">docker compose up -d</code> works too. Once the containers are healthy, open <strong>http://localhost:3000</strong> (or the host's IP) in your browser.</p>
-
-        <h2 id="dockerhub">Deploying from Docker Hub</h2>
-        <p>Run InSpectre without cloning the repository by pulling pre-built images directly from Docker Hub.</p>
-        <h3>Interactive installer (recommended)</h3>
-        <div class="code">
-          <div class="code-head"><span>bash</span><button data-copy>copy</button></div>
+          <div class="code-head"><span>bash — interactive installer</span><button data-copy>copy</button></div>
           <pre><code><span class="p">curl -fsSL https://raw.githubusercontent.com/thefunkygibbon/InSpectre/main/inspectre-install.sh | bash</span></code></pre>
         </div>
-        <p>The installer checks prerequisites, prompts for an install directory, generates secure passwords and a secret key, optionally lets you set <code class="mono">IP_RANGE</code> and <code class="mono">INTERFACE</code>, then starts the stack.</p>
-        <h3>Manual Docker Hub deploy</h3>
+        <p>The installer will:</p>
+        <ul>
+          <li>Verify all prerequisites (Docker, Docker Compose v2, curl, openssl) and that the Docker daemon is running</li>
+          <li>Detect your CPU architecture and ask whether to install <strong>x64</strong> or <strong>Raspberry&nbsp;Pi</strong> images (pulling the <code class="mono">latest</code> or <code class="mono">raspi</code> image tags accordingly)</li>
+          <li>Prompt for an install directory and download <code class="mono">docker-compose.deploy.yml</code></li>
+          <li>Generate a strong database password and a JWT secret key automatically</li>
+          <li>Optionally let you set <code class="mono">IP_RANGE</code> and <code class="mono">INTERFACE</code> (otherwise auto-detected)</li>
+          <li>Write a <code class="mono">.env</code> file and start the whole stack with <code class="mono">docker compose up -d</code></li>
+        </ul>
+        <p>When it finishes, open <strong>http://localhost:3000</strong> (or the host's IP) and complete the first-run setup wizard.</p>
+
+        <h2 id="dockerhub">Manual deployment (advanced)</h2>
+        <p>If you'd rather not use the installer, you can deploy the pre-built Docker Hub images by hand. Set <code class="mono">INSPECTRE_TAG=raspi</code> on a Raspberry&nbsp;Pi / ARM64 host, or leave it as <code class="mono">latest</code> for x86-64.</p>
         <div class="code">
-          <div class="code-head"><span>bash</span><button data-copy>copy</button></div>
+          <div class="code-head"><span>bash — manual Docker Hub deploy</span><button data-copy>copy</button></div>
           <pre><code><span class="c"># 1. Download the deploy compose file</span>
 curl -O https://raw.githubusercontent.com/thefunkygibbon/InSpectre/main/docker-compose.deploy.yml
 
 <span class="c"># 2. Edit — change POSTGRES_PASSWORD and SECRET_KEY</span>
 <span class="c">#    Generate a key: openssl rand -hex 32</span>
 
-<span class="c"># 3. Start</span>
+<span class="c"># 3. (Raspberry Pi only) select the ARM64 images</span>
+<span class="c">#    echo "INSPECTRE_TAG=raspi" >> .env</span>
+
+<span class="c"># 4. Start</span>
 <span class="p">docker compose -f docker-compose.deploy.yml up -d</span></code></pre>
         </div>
         <table>
           <thead><tr><th>Variable</th><th>Required</th><th>Notes</th></tr></thead>
           <tbody>
+            <tr><td><code class="mono">INSPECTRE_TAG</code></td><td>Optional</td><td>Image tag / architecture: <code class="mono">latest</code> = x86-64 (default), <code class="mono">raspi</code> = ARM64 / Raspberry&nbsp;Pi</td></tr>
             <tr><td><code class="mono">POSTGRES_PASSWORD</code></td><td>✅ Must change</td><td>Internal DB password — set the same value in both db and web/probe sections</td></tr>
             <tr><td><code class="mono">SECRET_KEY</code></td><td>✅ Must change</td><td>JWT signing key — generate with <code class="mono">openssl rand -hex 32</code></td></tr>
             <tr><td><code class="mono">IP_RANGE</code></td><td>Optional</td><td>Leave commented out for auto-detection</td></tr>
@@ -125,6 +130,15 @@ curl -O https://raw.githubusercontent.com/thefunkygibbon/InSpectre/main/docker-c
           <div class="code-head"><span>bash</span><button data-copy>copy</button></div>
           <pre><code>docker compose -f docker-compose.deploy.yml pull
 <span class="p">docker compose -f docker-compose.deploy.yml up -d</span></code></pre>
+        </div>
+
+        <h3>Building from source (developers)</h3>
+        <p>Only needed if you want to modify and rebuild the images yourself. Clone the repository and use the bundled helper script:</p>
+        <div class="code">
+          <div class="code-head"><span>bash</span><button data-copy>copy</button></div>
+          <pre><code>git clone https://github.com/thefunkygibbon/InSpectre.git
+cd InSpectre
+<span class="p">./inspectre.sh up</span></code></pre>
         </div>
 
         <h2 id="firstrun">First run &amp; setup wizard</h2>

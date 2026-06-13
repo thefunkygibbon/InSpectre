@@ -115,18 +115,52 @@ Check the [Wiki](https://github.com/thefunkygibbon/InSpectre/wiki) for full admi
 
 ### Requirements
 
-- Docker 24+
-- Docker Compose v2
+- Docker 24+ (with the daemon running)
+- Docker Compose v2 (the `docker compose` plugin)
+- `curl` and `openssl` (used by the installer)
+- An x86-64 **or** ARM64 (Raspberry Pi 3/4/5, 64-bit) Linux host
 
-### Using `inspectre.sh` (recommended)
+### One-line install (recommended)
+
+The fastest way to get started. This simply downloads and runs `inspectre-install.sh` — **you do not need to clone the repository or build anything.** The installer pulls the pre-built images straight from Docker Hub.
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/thefunkygibbon/InSpectre/main/inspectre-install.sh | bash
+```
+
+The installer will:
+
+- Check all prerequisites (Docker, Docker Compose v2, curl, openssl) and that the Docker daemon is running
+- Detect your CPU architecture and ask whether to install **x64** or **Raspberry Pi** images (the `latest` or `raspi` image tags)
+- Prompt for an install directory and download `docker-compose.deploy.yml`
+- Generate a strong database password and JWT secret key automatically
+- Optionally let you set `IP_RANGE` and `INTERFACE` (otherwise auto-detected)
+- Write a `.env` file and start the whole stack
+
+When it finishes, open **http://localhost:3000** and complete the first-run setup wizard.
+
+### Manual Docker Hub deploy (advanced)
+
+If you'd rather configure things by hand, pull the pre-built images directly. On a Raspberry Pi / ARM64 host, set `INSPECTRE_TAG=raspi`; on x86-64 leave it as the default `latest`.
+
+```bash
+curl -O https://raw.githubusercontent.com/thefunkygibbon/InSpectre/main/docker-compose.deploy.yml
+# Edit docker-compose.deploy.yml — change POSTGRES_PASSWORD and SECRET_KEY
+# Raspberry Pi only:  echo "INSPECTRE_TAG=raspi" >> .env
+docker compose -f docker-compose.deploy.yml up -d
+```
+
+Open **http://localhost:3000** and complete the setup wizard.
+
+### Building from source (developers)
+
+Only needed if you want to modify and rebuild the images yourself.
 
 ```bash
 git clone https://github.com/thefunkygibbon/InSpectre.git
 cd InSpectre
 ./inspectre.sh up
 ```
-
-Open **http://localhost:3000** in your browser and complete the first-run setup wizard. The wizard configures your network settings, scan range, and notifications — no file editing required.
 
 ### Available helper commands
 
@@ -136,30 +170,6 @@ Open **http://localhost:3000** in your browser and complete the first-run setup 
 ./inspectre.sh rebuild          # full wipe and rebuild (deletes postgres_data/)
 ./inspectre.sh rebuild keep-data  # rebuild but preserve the database
 ./inspectre.sh logs             # tail logs from all containers
-```
-
-### Using pre-built Docker images (Docker Hub)
-
-If you want to run InSpectre without cloning the repository:
-
-```bash
-curl -O https://raw.githubusercontent.com/thefunkygibbon/InSpectre/main/docker-compose.deploy.yml
-# Edit docker-compose.deploy.yml — change POSTGRES_PASSWORD and SECRET_KEY
-docker compose -f docker-compose.deploy.yml up -d
-```
-
-Open **http://localhost:3000** and complete the setup wizard.
-
-Or use the interactive installer, which handles configuration automatically:
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/thefunkygibbon/InSpectre/main/inspectre-install.sh | bash
-```
-
-### Using Docker Compose directly
-
-```bash
-docker compose up -d
 ```
 
 ---
