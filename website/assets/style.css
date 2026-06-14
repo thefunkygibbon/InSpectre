@@ -312,4 +312,15 @@ a:hover { color: var(--accent); }
   .man-grid { grid-template-columns: 1fr; }
   .form-row2 { grid-template-columns: 1fr; }
   .flow { grid-template-columns: 1fr; }
+
+  /* Hero: trim the decorative scan-output preamble so the headline is
+     visible near the top of the screen without scrolling. */
+  .hero-term { margin-top: 16px; }
+  .hero-term .term-body { padding: 14px 15px; }
+  .hero-term .ln.out,
+  .hero-term .ln.blank { display: none; }
+  .headline { margin-top: 8px; font-size: clamp(1.7rem, 8vw, 2.4rem); }
+  .lead { line-height: 1.6; margin-bottom: 18px; }
+  .actions { gap: 10px; }
+  .actions .btn { flex: 1 1 auto; text-align: center; }
 }
