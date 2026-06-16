@@ -378,6 +378,10 @@ export const api = {
   // Nuclei templates
   nucleiTemplateStatus: ()                    => request('GET', '/nuclei/template-status'),
   nucleiTemplateUpdate: (onLine, signal)      => streamSSE('/nuclei/template-update', onLine, signal),
+
+  // System / appliance auto-updates
+  getSystemInfo:        ()                    => request('GET',  '/system/info'),
+  setAutoUpdate:        (enabled, schedule)   => request('POST', '/system/auto-update', { enabled, schedule }),
 }
 
 export { streamSSE }

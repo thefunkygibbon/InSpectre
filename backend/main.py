@@ -664,6 +664,9 @@ DEFAULT_SETTINGS = {
     "float_new_to_top":          ("true",  "Surface unacknowledged new devices and containers to the top of the list."),
     # Setup wizard
     "setup_complete":            ("false", "Whether the initial setup wizard has been completed."),
+    # Appliance auto-updates (Watchtower) — only meaningful on VM/Pi appliance builds
+    "auto_update_enabled":       ("false", "Enable automatic container updates via Watchtower. Appliance (VM/Pi) builds only; disabled by default."),
+    "auto_update_schedule":      ("daily", "How often Watchtower checks for container updates: 6h, 12h, daily, or weekly."),
     # Docker monitoring
     "docker_enabled":            ("false", "Enable Docker container monitoring."),
     "docker_host":               ("unix:///var/run/docker.sock", "Docker host — socket path (unix:///var/run/docker.sock) or TCP URL (tcp://host:2375)."),
@@ -2482,6 +2485,8 @@ class SetupCompleteRequest(BaseModel):
     docker_enabled:       bool   = False
     docker_host:          str    = "unix:///var/run/docker.sock"
     fingerbank_api_key:   str    = ""
+    auto_update_enabled:  bool   = False
+    auto_update_schedule: str    = "daily"
 
 
 # ---------------------------------------------------------------------------
@@ -2989,6 +2994,8 @@ def setup_complete(
         "vuln_scan_on_new_device":   "true" if payload.vuln_scan_on_new else "false",
         "vuln_scan_schedule":        payload.vuln_scan_schedule if payload.vuln_scan_enabled else "disabled",
         "docker_enabled":            "true" if payload.docker_enabled else "false",
+        "auto_update_enabled":       "true" if payload.auto_update_enabled else "false",
+        "auto_update_schedule":      (payload.auto_update_schedule or "daily").lower(),
     }
     if payload.ntfy_topic:
         to_save["ntfy_topic"] = payload.ntfy_topic
@@ -3005,7 +3012,175 @@ def setup_complete(
         else:
             db.add(Setting(key=key, value=value))
     db.commit()
+    # On appliance builds, (re)configure Watchtower to match the wizard choice.
+    if _appliance_info() is not None:
+        try:
+            _configure_watchtower(payload.auto_update_enabled,
+                                  (payload.auto_update_schedule or "daily").lower())
+        except Exception:
+            pass
     return {"ok": True, "setup_complete": True}
+
+
+# ---------------------------------------------------------------------------
+# Appliance auto-updates (Watchtower) — only active on VM/Pi appliance builds.
+# An appliance is identified by the presence of /opt/inspectre/appliance.json,
+# which is bind-mounted ONLY by the appliance (VM/Pi) compose files. A plain
+# Docker install never has it, so the auto-update UI/endpoints stay hidden there.
+# ---------------------------------------------------------------------------
+APPLIANCE_JSON_PATH       = "/opt/inspectre/appliance.json"
+WATCHTOWER_CONTAINER_NAME = "inspectre-watchtower"
+WATCHTOWER_IMAGE          = "containrrr/watchtower:latest"
+
+# UI schedule choices -> 6-field cron expressions understood by Watchtower.
+_WATCHTOWER_SCHEDULES = {
+    "6h":     "0 0 */6 * * *",
+    "12h":    "0 0 */12 * * *",
+    "daily":  "0 0 4 * * *",
+    "24h":    "0 0 4 * * *",
+    "weekly": "0 0 4 * * 0",
+}
+
+
+def _appliance_info():
+    """Return the appliance descriptor dict if this is a VM/Pi build, else None."""
+    try:
+        with open(APPLIANCE_JSON_PATH, "r") as fh:
+            return json.load(fh)
+    except Exception:
+        return None
+
+
+def _setting_get(db: Session, key: str, default: str = "") -> str:
+    s = db.get(Setting, key)
+    return s.value if (s and s.value is not None) else default
+
+
+def _setting_put(db: Session, key: str, value: str) -> None:
+    s = db.get(Setting, key)
+    if s:
+        s.value = value
+    else:
+        db.add(Setting(key=key, value=value))
+
+
+def _watchtower_schedule_cron(schedule: str) -> str:
+    return _WATCHTOWER_SCHEDULES.get((schedule or "daily").lower(), _WATCHTOWER_SCHEDULES["daily"])
+
+
+def _watchtower_status() -> dict:
+    """Best-effort status of the Watchtower updater container."""
+    try:
+        client = _make_docker_client("unix:///var/run/docker.sock")
+    except Exception:
+        return {"running": False, "available": False}
+    try:
+        c = client.containers.get(WATCHTOWER_CONTAINER_NAME)
+        return {"running": c.status == "running", "available": True, "status": c.status}
+    except Exception:
+        return {"running": False, "available": True}
+    finally:
+        try:
+            client.close()
+        except Exception:
+            pass
+
+
+def _configure_watchtower(enabled: bool, schedule: str) -> dict:
+    """Create/replace or remove the Watchtower updater container on the local
+    Docker socket. Idempotent: always removes any existing instance first."""
+    client = _make_docker_client("unix:///var/run/docker.sock")
+    try:
+        try:
+            client.containers.get(WATCHTOWER_CONTAINER_NAME).remove(force=True)
+        except Exception:
+            pass
+
+        if not enabled:
+            return {"enabled": False, "running": False}
+
+        cron = _watchtower_schedule_cron(schedule)
+        # Best-effort pull: bundled into appliance images, but online builds may
+        # need to fetch it on first enable.
+        try:
+            client.images.pull(WATCHTOWER_IMAGE)
+        except Exception:
+            pass
+
+        container = client.containers.run(
+            WATCHTOWER_IMAGE,
+            name=WATCHTOWER_CONTAINER_NAME,
+            detach=True,
+            restart_policy={"Name": "unless-stopped"},
+            volumes={"/var/run/docker.sock": {"bind": "/var/run/docker.sock", "mode": "rw"}},
+            environment={
+                "WATCHTOWER_SCHEDULE":          cron,
+                "WATCHTOWER_CLEANUP":           "true",
+                "WATCHTOWER_LABEL_ENABLE":      "true",
+                "WATCHTOWER_INCLUDE_RESTARTING": "true",
+            },
+            # Don't let Watchtower update itself.
+            labels={"com.centurylinklabs.watchtower.enable": "false"},
+        )
+        return {"enabled": True, "running": True, "schedule": schedule, "cron": cron, "id": container.id[:12]}
+    finally:
+        try:
+            client.close()
+        except Exception:
+            pass
+
+
+class AutoUpdateRequest(BaseModel):
+    enabled: bool = False
+    schedule: str = "daily"
+
+
+@app.get("/system/info")
+def system_info(username: str = Depends(get_current_user), db: Session = Depends(get_db)):
+    """Report appliance status + current auto-update (Watchtower) configuration.
+    The frontend uses is_appliance to decide whether to show the auto-update UI."""
+    appliance = _appliance_info()
+    enabled   = (_setting_get(db, "auto_update_enabled",  "false") == "true")
+    schedule  = _setting_get(db, "auto_update_schedule", "daily")
+    info = {
+        "is_appliance": appliance is not None,
+        "appliance":    appliance,
+        "version":      VERSION,
+        "auto_update": {
+            "enabled":  enabled,
+            "schedule": schedule,
+        },
+    }
+    if appliance is not None:
+        info["auto_update"]["watchtower"] = _watchtower_status()
+    return info
+
+
+@app.post("/system/auto-update")
+def system_auto_update(
+    payload: AutoUpdateRequest,
+    username: str = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Enable/disable and schedule appliance auto-updates, then (re)configure the
+    Watchtower container. Appliance (VM/Pi) builds only."""
+    if _appliance_info() is None:
+        raise HTTPException(400, "Automatic updates are only available on InSpectre appliance (VM/Pi) builds.")
+
+    schedule = (payload.schedule or "daily").lower()
+    if schedule not in _WATCHTOWER_SCHEDULES:
+        raise HTTPException(422, f"Invalid schedule '{payload.schedule}'. Use one of: {', '.join(sorted(_WATCHTOWER_SCHEDULES))}.")
+
+    _setting_put(db, "auto_update_enabled",  "true" if payload.enabled else "false")
+    _setting_put(db, "auto_update_schedule", schedule)
+    db.commit()
+
+    try:
+        result = _configure_watchtower(payload.enabled, schedule)
+    except Exception as e:
+        raise HTTPException(502, f"Settings saved but failed to configure Watchtower: {e}")
+
+    return {"ok": True, "auto_update": {"enabled": payload.enabled, "schedule": schedule, "watchtower": result}}
 
 
 # ---------------------------------------------------------------------------

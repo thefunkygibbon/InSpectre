@@ -22,3 +22,8 @@ postgres_dataold2/
 /dist/
 /frontend/dist/
 /data/
+# Python bytecode
+backend/__pycache__/
+probe/__pycache__/
+__pycache__/
+*.pyc

@@ -5,6 +5,8 @@ services:
     image: inspectre-postgres:arm64
     container_name: inspectre-db
     restart: unless-stopped
+    labels:
+      - "com.centurylinklabs.watchtower.enable=true"
     ports:
       - "5432:5432"
     environment:
@@ -24,6 +26,8 @@ services:
     image: inspectre-backend:arm64
     container_name: inspectre-web
     restart: unless-stopped
+    labels:
+      - "com.centurylinklabs.watchtower.enable=true"
     ports:
       - "8000:8000"
     environment:
@@ -37,6 +41,10 @@ services:
       - "host.docker.internal:host-gateway"
     volumes:
       - ./data/vuln/trivy:/root/.cache/trivy
+      # Appliance auto-update support: lets the backend detect the appliance
+      # build (appliance.json) and manage the Watchtower updater (docker.sock).
+      - ./appliance.json:/opt/inspectre/appliance.json:ro
+      - /var/run/docker.sock:/var/run/docker.sock
     depends_on:
       db:
         condition: service_healthy
@@ -45,6 +53,8 @@ services:
     image: inspectre-frontend:arm64
     container_name: inspectre-frontend
     restart: unless-stopped
+    labels:
+      - "com.centurylinklabs.watchtower.enable=true"
     ports:
       - "3000:80"
     depends_on:
@@ -54,6 +64,8 @@ services:
     image: inspectre-probe:arm64
     container_name: inspectre-probe
     restart: unless-stopped
+    labels:
+      - "com.centurylinklabs.watchtower.enable=true"
     network_mode: "host"
     privileged: true
     environment:

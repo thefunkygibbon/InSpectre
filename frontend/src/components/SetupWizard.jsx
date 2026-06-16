@@ -2,13 +2,13 @@ import { useState, useEffect } from 'react'
 import {
   User, Lock, Network, Shield, Bell, ArrowRight,
   CheckCircle, Eye, EyeOff, Upload, RotateCcw, Database,
-  Box, Server, Plus, Loader2, Check, Fingerprint, ExternalLink,
+  Box, Server, Plus, Loader2, Check, Fingerprint, ExternalLink, RefreshCw,
 } from 'lucide-react'
 import { Logo } from './Logo'
 import { api, setToken } from '../api'
 
 // Steps for the "fresh setup" path only (restore path bypasses all of these)
-const FRESH_STEPS = [
+const FRESH_STEPS_BASE = [
   { id: 'user',        label: 'Create Account',   Icon: User        },
   { id: 'network',     label: 'Network Settings', Icon: Network     },
   { id: 'vuln',        label: 'Vuln Scans',       Icon: Shield      },
@@ -17,6 +17,17 @@ const FRESH_STEPS = [
   { id: 'fingerbank',  label: 'Device ID',        Icon: Fingerprint },
   { id: 'done',        label: 'All Set!',          Icon: CheckCircle },
 ]
+
+const AUTO_UPDATE_STEP = { id: 'autoupdate', label: 'Auto Updates', Icon: RefreshCw }
+
+// On appliance (VM/Pi) builds we offer an automatic-updates step just before the
+// final screen. The standard Docker build omits it (is_appliance is false).
+function buildFreshSteps(isAppliance) {
+  if (!isAppliance) return FRESH_STEPS_BASE
+  const steps = [...FRESH_STEPS_BASE]
+  steps.splice(steps.length - 1, 0, AUTO_UPDATE_STEP)
+  return steps
+}
 
 const WIZARD_HOST_TYPES = [
   { value: 'docker_local',  label: 'Docker — Local socket',  hint: 'Connects via unix socket (requires socket mount).' },
@@ -821,6 +832,61 @@ function StepFingerbank({ onNext }) {
   )
 }
 
+function StepAutoUpdate({ onNext }) {
+  const [enabled,  setEnabled]  = useState(false)
+  const [schedule, setSchedule] = useState('daily')
+
+  function handleNext() {
+    onNext({ auto_update_enabled: enabled, auto_update_schedule: schedule })
+  }
+
+  return (
+    <div className="space-y-5">
+      <p className="text-sm" style={{ color: 'var(--color-text-muted)' }}>
+        This appliance can keep its containers up to date automatically using Watchtower.
+        Updates are off by default — you can change this any time in Settings → Admin.
+      </p>
+
+      <label className="flex items-start gap-3 cursor-pointer p-3 rounded-xl border transition-colors"
+        style={{
+          borderColor: enabled ? 'var(--color-brand)' : 'var(--color-border)',
+          background: enabled ? 'rgba(99,102,241,0.06)' : 'transparent',
+        }}>
+        <input type="checkbox" className="mt-0.5" checked={enabled}
+          onChange={e => setEnabled(e.target.checked)} />
+        <div>
+          <p className="text-sm font-medium" style={{ color: 'var(--color-text)' }}>Enable automatic updates</p>
+          <p className="text-xs mt-0.5" style={{ color: 'var(--color-text-muted)' }}>
+            Periodically checks for and installs new InSpectre container images.
+          </p>
+        </div>
+      </label>
+
+      {enabled && (
+        <div className="space-y-3 pl-1">
+          <div>
+            <label className="block text-xs font-medium mb-1" style={{ color: 'var(--color-text-muted)' }}>
+              Check schedule
+            </label>
+            <select className="input w-full" value={schedule} onChange={e => setSchedule(e.target.value)}>
+              <option value="6h">Every 6 hours</option>
+              <option value="12h">Every 12 hours</option>
+              <option value="daily">Daily</option>
+              <option value="weekly">Weekly</option>
+            </select>
+          </div>
+        </div>
+      )}
+
+      <button onClick={handleNext}
+        className="w-full py-2.5 rounded-xl font-semibold text-sm flex items-center justify-center gap-2"
+        style={{ background: 'var(--color-brand)', color: 'white' }}>
+        Continue <ArrowRight size={14} />
+      </button>
+    </div>
+  )
+}
+
 function StepDone({ onFinish }) {
   return (
     <div className="space-y-6 text-center">
@@ -849,6 +915,13 @@ export function SetupWizard({ onComplete }) {
   const [mode,      setMode]      = useState(null)
   const [step,      setStep]      = useState(0)
   const [collected, setCollected] = useState({})
+  const [isAppliance, setIsAppliance] = useState(false)
+
+  useEffect(() => {
+    api.getSystemInfo().then(info => setIsAppliance(!!info?.is_appliance)).catch(() => {})
+  }, [])
+
+  const freshSteps = buildFreshSteps(isAppliance)
 
   function handleNext(data = {}) {
     setCollected(prev => ({ ...prev, ...data }))
@@ -869,6 +942,8 @@ export function SetupWizard({ onComplete }) {
         pushbullet_api_key:    collected.pushbullet_api_key    ?? '',
         alert_webhook_url:     collected.alert_webhook_url     ?? '',
         fingerbank_api_key:    collected.fingerbank_api_key    ?? '',
+        auto_update_enabled:   collected.auto_update_enabled   ?? false,
+        auto_update_schedule:  collected.auto_update_schedule  ?? 'daily',
       })
     } catch (_) { /* ignore — dashboard still loads */ }
     onComplete()
@@ -878,7 +953,7 @@ export function SetupWizard({ onComplete }) {
   const isChoice = mode === null
   const isRestore = mode === 'restore'
   const isFresh = mode === 'fresh'
-  const currentStep = isFresh ? FRESH_STEPS[step] : null
+  const currentStep = isFresh ? freshSteps[step] : null
 
   return (
     <div className="min-h-screen flex flex-col items-center justify-center px-4"
@@ -897,14 +972,14 @@ export function SetupWizard({ onComplete }) {
             <p className="text-xs" style={{ color: 'var(--color-text-faint)' }}>Restoring from backup</p>
           )}
           {isFresh && (
-            <p className="text-xs" style={{ color: 'var(--color-text-faint)' }}>Initial setup — step {step + 1} of {FRESH_STEPS.length}</p>
+            <p className="text-xs" style={{ color: 'var(--color-text-faint)' }}>Initial setup — step {step + 1} of {freshSteps.length}</p>
           )}
         </div>
 
         {/* Progress dots — only for fresh path */}
         {isFresh && (
           <div className="flex items-center justify-center gap-2 mb-6">
-            {FRESH_STEPS.map((s, i) => (
+            {freshSteps.map((s, i) => (
               <StepDot key={s.id} step={i} current={step} completed={step} />
             ))}
           </div>
@@ -939,14 +1014,16 @@ export function SetupWizard({ onComplete }) {
             />
           )}
 
-          {/* Fresh setup steps */}
-          {isFresh && step === 0 && <StepUser        onNext={handleNext} />}
-          {isFresh && step === 1 && <StepNetwork     onNext={handleNext} />}
-          {isFresh && step === 2 && <StepVuln        onNext={handleNext} />}
-          {isFresh && step === 3 && <StepNotify      onNext={handleNext} />}
-          {isFresh && step === 4 && <StepContainers  onNext={handleNext} />}
-          {isFresh && step === 5 && <StepFingerbank  onNext={handleNext} />}
-          {isFresh && step === 6 && <StepDone        onFinish={handleFinish} />}
+          {/* Fresh setup steps — rendered by step id so the optional
+              auto-update step can be inserted on appliance builds. */}
+          {isFresh && currentStep?.id === 'user'        && <StepUser        onNext={handleNext} />}
+          {isFresh && currentStep?.id === 'network'     && <StepNetwork     onNext={handleNext} />}
+          {isFresh && currentStep?.id === 'vuln'        && <StepVuln        onNext={handleNext} />}
+          {isFresh && currentStep?.id === 'notify'      && <StepNotify      onNext={handleNext} />}
+          {isFresh && currentStep?.id === 'containers'  && <StepContainers  onNext={handleNext} />}
+          {isFresh && currentStep?.id === 'fingerbank'  && <StepFingerbank  onNext={handleNext} />}
+          {isFresh && currentStep?.id === 'autoupdate'  && <StepAutoUpdate  onNext={handleNext} />}
+          {isFresh && currentStep?.id === 'done'        && <StepDone        onFinish={handleFinish} />}
         </div>
       </div>
     </div>
