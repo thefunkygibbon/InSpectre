@@ -571,6 +571,142 @@ function ComposeTab({ containerId, containerName, labels }) {
 // ---------------------------------------------------------------------------
 // Main drawer
 // ---------------------------------------------------------------------------
+const RESTART_POLICIES = [
+  { value: 'no',             label: 'No (never restart)' },
+  { value: 'on-failure',     label: 'On failure' },
+  { value: 'always',         label: 'Always' },
+  { value: 'unless-stopped', label: 'Unless stopped' },
+]
+
+function ConfigSection({ container, isProxmox, onContainerUpdate }) {
+  const [networks, setNetworks]   = useState(null)
+  const [curNet, setCurNet]       = useState('')
+  const [selNet, setSelNet]       = useState('')
+  const [selPolicy, setSelPolicy] = useState(container.restart_policy || 'no')
+  const [retries, setRetries]     = useState(0)
+  const [busy, setBusy]           = useState(null) // 'network' | 'policy'
+  const [msg, setMsg]             = useState('')
+
+  useEffect(() => {
+    let alive = true
+    api.dockerContainerNetworks(container.id)
+      .then(r => {
+        if (!alive) return
+        setNetworks(r.networks || [])
+        setCurNet(r.current || '')
+        setSelNet(r.current || (r.networks && r.networks[0]) || '')
+      })
+      .catch(() => { if (alive) setNetworks([]) })
+    return () => { alive = false }
+  }, [container.id])
+
+  async function applyNetwork() {
+    setBusy('network'); setMsg('')
+    try {
+      const updated = await api.dockerSetNetwork(container.id, selNet)
+      if (updated && onContainerUpdate) onContainerUpdate(updated)
+      setCurNet(selNet)
+      setMsg(`[OK] Network changed to "${selNet}".`)
+    } catch (e) {
+      setMsg(`[ERROR] ${e.message}`)
+    } finally { setBusy(null) }
+  }
+
+  async function applyPolicy() {
+    setBusy('policy'); setMsg('')
+    try {
+      const updated = await api.dockerSetRestartPolicy(container.id, selPolicy, Number(retries) || 0)
+      if (updated && onContainerUpdate) onContainerUpdate(updated)
+      setMsg(`[OK] Restart policy set to "${selPolicy}".`)
+    } catch (e) {
+      setMsg(`[ERROR] ${e.message}`)
+    } finally { setBusy(null) }
+  }
+
+  const selectCls = "w-full rounded-lg border bg-transparent px-3 py-2 text-xs text-text focus:outline-none"
+  const selectStyle = { borderColor: 'var(--color-border)', background: 'var(--color-surface-offset)' }
+
+  return (
+    <Collapsible title="Configuration" icon={Settings2} defaultOpen>
+      <div className="space-y-4 pt-1">
+        {/* Network */}
+        <div className="space-y-1.5">
+          <label className="text-[11px] font-medium flex items-center gap-1.5" style={{ color: 'var(--color-text-muted)' }}>
+            <Network size={12} /> {isProxmox ? 'Bridge' : 'Network mode'}
+          </label>
+          {networks === null ? (
+            <p className="text-[11px] text-text-faint flex items-center gap-1.5"><Loader2 size={11} className="animate-spin" /> Loading…</p>
+          ) : (
+            <>
+              <select className={selectCls} style={selectStyle} value={selNet}
+                onChange={e => setSelNet(e.target.value)} disabled={!!busy}>
+                {networks.length === 0 && <option value="">No networks found</option>}
+                {!networks.includes(curNet) && curNet && <option value={curNet}>{curNet} (current)</option>}
+                {networks.map(n => (
+                  <option key={n} value={n}>{n}{n === curNet ? ' (current)' : ''}</option>
+                ))}
+              </select>
+              {!isProxmox && (
+                <p className="text-[10px] text-text-faint">User networks attach live. Switching to <span className="font-mono">host</span>/<span className="font-mono">none</span> recreates the container (config preserved).</p>
+              )}
+              <button onClick={applyNetwork} disabled={!!busy || !selNet || selNet === curNet}
+                className="flex items-center justify-center gap-2 px-3 py-2 rounded-lg border text-xs font-medium w-full
+                           transition-colors border-indigo-500/40 bg-indigo-500/10 text-indigo-400
+                           hover:bg-indigo-500/20 disabled:opacity-40 disabled:cursor-not-allowed">
+                {busy === 'network' ? <Loader2 size={12} className="animate-spin" /> : <Check size={12} />}
+                {busy === 'network' ? 'Applying…' : 'Apply Network'}
+              </button>
+            </>
+          )}
+        </div>
+
+        {/* Restart policy */}
+        <div className="space-y-1.5 pt-2 border-t border-border">
+          <label className="text-[11px] font-medium flex items-center gap-1.5" style={{ color: 'var(--color-text-muted)' }}>
+            <RotateCcw size={12} /> Restart policy
+          </label>
+          <select className={selectCls} style={selectStyle} value={selPolicy}
+            onChange={e => setSelPolicy(e.target.value)} disabled={!!busy}>
+            {RESTART_POLICIES.map(p => (
+              <option key={p.value} value={p.value}>{p.label}</option>
+            ))}
+          </select>
+          {!isProxmox && selPolicy === 'on-failure' && (
+            <div className="flex items-center gap-2">
+              <span className="text-[10px] text-text-faint">Max retries</span>
+              <input type="number" min="0" value={retries} disabled={!!busy}
+                onChange={e => setRetries(e.target.value)}
+                className="w-20 rounded-lg border bg-transparent px-2 py-1 text-xs text-text focus:outline-none"
+                style={selectStyle} />
+            </div>
+          )}
+          {isProxmox && (
+            <p className="text-[10px] text-text-faint">Maps to Proxmox "Start at boot" (always / unless-stopped → on).</p>
+          )}
+          <button onClick={applyPolicy} disabled={!!busy}
+            className="flex items-center justify-center gap-2 px-3 py-2 rounded-lg border text-xs font-medium w-full
+                       transition-colors border-indigo-500/40 bg-indigo-500/10 text-indigo-400
+                       hover:bg-indigo-500/20 disabled:opacity-40 disabled:cursor-not-allowed">
+            {busy === 'policy' ? <Loader2 size={12} className="animate-spin" /> : <Check size={12} />}
+            {busy === 'policy' ? 'Applying…' : 'Apply Policy'}
+          </button>
+        </div>
+
+        {msg && (
+          <div className="rounded-lg px-3 py-2 font-mono text-xs"
+            style={{
+              background: msg.includes('[ERROR]') ? 'rgba(239,68,68,0.1)' : 'rgba(34,197,94,0.1)',
+              color: msg.includes('[ERROR]') ? '#ef4444' : '#22c55e',
+              border: `1px solid ${msg.includes('[ERROR]') ? 'rgba(239,68,68,0.3)' : 'rgba(34,197,94,0.3)'}`,
+            }}>
+            {msg}
+          </div>
+        )}
+      </div>
+    </Collapsible>
+  )
+}
+
 export function ContainerDrawer({ container: initialContainer, trivyScan, updateTrivyScan, initialTab, onClose, onContainerUpdate }) {
   const [container,   setContainer]   = useState(initialContainer)
   const isProxmox   = container.host_type === 'proxmox'
@@ -884,6 +1020,8 @@ export function ContainerDrawer({ container: initialContainer, trivyScan, update
                   </div>
                 )}
               </Collapsible>
+
+              <ConfigSection container={container} isProxmox={isProxmox} onContainerUpdate={(u) => { setContainer(u); if (onContainerUpdate) onContainerUpdate(u) }} />
 
               {(container.command || []).length > 0 && (
                 <Collapsible title="Command" icon={Terminal} defaultOpen={false}>

@@ -22,7 +22,18 @@ async function request(method, path, body) {
     window.location.reload()
     throw new Error('Session expired')
   }
-  if (!res.ok) throw new Error(`${method} ${path} \u2192 ${res.status}`)
+  if (!res.ok) {
+    let detail = ''
+    try {
+      const data = await res.clone().json()
+      detail = data?.detail || data?.message || ''
+    } catch (_) {
+      try { detail = await res.text() } catch (_) { detail = '' }
+    }
+    throw new Error(detail
+      ? `${method} ${path} \u2192 ${res.status}: ${detail}`
+      : `${method} ${path} \u2192 ${res.status}`)
+  }
   return res.json()
 }
 
@@ -329,6 +340,9 @@ export const api = {
   dockerLogs:             (id, tail, onLine, signal) => streamSSE(`/docker/containers/${id}/logs${tail ? `?tail=${tail}` : ''}`, onLine, signal),
   dockerTrivyScan:        (id, onLine, signal)       => streamSSE(`/docker/containers/${id}/trivy-scan`, onLine, signal),
   dockerCompose:          (id)                       => request('GET',  `/docker/containers/${id}/compose`),
+  dockerContainerNetworks:(id)            => request('GET',  `/docker/containers/${id}/networks`),
+  dockerSetNetwork:       (id, network)   => request('POST', `/docker/containers/${id}/network`, { network }),
+  dockerSetRestartPolicy: (id, name, maximum_retry_count = 0) => request('POST', `/docker/containers/${id}/restart-policy`, { name, maximum_retry_count }),
   dockerAutoScanResult:   (name)      => request('GET',  `/docker/auto-scan/${encodeURIComponent(name)}`),
   dockerVulnSummary:      ()          => request('GET',  '/docker/vuln-summary'),
   dockerScanAll:          ()          => request('POST', '/docker/scan-all'),

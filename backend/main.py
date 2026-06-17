@@ -2405,9 +2405,17 @@ class ContainerHostUpdate(BaseModel):
     node:       Optional[str]  = None
     local_ip:   Optional[str]  = None
 
+class ContainerNetworkUpdate(BaseModel):
+    network: str   # docker: host | bridge | none | <named net>;  proxmox: <bridge iface>
+
+class ContainerRestartPolicyUpdate(BaseModel):
+    name:                str = "no"   # no | always | unless-stopped | on-failure
+    maximum_retry_count: int = 0      # only used with on-failure
+
 class DeviceUpdate(BaseModel):
     custom_name: Optional[str] = None
     hostname:    Optional[str] = None
+
 
 class SettingUpdate(BaseModel):
     value: str
@@ -8771,44 +8779,418 @@ async def docker_update(container_id: str, db: Session = Depends(get_db)):
             config = attrs.get("Config", {})
             host_cfg = attrs.get("HostConfig", {})
             
-            # Stop container
-            if c.status != "exited":
+            original_name = c.name.lstrip("/")
+            was_running   = c.status not in ("exited", "created", "dead")
+
+            # Stop container before swapping it out
+            if was_running:
                 c.stop(timeout=10)
-            
-            # Remove old container
-            c.remove(force=True)
-            
-            # Create new container with same config
-            new_c = client.containers.create(
-                image=image_name,
-                command=config.get("Cmd"),
-                environment=config.get("Env"),
-                labels=config.get("Labels"),
-                hostname=config.get("Hostname"),
-                working_dir=config.get("WorkingDir"),
-                name=c.name.lstrip("/"),
-                ports=None,  # Will be handled by port bindings in host_config
-                volumes=None,  # Will be handled by binds in host_config
-                restart_policy={"Name": host_cfg.get("RestartPolicy", {}).get("Name", "no")},
-                host_config=client.api.create_host_config(
-                    port_bindings={
-                        p.split("/")[0]: int(b.get("HostPort", 0)) 
-                        for p, bindings in (attrs.get("NetworkSettings", {}).get("Ports") or {}).items()
-                        if bindings
-                        for b in bindings
-                    },
-                    binds={
-                        m.get("Source", ""): {"bind": m.get("Destination", ""), "mode": m.get("Mode", "rw")}
-                        for m in (attrs.get("Mounts") or [])
-                        if m.get("Type") == "bind"
-                    },
-                ),
-            )
-            
-            # Start new container
-            new_c.start()
-            new_c.reload()
+
+            # SAFE RECREATE: rename the old container to a backup name instead of
+            # removing it up-front, so a failed create/start can be rolled back
+            # and never leaves the user with no container at all.
+            import time as _time
+            backup_name = f"{original_name}_inspectre_bak_{int(_time.time())}"
+            c.rename(backup_name)
+
+            new_c = None
+            try:
+                # Create new container with same config, reusing the freed name
+                new_mode = host_cfg.get("NetworkMode") or "bridge"
+                port_bindings = {
+                    p: int(b.get("HostPort"))
+                    for p, bindings in (attrs.get("NetworkSettings", {}).get("Ports") or {}).items()
+                    if bindings
+                    for b in bindings
+                    if b.get("HostPort")
+                }
+                binds = {
+                    m.get("Source", ""): {"bind": m.get("Destination", ""), "mode": m.get("Mode", "rw") or "rw"}
+                    for m in (attrs.get("Mounts") or [])
+                    if m.get("Type") == "bind" and m.get("Source")
+                }
+                new_c = client.containers.create(
+                    image=image_name,
+                    command=config.get("Cmd"),
+                    environment=config.get("Env"),
+                    labels=config.get("Labels"),
+                    hostname=None if new_mode == "host" else config.get("Hostname"),
+                    working_dir=config.get("WorkingDir"),
+                    name=original_name,
+                    network_mode=new_mode,
+                    restart_policy={"Name": host_cfg.get("RestartPolicy", {}).get("Name", "no")},
+                    ports=None if new_mode == "host" else (port_bindings or None),
+                    volumes=binds or None,
+                )
+
+                # Start new container
+                new_c.start()
+                new_c.reload()
+            except Exception:
+                # Roll back: discard the half-created container and restore the
+                # original under its real name (restarting if it had been running).
+                try:
+                    if new_c is not None:
+                        new_c.remove(force=True)
+                except Exception:
+                    pass
+                try:
+                    c.rename(original_name)
+                    if was_running:
+                        c.start()
+                except Exception:
+                    pass
+                raise
+
+            # New container is healthy — now it's safe to remove the backup.
+            try:
+                c.remove(force=True)
+            except Exception:
+                # Update succeeded; failing to clean up the backup is non-fatal.
+                pass
+
             return _add_docker_host_meta(_fmt_container(new_c), docker_hosts[0], host_url)
+        finally:
+            client.close()
+
+    try:
+        return await asyncio.to_thread(_do)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(400, str(e))
+
+
+
+
+# ---------------------------------------------------------------------------
+# Container network + restart-policy editing (Docker & Proxmox)
+# ---------------------------------------------------------------------------
+
+_DOCKER_SPECIAL_NETS = ["bridge", "host", "none"]
+
+
+def _docker_host_for(db: Session):
+    """Return (host_dict, host_url) for the first enabled Docker host, or raise."""
+    docker_hosts = [h for h in _get_enabled_hosts(db) if h["type"] != "proxmox"]
+    if not docker_hosts:
+        raise HTTPException(503, "No Docker hosts.")
+    return docker_hosts[0], (docker_hosts[0]["url"] or "unix:///var/run/docker.sock")
+
+
+@app.get("/docker/containers/{container_id}/networks")
+async def docker_container_networks(container_id: str, db: Session = Depends(get_db)):
+    """List networks a container can be attached to, plus its current network mode.
+
+    For Docker: returns the special modes (bridge/host/none) plus user-defined
+    networks. For Proxmox: returns the host bridges (vmbrX)."""
+    px = _parse_proxmox_id(container_id)
+    if px:
+        host_id, node, vmid = px
+        host = _get_host_row(db, host_id)
+
+        def _do_px():
+            current = ""
+            try:
+                cfg = _proxmox_request(host, "GET", f"/api2/json/nodes/{node}/lxc/{vmid}/config")
+                net0 = (cfg.get("data") or {}).get("net0", "") or ""
+                for part in net0.split(","):
+                    if part.startswith("bridge="):
+                        current = part.split("=", 1)[1]
+                        break
+            except Exception:
+                pass
+            bridges = []
+            try:
+                nets = _proxmox_request(host, "GET", f"/api2/json/nodes/{node}/network")
+                for n in (nets.get("data") or []):
+                    iface = n.get("iface", "")
+                    if n.get("type") == "bridge" or iface.startswith("vmbr"):
+                        bridges.append(iface)
+            except Exception:
+                pass
+            if not bridges:
+                bridges = [current] if current else ["vmbr0"]
+            return {"current": current, "networks": sorted(set(bridges)), "host_type": "proxmox"}
+
+        try:
+            return await asyncio.to_thread(_do_px)
+        except Exception as e:
+            raise HTTPException(503, str(e))
+
+    host, host_url = _docker_host_for(db)
+
+    def _do():
+        client = _make_docker_client(host_url)
+        try:
+            c = client.containers.get(container_id)
+            attrs = c.attrs or {}
+            mode = (attrs.get("HostConfig", {}) or {}).get("NetworkMode", "") or ""
+
+            # NetworkMode is authoritative only for the special modes
+            # (host/none/container:). For ordinary user/bridge networks it can
+            # go stale after a live connect/disconnect — Docker keeps the
+            # original NetworkMode even though the container is now attached to a
+            # different network. Derive the real current network from the live
+            # NetworkSettings.Networks in that case.
+            connected = list((attrs.get("NetworkSettings", {}).get("Networks") or {}).keys())
+            if mode in ("host", "none") or mode.startswith("container:"):
+                current = mode
+            elif connected:
+                current = mode if mode in connected else connected[0]
+            else:
+                current = mode
+
+            named = []
+            for n in client.networks.list():
+                nm = n.name
+                if nm and nm not in _DOCKER_SPECIAL_NETS:
+                    named.append(nm)
+            return {
+                "current": current,
+                "networks": _DOCKER_SPECIAL_NETS + sorted(named),
+                "host_type": "docker",
+            }
+        finally:
+            client.close()
+
+    try:
+        return await asyncio.to_thread(_do)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(400, str(e))
+
+
+def _recreate_with_overrides(client, c, *, network_mode=None, restart_policy=None):
+    """Recreate a container preserving its config, optionally overriding the
+    NetworkMode and/or RestartPolicy. Returns the new container object."""
+    attrs    = c.attrs or {}
+    config   = attrs.get("Config", {}) or {}
+    host_cfg = attrs.get("HostConfig", {}) or {}
+    net_sets = attrs.get("NetworkSettings", {}) or {}
+    name     = c.name.lstrip("/")
+    image    = config.get("Image") or (c.image.tags[0] if c.image.tags else str(c.image.id))
+
+    new_mode = network_mode if network_mode is not None else (host_cfg.get("NetworkMode") or "bridge")
+    new_rp   = restart_policy if restart_policy is not None else (host_cfg.get("RestartPolicy") or {"Name": "no"})
+
+    # Port bindings only apply when not sharing the host network namespace.
+    port_bindings = {}
+    if new_mode != "host":
+        for p, bindings in (net_sets.get("Ports") or {}).items():
+            if bindings:
+                hp = bindings[0].get("HostPort")
+                if hp:
+                    port_bindings[p] = int(hp)
+
+    binds = {
+        m.get("Source", ""): {"bind": m.get("Destination", ""), "mode": m.get("Mode", "rw") or "rw"}
+        for m in (attrs.get("Mounts") or [])
+        if m.get("Type") == "bind" and m.get("Source")
+    }
+
+    running = c.status == "running"
+    if running:
+        c.stop(timeout=10)
+
+    # SAFE RECREATE: rename the existing container to a backup name instead of
+    # removing it up-front. Docker can't change a live container's NetworkMode,
+    # so a recreate is unavoidable — but renaming (rather than deleting) lets us
+    # roll back if create/start fails, so a failed change can never leave the
+    # user with no container at all.
+    import time as _time
+    backup_name = f"{name}_inspectre_bak_{int(_time.time())}"
+    c.rename(backup_name)
+
+    new_c = None
+    try:
+        new_c = client.containers.create(
+            image=image,
+            command=config.get("Cmd"),
+            environment=config.get("Env"),
+            labels=config.get("Labels"),
+            hostname=None if new_mode == "host" else config.get("Hostname"),
+            working_dir=config.get("WorkingDir") or None,
+            name=name,
+            network_mode=new_mode,
+            restart_policy=new_rp,
+            ports=None if new_mode == "host" else (port_bindings or None),
+            volumes=binds or None,
+        )
+        if running:
+            new_c.start()
+        new_c.reload()
+    except Exception:
+        # Roll back: discard the half-created container and restore the
+        # original under its real name (restarting it if it had been running).
+        try:
+            if new_c is not None:
+                new_c.remove(force=True)
+        except Exception:
+            pass
+        try:
+            c.rename(name)
+            if running:
+                c.start()
+        except Exception:
+            pass
+        raise
+
+    # New container is healthy — now it's safe to remove the backup.
+    try:
+        c.remove(force=True)
+    except Exception:
+        # The change succeeded; failing to clean up the backup is non-fatal.
+        pass
+
+    return new_c
+
+
+@app.post("/docker/containers/{container_id}/network")
+async def docker_set_network(container_id: str, payload: ContainerNetworkUpdate, db: Session = Depends(get_db)):
+    """Change the network a container is attached to.
+
+    Docker: setting `host` switches to host networking; a named network or
+    bridge/none recreates the container with the new NetworkMode (required
+    because Docker can't change the network mode of a live container).
+    Proxmox: updates the bridge on net0."""
+    new_net = (payload.network or "").strip()
+    if not new_net:
+        raise HTTPException(400, "network is required.")
+
+    px = _parse_proxmox_id(container_id)
+    if px:
+        host_id, node, vmid = px
+        host = _get_host_row(db, host_id)
+
+        def _do_px():
+            cfg = _proxmox_request(host, "GET", f"/api2/json/nodes/{node}/lxc/{vmid}/config")
+            net0 = ((cfg.get("data") or {}).get("net0", "") or "")
+            if net0:
+                parts = []
+                replaced = False
+                for part in net0.split(","):
+                    if part.startswith("bridge="):
+                        parts.append(f"bridge={new_net}")
+                        replaced = True
+                    else:
+                        parts.append(part)
+                if not replaced:
+                    parts.append(f"bridge={new_net}")
+                new_net0 = ",".join(parts)
+            else:
+                new_net0 = f"name=eth0,bridge={new_net}"
+            _proxmox_request(host, "PUT", f"/api2/json/nodes/{node}/lxc/{vmid}/config",
+                             data={"net0": new_net0})
+            r = _proxmox_request(host, "GET", f"/api2/json/nodes/{node}/lxc/{vmid}/status/current")
+            return _fmt_proxmox_container(r.get("data", {}), vmid, node, host)
+
+        try:
+            return await asyncio.to_thread(_do_px)
+        except Exception as e:
+            raise HTTPException(400, str(e))
+
+    host, host_url = _docker_host_for(db)
+
+    def _is_mode_net(value: str) -> bool:
+        """True for network *modes* that aren't live-attachable user networks."""
+        return value in ("host", "none") or value.startswith("container:")
+
+    def _do():
+        client = _make_docker_client(host_url)
+        try:
+            c = client.containers.get(container_id)
+            c.reload()
+            host_cfg = (c.attrs or {}).get("HostConfig", {}) or {}
+            cur_mode = host_cfg.get("NetworkMode", "") or ""
+
+            # A recreate is only required when the *target* or the *current*
+            # configuration is a special network mode (host/none/container:).
+            # Docker cannot switch a live container into or out of those modes.
+            # For ordinary user-defined / bridge networks we attach live with
+            # network connect/disconnect — exactly how Portainer does it — which
+            # avoids recreating the container entirely.
+            if _is_mode_net(new_net) or _is_mode_net(cur_mode):
+                new_c = _recreate_with_overrides(client, c, network_mode=new_net)
+                return _add_docker_host_meta(_fmt_container(new_c), host, host_url)
+
+            # Live attach path. Verify the target network exists first so we can
+            # return a clear error instead of a generic failure.
+            try:
+                target = client.networks.get(new_net)
+            except Exception:
+                raise HTTPException(404, f"Network '{new_net}' not found on this Docker host.")
+
+            current = list(((c.attrs or {}).get("NetworkSettings", {}).get("Networks") or {}).keys())
+            if new_net not in current:
+                target.connect(c)
+
+            # Switch semantics: detach from the other user networks so the
+            # container ends up only on the selected one.
+            c.reload()
+            current = list(((c.attrs or {}).get("NetworkSettings", {}).get("Networks") or {}).keys())
+            for other in current:
+                if other == new_net:
+                    continue
+                try:
+                    client.networks.get(other).disconnect(c)
+                except Exception:
+                    pass
+
+            c.reload()
+            return _add_docker_host_meta(_fmt_container(c), host, host_url)
+        finally:
+            client.close()
+
+    try:
+        return await asyncio.to_thread(_do)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(400, str(e))
+
+
+@app.post("/docker/containers/{container_id}/restart-policy")
+async def docker_set_restart_policy(container_id: str, payload: ContainerRestartPolicyUpdate, db: Session = Depends(get_db)):
+    """Change a container's restart policy.
+
+    Docker: applied live via the update API (no recreate needed).
+    Proxmox: maps `always`/`unless-stopped` → onboot=1, otherwise onboot=0."""
+    name = (payload.name or "no").strip()
+    valid = {"no", "always", "unless-stopped", "on-failure"}
+    if name not in valid:
+        raise HTTPException(400, f"Invalid restart policy '{name}'. Use one of: {', '.join(sorted(valid))}.")
+
+    px = _parse_proxmox_id(container_id)
+    if px:
+        host_id, node, vmid = px
+        host = _get_host_row(db, host_id)
+        onboot = 1 if name in ("always", "unless-stopped") else 0
+
+        def _do_px():
+            _proxmox_request(host, "PUT", f"/api2/json/nodes/{node}/lxc/{vmid}/config",
+                             data={"onboot": onboot})
+            r = _proxmox_request(host, "GET", f"/api2/json/nodes/{node}/lxc/{vmid}/status/current")
+            return _fmt_proxmox_container(r.get("data", {}), vmid, node, host)
+
+        try:
+            return await asyncio.to_thread(_do_px)
+        except Exception as e:
+            raise HTTPException(400, str(e))
+
+    host, host_url = _docker_host_for(db)
+    rp = {"Name": name}
+    if name == "on-failure":
+        rp["MaximumRetryCount"] = max(0, int(payload.maximum_retry_count or 0))
+
+    def _do():
+        client = _make_docker_client(host_url)
+        try:
+            c = client.containers.get(container_id)
+            c.update(restart_policy=rp)
+            c.reload()
+            return _add_docker_host_meta(_fmt_container(c), host, host_url)
         finally:
             client.close()
 
