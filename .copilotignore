@@ -27,3 +27,5 @@ postgres_dataold2/
 /dist/
 /frontend/dist/
 /data/
+output/
+/output/
