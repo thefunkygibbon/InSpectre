@@ -51,7 +51,14 @@ export const APP_VERSION = '$VERSION'
 EOF
 
 # Update frontend/package.json "version" field without disturbing the rest.
-python3 - "$VERSION" <<'PY'
+# Portable: prefer jq, fall back to python3, then a sed-based last resort, so
+# the version tooling works on hosts that don't have Python installed.
+if command -v jq >/dev/null 2>&1; then
+  tmp="$(mktemp)"
+  jq --arg v "$VERSION" '.version = $v' frontend/package.json > "$tmp"
+  mv "$tmp" frontend/package.json
+elif command -v python3 >/dev/null 2>&1; then
+  python3 - "$VERSION" <<'PY'
 import json, sys
 version = sys.argv[1]
 path = "frontend/package.json"
@@ -62,5 +69,9 @@ with open(path, "w", encoding="utf-8") as fh:
     json.dump(data, fh, indent=2)
     fh.write("\n")
 PY
+else
+  # Last resort: rewrite the first "version": "..." line in place.
+  sed -i -E "0,/\"version\"[[:space:]]*:[[:space:]]*\"[^\"]*\"/s//\"version\": \"$VERSION\"/" frontend/package.json
+fi
 
 echo "[sync-version] version $VERSION → backend/_version.py, probe/_version.py, frontend/src/version.js, frontend/package.json"

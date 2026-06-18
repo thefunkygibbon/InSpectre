@@ -55,7 +55,7 @@ a { color: var(--brand-light); text-decoration: none; }
 a:hover { color: var(--accent); }
 
 .container { width: 100%; max-width: var(--maxw); margin: 0 auto; padding: 0 20px; }
-.logo { width: 22px; height: 22px; filter: invert(1) sepia(1) saturate(6) hue-rotate(90deg) brightness(.9); vertical-align: middle; }
+.logo { width: 26px; height: 26px; vertical-align: middle; color: var(--accent); }
 .blink { animation: blink 1.1s steps(1) infinite; color: var(--accent); }
 @keyframes blink { 50% { opacity: 0; } }
 .ok { color: var(--accent); }
@@ -76,7 +76,7 @@ a:hover { color: var(--accent); }
 }
 .sb-session { display: inline-flex; align-items: center; gap: 7px; color: #001a08; background: var(--accent); padding: 0 12px; height: 38px; font-weight: 700; }
 .sb-session:hover { color: #001a08; }
-.sb-session .logo { filter: brightness(0); }
+.sb-session .logo { color: #001a08; }
 .sb-name { letter-spacing: .02em; }
 .sb-windows { display: flex; gap: 2px; flex: 1; margin-left: 6px; flex-wrap: wrap; }
 .sb-windows a { color: var(--text-muted); padding: 4px 9px; }
@@ -312,4 +312,15 @@ a:hover { color: var(--accent); }
   .man-grid { grid-template-columns: 1fr; }
   .form-row2 { grid-template-columns: 1fr; }
   .flow { grid-template-columns: 1fr; }
+
+  /* Hero: trim the decorative scan-output preamble so the headline is
+     visible near the top of the screen without scrolling. */
+  .hero-term { margin-top: 16px; }
+  .hero-term .term-body { padding: 14px 15px; }
+  .hero-term .ln.out,
+  .hero-term .ln.blank { display: none; }
+  .headline { margin-top: 8px; font-size: clamp(1.7rem, 8vw, 2.4rem); }
+  .lead { line-height: 1.6; margin-bottom: 18px; }
+  .actions { gap: 10px; }
+  .actions .btn { flex: 1 1 auto; text-align: center; }
 }

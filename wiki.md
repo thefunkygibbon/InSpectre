@@ -105,14 +105,22 @@
 
 ### 1.1 Requirements
 
-- **Docker** 24 or later
+- **Docker** 24 or later (with the daemon running)
 - **Docker Compose** v2 (included with modern Docker Desktop and Docker Engine installs)
-- A Linux host (the probe container requires raw network access and runs on the host network stack)
-- The host machine must be connected to the LAN you want to monitor
+- **curl** and **openssl** (used by the installer to download the compose file and generate secure keys)
+- A Linux host — **x86-64** or **ARM64 (Raspberry Pi 3/4/5, 64-bit)** — connected to the LAN you want to monitor (the probe container requires raw network access and runs on the host network stack)
 
 ### 1.2 Installation
 
-Clone the repository and start the stack — no file editing required before first run:
+The recommended way to install InSpectre is the **one-line installer**. It simply downloads and runs `inspectre-install.sh` — **you do not need to clone the repository or build anything**. The installer pulls the pre-built images directly from Docker Hub.
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/thefunkygibbon/InSpectre/main/inspectre-install.sh | bash
+```
+
+The installer checks all prerequisites, detects your CPU architecture and asks whether to install **x64** or **Raspberry Pi** images, generates secure credentials, and starts the whole stack. See [1.6 Deploying from Docker Hub](#16-deploying-from-docker-hub) for full details and the manual alternative.
+
+**Building from source (developers only):** if you want to modify and rebuild the images yourself, clone the repository and use the helper script:
 
 ```bash
 git clone https://github.com/thefunkygibbon/InSpectre.git
@@ -134,7 +142,7 @@ Rebuild after changing docker-compose.yml: `./inspectre.sh rebuild keep-data`.
 
 ### 1.3 First Run & Setup Wizard
 
-This builds all three containers and starts them in the background. On first run, the database schema is created automatically — you do not need to run any migrations manually.
+This builds all four containers (database, backend/web, probe, and frontend) and starts them in the background. On first run, the database schema is created automatically — you do not need to run any migrations manually.
 
 The first ARP sweep begins within a few seconds. Depending on the size of your network, all currently-online devices typically appear within 30–60 seconds.
 
@@ -192,23 +200,32 @@ Go to **Settings → Admin → Change Password** to update your credentials at a
 
 ### 1.6 Deploying from Docker Hub
 
-If you would rather run InSpectre without cloning the repository, you can pull pre-built images directly from Docker Hub.
+The [one-line installer](#12-installation) is the easiest path and uses these images under the hood. This section documents the images and the manual deployment process.
 
 **Docker Hub images:**
 
-| Image | Purpose |
-|---|---|
-| `thefunkygibbon/inspectre-frontend:latest` | nginx + React SPA |
-| `thefunkygibbon/inspectre-web:latest` | FastAPI backend |
-| `thefunkygibbon/inspectre-probe:latest` | Network probe |
+| Image | x86-64 tag | Raspberry Pi / ARM64 tag | Purpose |
+|---|---|---|---|
+| `thefunkygibbon/inspectre-frontend` | `latest` | `raspi` | nginx + React SPA |
+| `thefunkygibbon/inspectre-web` | `latest` | `raspi` | FastAPI backend |
+| `thefunkygibbon/inspectre-probe` | `latest` | `raspi` | Network probe |
 
-**Quick install (interactive):**
+The PostgreSQL database uses the official multi-arch `postgres:15-alpine` image, which runs natively on both architectures.
+
+**Quick install (interactive, recommended):**
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/thefunkygibbon/InSpectre/main/inspectre-install.sh | bash
 ```
 
-The installer checks for Docker, asks for an install directory, generates a secure database password and secret key, optionally lets you set `IP_RANGE` and `INTERFACE`, writes a `.env` file, and starts the stack.
+The installer:
+
+- Verifies all prerequisites (Docker, Docker Compose v2, curl, openssl) and that the Docker daemon is running
+- Detects your CPU architecture and asks whether to install **x64** (`latest`) or **Raspberry Pi** (`raspi`) images
+- Asks for an install directory and downloads `docker-compose.deploy.yml`
+- Generates a secure database password and secret key
+- Optionally lets you set `IP_RANGE` and `INTERFACE`
+- Writes a `.env` file (including `INSPECTRE_TAG`) and starts the stack
 
 **Manual install:**
 
@@ -218,17 +235,26 @@ The installer checks for Docker, asks for an install directory, generates a secu
 curl -O https://raw.githubusercontent.com/thefunkygibbon/InSpectre/main/docker-compose.deploy.yml
 ```
 
-2. Edit the file and replace the two placeholders:
+2. Create a `.env` file (in the same directory) and set the required values:
 
-| Variable | What to change |
+| Variable | What to set |
 |---|---|
-| `POSTGRES_PASSWORD` | Set a strong password for the database — used in both `db` and `web`/`probe` |
-| `SECRET_KEY` | Set a random 64-character hex string for JWT signing |
+| `INSPECTRE_TAG` | `latest` for x86-64 (default), or `raspi` for Raspberry Pi / ARM64 |
+| `POSTGRES_PASSWORD` | A strong password for the database — used by both `db` and `web`/`probe` |
+| `SECRET_KEY` | A random 64-character hex string for JWT signing |
 
 Generate a secure `SECRET_KEY`:
 
 ```bash
 openssl rand -hex 32
+```
+
+Example `.env` for a Raspberry Pi:
+
+```bash
+INSPECTRE_TAG=raspi
+POSTGRES_PASSWORD=your-strong-password
+SECRET_KEY=your-64-char-hex-key
 ```
 
 3. Optionally override network detection (leave commented out for auto-detection):

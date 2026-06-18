@@ -7,6 +7,10 @@
 #  2. Change SECRET_KEY        (search for CHANGE_ME_SECRET_KEY)
 #     Generate one with:  openssl rand -hex 32
 #  3. Optionally set DATA_DIR, IP_RANGE, and INTERFACE below.
+#  4. Choose your architecture by setting INSPECTRE_TAG:
+#       INSPECTRE_TAG=latest  → x86-64 / Intel / AMD (default)
+#       INSPECTRE_TAG=raspi   → Raspberry Pi / ARM64
+#     (The inspectre-install.sh installer sets this for you automatically.)
 #
 #  Start:   docker compose -f docker-compose.deploy.yml up -d
 #  Stop:    docker compose -f docker-compose.deploy.yml down
@@ -41,7 +45,7 @@ services:
       start_period: 10s
 
   web:
-    image: thefunkygibbon/inspectre-web:latest
+    image: thefunkygibbon/inspectre-web:${INSPECTRE_TAG:-latest}
     container_name: inspectre-web
     restart: always
     ports:
@@ -68,7 +72,7 @@ services:
         condition: service_healthy
 
   probe:
-    image: thefunkygibbon/inspectre-probe:latest
+    image: thefunkygibbon/inspectre-probe:${INSPECTRE_TAG:-latest}
     container_name: inspectre-probe
     network_mode: "host"
     privileged: true
@@ -102,7 +106,7 @@ services:
         condition: service_healthy
 
   frontend:
-    image: thefunkygibbon/inspectre-frontend:latest
+    image: thefunkygibbon/inspectre-frontend:${INSPECTRE_TAG:-latest}
     container_name: inspectre-frontend
     restart: always
     ports:

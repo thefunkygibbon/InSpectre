@@ -15,7 +15,7 @@
 
   <header class="statusbar">
     <div class="sb-inner">
-      <a href="index.html" class="sb-session"><img src="assets/ghost-logo.svg" alt="" class="logo" /><span class="sb-name">inspectre</span></a>
+      <a href="index.html" class="sb-session"><img src="assets/ghost-logo.svg?v=2" alt="" class="logo" /><span class="sb-name">inspectre</span></a>
       <button class="nav-toggle" aria-label="Menu">[≡]</button>
       <nav class="sb-windows">
         <a href="index.html">0:home</a>
@@ -34,7 +34,7 @@
     <section class="page-head">
       <p class="crumb"><span class="dollar">$</span> cd ~/inspectre &amp;&amp; ls dist/</p>
       <h1>Download <span class="hl">InSpectre</span></h1>
-      <p>Pick the format that suits your setup. Docker is the recommended path; VM and Raspberry Pi images are on the way for plug-and-play deployments.</p>
+      <p>Pick the format that suits your setup. Docker is the recommended path; a pre-built VM appliance image is available now for VirtualBox, VMware and Proxmox. A Raspberry Pi image is coming soon.</p>
     </section>
 
     <section class="section" data-reveal>
@@ -47,10 +47,11 @@
           <a href="https://hub.docker.com/u/thefunkygibbon" class="btn btn-ghost" target="_blank" rel="noopener">docker hub images</a>
         </div>
         <div class="dl-card">
-          <span class="badge soon">coming soon</span>
+          <span class="badge ready">available now</span>
           <h3>Virtual Machine</h3>
-          <p>A self-contained VM appliance (OVA / qcow2) with InSpectre pre-installed. Import into VirtualBox, VMware, or Proxmox and boot straight into the setup wizard.</p>
-          <a href="#notify" class="btn btn-ghost" aria-disabled="true">coming soon</a>
+          <p>A self-contained qcow2 appliance with InSpectre pre-installed. Import into VirtualBox, VMware, or Proxmox and boot straight into the setup wizard. Online variant pulls containers from Docker Hub on first boot.</p>
+          <a href="https://github.com/thefunkygibbon/InSpectre/releases/download/vm-v1.0/inspectre-vm-online.qcow2.xz" class="btn btn-primary">download vm image</a>
+          <a href="https://github.com/thefunkygibbon/InSpectre/releases/tag/vm-v1.0" class="btn btn-ghost" target="_blank" rel="noopener">release notes</a>
         </div>
         <div class="dl-card">
           <span class="badge soon">coming soon</span>
@@ -72,7 +73,7 @@
         <pre><code><span class="c"># Downloads and starts InSpectre interactively</span>
 <span class="p">curl -fsSL https://raw.githubusercontent.com/thefunkygibbon/InSpectre/main/inspectre-install.sh | bash</span></code></pre>
       </div>
-      <div class="callout">The installer checks for Docker, asks for an install directory, generates secure passwords and secret keys, optionally lets you set your IP range and interface, then starts the stack automatically.</div>
+      <div class="callout">The installer checks all prerequisites (Docker, Docker Compose v2, curl, openssl), asks whether you're installing on <strong>x64</strong> or <strong>Raspberry&nbsp;Pi</strong> and pulls the matching images, asks for an install directory, generates secure passwords and secret keys, optionally lets you set your IP range and interface, then starts the stack automatically — no git clone and no building required.</div>
 
       <h3 style="color:var(--brand-light);margin-top:28px;">Or pull manually from Docker Hub</h3>
       <div class="code">
@@ -103,7 +104,7 @@ curl -O https://raw.githubusercontent.com/thefunkygibbon/InSpectre/main/docker-c
       </div>
       <p class="comment" style="margin-top:10px;">The PostgreSQL database uses the official <code>postgres:15-alpine</code> image — no custom build.</p>
 
-      <h3 style="color:var(--brand-light);margin-top:28px;">Or clone from GitHub</h3>
+      <h3 style="color:var(--brand-light);margin-top:28px;">Or clone from GitHub (developers / building from source)</h3>
       <div class="code">
         <div class="code-head"><span>recommended — inspectre.sh</span><button data-copy>copy</button></div>
         <pre><code><span class="c"># 1. Clone the repository</span>
@@ -131,14 +132,14 @@ cd InSpectre
     <section class="term cta-term" id="notify" data-reveal>
       <div class="term-bar">
         <span class="term-dot"></span><span class="term-dot"></span><span class="term-dot"></span>
-        <span class="term-title">roadmap — vm &amp; pi</span>
+        <span class="term-title">roadmap — pi</span>
       </div>
       <div class="term-body">
-        <h2 class="cta-h">VM &amp; Raspberry Pi images are coming.</h2>
-        <p class="lead">Prefer a flash-and-go appliance? Pre-built VM and Pi images are in the works. Watch the repository to be the first to know when they land.</p>
+        <h2 class="cta-h">Raspberry Pi image is coming.</h2>
+        <p class="lead">A flashable Raspberry Pi OS image is in the works. Watch the repository to be the first to know when it lands. In the meantime, the VM appliance is ready to go.</p>
         <p class="actions">
-          <a href="https://github.com/thefunkygibbon/InSpectre" class="btn btn-primary" target="_blank" rel="noopener">▸ watch on github</a>
-          <a href="docs.html" class="btn btn-ghost">▸ read the docs</a>
+          <a href="https://github.com/thefunkygibbon/InSpectre/releases/download/vm-v1.0/inspectre-vm-online.qcow2.xz" class="btn btn-primary">▸ download vm image</a>
+          <a href="https://github.com/thefunkygibbon/InSpectre" class="btn btn-ghost" target="_blank" rel="noopener">▸ watch on github</a>
         </p>
       </div>
     </section>
@@ -148,7 +149,7 @@ cd InSpectre
   <footer class="footer">
     <div class="foot-inner">
       <div class="foot-cols">
-        <a href="index.html" class="sb-session"><img src="assets/ghost-logo.svg" alt="" class="logo" /><span class="sb-name">inspectre</span></a>
+        <a href="index.html" class="sb-session"><img src="assets/ghost-logo.svg?v=2" alt="" class="logo" /><span class="sb-name">inspectre</span></a>
         <div class="foot-links">
           <a href="downloads.html">downloads</a>
           <a href="docs.html">docs</a>

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-#  InSpectre — Appliance Image Builder  v5.3 (Production Master)
+#  InSpectre — Appliance Image Builder  v5.4 (Production Master)
 # =============================================================================
 set -euo pipefail
 export DOCKER_BUILDKIT=1
@@ -25,7 +25,12 @@ BUILD_CONTAINERS_ARM=false
 CLI_TARGET_SPECIFIED=false
 MAX_COMPRESS=false
 PUSH_DOCKERHUB=false
-VM_BASE_OS="ubuntu"   # "ubuntu" or "debian" — set interactively or via --debian flag
+VM_BASE_OS="debian"   # "debian" (default, smallest) or "ubuntu" — set interactively or via flags
+# Hypervisor target for VM (online) builds: "kvm" | "vmware" | "universal".
+#  kvm       → Debian genericcloud base (virtio only, smallest) → qcow2
+#  vmware    → Debian generic base (broad drivers)              → vmdk (+ ova)
+#  universal → Debian generic base (broad drivers)              → qcow2 + vmdk + vhdx (+ ova)
+VM_HV_TARGET="kvm"
 
 REPO_URL="https://github.com/thefunkygibbon/InSpectre.git"
 REPO_BRANCH="main"
@@ -41,13 +46,19 @@ PI_ONLINE_IMAGE="inspectre-pi-online.img"
 # ── Base OS image URLs ────────────────────────────────────────────────────────
 UBUNTU_URL="https://cloud-images.ubuntu.com/jammy/current/jammy-server-cloudimg-amd64.img"
 UBUNTU_SHA_URL="https://cloud-images.ubuntu.com/jammy/current/SHA256SUMS"
-DEBIAN_URL="https://cloud.debian.org/images/cloud/bookworm/latest/debian-12-genericcloud-amd64.qcow2"
+# Debian 13 "Trixie" cloud images (latest stable). Two variants:
+#   genericcloud → smallest, virtio-focused (ideal for KVM/Proxmox)
+#   generic      → broader driver set (boots on VMware/Hyper-V/bare-metal too)
+DEBIAN_URL="https://cloud.debian.org/images/cloud/trixie/latest/debian-13-genericcloud-amd64.qcow2"
+DEBIAN_GENERIC_URL="https://cloud.debian.org/images/cloud/trixie/latest/debian-13-generic-amd64.qcow2"
 RPI_INDEX="https://downloads.raspberrypi.com/raspios_lite_arm64/images"
 
 WORK="$(mktemp -d /tmp/inspectre-build.XXXXXX)"
 REPO="${WORK}/repo"
 TAR_AMD="${CACHE_DIR}/inspectre-amd64.tar"
 TAR_ARM="${CACHE_DIR}/inspectre-arm64.tar"
+# Watchtower powers optional appliance auto-updates (multi-arch image).
+WATCHTOWER_IMAGE="containrrr/watchtower:latest"
 
 mkdir -p "${CACHE_DIR}"
 
@@ -62,6 +73,7 @@ while [[ $# -gt 0 ]]; do
     --push)           PUSH_DOCKERHUB=true ;;
     --debian)         VM_BASE_OS="debian" ;;
     --ubuntu)         VM_BASE_OS="ubuntu" ;;
+    --target)         VM_HV_TARGET="$2"; shift ;;
     --branch)         REPO_BRANCH="$2"; shift ;;
     --output-dir)     OUTPUT_DIR="$2"; shift ;;
     --help|-h)        sed -n '2,15p' "$0" | sed 's/^#  \{0,2\}//'; exit 0 ;;
@@ -69,6 +81,12 @@ while [[ $# -gt 0 ]]; do
   esac
   shift
 done
+
+# Validate hypervisor target early (applies to VM online builds).
+case "${VM_HV_TARGET}" in
+  kvm|vmware|universal) ;;
+  *) die "Invalid --target '${VM_HV_TARGET}'. Use: kvm, vmware, or universal." ;;
+esac
 
 # ── Interactive Menu ──────────────────────────────────────────────────────────
 if ! $CLI_TARGET_SPECIFIED; then
@@ -135,14 +153,33 @@ if ! $CLI_TARGET_SPECIFIED; then
     echo -e "${CYAN}${BOLD}╔══════════════════════════════════════════════════╗${NC}"
     echo -e "${CYAN}${BOLD}║          Select VM Base Operating System         ║${NC}"
     echo -e "${CYAN}${BOLD}╚══════════════════════════════════════════════════╝${NC}"
-    echo -e "  1) Ubuntu 22.04 LTS (Jammy)   — larger (~550 MB base), well-tested"
-    echo -e "  2) Debian 12 (Bookworm)        — smaller (~200 MB base), leaner image"
+    echo -e "  1) Debian 13 (Trixie)          — smallest, recommended (default)"
+    echo -e "  2) Ubuntu 22.04 LTS (Jammy)    — larger (~550 MB base), well-tested"
     echo ""
     read -rp "Enter selection [1-2, default=1]: " os_choice
     echo ""
     case "${os_choice}" in
-      2) VM_BASE_OS="debian"; info "Using Debian 12 Bookworm as VM base OS." ;;
-      *) VM_BASE_OS="ubuntu"; info "Using Ubuntu 22.04 Jammy as VM base OS." ;;
+      2) VM_BASE_OS="ubuntu"; info "Using Ubuntu 22.04 Jammy as VM base OS." ;;
+      *) VM_BASE_OS="debian"; info "Using Debian 13 Trixie as VM base OS." ;;
+    esac
+  fi
+
+  # ── Hypervisor target selection (online VM build only) ────────────────────
+  if $BUILD_VM_ONLINE; then
+    echo ""
+    echo -e "${CYAN}${BOLD}╔══════════════════════════════════════════════════╗${NC}"
+    echo -e "${CYAN}${BOLD}║        Select Target Hypervisor (online VM)      ║${NC}"
+    echo -e "${CYAN}${BOLD}╚══════════════════════════════════════════════════╝${NC}"
+    echo -e "  1) KVM / Proxmox            — qcow2 only, smallest  (genericcloud base)"
+    echo -e "  2) VMware Workstation/ESXi  — vmdk + ova            (generic base)"
+    echo -e "  3) Universal (all hypervisors)— single qcow2 + converter script (generic base)"
+    echo ""
+    read -rp "Enter selection [1-3, default=1]: " hv_choice
+    echo ""
+    case "${hv_choice}" in
+      2) VM_HV_TARGET="vmware";    info "Target: VMware (vmdk + ova)." ;;
+      3) VM_HV_TARGET="universal"; info "Target: Universal (single qcow2 + converter script)." ;;
+      *) VM_HV_TARGET="kvm";       info "Target: KVM/Proxmox (qcow2)." ;;
     esac
   fi
 
@@ -179,6 +216,14 @@ check_deps() {
     command -v "$d" &>/dev/null && ok "$d" || missing+=("$d")
   done
   [[ ${#missing[@]} -eq 0 ]] || die "Missing tools: ${missing[*]}. Run: sudo apt-get install -y qemu-utils git curl xz-utils parted e2fsprogs gdisk docker.io"
+
+  # Soft (optional) tools for size optimisation / format conversion of VM images.
+  if $BUILD_VM || $BUILD_VM_ONLINE; then
+    command -v zerofree &>/dev/null && ok "zerofree (optional)" \
+      || warn "zerofree not found — root fs won't be zeroed (images compress less). Install: sudo apt-get install -y zerofree"
+    command -v tar &>/dev/null && ok "tar (optional, for OVA)" \
+      || warn "tar not found — OVA packaging will be skipped."
+  fi
 
   # FIX #13: ARM binfmt check also triggers for ARM container-only builds
   if ( $BUILD_CONTAINERS_ARM || $BUILD_PI || $BUILD_PI_ONLINE ) && \
@@ -262,18 +307,24 @@ build_docker_images() {
   if $BUILD_CONTAINERS_AMD; then
     docker pull --platform linux/amd64 --quiet postgres:15-alpine
     docker tag postgres:15-alpine inspectre-postgres:amd64
+    # Bundle Watchtower so offline appliances can self-update without internet.
+    docker pull --platform linux/amd64 --quiet "${WATCHTOWER_IMAGE}"
     docker save \
       inspectre-backend:amd64 inspectre-probe:amd64 \
       inspectre-frontend:amd64 inspectre-postgres:amd64 \
+      "${WATCHTOWER_IMAGE}" \
       > "${TAR_AMD}"
     ok "x64 container bundle saved: ${TAR_AMD}"
   fi
   if $BUILD_CONTAINERS_ARM; then
     docker pull --platform linux/arm64 --quiet postgres:15-alpine
     docker tag postgres:15-alpine inspectre-postgres:arm64
+    # Bundle Watchtower so offline appliances can self-update without internet.
+    docker pull --platform linux/arm64 --quiet "${WATCHTOWER_IMAGE}"
     docker save \
       inspectre-backend:arm64 inspectre-probe:arm64 \
       inspectre-frontend:arm64 inspectre-postgres:arm64 \
+      "${WATCHTOWER_IMAGE}" \
       > "${TAR_ARM}"
     ok "ARM64 container bundle saved: ${TAR_ARM}"
   fi
@@ -380,11 +431,15 @@ cd /opt/inspectre
 echo "[InSpectre] Waiting for Docker Hub connectivity..."
 connected=false
 for i in $(seq 1 30); do
-  if curl -fsSL --max-time 5 https://registry-1.docker.io/v2/ > /dev/null 2>&1; then
+  # NOTE: registry-1.docker.io/v2/ returns HTTP 401 (auth required) when reachable,
+  # so we must NOT use curl -f (which fails on 401). Treat any real HTTP response
+  # code (200/401) as "Docker Hub is reachable".
+  code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 https://registry-1.docker.io/v2/ 2>/dev/null || true)
+  if [[ "$code" == "200" || "$code" == "401" ]]; then
     connected=true
     break
   fi
-  echo "[InSpectre] Attempt ${i}/30 — no connectivity yet, retrying in 10s..."
+  echo "[InSpectre] Attempt ${i}/30 — no connectivity yet (code=${code:-none}), retrying in 10s..."
   sleep 10
 done
 
@@ -478,10 +533,17 @@ EOF
 _mount_ubuntu_base() {
   local vw="$1" disk_name="$2" disk_size="$3"
   local base_url="$UBUNTU_URL"
-  [[ "${VM_BASE_OS}" == "debian" ]] && base_url="$DEBIAN_URL"
 
   if [[ "${VM_BASE_OS}" == "debian" ]]; then
-    info "Downloading Debian 12 Bookworm cloud image..."
+    # genericcloud = smallest (virtio only, KVM/Proxmox); generic = broad drivers
+    # (needed for VMware/Hyper-V/universal targets).
+    if [[ "${VM_HV_TARGET}" == "vmware" || "${VM_HV_TARGET}" == "universal" ]]; then
+      base_url="$DEBIAN_GENERIC_URL"
+      info "Downloading Debian 13 Trixie cloud image (generic — broad driver set)..."
+    else
+      base_url="$DEBIAN_URL"
+      info "Downloading Debian 13 Trixie cloud image (genericcloud — virtio)..."
+    fi
   else
     info "Downloading Ubuntu 22.04 Jammy cloud image..."
   fi
@@ -554,6 +616,16 @@ EOF
     sudo ln -sf /lib/systemd/system/systemd-resolved.service \
       "${mnt}/etc/systemd/system/multi-user.target.wants/systemd-resolved.service" 2>/dev/null || true
 
+    # Ensure DHCP/network-online is reached BEFORE inspectre.service tries to
+    # pull containers. --any => don't block boot waiting for *every* NIC on a
+    # multi-NIC host (prevents the "no IP before container pull" regression).
+    sudo mkdir -p "${mnt}/etc/systemd/system/systemd-networkd-wait-online.service.d"
+    sudo tee "${mnt}/etc/systemd/system/systemd-networkd-wait-online.service.d/override.conf" >/dev/null <<'EOF'
+[Service]
+ExecStart=
+ExecStart=/usr/lib/systemd/systemd-networkd-wait-online --any --timeout=60
+EOF
+
     sudo mkdir -p "${mnt}/etc/cloud/cloud.cfg.d"
     sudo tee "${mnt}/etc/cloud/cloud.cfg.d/99-inspectre.cfg" >/dev/null <<'EOF'
 datasource_list: [None]
@@ -598,6 +670,7 @@ POLICY
   _MOUNT_NBD="${nbd}"
   _MOUNT_MNT="${mnt}"
   _MOUNT_DISK="${disk}"
+  _MOUNT_ROOT="${root_part}"
 }
 
 # FIX #7 #8 #9: Docker is now explicitly enabled in both Ubuntu and Debian chroots;
@@ -625,6 +698,13 @@ echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.
 apt-get update -qq
 apt-get install -y --no-install-recommends \
   docker-ce docker-ce-cli containerd.io docker-compose-plugin
+
+# Remove cloud-init: on a fixed appliance it serves no purpose and (critically)
+# can re-lock/expire the inspectre account or reset networking at first boot,
+# which caused the prior "login doesn't work" regression.
+apt-get purge -y cloud-init || true
+rm -rf /etc/cloud /var/lib/cloud
+apt-get autoremove -y --purge || true
 apt-get clean
 rm -rf /var/lib/apt/lists/*
 
@@ -633,6 +713,8 @@ systemctl enable docker
 systemctl enable ssh
 systemctl enable systemd-networkd
 systemctl enable systemd-resolved
+# Block container pulls until DHCP/network is actually up.
+systemctl enable systemd-networkd-wait-online
 
 sed -i 's/^#*PasswordAuthentication .*/PasswordAuthentication yes/' /etc/ssh/sshd_config
 sed -i 's/^#*PermitRootLogin .*/PermitRootLogin yes/' /etc/ssh/sshd_config
@@ -641,12 +723,24 @@ id inspectre &>/dev/null || useradd -m -s /bin/bash inspectre
 usermod -aG sudo,docker inspectre
 echo "inspectre:inspectre" | chpasswd
 echo "root:inspectre" | chpasswd
+# Guarantee the account is usable: unlock and never expire the password.
+passwd -u inspectre || true
+chage -M -1 inspectre || true
 echo "inspectre ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/inspectre
 chmod 0440 /etc/sudoers.d/inspectre
 
 # FIX #7: Replace resolv.conf with systemd-resolved stub now (inside chroot)
 rm -f /etc/resolv.conf
 ln -sf /run/systemd/resolve/stub-resolv.conf /etc/resolv.conf
+
+# Shrink: strip docs/man/locales + transient files, then zero free space with dd
+# (works WITHOUT zerofree on the build host so the qcow2 stays compact / xz well).
+rm -rf /usr/share/doc/* /usr/share/man/* /usr/share/info/* /usr/share/locale/* \
+       /usr/share/lintian/* /var/cache/apt/* /var/lib/apt/lists/* /var/log/* \
+       /tmp/* /var/tmp/* 2>/dev/null || true
+dd if=/dev/zero of=/ZEROFILL bs=4M 2>/dev/null || true
+rm -f /ZEROFILL
+sync
 CHROOT
 
   else
@@ -671,16 +765,269 @@ id inspectre &>/dev/null || useradd -m -s /bin/bash inspectre
 usermod -aG sudo,docker inspectre
 echo "inspectre:inspectre" | chpasswd
 echo "root:inspectre" | chpasswd
+# Guarantee the account is usable: unlock and never expire the password.
+passwd -u inspectre || true
+chage -M -1 inspectre || true
 echo "inspectre ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/inspectre
 chmod 0440 /etc/sudoers.d/inspectre
+
+# Shrink: strip docs/man/locales + transient files, then zero free space with dd.
+rm -rf /usr/share/doc/* /usr/share/man/* /usr/share/info/* /usr/share/locale/* \
+       /usr/share/lintian/* /var/cache/apt/* /var/lib/apt/lists/* /var/log/* \
+       /tmp/* /var/tmp/* 2>/dev/null || true
+dd if=/dev/zero of=/ZEROFILL bs=4M 2>/dev/null || true
+rm -f /ZEROFILL
+sync
 CHROOT
   fi
+}
+
+# ── Disk format conversion / packaging helpers ───────────────────────────────
+# Return the virtual disk size in bytes (for OVF capacity).
+_disk_virtual_bytes() {
+  qemu-img info --output=json "$1" 2>/dev/null \
+    | grep -oP '"virtual-size":\s*\K[0-9]+' | head -1
+}
+
+# Optionally xz-compress a finished artifact (only when MAX_COMPRESS is on).
+_maybe_xz() {
+  local f="$1"
+  if $MAX_COMPRESS; then
+    info "Compressing $(basename "${f}") with xz -9..."
+    xz --threads=0 -9 -f "${f}"
+    ok "Artifact ready: ${f}.xz"
+  else
+    ok "Artifact ready: ${f}"
+  fi
+}
+
+_emit_qcow2() {
+  local disk="$1" out_base="$2"
+  info "Emitting qcow2 (${out_base})..."
+  qemu-img convert -c -O qcow2 "${disk}" "${OUTPUT_DIR}/${out_base}.qcow2"
+  _maybe_xz "${OUTPUT_DIR}/${out_base}.qcow2"
+}
+
+_emit_vmdk() {
+  local disk="$1" out_base="$2"
+  info "Emitting VMDK (streamOptimized, ${out_base})..."
+  qemu-img convert -O vmdk -o subformat=streamOptimized \
+    "${disk}" "${OUTPUT_DIR}/${out_base}.vmdk"
+  _maybe_xz "${OUTPUT_DIR}/${out_base}.vmdk"
+}
+
+_emit_vhdx() {
+  local disk="$1" out_base="$2"
+  info "Emitting VHDX (dynamic, ${out_base})..."
+  qemu-img convert -O vhdx -o subformat=dynamic \
+    "${disk}" "${OUTPUT_DIR}/${out_base}.vhdx"
+  _maybe_xz "${OUTPUT_DIR}/${out_base}.vhdx"
+}
+
+# Build an OVA (OVF 1.0 + streamOptimized VMDK + manifest) for VMware/ESXi.
+# Best-effort: skipped (non-fatal) if tar/qemu-img conversion is unavailable.
+_emit_ova() {
+  local disk="$1" out_base="$2"
+  command -v tar &>/dev/null || { warn "tar missing — skipping OVA (${out_base})."; return 0; }
+  local tmp; tmp="$(mktemp -d)"
+  local vmdk_name="${out_base}-disk1.vmdk"
+  local ovf_name="${out_base}.ovf"
+  local mf_name="${out_base}.mf"
+
+  info "Creating streamOptimized VMDK for OVA (${out_base})..."
+  if ! qemu-img convert -O vmdk -o subformat=streamOptimized \
+        "${disk}" "${tmp}/${vmdk_name}"; then
+    warn "VMDK conversion failed — skipping OVA (${out_base})."
+    rm -rf "${tmp}"; return 0
+  fi
+
+  local cap; cap="$(_disk_virtual_bytes "${disk}")"
+  [[ -n "${cap}" ]] || cap="21474836480"
+  local fsize; fsize="$(stat -c%s "${tmp}/${vmdk_name}")"
+
+  cat > "${tmp}/${ovf_name}" <<OVF
+<?xml version="1.0" encoding="UTF-8"?>
+<Envelope vmw:buildId="build-1" xmlns="http://schemas.dmtf.org/ovf/envelope/1" xmlns:cim="http://schemas.dmtf.org/wbem/wscim/1/common" xmlns:ovf="http://schemas.dmtf.org/ovf/envelope/1" xmlns:rasd="http://schemas.dmtf.org/wbem/wscim/1/cim-schema/2/CIM_ResourceAllocationSettingData" xmlns:vmw="http://www.vmware.com/schema/ovf" xmlns:vssd="http://schemas.dmtf.org/wbem/wscim/1/cim-schema/2/CIM_VirtualSystemSettingData" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+  <References>
+    <File ovf:href="${vmdk_name}" ovf:id="file1" ovf:size="${fsize}"/>
+  </References>
+  <DiskSection>
+    <Info>Virtual disk information</Info>
+    <Disk ovf:capacity="${cap}" ovf:capacityAllocationUnits="byte" ovf:diskId="vmdisk1" ovf:fileRef="file1" ovf:format="http://www.vmware.com/interfaces/specifications/vmdk.html#streamOptimized" ovf:populatedSize="${fsize}"/>
+  </DiskSection>
+  <NetworkSection>
+    <Info>The list of logical networks</Info>
+    <Network ovf:name="VM Network">
+      <Description>The VM Network network</Description>
+    </Network>
+  </NetworkSection>
+  <VirtualSystem ovf:id="${out_base}">
+    <Info>InSpectre System Scanner Appliance</Info>
+    <Name>${out_base}</Name>
+    <OperatingSystemSection ovf:id="96" vmw:osType="debian12_64Guest">
+      <Info>The kind of installed guest operating system</Info>
+      <Description>Debian GNU/Linux (64-bit)</Description>
+    </OperatingSystemSection>
+    <VirtualHardwareSection>
+      <Info>Virtual hardware requirements</Info>
+      <System>
+        <vssd:ElementName>Virtual Hardware Family</vssd:ElementName>
+        <vssd:InstanceID>0</vssd:InstanceID>
+        <vssd:VirtualSystemIdentifier>${out_base}</vssd:VirtualSystemIdentifier>
+        <vssd:VirtualSystemType>vmx-13</vssd:VirtualSystemType>
+      </System>
+      <Item>
+        <rasd:AllocationUnits>hertz * 10^6</rasd:AllocationUnits>
+        <rasd:Description>Number of Virtual CPUs</rasd:Description>
+        <rasd:ElementName>2 virtual CPU(s)</rasd:ElementName>
+        <rasd:InstanceID>1</rasd:InstanceID>
+        <rasd:ResourceType>3</rasd:ResourceType>
+        <rasd:VirtualQuantity>2</rasd:VirtualQuantity>
+      </Item>
+      <Item>
+        <rasd:AllocationUnits>byte * 2^20</rasd:AllocationUnits>
+        <rasd:Description>Memory Size</rasd:Description>
+        <rasd:ElementName>2048MB of memory</rasd:ElementName>
+        <rasd:InstanceID>2</rasd:InstanceID>
+        <rasd:ResourceType>4</rasd:ResourceType>
+        <rasd:VirtualQuantity>2048</rasd:VirtualQuantity>
+      </Item>
+      <Item>
+        <rasd:Address>0</rasd:Address>
+        <rasd:Description>SCSI Controller</rasd:Description>
+        <rasd:ElementName>SCSI Controller 0</rasd:ElementName>
+        <rasd:InstanceID>3</rasd:InstanceID>
+        <rasd:ResourceSubType>lsilogic</rasd:ResourceSubType>
+        <rasd:ResourceType>6</rasd:ResourceType>
+      </Item>
+      <Item>
+        <rasd:AddressOnParent>0</rasd:AddressOnParent>
+        <rasd:ElementName>Hard Disk 1</rasd:ElementName>
+        <rasd:HostResource>ovf:/disk/vmdisk1</rasd:HostResource>
+        <rasd:InstanceID>4</rasd:InstanceID>
+        <rasd:Parent>3</rasd:Parent>
+        <rasd:ResourceType>17</rasd:ResourceType>
+      </Item>
+      <Item>
+        <rasd:AddressOnParent>7</rasd:AddressOnParent>
+        <rasd:AutomaticAllocation>true</rasd:AutomaticAllocation>
+        <rasd:Connection>VM Network</rasd:Connection>
+        <rasd:Description>E1000 ethernet adapter</rasd:Description>
+        <rasd:ElementName>Ethernet 1</rasd:ElementName>
+        <rasd:InstanceID>5</rasd:InstanceID>
+        <rasd:ResourceSubType>E1000</rasd:ResourceSubType>
+        <rasd:ResourceType>10</rasd:ResourceType>
+      </Item>
+    </VirtualHardwareSection>
+  </VirtualSystem>
+</Envelope>
+OVF
+
+  {
+    printf 'SHA256(%s)= %s\n' "${ovf_name}"  "$(sha256sum "${tmp}/${ovf_name}"  | awk '{print $1}')"
+    printf 'SHA256(%s)= %s\n' "${vmdk_name}" "$(sha256sum "${tmp}/${vmdk_name}" | awk '{print $1}')"
+  } > "${tmp}/${mf_name}"
+
+  # OVA = tar with the .ovf first, then disk(s), then manifest.
+  ( cd "${tmp}" && tar -cf "${OUTPUT_DIR}/${out_base}.ova" "${ovf_name}" "${vmdk_name}" "${mf_name}" )
+  rm -rf "${tmp}"
+  ok "OVA ready: ${OUTPUT_DIR}/${out_base}.ova"
+}
+
+# Write a standalone converter script next to the universal qcow2 so the user
+# can produce vmdk (VMware) / vhdx (Hyper-V) / ova (ESXi import) on demand from
+# the single portable image — instead of shipping every format up front.
+_write_convert_script() {
+  local script="${OUTPUT_DIR}/convert-inspectre-image.sh"
+  cat > "${script}" <<'CONV'
+#!/usr/bin/env bash
+# InSpectre universal-image converter.
+# Usage: ./convert-inspectre-image.sh <image.qcow2[.xz]> <vmdk|vhdx|ova|raw>
+set -euo pipefail
+SRC="${1:-}"; FMT="${2:-}"
+[[ -n "$SRC" && -n "$FMT" ]] || { echo "Usage: $0 <image.qcow2[.xz]> <vmdk|vhdx|ova|raw>"; exit 1; }
+command -v qemu-img >/dev/null || { echo "qemu-img required (apt-get install qemu-utils)"; exit 1; }
+
+# Decompress .xz transparently to a temp working copy.
+WORK="$SRC"
+if [[ "$SRC" == *.xz ]]; then
+  WORK="${SRC%.xz}"
+  echo "[*] Decompressing $SRC ..."
+  xz -dkf "$SRC"
+fi
+BASE="${WORK%.qcow2}"
+
+case "$FMT" in
+  raw)  qemu-img convert -O raw  "$WORK" "${BASE}.img";  echo "[+] ${BASE}.img" ;;
+  vmdk) qemu-img convert -O vmdk -o subformat=streamOptimized "$WORK" "${BASE}.vmdk"; echo "[+] ${BASE}.vmdk" ;;
+  vhdx) qemu-img convert -O vhdx -o subformat=dynamic         "$WORK" "${BASE}.vhdx"; echo "[+] ${BASE}.vhdx" ;;
+  ova)
+    DISK="${BASE}-disk1.vmdk"
+    qemu-img convert -O vmdk -o subformat=streamOptimized "$WORK" "$DISK"
+    CAP=$(qemu-img info --output=json "$WORK" | grep -oP '"virtual-size":\s*\K[0-9]+' | head -1)
+    FSZ=$(stat -c%s "$DISK"); NAME="$(basename "$BASE")"
+    OVF="${BASE}.ovf"
+    cat > "$OVF" <<OVF
+<?xml version="1.0" encoding="UTF-8"?>
+<Envelope xmlns="http://schemas.dmtf.org/ovf/envelope/1" xmlns:ovf="http://schemas.dmtf.org/ovf/envelope/1" xmlns:rasd="http://schemas.dmtf.org/wbem/wscim/1/cim-schema/2/CIM_ResourceAllocationSettingData" xmlns:vmw="http://www.vmware.com/schema/ovf" xmlns:vssd="http://schemas.dmtf.org/wbem/wscim/1/cim-schema/2/CIM_VirtualSystemSettingData">
+  <References><File ovf:href="$(basename "$DISK")" ovf:id="file1" ovf:size="${FSZ}"/></References>
+  <DiskSection><Info>Virtual disk</Info><Disk ovf:capacity="${CAP}" ovf:capacityAllocationUnits="byte" ovf:diskId="vmdisk1" ovf:fileRef="file1" ovf:format="http://www.vmware.com/interfaces/specifications/vmdk.html#streamOptimized"/></DiskSection>
+  <NetworkSection><Info>Networks</Info><Network ovf:name="VM Network"><Description>VM Network</Description></Network></NetworkSection>
+  <VirtualSystem ovf:id="${NAME}"><Info>InSpectre Appliance</Info><Name>${NAME}</Name>
+    <OperatingSystemSection ovf:id="96" vmw:osType="debian12_64Guest"><Info>Guest OS</Info></OperatingSystemSection>
+    <VirtualHardwareSection><Info>HW</Info>
+      <System><vssd:ElementName>Virtual Hardware Family</vssd:ElementName><vssd:InstanceID>0</vssd:InstanceID><vssd:VirtualSystemIdentifier>${NAME}</vssd:VirtualSystemIdentifier><vssd:VirtualSystemType>vmx-13</vssd:VirtualSystemType></System>
+      <Item><rasd:AllocationUnits>hertz * 10^6</rasd:AllocationUnits><rasd:ElementName>2 vCPU</rasd:ElementName><rasd:InstanceID>1</rasd:InstanceID><rasd:ResourceType>3</rasd:ResourceType><rasd:VirtualQuantity>2</rasd:VirtualQuantity></Item>
+      <Item><rasd:AllocationUnits>byte * 2^20</rasd:AllocationUnits><rasd:ElementName>2048MB</rasd:ElementName><rasd:InstanceID>2</rasd:InstanceID><rasd:ResourceType>4</rasd:ResourceType><rasd:VirtualQuantity>2048</rasd:VirtualQuantity></Item>
+      <Item><rasd:Address>0</rasd:Address><rasd:ElementName>SCSI Controller 0</rasd:ElementName><rasd:InstanceID>3</rasd:InstanceID><rasd:ResourceSubType>lsilogic</rasd:ResourceSubType><rasd:ResourceType>6</rasd:ResourceType></Item>
+      <Item><rasd:AddressOnParent>0</rasd:AddressOnParent><rasd:ElementName>Hard Disk 1</rasd:ElementName><rasd:HostResource>ovf:/disk/vmdisk1</rasd:HostResource><rasd:InstanceID>4</rasd:InstanceID><rasd:Parent>3</rasd:Parent><rasd:ResourceType>17</rasd:ResourceType></Item>
+      <Item><rasd:AddressOnParent>7</rasd:AddressOnParent><rasd:AutomaticAllocation>true</rasd:AutomaticAllocation><rasd:Connection>VM Network</rasd:Connection><rasd:ElementName>Ethernet 1</rasd:ElementName><rasd:InstanceID>5</rasd:InstanceID><rasd:ResourceSubType>E1000</rasd:ResourceSubType><rasd:ResourceType>10</rasd:ResourceType></Item>
+    </VirtualHardwareSection>
+  </VirtualSystem>
+</Envelope>
+OVF
+    MF="${BASE}.mf"
+    { printf 'SHA256(%s)= %s\n' "$(basename "$OVF")"  "$(sha256sum "$OVF"  | awk '{print $1}')";
+      printf 'SHA256(%s)= %s\n' "$(basename "$DISK")" "$(sha256sum "$DISK" | awk '{print $1}')"; } > "$MF"
+    ( cd "$(dirname "$BASE")" && tar -cf "$(basename "$BASE").ova" "$(basename "$OVF")" "$(basename "$DISK")" "$(basename "$MF")" )
+    echo "[+] ${BASE}.ova"
+    ;;
+  *) echo "Unknown format: $FMT (use vmdk|vhdx|ova|raw)"; exit 1 ;;
+esac
+echo "[done]"
+CONV
+  chmod +x "${script}"
+  ok "Converter script: ${script}  (qcow2 -> vmdk|vhdx|ova|raw)"
+}
+
+# Dispatch the right set of artifacts for the selected hypervisor target.
+_emit_artifacts() {
+  local disk="$1" out_base="$2" target="$3"
+  case "${target}" in
+    kvm)
+      _emit_qcow2 "${disk}" "${out_base}"
+      ;;
+    vmware)
+      _emit_vmdk "${disk}" "${out_base}"
+      _emit_ova  "${disk}" "${out_base}"
+      ;;
+    universal)
+      # ONE portable image (qcow2, broad-driver "generic" base) + a converter
+      # script so the user can turn it into vmdk/vhdx/ova on demand.
+      _emit_qcow2 "${disk}" "${out_base}"
+      _write_convert_script
+      ;;
+    *)
+      _emit_qcow2 "${disk}" "${out_base}"
+      ;;
+  esac
 }
 
 # FIX #7 cont: Debian no longer restores resolv.conf.bak (already replaced inside chroot).
 #              Ubuntu restores its original symlink as before.
 _finalise_vm() {
-  local mnt="$1" nbd="$2" disk="$3" out_image="$4"
+  local mnt="$1" nbd="$2" disk="$3" out_base="$4" target="${5:-kvm}"
+  local root_part="${_MOUNT_ROOT}"
   sudo rm -f "${mnt}/usr/sbin/policy-rc.d"
 
   if [[ "${VM_BASE_OS}" == "debian" ]]; then
@@ -698,19 +1045,19 @@ _finalise_vm() {
   sudo umount "${mnt}/sys"     2>/dev/null || true
   sudo umount "${mnt}/proc"    2>/dev/null || true
   sudo umount "${mnt}"
+
+  # Zero free space on the root fs so the image compresses much smaller.
+  # Optional: warn+skip if zerofree is not installed.
+  if [[ -n "${root_part}" ]] && command -v zerofree &>/dev/null; then
+    info "Zeroing free space on ${root_part} (improves compression)..."
+    sudo e2fsck -f "${root_part}" -y >/dev/null 2>&1 || true
+    sudo zerofree "${root_part}" 2>/dev/null || warn "zerofree failed — continuing."
+  fi
+
   sudo qemu-nbd --disconnect "${nbd}"
   sleep 2
 
-  if $MAX_COMPRESS; then
-    info "Converting to raw qcow2 for xz pass..."
-    qemu-img convert -O qcow2 "${disk}" "${OUTPUT_DIR}/${out_image}"
-    info "Compressing with xz -9 (this will take several minutes)..."
-    xz --threads=0 -9 -f "${OUTPUT_DIR}/${out_image}"
-    ok "VM image ready: ${OUTPUT_DIR}/${out_image}.xz"
-  else
-    qemu-img convert -c -O qcow2 "${disk}" "${OUTPUT_DIR}/${out_image}"
-    ok "VM image ready: ${OUTPUT_DIR}/${out_image}"
-  fi
+  _emit_artifacts "${disk}" "${out_base}" "${target}"
 }
 
 # ── VM Appliance — Offline ────────────────────────────────────────────────────
@@ -736,12 +1083,12 @@ build_vm_image() {
   motd_content   | sudo tee "${mnt}/etc/motd" >/dev/null
   sudo chroot "${mnt}" systemctl enable inspectre
 
-  _finalise_vm "${mnt}" "${nbd}" "${disk}" "${VM_IMAGE}"
+  _finalise_vm "${mnt}" "${nbd}" "${disk}" "inspectre-vm" "kvm"
 }
 
 # ── VM Appliance — Online ─────────────────────────────────────────────────────
 build_vm_online_image() {
-  step "Building VM Appliance — Online (x86_64) [base: ${VM_BASE_OS}]"
+  step "Building VM Appliance — Online (x86_64) [base: ${VM_BASE_OS}, target: ${VM_HV_TARGET}]"
   info "Image will pull thefunkygibbon/inspectre-* from Docker Hub on first boot."
 
   local vw="${WORK}/vm-online"
@@ -761,7 +1108,7 @@ build_vm_online_image() {
   motd_content          | sudo tee "${mnt}/etc/motd" >/dev/null
   sudo chroot "${mnt}" systemctl enable inspectre
 
-  _finalise_vm "${mnt}" "${nbd}" "${disk}" "${VM_ONLINE_IMAGE}"
+  _finalise_vm "${mnt}" "${nbd}" "${disk}" "inspectre-vm-online-${VM_HV_TARGET}" "${VM_HV_TARGET}"
 }
 
 # ── Pi helpers ────────────────────────────────────────────────────────────────

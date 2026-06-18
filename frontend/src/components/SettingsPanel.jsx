@@ -221,6 +221,11 @@ export function SettingsPanel({ onClose, onSettingChange }) {
   const [nucleiLines,       setNucleiLines]       = useState([])
   const nucleiAbortRef = useRef(null)
 
+  // Appliance auto-updates (only available on VM/Pi appliance builds)
+  const [systemInfo,        setSystemInfo]        = useState(null)
+  const [autoUpdateSaving,  setAutoUpdateSaving]  = useState(false)
+  const [autoUpdateError,   setAutoUpdateError]   = useState('')
+
   const fetchTrivyStatus = useCallback(() => {
     api.trivyDbStatus().then(setTrivyDbStatus).catch(() => {})
   }, [])
@@ -240,11 +245,26 @@ export function SettingsPanel({ onClose, onSettingChange }) {
     }).catch(() => {})
     fetchTrivyStatus()
     fetchNucleiStatus()
+    api.getSystemInfo().then(setSystemInfo).catch(() => {})
   }, [fetchTrivyStatus, fetchNucleiStatus])
 
   function handleChange(key, value) {
     setDirty(d => ({ ...d, [key]: value }))
     onSettingChange?.(key, value)
+  }
+
+  async function handleAutoUpdate(enabled, schedule) {
+    setAutoUpdateSaving(true)
+    setAutoUpdateError('')
+    try {
+      await api.setAutoUpdate(enabled, schedule)
+      const info = await api.getSystemInfo()
+      setSystemInfo(info)
+    } catch (e) {
+      setAutoUpdateError((e?.message || String(e)).replace(/^.*?\d{3}\s*/, ''))
+    } finally {
+      setAutoUpdateSaving(false)
+    }
   }
 
   async function handleSave() {
@@ -1015,6 +1035,65 @@ export function SettingsPanel({ onClose, onSettingChange }) {
           {/* ── Admin tab (Appearance + Account) ────────────────────────────── */}
           {activeTab === 'admin' && (
             <>
+              {systemInfo?.is_appliance && (
+                <div className="space-y-3 pb-2">
+                  <SectionHeader label="Automatic Updates" Icon={RefreshCw} />
+                  <p className="text-xs" style={{ color: 'var(--color-text-faint)' }}>
+                    This appliance build can keep its containers up to date automatically
+                    using Watchtower. Updates are disabled by default.
+                  </p>
+
+                  {/* Enable toggle */}
+                  <label className="flex items-center justify-between gap-3 rounded-lg px-3 py-2"
+                    style={{ background: 'var(--color-surface-offset)', border: '1px solid var(--color-border)' }}>
+                    <span className="text-sm" style={{ color: 'var(--color-text)' }}>
+                      Enable automatic updates
+                    </span>
+                    <input
+                      type="checkbox"
+                      checked={!!systemInfo?.auto_update?.enabled}
+                      disabled={autoUpdateSaving}
+                      onChange={e => handleAutoUpdate(
+                        e.target.checked,
+                        systemInfo?.auto_update?.schedule || 'daily',
+                      )}
+                    />
+                  </label>
+
+                  {/* Schedule selector */}
+                  <div className="space-y-1">
+                    <label className="text-xs" style={{ color: 'var(--color-text-muted)' }}>Check schedule</label>
+                    <select
+                      className="w-full rounded-lg px-3 py-2 text-sm"
+                      style={{ background: 'var(--color-surface-offset)', border: '1px solid var(--color-border)', color: 'var(--color-text)' }}
+                      value={systemInfo?.auto_update?.schedule || 'daily'}
+                      disabled={autoUpdateSaving || !systemInfo?.auto_update?.enabled}
+                      onChange={e => handleAutoUpdate(
+                        !!systemInfo?.auto_update?.enabled,
+                        e.target.value,
+                      )}
+                    >
+                      <option value="6h">Every 6 hours</option>
+                      <option value="12h">Every 12 hours</option>
+                      <option value="daily">Daily</option>
+                      <option value="weekly">Weekly</option>
+                    </select>
+                    <p className="text-xs" style={{ color: 'var(--color-text-faint)' }}>
+                      {systemInfo?.auto_update?.enabled
+                        ? `Watchtower is ${systemInfo?.auto_update?.watchtower?.running ? 'running' : 'configured'} and will check on this schedule.`
+                        : 'Turn on automatic updates to choose how often to check.'}
+                    </p>
+                  </div>
+
+                  {autoUpdateError && (
+                    <p className="text-xs rounded-lg px-3 py-2"
+                      style={{ background: 'rgba(239,68,68,0.08)', border: '1px solid rgba(239,68,68,0.3)', color: '#ef4444' }}>
+                      {autoUpdateError}
+                    </p>
+                  )}
+                </div>
+              )}
+
               <SectionHeader label="UI Style" Icon={Paintbrush} />
               <p className="text-xs" style={{ color: 'var(--color-text-faint)' }}>
                 Choose a UI style. Changes take effect immediately — no reload required.

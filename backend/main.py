@@ -664,6 +664,9 @@ DEFAULT_SETTINGS = {
     "float_new_to_top":          ("true",  "Surface unacknowledged new devices and containers to the top of the list."),
     # Setup wizard
     "setup_complete":            ("false", "Whether the initial setup wizard has been completed."),
+    # Appliance auto-updates (Watchtower) — only meaningful on VM/Pi appliance builds
+    "auto_update_enabled":       ("false", "Enable automatic container updates via Watchtower. Appliance (VM/Pi) builds only; disabled by default."),
+    "auto_update_schedule":      ("daily", "How often Watchtower checks for container updates: 6h, 12h, daily, or weekly."),
     # Docker monitoring
     "docker_enabled":            ("false", "Enable Docker container monitoring."),
     "docker_host":               ("unix:///var/run/docker.sock", "Docker host — socket path (unix:///var/run/docker.sock) or TCP URL (tcp://host:2375)."),
@@ -2402,9 +2405,17 @@ class ContainerHostUpdate(BaseModel):
     node:       Optional[str]  = None
     local_ip:   Optional[str]  = None
 
+class ContainerNetworkUpdate(BaseModel):
+    network: str   # docker: host | bridge | none | <named net>;  proxmox: <bridge iface>
+
+class ContainerRestartPolicyUpdate(BaseModel):
+    name:                str = "no"   # no | always | unless-stopped | on-failure
+    maximum_retry_count: int = 0      # only used with on-failure
+
 class DeviceUpdate(BaseModel):
     custom_name: Optional[str] = None
     hostname:    Optional[str] = None
+
 
 class SettingUpdate(BaseModel):
     value: str
@@ -2482,6 +2493,8 @@ class SetupCompleteRequest(BaseModel):
     docker_enabled:       bool   = False
     docker_host:          str    = "unix:///var/run/docker.sock"
     fingerbank_api_key:   str    = ""
+    auto_update_enabled:  bool   = False
+    auto_update_schedule: str    = "daily"
 
 
 # ---------------------------------------------------------------------------
@@ -2989,6 +3002,8 @@ def setup_complete(
         "vuln_scan_on_new_device":   "true" if payload.vuln_scan_on_new else "false",
         "vuln_scan_schedule":        payload.vuln_scan_schedule if payload.vuln_scan_enabled else "disabled",
         "docker_enabled":            "true" if payload.docker_enabled else "false",
+        "auto_update_enabled":       "true" if payload.auto_update_enabled else "false",
+        "auto_update_schedule":      (payload.auto_update_schedule or "daily").lower(),
     }
     if payload.ntfy_topic:
         to_save["ntfy_topic"] = payload.ntfy_topic
@@ -3005,7 +3020,175 @@ def setup_complete(
         else:
             db.add(Setting(key=key, value=value))
     db.commit()
+    # On appliance builds, (re)configure Watchtower to match the wizard choice.
+    if _appliance_info() is not None:
+        try:
+            _configure_watchtower(payload.auto_update_enabled,
+                                  (payload.auto_update_schedule or "daily").lower())
+        except Exception:
+            pass
     return {"ok": True, "setup_complete": True}
+
+
+# ---------------------------------------------------------------------------
+# Appliance auto-updates (Watchtower) — only active on VM/Pi appliance builds.
+# An appliance is identified by the presence of /opt/inspectre/appliance.json,
+# which is bind-mounted ONLY by the appliance (VM/Pi) compose files. A plain
+# Docker install never has it, so the auto-update UI/endpoints stay hidden there.
+# ---------------------------------------------------------------------------
+APPLIANCE_JSON_PATH       = "/opt/inspectre/appliance.json"
+WATCHTOWER_CONTAINER_NAME = "inspectre-watchtower"
+WATCHTOWER_IMAGE          = "containrrr/watchtower:latest"
+
+# UI schedule choices -> 6-field cron expressions understood by Watchtower.
+_WATCHTOWER_SCHEDULES = {
+    "6h":     "0 0 */6 * * *",
+    "12h":    "0 0 */12 * * *",
+    "daily":  "0 0 4 * * *",
+    "24h":    "0 0 4 * * *",
+    "weekly": "0 0 4 * * 0",
+}
+
+
+def _appliance_info():
+    """Return the appliance descriptor dict if this is a VM/Pi build, else None."""
+    try:
+        with open(APPLIANCE_JSON_PATH, "r") as fh:
+            return json.load(fh)
+    except Exception:
+        return None
+
+
+def _setting_get(db: Session, key: str, default: str = "") -> str:
+    s = db.get(Setting, key)
+    return s.value if (s and s.value is not None) else default
+
+
+def _setting_put(db: Session, key: str, value: str) -> None:
+    s = db.get(Setting, key)
+    if s:
+        s.value = value
+    else:
+        db.add(Setting(key=key, value=value))
+
+
+def _watchtower_schedule_cron(schedule: str) -> str:
+    return _WATCHTOWER_SCHEDULES.get((schedule or "daily").lower(), _WATCHTOWER_SCHEDULES["daily"])
+
+
+def _watchtower_status() -> dict:
+    """Best-effort status of the Watchtower updater container."""
+    try:
+        client = _make_docker_client("unix:///var/run/docker.sock")
+    except Exception:
+        return {"running": False, "available": False}
+    try:
+        c = client.containers.get(WATCHTOWER_CONTAINER_NAME)
+        return {"running": c.status == "running", "available": True, "status": c.status}
+    except Exception:
+        return {"running": False, "available": True}
+    finally:
+        try:
+            client.close()
+        except Exception:
+            pass
+
+
+def _configure_watchtower(enabled: bool, schedule: str) -> dict:
+    """Create/replace or remove the Watchtower updater container on the local
+    Docker socket. Idempotent: always removes any existing instance first."""
+    client = _make_docker_client("unix:///var/run/docker.sock")
+    try:
+        try:
+            client.containers.get(WATCHTOWER_CONTAINER_NAME).remove(force=True)
+        except Exception:
+            pass
+
+        if not enabled:
+            return {"enabled": False, "running": False}
+
+        cron = _watchtower_schedule_cron(schedule)
+        # Best-effort pull: bundled into appliance images, but online builds may
+        # need to fetch it on first enable.
+        try:
+            client.images.pull(WATCHTOWER_IMAGE)
+        except Exception:
+            pass
+
+        container = client.containers.run(
+            WATCHTOWER_IMAGE,
+            name=WATCHTOWER_CONTAINER_NAME,
+            detach=True,
+            restart_policy={"Name": "unless-stopped"},
+            volumes={"/var/run/docker.sock": {"bind": "/var/run/docker.sock", "mode": "rw"}},
+            environment={
+                "WATCHTOWER_SCHEDULE":          cron,
+                "WATCHTOWER_CLEANUP":           "true",
+                "WATCHTOWER_LABEL_ENABLE":      "true",
+                "WATCHTOWER_INCLUDE_RESTARTING": "true",
+            },
+            # Don't let Watchtower update itself.
+            labels={"com.centurylinklabs.watchtower.enable": "false"},
+        )
+        return {"enabled": True, "running": True, "schedule": schedule, "cron": cron, "id": container.id[:12]}
+    finally:
+        try:
+            client.close()
+        except Exception:
+            pass
+
+
+class AutoUpdateRequest(BaseModel):
+    enabled: bool = False
+    schedule: str = "daily"
+
+
+@app.get("/system/info")
+def system_info(username: str = Depends(get_current_user), db: Session = Depends(get_db)):
+    """Report appliance status + current auto-update (Watchtower) configuration.
+    The frontend uses is_appliance to decide whether to show the auto-update UI."""
+    appliance = _appliance_info()
+    enabled   = (_setting_get(db, "auto_update_enabled",  "false") == "true")
+    schedule  = _setting_get(db, "auto_update_schedule", "daily")
+    info = {
+        "is_appliance": appliance is not None,
+        "appliance":    appliance,
+        "version":      VERSION,
+        "auto_update": {
+            "enabled":  enabled,
+            "schedule": schedule,
+        },
+    }
+    if appliance is not None:
+        info["auto_update"]["watchtower"] = _watchtower_status()
+    return info
+
+
+@app.post("/system/auto-update")
+def system_auto_update(
+    payload: AutoUpdateRequest,
+    username: str = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Enable/disable and schedule appliance auto-updates, then (re)configure the
+    Watchtower container. Appliance (VM/Pi) builds only."""
+    if _appliance_info() is None:
+        raise HTTPException(400, "Automatic updates are only available on InSpectre appliance (VM/Pi) builds.")
+
+    schedule = (payload.schedule or "daily").lower()
+    if schedule not in _WATCHTOWER_SCHEDULES:
+        raise HTTPException(422, f"Invalid schedule '{payload.schedule}'. Use one of: {', '.join(sorted(_WATCHTOWER_SCHEDULES))}.")
+
+    _setting_put(db, "auto_update_enabled",  "true" if payload.enabled else "false")
+    _setting_put(db, "auto_update_schedule", schedule)
+    db.commit()
+
+    try:
+        result = _configure_watchtower(payload.enabled, schedule)
+    except Exception as e:
+        raise HTTPException(502, f"Settings saved but failed to configure Watchtower: {e}")
+
+    return {"ok": True, "auto_update": {"enabled": payload.enabled, "schedule": schedule, "watchtower": result}}
 
 
 # ---------------------------------------------------------------------------
@@ -8596,44 +8779,418 @@ async def docker_update(container_id: str, db: Session = Depends(get_db)):
             config = attrs.get("Config", {})
             host_cfg = attrs.get("HostConfig", {})
             
-            # Stop container
-            if c.status != "exited":
+            original_name = c.name.lstrip("/")
+            was_running   = c.status not in ("exited", "created", "dead")
+
+            # Stop container before swapping it out
+            if was_running:
                 c.stop(timeout=10)
-            
-            # Remove old container
-            c.remove(force=True)
-            
-            # Create new container with same config
-            new_c = client.containers.create(
-                image=image_name,
-                command=config.get("Cmd"),
-                environment=config.get("Env"),
-                labels=config.get("Labels"),
-                hostname=config.get("Hostname"),
-                working_dir=config.get("WorkingDir"),
-                name=c.name.lstrip("/"),
-                ports=None,  # Will be handled by port bindings in host_config
-                volumes=None,  # Will be handled by binds in host_config
-                restart_policy={"Name": host_cfg.get("RestartPolicy", {}).get("Name", "no")},
-                host_config=client.api.create_host_config(
-                    port_bindings={
-                        p.split("/")[0]: int(b.get("HostPort", 0)) 
-                        for p, bindings in (attrs.get("NetworkSettings", {}).get("Ports") or {}).items()
-                        if bindings
-                        for b in bindings
-                    },
-                    binds={
-                        m.get("Source", ""): {"bind": m.get("Destination", ""), "mode": m.get("Mode", "rw")}
-                        for m in (attrs.get("Mounts") or [])
-                        if m.get("Type") == "bind"
-                    },
-                ),
-            )
-            
-            # Start new container
-            new_c.start()
-            new_c.reload()
+
+            # SAFE RECREATE: rename the old container to a backup name instead of
+            # removing it up-front, so a failed create/start can be rolled back
+            # and never leaves the user with no container at all.
+            import time as _time
+            backup_name = f"{original_name}_inspectre_bak_{int(_time.time())}"
+            c.rename(backup_name)
+
+            new_c = None
+            try:
+                # Create new container with same config, reusing the freed name
+                new_mode = host_cfg.get("NetworkMode") or "bridge"
+                port_bindings = {
+                    p: int(b.get("HostPort"))
+                    for p, bindings in (attrs.get("NetworkSettings", {}).get("Ports") or {}).items()
+                    if bindings
+                    for b in bindings
+                    if b.get("HostPort")
+                }
+                binds = {
+                    m.get("Source", ""): {"bind": m.get("Destination", ""), "mode": m.get("Mode", "rw") or "rw"}
+                    for m in (attrs.get("Mounts") or [])
+                    if m.get("Type") == "bind" and m.get("Source")
+                }
+                new_c = client.containers.create(
+                    image=image_name,
+                    command=config.get("Cmd"),
+                    environment=config.get("Env"),
+                    labels=config.get("Labels"),
+                    hostname=None if new_mode == "host" else config.get("Hostname"),
+                    working_dir=config.get("WorkingDir"),
+                    name=original_name,
+                    network_mode=new_mode,
+                    restart_policy={"Name": host_cfg.get("RestartPolicy", {}).get("Name", "no")},
+                    ports=None if new_mode == "host" else (port_bindings or None),
+                    volumes=binds or None,
+                )
+
+                # Start new container
+                new_c.start()
+                new_c.reload()
+            except Exception:
+                # Roll back: discard the half-created container and restore the
+                # original under its real name (restarting if it had been running).
+                try:
+                    if new_c is not None:
+                        new_c.remove(force=True)
+                except Exception:
+                    pass
+                try:
+                    c.rename(original_name)
+                    if was_running:
+                        c.start()
+                except Exception:
+                    pass
+                raise
+
+            # New container is healthy — now it's safe to remove the backup.
+            try:
+                c.remove(force=True)
+            except Exception:
+                # Update succeeded; failing to clean up the backup is non-fatal.
+                pass
+
             return _add_docker_host_meta(_fmt_container(new_c), docker_hosts[0], host_url)
+        finally:
+            client.close()
+
+    try:
+        return await asyncio.to_thread(_do)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(400, str(e))
+
+
+
+
+# ---------------------------------------------------------------------------
+# Container network + restart-policy editing (Docker & Proxmox)
+# ---------------------------------------------------------------------------
+
+_DOCKER_SPECIAL_NETS = ["bridge", "host", "none"]
+
+
+def _docker_host_for(db: Session):
+    """Return (host_dict, host_url) for the first enabled Docker host, or raise."""
+    docker_hosts = [h for h in _get_enabled_hosts(db) if h["type"] != "proxmox"]
+    if not docker_hosts:
+        raise HTTPException(503, "No Docker hosts.")
+    return docker_hosts[0], (docker_hosts[0]["url"] or "unix:///var/run/docker.sock")
+
+
+@app.get("/docker/containers/{container_id}/networks")
+async def docker_container_networks(container_id: str, db: Session = Depends(get_db)):
+    """List networks a container can be attached to, plus its current network mode.
+
+    For Docker: returns the special modes (bridge/host/none) plus user-defined
+    networks. For Proxmox: returns the host bridges (vmbrX)."""
+    px = _parse_proxmox_id(container_id)
+    if px:
+        host_id, node, vmid = px
+        host = _get_host_row(db, host_id)
+
+        def _do_px():
+            current = ""
+            try:
+                cfg = _proxmox_request(host, "GET", f"/api2/json/nodes/{node}/lxc/{vmid}/config")
+                net0 = (cfg.get("data") or {}).get("net0", "") or ""
+                for part in net0.split(","):
+                    if part.startswith("bridge="):
+                        current = part.split("=", 1)[1]
+                        break
+            except Exception:
+                pass
+            bridges = []
+            try:
+                nets = _proxmox_request(host, "GET", f"/api2/json/nodes/{node}/network")
+                for n in (nets.get("data") or []):
+                    iface = n.get("iface", "")
+                    if n.get("type") == "bridge" or iface.startswith("vmbr"):
+                        bridges.append(iface)
+            except Exception:
+                pass
+            if not bridges:
+                bridges = [current] if current else ["vmbr0"]
+            return {"current": current, "networks": sorted(set(bridges)), "host_type": "proxmox"}
+
+        try:
+            return await asyncio.to_thread(_do_px)
+        except Exception as e:
+            raise HTTPException(503, str(e))
+
+    host, host_url = _docker_host_for(db)
+
+    def _do():
+        client = _make_docker_client(host_url)
+        try:
+            c = client.containers.get(container_id)
+            attrs = c.attrs or {}
+            mode = (attrs.get("HostConfig", {}) or {}).get("NetworkMode", "") or ""
+
+            # NetworkMode is authoritative only for the special modes
+            # (host/none/container:). For ordinary user/bridge networks it can
+            # go stale after a live connect/disconnect — Docker keeps the
+            # original NetworkMode even though the container is now attached to a
+            # different network. Derive the real current network from the live
+            # NetworkSettings.Networks in that case.
+            connected = list((attrs.get("NetworkSettings", {}).get("Networks") or {}).keys())
+            if mode in ("host", "none") or mode.startswith("container:"):
+                current = mode
+            elif connected:
+                current = mode if mode in connected else connected[0]
+            else:
+                current = mode
+
+            named = []
+            for n in client.networks.list():
+                nm = n.name
+                if nm and nm not in _DOCKER_SPECIAL_NETS:
+                    named.append(nm)
+            return {
+                "current": current,
+                "networks": _DOCKER_SPECIAL_NETS + sorted(named),
+                "host_type": "docker",
+            }
+        finally:
+            client.close()
+
+    try:
+        return await asyncio.to_thread(_do)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(400, str(e))
+
+
+def _recreate_with_overrides(client, c, *, network_mode=None, restart_policy=None):
+    """Recreate a container preserving its config, optionally overriding the
+    NetworkMode and/or RestartPolicy. Returns the new container object."""
+    attrs    = c.attrs or {}
+    config   = attrs.get("Config", {}) or {}
+    host_cfg = attrs.get("HostConfig", {}) or {}
+    net_sets = attrs.get("NetworkSettings", {}) or {}
+    name     = c.name.lstrip("/")
+    image    = config.get("Image") or (c.image.tags[0] if c.image.tags else str(c.image.id))
+
+    new_mode = network_mode if network_mode is not None else (host_cfg.get("NetworkMode") or "bridge")
+    new_rp   = restart_policy if restart_policy is not None else (host_cfg.get("RestartPolicy") or {"Name": "no"})
+
+    # Port bindings only apply when not sharing the host network namespace.
+    port_bindings = {}
+    if new_mode != "host":
+        for p, bindings in (net_sets.get("Ports") or {}).items():
+            if bindings:
+                hp = bindings[0].get("HostPort")
+                if hp:
+                    port_bindings[p] = int(hp)
+
+    binds = {
+        m.get("Source", ""): {"bind": m.get("Destination", ""), "mode": m.get("Mode", "rw") or "rw"}
+        for m in (attrs.get("Mounts") or [])
+        if m.get("Type") == "bind" and m.get("Source")
+    }
+
+    running = c.status == "running"
+    if running:
+        c.stop(timeout=10)
+
+    # SAFE RECREATE: rename the existing container to a backup name instead of
+    # removing it up-front. Docker can't change a live container's NetworkMode,
+    # so a recreate is unavoidable — but renaming (rather than deleting) lets us
+    # roll back if create/start fails, so a failed change can never leave the
+    # user with no container at all.
+    import time as _time
+    backup_name = f"{name}_inspectre_bak_{int(_time.time())}"
+    c.rename(backup_name)
+
+    new_c = None
+    try:
+        new_c = client.containers.create(
+            image=image,
+            command=config.get("Cmd"),
+            environment=config.get("Env"),
+            labels=config.get("Labels"),
+            hostname=None if new_mode == "host" else config.get("Hostname"),
+            working_dir=config.get("WorkingDir") or None,
+            name=name,
+            network_mode=new_mode,
+            restart_policy=new_rp,
+            ports=None if new_mode == "host" else (port_bindings or None),
+            volumes=binds or None,
+        )
+        if running:
+            new_c.start()
+        new_c.reload()
+    except Exception:
+        # Roll back: discard the half-created container and restore the
+        # original under its real name (restarting it if it had been running).
+        try:
+            if new_c is not None:
+                new_c.remove(force=True)
+        except Exception:
+            pass
+        try:
+            c.rename(name)
+            if running:
+                c.start()
+        except Exception:
+            pass
+        raise
+
+    # New container is healthy — now it's safe to remove the backup.
+    try:
+        c.remove(force=True)
+    except Exception:
+        # The change succeeded; failing to clean up the backup is non-fatal.
+        pass
+
+    return new_c
+
+
+@app.post("/docker/containers/{container_id}/network")
+async def docker_set_network(container_id: str, payload: ContainerNetworkUpdate, db: Session = Depends(get_db)):
+    """Change the network a container is attached to.
+
+    Docker: setting `host` switches to host networking; a named network or
+    bridge/none recreates the container with the new NetworkMode (required
+    because Docker can't change the network mode of a live container).
+    Proxmox: updates the bridge on net0."""
+    new_net = (payload.network or "").strip()
+    if not new_net:
+        raise HTTPException(400, "network is required.")
+
+    px = _parse_proxmox_id(container_id)
+    if px:
+        host_id, node, vmid = px
+        host = _get_host_row(db, host_id)
+
+        def _do_px():
+            cfg = _proxmox_request(host, "GET", f"/api2/json/nodes/{node}/lxc/{vmid}/config")
+            net0 = ((cfg.get("data") or {}).get("net0", "") or "")
+            if net0:
+                parts = []
+                replaced = False
+                for part in net0.split(","):
+                    if part.startswith("bridge="):
+                        parts.append(f"bridge={new_net}")
+                        replaced = True
+                    else:
+                        parts.append(part)
+                if not replaced:
+                    parts.append(f"bridge={new_net}")
+                new_net0 = ",".join(parts)
+            else:
+                new_net0 = f"name=eth0,bridge={new_net}"
+            _proxmox_request(host, "PUT", f"/api2/json/nodes/{node}/lxc/{vmid}/config",
+                             data={"net0": new_net0})
+            r = _proxmox_request(host, "GET", f"/api2/json/nodes/{node}/lxc/{vmid}/status/current")
+            return _fmt_proxmox_container(r.get("data", {}), vmid, node, host)
+
+        try:
+            return await asyncio.to_thread(_do_px)
+        except Exception as e:
+            raise HTTPException(400, str(e))
+
+    host, host_url = _docker_host_for(db)
+
+    def _is_mode_net(value: str) -> bool:
+        """True for network *modes* that aren't live-attachable user networks."""
+        return value in ("host", "none") or value.startswith("container:")
+
+    def _do():
+        client = _make_docker_client(host_url)
+        try:
+            c = client.containers.get(container_id)
+            c.reload()
+            host_cfg = (c.attrs or {}).get("HostConfig", {}) or {}
+            cur_mode = host_cfg.get("NetworkMode", "") or ""
+
+            # A recreate is only required when the *target* or the *current*
+            # configuration is a special network mode (host/none/container:).
+            # Docker cannot switch a live container into or out of those modes.
+            # For ordinary user-defined / bridge networks we attach live with
+            # network connect/disconnect — exactly how Portainer does it — which
+            # avoids recreating the container entirely.
+            if _is_mode_net(new_net) or _is_mode_net(cur_mode):
+                new_c = _recreate_with_overrides(client, c, network_mode=new_net)
+                return _add_docker_host_meta(_fmt_container(new_c), host, host_url)
+
+            # Live attach path. Verify the target network exists first so we can
+            # return a clear error instead of a generic failure.
+            try:
+                target = client.networks.get(new_net)
+            except Exception:
+                raise HTTPException(404, f"Network '{new_net}' not found on this Docker host.")
+
+            current = list(((c.attrs or {}).get("NetworkSettings", {}).get("Networks") or {}).keys())
+            if new_net not in current:
+                target.connect(c)
+
+            # Switch semantics: detach from the other user networks so the
+            # container ends up only on the selected one.
+            c.reload()
+            current = list(((c.attrs or {}).get("NetworkSettings", {}).get("Networks") or {}).keys())
+            for other in current:
+                if other == new_net:
+                    continue
+                try:
+                    client.networks.get(other).disconnect(c)
+                except Exception:
+                    pass
+
+            c.reload()
+            return _add_docker_host_meta(_fmt_container(c), host, host_url)
+        finally:
+            client.close()
+
+    try:
+        return await asyncio.to_thread(_do)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(400, str(e))
+
+
+@app.post("/docker/containers/{container_id}/restart-policy")
+async def docker_set_restart_policy(container_id: str, payload: ContainerRestartPolicyUpdate, db: Session = Depends(get_db)):
+    """Change a container's restart policy.
+
+    Docker: applied live via the update API (no recreate needed).
+    Proxmox: maps `always`/`unless-stopped` → onboot=1, otherwise onboot=0."""
+    name = (payload.name or "no").strip()
+    valid = {"no", "always", "unless-stopped", "on-failure"}
+    if name not in valid:
+        raise HTTPException(400, f"Invalid restart policy '{name}'. Use one of: {', '.join(sorted(valid))}.")
+
+    px = _parse_proxmox_id(container_id)
+    if px:
+        host_id, node, vmid = px
+        host = _get_host_row(db, host_id)
+        onboot = 1 if name in ("always", "unless-stopped") else 0
+
+        def _do_px():
+            _proxmox_request(host, "PUT", f"/api2/json/nodes/{node}/lxc/{vmid}/config",
+                             data={"onboot": onboot})
+            r = _proxmox_request(host, "GET", f"/api2/json/nodes/{node}/lxc/{vmid}/status/current")
+            return _fmt_proxmox_container(r.get("data", {}), vmid, node, host)
+
+        try:
+            return await asyncio.to_thread(_do_px)
+        except Exception as e:
+            raise HTTPException(400, str(e))
+
+    host, host_url = _docker_host_for(db)
+    rp = {"Name": name}
+    if name == "on-failure":
+        rp["MaximumRetryCount"] = max(0, int(payload.maximum_retry_count or 0))
+
+    def _do():
+        client = _make_docker_client(host_url)
+        try:
+            c = client.containers.get(container_id)
+            c.update(restart_policy=rp)
+            c.reload()
+            return _add_docker_host_meta(_fmt_container(c), host, host_url)
         finally:
             client.close()
 
