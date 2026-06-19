@@ -610,7 +610,7 @@ DEFAULT_SETTINGS = {
     "sniffer_workers":         ("4",     "Number of parallel scanner threads."),
     "ip_range":                ("192.168.0.0/24", "CIDR range to scan."),
     "arp_scan_retry":          ("1", "ARP sweep retry rounds (0 = single pass, 1 = two rounds). Higher values increase broadcast traffic but may catch more sleeping devices. The passive sniffer catches most devices that miss sweeps."),
-    "primary_ip_mode":         ("locked", "How the probe updates a device's primary IP. locked: respects the per-device IP lock flag — locked devices never have their primary IP auto-changed. dynamic: always adopts the current IP as primary when a device returns from offline (mirrors InSpectre-main behaviour)."),
+    "primary_ip_mode":         ("locked", "Default auto-behaviour for the probe when a device returns from offline at a new IP. locked: keep the existing primary IP. dynamic: adopt the newly-seen IP as primary (mirrors InSpectre-main behaviour). NOTE: a manually pinned primary IP (the per-device lock) ALWAYS wins and is never auto-changed, regardless of this setting — it only affects devices you have not pinned."),
     "notifications_enabled":              ("true",  "Show popup toasts when new devices appear or go offline."),
     "browser_notifications_enabled":      ("false", "Show OS-level browser notifications for device events."),
     "pushbullet_api_key":                 ("",      "Pushbullet API access token for push notifications."),
@@ -3682,21 +3682,66 @@ def set_primary_ip(mac: str, payload: PrimaryIPUpdate, db: Session = Depends(get
         raise HTTPException(404, "IP not found in device history")
 
     old_primary = getattr(d, 'primary_ip', None) or d.ip_address
-    d.primary_ip = target_ip
-    d.primary_ip_locked = True
-    d.ip_address = target_ip
-    d.deep_scanned = False
-    d.scan_results = None
-    _add_event(db, mac.lower(), 'primary_ip_changed', {'old_primary_ip': old_primary, 'new_primary_ip': target_ip})
-    db.commit()
-    db.refresh(d)
+
+    # The devices table has a BEFORE UPDATE trigger (enforce_primary_ip_lock) that
+    # freezes primary_ip/ip_address while primary_ip_locked is true, so automatic
+    # probe writers can never move a pinned IP. This user-initiated pin must be
+    # allowed through, so we run the privileged write as ONE raw-SQL statement that
+    # carries its own bypass flag, guaranteeing the SET and the UPDATE share the
+    # exact same transaction (ORM flush ordering can't be relied on for this).
+    try:
+        db.execute(text("SET LOCAL inspectre.bypass_ip_lock = 'on'"))
+        db.execute(
+            text("UPDATE devices "
+                 "SET primary_ip = :ip, ip_address = :ip, primary_ip_locked = true, "
+                 "    deep_scanned = false, scan_results = NULL "
+                 "WHERE mac_address = :mac"),
+            {"ip": target_ip, "mac": mac.lower()},
+        )
+        db.commit()
+    except Exception as exc:
+        db.rollback()
+        import traceback as _tb
+        print(f"[set_primary_ip] write FAILED for {mac}: {exc}\n{_tb.format_exc()}", flush=True)
+        raise HTTPException(500, f"Failed to set primary IP: {exc}")
+
+    # Verify the privileged write actually landed (catches a mis-installed trigger
+    # or a bypass that failed to fire) using a plain raw read — no ORM involved.
+    persisted = db.execute(
+        text("SELECT primary_ip FROM devices WHERE mac_address = :mac"),
+        {"mac": mac.lower()},
+    ).scalar()
+    if persisted != target_ip:
+        raise HTTPException(
+            500,
+            f"Pin failed to persist (primary_ip is {persisted!r}, expected {target_ip!r}). "
+            "The pin-lock DB trigger may be blocking the write.",
+        )
+
+    # The write+verify succeeded; everything below is best-effort. A failure here
+    # (event log, rescan kick, serialization) must NOT turn a successful pin into
+    # an error popup for the user.
+    try:
+        _add_event(db, mac.lower(), 'primary_ip_changed',
+                   {'old_primary_ip': old_primary, 'new_primary_ip': target_ip})
+        db.commit()
+    except Exception as exc:
+        db.rollback()
+        print(f"[set_primary_ip] event log failed for {mac} (non-fatal): {exc}", flush=True)
 
     try:
         httpx.post(f"{PROBE_URL}/rescan/{mac.lower()}", timeout=10.0, headers=_probe_headers())
     except Exception:
         pass
 
-    return {"ok": True, "device": _to_dict(d)}
+    try:
+        db.expire_all()
+        d = db.get(Device, mac.lower())
+        return {"ok": True, "device": _to_dict(d)}
+    except Exception as exc:
+        import traceback as _tb
+        print(f"[set_primary_ip] response build failed for {mac} (pin DID persist): {exc}\n{_tb.format_exc()}", flush=True)
+        return {"ok": True, "device": {"mac_address": mac.lower(), "primary_ip": target_ip, "primary_ip_locked": True}}
 
 
 @app.post("/devices/{mac}/unpin-ip")
@@ -3704,9 +3749,14 @@ def unpin_primary_ip(mac: str, db: Session = Depends(get_db)):
     d = db.get(Device, mac.lower())
     if not d:
         raise HTTPException(404, "Device not found")
-    d.primary_ip_locked = False
+    db.execute(text("SET LOCAL inspectre.bypass_ip_lock = 'on'"))
+    db.execute(
+        text("UPDATE devices SET primary_ip_locked = false WHERE mac_address = :mac"),
+        {"mac": mac.lower()},
+    )
     db.commit()
-    db.refresh(d)
+    db.expire_all()
+    d = db.get(Device, mac.lower())
     return {"ok": True, "device": _to_dict(d)}
 
 

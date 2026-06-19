@@ -19,7 +19,11 @@ async function request(method, path, body) {
   })
   if (res.status === 401) {
     clearToken()
-    window.location.reload()
+    // Only force a reload when a token actually existed — i.e. a real session
+    // that just expired. A 401 with no token is expected for pre-auth calls
+    // (e.g. the setup wizard probing a protected endpoint); reloading there
+    // causes an infinite refresh loop, so just throw and let the caller handle.
+    if (token) window.location.reload()
     throw new Error('Session expired')
   }
   if (!res.ok) {
