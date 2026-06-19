@@ -399,7 +399,7 @@ export const api = {
 
   // System / appliance auto-updates
   getSystemInfo:        ()                    => request('GET',  '/system/info'),
-  setAutoUpdate:        (enabled, schedule)   => request('POST', '/system/auto-update', { enabled, schedule }),
+  setAutoUpdate:        (enabled, hour, days) => request('POST', '/system/auto-update', { enabled, hour, days }),
 }
 
 export { streamSSE }

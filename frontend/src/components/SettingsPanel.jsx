@@ -253,11 +253,11 @@ export function SettingsPanel({ onClose, onSettingChange }) {
     onSettingChange?.(key, value)
   }
 
-  async function handleAutoUpdate(enabled, schedule) {
+  async function handleAutoUpdate(enabled, hour, days) {
     setAutoUpdateSaving(true)
     setAutoUpdateError('')
     try {
-      await api.setAutoUpdate(enabled, schedule)
+      await api.setAutoUpdate(enabled, hour, days)
       const info = await api.getSystemInfo()
       setSystemInfo(info)
     } catch (e) {
@@ -265,6 +265,24 @@ export function SettingsPanel({ onClose, onSettingChange }) {
     } finally {
       setAutoUpdateSaving(false)
     }
+  }
+
+  // Current auto-update config (with sensible fallbacks) for the admin UI.
+  function curAutoUpdate() {
+    const au = systemInfo?.auto_update || {}
+    return {
+      enabled: !!au.enabled,
+      hour: Number.isInteger(au.hour) ? au.hour : 4,
+      days: Array.isArray(au.days) ? au.days : [],   // [] = every day; else cron dow 0-6
+    }
+  }
+
+  // Toggle a single weekday (cron dow: 0=Sun … 6=Sat). All 7 collapses to "every day".
+  function toggleAutoUpdateDay(dow) {
+    const { enabled, hour, days } = curAutoUpdate()
+    let next = days.includes(dow) ? days.filter(d => d !== dow) : [...days, dow].sort((a, b) => a - b)
+    if (next.length === 7) next = []
+    handleAutoUpdate(enabled, hour, next)
   }
 
   async function handleSave() {
@@ -1053,36 +1071,96 @@ export function SettingsPanel({ onClose, onSettingChange }) {
                       type="checkbox"
                       checked={!!systemInfo?.auto_update?.enabled}
                       disabled={autoUpdateSaving}
-                      onChange={e => handleAutoUpdate(
-                        e.target.checked,
-                        systemInfo?.auto_update?.schedule || 'daily',
-                      )}
+                      onChange={e => {
+                        const { hour, days } = curAutoUpdate()
+                        handleAutoUpdate(e.target.checked, hour, days)
+                      }}
                     />
                   </label>
 
-                  {/* Schedule selector */}
-                  <div className="space-y-1">
-                    <label className="text-xs" style={{ color: 'var(--color-text-muted)' }}>Check schedule</label>
-                    <select
-                      className="w-full rounded-lg px-3 py-2 text-sm"
-                      style={{ background: 'var(--color-surface-offset)', border: '1px solid var(--color-border)', color: 'var(--color-text)' }}
-                      value={systemInfo?.auto_update?.schedule || 'daily'}
-                      disabled={autoUpdateSaving || !systemInfo?.auto_update?.enabled}
-                      onChange={e => handleAutoUpdate(
-                        !!systemInfo?.auto_update?.enabled,
-                        e.target.value,
-                      )}
-                    >
-                      <option value="6h">Every 6 hours</option>
-                      <option value="12h">Every 12 hours</option>
-                      <option value="daily">Daily</option>
-                      <option value="weekly">Weekly</option>
-                    </select>
+                  {/* Time of day + days of week */}
+                  <div className="space-y-3" style={{ opacity: systemInfo?.auto_update?.enabled ? 1 : 0.5 }}>
+                    <div className="space-y-1">
+                      <label className="text-xs" style={{ color: 'var(--color-text-muted)' }}>Check for updates at</label>
+                      <select
+                        className="w-full rounded-lg px-3 py-2 text-sm"
+                        style={{ background: 'var(--color-surface-offset)', border: '1px solid var(--color-border)', color: 'var(--color-text)' }}
+                        value={curAutoUpdate().hour}
+                        disabled={autoUpdateSaving || !systemInfo?.auto_update?.enabled}
+                        onChange={e => {
+                          const { enabled, days } = curAutoUpdate()
+                          handleAutoUpdate(enabled, parseInt(e.target.value, 10), days)
+                        }}
+                      >
+                        {Array.from({ length: 24 }, (_, h) => (
+                          <option key={h} value={h}>{String(h).padStart(2, '0')}:00</option>
+                        ))}
+                      </select>
+                      <p className="text-xs" style={{ color: 'var(--color-text-faint)' }}>
+                        Appliance local time (24-hour).
+                      </p>
+                    </div>
+
+                    <div className="space-y-1">
+                      <label className="text-xs" style={{ color: 'var(--color-text-muted)' }}>On these days</label>
+                      <div className="flex flex-wrap gap-1.5">
+                        {[[1,'Mon'],[2,'Tue'],[3,'Wed'],[4,'Thu'],[5,'Fri'],[6,'Sat'],[0,'Sun']].map(([dow, lbl]) => {
+                          const { days } = curAutoUpdate()
+                          const everyDay = days.length === 0
+                          const active = everyDay || days.includes(dow)
+                          return (
+                            <button
+                              key={dow}
+                              type="button"
+                              disabled={autoUpdateSaving || !systemInfo?.auto_update?.enabled}
+                              onClick={() => toggleAutoUpdateDay(dow)}
+                              className="px-2.5 py-1 rounded-md text-xs font-medium transition-colors"
+                              style={{
+                                background: active && !everyDay ? 'var(--color-brand)' : 'var(--color-surface-offset)',
+                                color: active && !everyDay ? 'white' : 'var(--color-text-muted)',
+                                border: '1px solid var(--color-border)',
+                              }}
+                            >
+                              {lbl}
+                            </button>
+                          )
+                        })}
+                      </div>
+                      <p className="text-xs" style={{ color: 'var(--color-text-faint)' }}>
+                        {curAutoUpdate().days.length === 0
+                          ? 'Every day. Tap days to limit which days it checks.'
+                          : `Selected: ${curAutoUpdate().days.slice().sort((a,b)=>a-b).map(d => ['Sun','Mon','Tue','Wed','Thu','Fri','Sat'][d]).join(', ')}.`}
+                      </p>
+                    </div>
+
                     <p className="text-xs" style={{ color: 'var(--color-text-faint)' }}>
                       {systemInfo?.auto_update?.enabled
-                        ? `Watchtower is ${systemInfo?.auto_update?.watchtower?.running ? 'running' : 'configured'} and will check on this schedule.`
-                        : 'Turn on automatic updates to choose how often to check.'}
+                        ? `Updater is ${systemInfo?.auto_update?.watchtower?.running
+                            ? 'running'
+                            : (systemInfo?.auto_update?.watchtower?.restarting ? 'restarting (check logs below)' : 'configured')}.`
+                        : 'Turn on automatic updates to choose when to check.'}
                     </p>
+
+                    {/* Updater diagnostics — visible even when the container restart-loops */}
+                    {systemInfo?.auto_update?.enabled && systemInfo?.auto_update?.watchtower?.last_logs && (
+                      <details className="rounded-lg" style={{ border: '1px solid var(--color-border)' }}>
+                        <summary className="text-xs cursor-pointer px-3 py-2" style={{ color: 'var(--color-text-muted)' }}>
+                          Updater logs
+                          {Number.isInteger(systemInfo?.auto_update?.watchtower?.restart_count) &&
+                            ` (restarts: ${systemInfo.auto_update.watchtower.restart_count}`}
+                          {Number.isInteger(systemInfo?.auto_update?.watchtower?.exit_code) &&
+                            `, exit: ${systemInfo.auto_update.watchtower.exit_code}`}
+                          {Number.isInteger(systemInfo?.auto_update?.watchtower?.restart_count) && ')'}
+                        </summary>
+                        <pre className="text-xs overflow-auto px-3 py-2 m-0"
+                          style={{ maxHeight: 200, color: 'var(--color-text-faint)', whiteSpace: 'pre-wrap' }}>
+                          {systemInfo.auto_update.watchtower.error
+                            ? `error: ${systemInfo.auto_update.watchtower.error}\n\n`
+                            : ''}
+                          {systemInfo.auto_update.watchtower.last_logs}
+                        </pre>
+                      </details>
+                    )}
                   </div>
 
                   {autoUpdateError && (

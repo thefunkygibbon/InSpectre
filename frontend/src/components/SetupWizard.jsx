@@ -833,11 +833,20 @@ function StepFingerbank({ onNext }) {
 }
 
 function StepAutoUpdate({ onNext }) {
-  const [enabled,  setEnabled]  = useState(false)
-  const [schedule, setSchedule] = useState('daily')
+  const [enabled, setEnabled] = useState(false)
+  const [hour,    setHour]    = useState(4)
+  const [days,    setDays]    = useState([])   // [] = every day; else cron dow 0-6
+
+  function toggleDay(dow) {
+    setDays(prev => {
+      let next = prev.includes(dow) ? prev.filter(d => d !== dow) : [...prev, dow].sort((a, b) => a - b)
+      if (next.length === 7) next = []
+      return next
+    })
+  }
 
   function handleNext() {
-    onNext({ auto_update_enabled: enabled, auto_update_schedule: schedule })
+    onNext({ auto_update_enabled: enabled, auto_update_hour: hour, auto_update_days: days })
   }
 
   return (
@@ -863,17 +872,43 @@ function StepAutoUpdate({ onNext }) {
       </label>
 
       {enabled && (
-        <div className="space-y-3 pl-1">
+        <div className="space-y-4 pl-1">
           <div>
             <label className="block text-xs font-medium mb-1" style={{ color: 'var(--color-text-muted)' }}>
-              Check schedule
+              Check for updates at
             </label>
-            <select className="input w-full" value={schedule} onChange={e => setSchedule(e.target.value)}>
-              <option value="6h">Every 6 hours</option>
-              <option value="12h">Every 12 hours</option>
-              <option value="daily">Daily</option>
-              <option value="weekly">Weekly</option>
+            <select className="input w-full" value={hour} onChange={e => setHour(parseInt(e.target.value, 10))}>
+              {Array.from({ length: 24 }, (_, h) => (
+                <option key={h} value={h}>{String(h).padStart(2, '0')}:00</option>
+              ))}
             </select>
+            <p className="text-xs mt-1" style={{ color: 'var(--color-text-faint)' }}>Appliance local time (24-hour).</p>
+          </div>
+
+          <div>
+            <label className="block text-xs font-medium mb-1" style={{ color: 'var(--color-text-muted)' }}>
+              On these days
+            </label>
+            <div className="flex flex-wrap gap-1.5">
+              {[[1,'Mon'],[2,'Tue'],[3,'Wed'],[4,'Thu'],[5,'Fri'],[6,'Sat'],[0,'Sun']].map(([dow, lbl]) => {
+                const everyDay = days.length === 0
+                const active = !everyDay && days.includes(dow)
+                return (
+                  <button key={dow} type="button" onClick={() => toggleDay(dow)}
+                    className="px-2.5 py-1 rounded-md text-xs font-medium transition-colors"
+                    style={{
+                      background: active ? 'var(--color-brand)' : 'transparent',
+                      color: active ? 'white' : 'var(--color-text-muted)',
+                      border: '1px solid var(--color-border)',
+                    }}>
+                    {lbl}
+                  </button>
+                )
+              })}
+            </div>
+            <p className="text-xs mt-1" style={{ color: 'var(--color-text-faint)' }}>
+              {days.length === 0 ? 'Every day. Tap days to limit which days it checks.' : `Selected days only.`}
+            </p>
           </div>
         </div>
       )}
@@ -918,7 +953,10 @@ export function SetupWizard({ onComplete }) {
   const [isAppliance, setIsAppliance] = useState(false)
 
   useEffect(() => {
-    api.getSystemInfo().then(info => setIsAppliance(!!info?.is_appliance)).catch(() => {})
+    // Use the PUBLIC setup status (no auth yet during fresh setup) to decide
+    // whether to show the appliance-only auto-update step. getSystemInfo()
+    // requires a token, which doesn't exist during the wizard.
+    api.setupStatus().then(s => setIsAppliance(!!s?.is_appliance)).catch(() => {})
   }, [])
 
   const freshSteps = buildFreshSteps(isAppliance)
@@ -944,6 +982,8 @@ export function SetupWizard({ onComplete }) {
         fingerbank_api_key:    collected.fingerbank_api_key    ?? '',
         auto_update_enabled:   collected.auto_update_enabled   ?? false,
         auto_update_schedule:  collected.auto_update_schedule  ?? 'daily',
+        auto_update_hour:      collected.auto_update_hour      ?? 4,
+        auto_update_days:      collected.auto_update_days      ?? [],
       })
     } catch (_) { /* ignore — dashboard still loads */ }
     onComplete()

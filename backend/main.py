@@ -666,7 +666,9 @@ DEFAULT_SETTINGS = {
     "setup_complete":            ("false", "Whether the initial setup wizard has been completed."),
     # Appliance auto-updates (Watchtower) — only meaningful on VM/Pi appliance builds
     "auto_update_enabled":       ("false", "Enable automatic container updates via Watchtower. Appliance (VM/Pi) builds only; disabled by default."),
-    "auto_update_schedule":      ("daily", "How often Watchtower checks for container updates: 6h, 12h, daily, or weekly."),
+    "auto_update_schedule":      ("daily", "Legacy schedule preset (6h/12h/daily/weekly). Superseded by auto_update_hour + auto_update_days; kept for backward compatibility."),
+    "auto_update_hour":          ("4",     "Hour of day (0-23, local appliance time) at which Watchtower checks for container updates."),
+    "auto_update_days":          ("*",     "Days of week Watchtower checks for updates: '*' for every day, or a comma list of weekday numbers (0=Sunday … 6=Saturday), e.g. '1,3,5'."),
     # Docker monitoring
     "docker_enabled":            ("false", "Enable Docker container monitoring."),
     "docker_host":               ("unix:///var/run/docker.sock", "Docker host — socket path (unix:///var/run/docker.sock) or TCP URL (tcp://host:2375)."),
@@ -2495,6 +2497,8 @@ class SetupCompleteRequest(BaseModel):
     fingerbank_api_key:   str    = ""
     auto_update_enabled:  bool   = False
     auto_update_schedule: str    = "daily"
+    auto_update_hour:     Optional[int] = None
+    auto_update_days:     Optional[List[int]] = None
 
 
 # ---------------------------------------------------------------------------
@@ -2931,7 +2935,11 @@ def setup_status(db: Session = Depends(get_db)):
                            description="Whether the initial setup wizard has been completed."))
         db.commit()
         setup_done = True
-    return {"setup_complete": setup_done, "has_user": has_user}
+    return {
+        "setup_complete": setup_done,
+        "has_user": has_user,
+        "is_appliance": _appliance_info() is not None,
+    }
 
 
 @app.post("/setup/create-user")
@@ -3004,6 +3012,9 @@ def setup_complete(
         "docker_enabled":            "true" if payload.docker_enabled else "false",
         "auto_update_enabled":       "true" if payload.auto_update_enabled else "false",
         "auto_update_schedule":      (payload.auto_update_schedule or "daily").lower(),
+        "auto_update_hour":          str(_normalize_update_hour(
+                                          payload.auto_update_hour if payload.auto_update_hour is not None else 4)),
+        "auto_update_days":          _normalize_update_days(payload.auto_update_days),
     }
     if payload.ntfy_topic:
         to_save["ntfy_topic"] = payload.ntfy_topic
@@ -3023,8 +3034,10 @@ def setup_complete(
     # On appliance builds, (re)configure Watchtower to match the wizard choice.
     if _appliance_info() is not None:
         try:
-            _configure_watchtower(payload.auto_update_enabled,
-                                  (payload.auto_update_schedule or "daily").lower())
+            _cron = _build_watchtower_cron(
+                payload.auto_update_hour if payload.auto_update_hour is not None else 4,
+                payload.auto_update_days)
+            _configure_watchtower(payload.auto_update_enabled, _cron)
         except Exception:
             pass
     return {"ok": True, "setup_complete": True}
@@ -3076,15 +3089,100 @@ def _watchtower_schedule_cron(schedule: str) -> str:
     return _WATCHTOWER_SCHEDULES.get((schedule or "daily").lower(), _WATCHTOWER_SCHEDULES["daily"])
 
 
+# Weekday labels for display; cron dow uses 0=Sunday … 6=Saturday.
+_WEEKDAY_LABELS = {0: "Sun", 1: "Mon", 2: "Tue", 3: "Wed", 4: "Thu", 5: "Fri", 6: "Sat"}
+
+
+def _normalize_update_hour(hour) -> int:
+    try:
+        h = int(str(hour).strip())
+    except Exception:
+        h = 4
+    return max(0, min(23, h))
+
+
+def _normalize_update_days(days) -> str:
+    """Return a canonical cron day-of-week field: '*' (every day) or a sorted
+    comma list of 0-6 (0=Sunday). Accepts a list or a comma/space string."""
+    if days is None:
+        return "*"
+    if isinstance(days, (list, tuple, set)):
+        items = list(days)
+    else:
+        text_val = str(days).strip().lower()
+        if text_val in ("", "*", "all", "daily", "everyday", "every day"):
+            return "*"
+        items = re.split(r"[,\s]+", text_val)
+    valid = []
+    for it in items:
+        try:
+            n = int(str(it).strip())
+        except Exception:
+            continue
+        if 0 <= n <= 6:
+            valid.append(n)
+    uniq = sorted(set(valid))
+    if not uniq or len(uniq) == 7:
+        return "*"
+    return ",".join(str(n) for n in uniq)
+
+
+def _build_watchtower_cron(hour, days) -> str:
+    """Build a 6-field (seconds-first) Watchtower cron from an hour + day list."""
+    return f"0 0 {_normalize_update_hour(hour)} * * {_normalize_update_days(days)}"
+
+
+def _resolve_watchtower_cron(hour=None, days=None, schedule=None) -> str:
+    """Prefer the structured hour+days model; fall back to a legacy preset."""
+    if hour is not None or days is not None:
+        return _build_watchtower_cron(hour, days)
+    if schedule:
+        return _watchtower_schedule_cron(schedule)
+    return _WATCHTOWER_SCHEDULES["daily"]
+
+
+def _autoupdate_config(db: Session) -> dict:
+    """Current auto-update config as stored in settings."""
+    hour = _normalize_update_hour(_setting_get(db, "auto_update_hour", "4"))
+    days = _normalize_update_days(_setting_get(db, "auto_update_days", "*"))
+    return {
+        "enabled":  (_setting_get(db, "auto_update_enabled", "false") == "true"),
+        "schedule": _setting_get(db, "auto_update_schedule", "daily"),
+        "hour":     hour,
+        "days":     days,
+        "cron":     _build_watchtower_cron(hour, days),
+    }
+
+
 def _watchtower_status() -> dict:
-    """Best-effort status of the Watchtower updater container."""
+    """Best-effort status of the Watchtower updater container, including recent
+    logs and exit/restart info so a crash-loop is diagnosable from the UI even
+    when the container restarts too fast to inspect manually."""
     try:
         client = _make_docker_client("unix:///var/run/docker.sock")
     except Exception:
         return {"running": False, "available": False}
     try:
         c = client.containers.get(WATCHTOWER_CONTAINER_NAME)
-        return {"running": c.status == "running", "available": True, "status": c.status}
+        attrs = c.attrs or {}
+        state = attrs.get("State", {}) or {}
+        info = {
+            "running":       c.status == "running",
+            "available":     True,
+            "status":        c.status,
+            "restart_count": int(attrs.get("RestartCount", 0) or 0),
+            "exit_code":     state.get("ExitCode"),
+            "error":         (state.get("Error") or "").strip() or None,
+            "restarting":    bool(state.get("Restarting", False)),
+        }
+        try:
+            logs = c.logs(tail=40, timestamps=False)
+            if isinstance(logs, bytes):
+                logs = logs.decode("utf-8", "replace")
+            info["last_logs"] = logs.strip()[-4000:]
+        except Exception:
+            info["last_logs"] = None
+        return info
     except Exception:
         return {"running": False, "available": True}
     finally:
@@ -3094,9 +3192,12 @@ def _watchtower_status() -> dict:
             pass
 
 
-def _configure_watchtower(enabled: bool, schedule: str) -> dict:
+def _configure_watchtower(enabled: bool, cron: str) -> dict:
     """Create/replace or remove the Watchtower updater container on the local
-    Docker socket. Idempotent: always removes any existing instance first."""
+    Docker socket. Idempotent: always removes any existing instance first.
+
+    `cron` is a 6-field (seconds-first) Watchtower schedule expression.
+    """
     client = _make_docker_client("unix:///var/run/docker.sock")
     try:
         try:
@@ -3107,7 +3208,7 @@ def _configure_watchtower(enabled: bool, schedule: str) -> dict:
         if not enabled:
             return {"enabled": False, "running": False}
 
-        cron = _watchtower_schedule_cron(schedule)
+        cron = (cron or "").strip() or _WATCHTOWER_SCHEDULES["daily"]
         # Best-effort pull: bundled into appliance images, but online builds may
         # need to fetch it on first enable.
         try:
@@ -3115,22 +3216,30 @@ def _configure_watchtower(enabled: bool, schedule: str) -> dict:
         except Exception:
             pass
 
+        # NOTE: we deliberately pass ONLY WATCHTOWER_SCHEDULE (never also
+        # WATCHTOWER_POLL_INTERVAL) — supplying both makes Watchtower exit
+        # immediately with a fatal config error, which manifests as a fast
+        # restart loop. We also restart on-failure with a capped retry count so
+        # any future misconfiguration can't hammer the host indefinitely and the
+        # container stays around long enough for its logs to be read.
         container = client.containers.run(
             WATCHTOWER_IMAGE,
             name=WATCHTOWER_CONTAINER_NAME,
             detach=True,
-            restart_policy={"Name": "unless-stopped"},
+            restart_policy={"Name": "on-failure", "MaximumRetryCount": 5},
             volumes={"/var/run/docker.sock": {"bind": "/var/run/docker.sock", "mode": "rw"}},
             environment={
-                "WATCHTOWER_SCHEDULE":          cron,
-                "WATCHTOWER_CLEANUP":           "true",
-                "WATCHTOWER_LABEL_ENABLE":      "true",
+                "WATCHTOWER_SCHEDULE":           cron,
+                "WATCHTOWER_CLEANUP":            "true",
+                "WATCHTOWER_LABEL_ENABLE":       "true",
                 "WATCHTOWER_INCLUDE_RESTARTING": "true",
+                "WATCHTOWER_NO_STARTUP_MESSAGE": "true",
+                "TZ":                            os.environ.get("TZ", "UTC"),
             },
             # Don't let Watchtower update itself.
             labels={"com.centurylinklabs.watchtower.enable": "false"},
         )
-        return {"enabled": True, "running": True, "schedule": schedule, "cron": cron, "id": container.id[:12]}
+        return {"enabled": True, "running": True, "cron": cron, "id": container.id[:12]}
     finally:
         try:
             client.close()
@@ -3140,7 +3249,9 @@ def _configure_watchtower(enabled: bool, schedule: str) -> dict:
 
 class AutoUpdateRequest(BaseModel):
     enabled: bool = False
-    schedule: str = "daily"
+    schedule: Optional[str] = None          # legacy preset (6h/12h/daily/weekly)
+    hour: Optional[int] = None              # 0-23, local appliance time
+    days: Optional[List[int]] = None        # 0=Sun … 6=Sat; empty/None = every day
 
 
 @app.get("/system/info")
@@ -3148,15 +3259,18 @@ def system_info(username: str = Depends(get_current_user), db: Session = Depends
     """Report appliance status + current auto-update (Watchtower) configuration.
     The frontend uses is_appliance to decide whether to show the auto-update UI."""
     appliance = _appliance_info()
-    enabled   = (_setting_get(db, "auto_update_enabled",  "false") == "true")
-    schedule  = _setting_get(db, "auto_update_schedule", "daily")
+    cfg = _autoupdate_config(db)
     info = {
         "is_appliance": appliance is not None,
         "appliance":    appliance,
         "version":      VERSION,
         "auto_update": {
-            "enabled":  enabled,
-            "schedule": schedule,
+            "enabled":  cfg["enabled"],
+            "schedule": cfg["schedule"],
+            "hour":     cfg["hour"],
+            # Expose days as a list for the UI; '*' (every day) becomes [].
+            "days":     [] if cfg["days"] == "*" else [int(x) for x in cfg["days"].split(",")],
+            "cron":     cfg["cron"],
         },
     }
     if appliance is not None:
@@ -3175,20 +3289,39 @@ def system_auto_update(
     if _appliance_info() is None:
         raise HTTPException(400, "Automatic updates are only available on InSpectre appliance (VM/Pi) builds.")
 
-    schedule = (payload.schedule or "daily").lower()
-    if schedule not in _WATCHTOWER_SCHEDULES:
-        raise HTTPException(422, f"Invalid schedule '{payload.schedule}'. Use one of: {', '.join(sorted(_WATCHTOWER_SCHEDULES))}.")
+    # Prefer the structured hour+days model; fall back to a legacy preset only if
+    # neither hour nor days was supplied (older clients).
+    if payload.hour is not None or payload.days is not None:
+        hour = _normalize_update_hour(payload.hour if payload.hour is not None else 4)
+        days = _normalize_update_days(payload.days)
+    else:
+        legacy = (payload.schedule or "daily").lower()
+        if legacy not in _WATCHTOWER_SCHEDULES:
+            raise HTTPException(422, f"Invalid schedule '{payload.schedule}'. Use one of: {', '.join(sorted(_WATCHTOWER_SCHEDULES))}.")
+        # Best-effort translation of legacy presets into the new model.
+        hour = 4
+        days = "0" if legacy == "weekly" else "*"
+        _setting_put(db, "auto_update_schedule", legacy)
 
-    _setting_put(db, "auto_update_enabled",  "true" if payload.enabled else "false")
-    _setting_put(db, "auto_update_schedule", schedule)
+    cron = _build_watchtower_cron(hour, days)
+
+    _setting_put(db, "auto_update_enabled", "true" if payload.enabled else "false")
+    _setting_put(db, "auto_update_hour",    str(hour))
+    _setting_put(db, "auto_update_days",    days)
     db.commit()
 
     try:
-        result = _configure_watchtower(payload.enabled, schedule)
+        result = _configure_watchtower(payload.enabled, cron)
     except Exception as e:
         raise HTTPException(502, f"Settings saved but failed to configure Watchtower: {e}")
 
-    return {"ok": True, "auto_update": {"enabled": payload.enabled, "schedule": schedule, "watchtower": result}}
+    return {"ok": True, "auto_update": {
+        "enabled": payload.enabled,
+        "hour":    hour,
+        "days":    [] if days == "*" else [int(x) for x in days.split(",")],
+        "cron":    cron,
+        "watchtower": result,
+    }}
 
 
 # ---------------------------------------------------------------------------
