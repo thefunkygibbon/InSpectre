@@ -27,3 +27,12 @@ backend/__pycache__/
 probe/__pycache__/
 __pycache__/
 *.pyc
+output/
+/output/
+*.xz
+*.qcow2
+dataold/
+/dataold/
+
+# Local env overrides (e.g. INSPECTRE_DATA_DIR)
+.env

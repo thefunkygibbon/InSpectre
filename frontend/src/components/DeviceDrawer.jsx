@@ -154,12 +154,17 @@ function IpHistorySection({ mac, primaryIp, primaryIpLocked, currentIp, onPrimar
       {history.map((row, i) => {
         const role  = rowRole(row)
         const badge = ROLE_BADGE[role]
-        const isPinnable = role === 'active_secondary' && row.ip !== primaryIp
-        const isActive   = role === 'pinned' || role === 'primary' || role === 'active_secondary'
+        // The effective primary (green "Current", or the locked "Pinned" IP) is the
+        // only row that can't be pinned. Every OTHER IP in the device's history —
+        // secondaries and older DHCP IPs alike — can be pinned manually, so a
+        // multi-homed host whose primary was auto-detected wrongly can always be
+        // corrected. The backend validates the IP exists in history.
+        const isEffectivePrimary = role === 'pinned' || role === 'primary'
+        const isPinnable = !isEffectivePrimary
+        const isActive   = isEffectivePrimary || role === 'active_secondary'
         return (
-          <div key={i} className="flex items-center gap-2 py-1.5 border-b border-border last:border-0"
-            style={{ opacity: isActive ? 1 : 0.6 }}>
-            <div className="flex-1 min-w-0">
+          <div key={i} className="flex items-center gap-2 py-1.5 border-b border-border last:border-0">
+            <div className="flex-1 min-w-0" style={{ opacity: isActive ? 1 : 0.6 }}>
               <div className="flex items-center gap-1.5 flex-wrap">
                 <span className="font-mono text-xs" style={{ color: isActive ? 'var(--color-text)' : 'var(--color-text-faint)' }}>
                   {row.ip}

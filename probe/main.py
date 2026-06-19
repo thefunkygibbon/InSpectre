@@ -540,6 +540,44 @@ def init_db() -> None:
         conn.execute(text("CREATE INDEX IF NOT EXISTS ix_vuln_reports_severity ON vuln_reports(severity)"))
         conn.commit()
 
+        # ── Hard pin enforcement (DB-level) ─────────────────────────────────
+        # A user-pinned primary IP must be absolutely immutable from automatic
+        # writers (the ARP sweep, the passive sniffer, reconnect handling, etc.).
+        # Python/SQL-level guards in upsert_seen_device lose races against the
+        # backend pin commit and stale ORM snapshots, so we enforce the lock at
+        # the database itself with a BEFORE UPDATE trigger. While a row stays
+        # locked, neither primary_ip nor ip_address can change. Legitimate user
+        # actions (pin to a new IP, unpin) run through the backend, which sets a
+        # transaction-local GUC to bypass the trigger.
+        try:
+            conn.execute(text("""
+                CREATE OR REPLACE FUNCTION enforce_primary_ip_lock()
+                RETURNS trigger AS $$
+                BEGIN
+                    IF COALESCE(current_setting('inspectre.bypass_ip_lock', true), '') = 'on' THEN
+                        RETURN NEW;
+                    END IF;
+                    IF OLD.primary_ip_locked AND NEW.primary_ip_locked THEN
+                        NEW.primary_ip := OLD.primary_ip;
+                        NEW.ip_address := OLD.primary_ip;
+                    END IF;
+                    RETURN NEW;
+                END;
+                $$ LANGUAGE plpgsql;
+            """))
+            conn.execute(text("DROP TRIGGER IF EXISTS trg_enforce_primary_ip_lock ON devices"))
+            conn.execute(text("""
+                CREATE TRIGGER trg_enforce_primary_ip_lock
+                    BEFORE UPDATE ON devices
+                    FOR EACH ROW
+                    EXECUTE FUNCTION enforce_primary_ip_lock();
+            """))
+            conn.commit()
+            print("[DB] Primary-IP lock trigger installed.", flush=True)
+        except Exception as e:
+            print(f"[DB] Pin-lock trigger note: {e}", flush=True)
+            conn.rollback()
+
     print("[DB] Migrations complete.", flush=True)
 
 # ---------------------------------------------------------------------------
@@ -2052,15 +2090,40 @@ def upsert_seen_device(mac: str, ip: str, source: str) -> None:
                 # it; non-primary sightings become passive secondary IPs.
                 cur_primary = existing.primary_ip or old_ip
                 locked      = bool(getattr(existing, "primary_ip_locked", False))
-                if PRIMARY_IP_MODE == "dynamic":
+                # The `existing` snapshot is read at the start of this function and
+                # can be STALE: the backend pin (a separate process) may have just
+                # committed primary_ip_locked=True after our read but before our
+                # write. Re-read the lock state under a row lock (FOR UPDATE) so the
+                # value is authoritative AND the row is held until our UPDATE
+                # commits — this serialises us against the backend pin and removes
+                # the race that let a freshly-pinned primary revert to a secondary.
+                try:
+                    _lk = session.execute(
+                        text("SELECT primary_ip, primary_ip_locked "
+                             "FROM devices WHERE mac_address = :m FOR UPDATE"),
+                        {"m": mac},
+                    ).fetchone()
+                    if _lk is not None:
+                        if _lk[0]:
+                            cur_primary = _lk[0]
+                        locked = bool(_lk[1])
+                except Exception as _e:
+                    print(f"[upsert] lock re-read failed for {mac}: {_e}", flush=True)
+                # A user-pinned primary IP is the strongest, most explicit signal
+                # of intent and must ALWAYS win — including in "dynamic" mode.
+                # PRIMARY_IP_MODE only governs how UNpinned devices behave. Without
+                # this guard, a pinned device that briefly blips offline/online has
+                # its primary silently overwritten by whichever IP was seen on
+                # return (e.g. a multi-homed host reverting from .2 back to .6),
+                # even though the lock flag stays set.
+                if locked and cur_primary:
+                    new_primary = cur_primary
+                elif PRIMARY_IP_MODE == "dynamic":
                     new_primary = ip if not was_online else (cur_primary or ip)
+                elif not was_online:
+                    new_primary = ip
                 else:
-                    if locked and cur_primary:
-                        new_primary = cur_primary
-                    elif not was_online:
-                        new_primary = ip
-                    else:
-                        new_primary = cur_primary or ip
+                    new_primary = cur_primary or ip
                 # While online, any IP other than the primary is a secondary
                 # interface — unless the primary itself has gone stale, meaning
                 # the host really moved and the new IP should take over.
@@ -2069,7 +2132,29 @@ def upsert_seen_device(mac: str, ip: str, source: str) -> None:
                         and _primary_ip_is_stale(mac, new_primary)):
                     new_primary           = ip
                     is_secondary_sighting = False
-                ip_to_store = new_primary if is_secondary_sighting else ip
+                # For a PINNED device the pinned IP is authoritative for BOTH
+                # primary_ip and the displayed ip_address. Without forcing
+                # ip_to_store here, a sighting on the shim/secondary IP while the
+                # device was briefly offline (was_online=False, so it is not
+                # classed as a "secondary sighting") would still overwrite
+                # ip_address with that IP — making the device appear to revert to
+                # e.g. .6 even though the primary stayed pinned at .2.
+                if locked and cur_primary:
+                    ip_to_store = cur_primary
+                else:
+                    ip_to_store = new_primary if is_secondary_sighting else ip
+
+                # Diagnostic: log whenever a sighting differs from the current
+                # primary so the pin/secondary decision is visible in probe logs.
+                # `locked` reflects the Python snapshot; the SQL UPDATE re-checks
+                # the live lock, so this is purely informational.
+                if ip != cur_primary:
+                    print(
+                        f"[upsert] {mac}: sighting {ip} differs from primary {cur_primary} "
+                        f"(locked={locked}, was_online={was_online}, mode={PRIMARY_IP_MODE}, "
+                        f"new_primary={new_primary}, ip_to_store={ip_to_store}, source={source})",
+                        flush=True,
+                    )
 
                 stmt = (
                     pg_insert(Device)
@@ -2090,8 +2175,22 @@ def upsert_seen_device(mac: str, ip: str, source: str) -> None:
                     .on_conflict_do_update(
                         index_elements=["mac_address"],
                         set_=dict(
-                            ip_address = ip_to_store,
-                            primary_ip = new_primary,
+                            # Enforce the user pin at the SQL level: read the LIVE
+                            # committed primary_ip_locked during the UPDATE rather
+                            # than trusting the Python-side `existing` snapshot
+                            # (which could be stale under concurrency between the
+                            # sniffer, the sweep and the backend pin). When the row
+                            # is locked, BOTH the primary and the displayed IP stay
+                            # pinned to the existing primary_ip; otherwise they take
+                            # the values computed in Python above.
+                            ip_address = text(
+                                "CASE WHEN devices.primary_ip_locked "
+                                "THEN devices.primary_ip ELSE :computed_ip END"
+                            ).bindparams(computed_ip=ip_to_store),
+                            primary_ip = text(
+                                "CASE WHEN devices.primary_ip_locked "
+                                "THEN devices.primary_ip ELSE :computed_primary END"
+                            ).bindparams(computed_primary=new_primary),
                             is_online  = True,
                             last_seen  = text("CASE WHEN devices.is_online = false THEN NOW() ELSE devices.last_seen END"),
                             miss_count = 0,

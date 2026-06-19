@@ -10,7 +10,7 @@ services:
     ports:
       - "5432:5432"
     volumes:
-      - ./data/db:/var/lib/postgresql/data
+      - ${INSPECTRE_DATA_DIR:-./data}/db:/var/lib/postgresql/data
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U admin -d inspectre"]
       interval: 5s
@@ -36,7 +36,7 @@ services:
     # (configure docker_host in Settings → Docker to tcp://host:2375 instead).
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
-      - ./data/vuln/trivy:/root/.cache/trivy
+      - ${INSPECTRE_DATA_DIR:-./data}/vuln/trivy:/root/.cache/trivy
     extra_hosts:
       - "host.docker.internal:host-gateway"
     depends_on:
@@ -67,7 +67,7 @@ services:
       # LAN_DNS_SERVER is intentionally omitted — backend resolves from gateway if blank.
       # LAN_DNS_SERVER: "192.168.0.1"
     volumes:
-      - ./data/vuln/nuclei:/root/nuclei-templates
+      - ${INSPECTRE_DATA_DIR:-./data}/vuln/nuclei:/root/nuclei-templates
     cap_add:
       - NET_ADMIN
       - NET_RAW
