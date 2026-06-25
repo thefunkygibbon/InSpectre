@@ -6,6 +6,7 @@ import {
 } from 'lucide-react'
 import { Logo } from './Logo'
 import { api, setToken } from '../api'
+import { COMMON_TIMEZONES, guessTimezone } from '../timezones'
 
 // Steps for the "fresh setup" path only (restore path bypasses all of these)
 const FRESH_STEPS_BASE = [
@@ -18,7 +19,7 @@ const FRESH_STEPS_BASE = [
   { id: 'done',        label: 'All Set!',          Icon: CheckCircle },
 ]
 
-const AUTO_UPDATE_STEP = { id: 'autoupdate', label: 'Auto Updates', Icon: RefreshCw }
+const AUTO_UPDATE_STEP = { id: 'autoupdate', label: 'Timezone & Updates', Icon: RefreshCw }
 
 // On appliance (VM/Pi) builds we offer an automatic-updates step just before the
 // final screen. The standard Docker build omits it (is_appliance is false).
@@ -836,25 +837,36 @@ function StepAutoUpdate({ onNext }) {
   const [enabled, setEnabled] = useState(false)
   const [hour,    setHour]    = useState(4)
   const [days,    setDays]    = useState([])   // [] = every day; else cron dow 0-6
+  const [tz,      setTz]      = useState(guessTimezone())
 
   function toggleDay(dow) {
-    setDays(prev => {
-      let next = prev.includes(dow) ? prev.filter(d => d !== dow) : [...prev, dow].sort((a, b) => a - b)
-      if (next.length === 7) next = []
-      return next
-    })
+    setDays(prev => (prev.includes(dow) ? prev.filter(d => d !== dow) : [...prev, dow].sort((a, b) => a - b)))
   }
 
   function handleNext() {
-    onNext({ auto_update_enabled: enabled, auto_update_hour: hour, auto_update_days: days })
+    onNext({ timezone: tz, auto_update_enabled: enabled, auto_update_hour: hour, auto_update_days: days })
   }
+
+  const tzOptions = COMMON_TIMEZONES.includes(tz) ? COMMON_TIMEZONES : [tz, ...COMMON_TIMEZONES]
 
   return (
     <div className="space-y-5">
       <p className="text-sm" style={{ color: 'var(--color-text-muted)' }}>
-        This appliance can keep its containers up to date automatically using Watchtower.
-        Updates are off by default — you can change this any time in Settings → Admin.
+        Set this appliance's timezone, and optionally let it keep its containers up to date
+        automatically. You can change either of these any time in Settings → Admin.
       </p>
+
+      <div>
+        <label className="block text-xs font-medium mb-1" style={{ color: 'var(--color-text-muted)' }}>
+          Timezone
+        </label>
+        <select className="input w-full" value={tz} onChange={e => setTz(e.target.value)}>
+          {tzOptions.map(z => <option key={z} value={z}>{z}</option>)}
+        </select>
+        <p className="text-xs mt-1" style={{ color: 'var(--color-text-faint)' }}>
+          Used for log timestamps and the update schedule below.
+        </p>
+      </div>
 
       <label className="flex items-start gap-3 cursor-pointer p-3 rounded-xl border transition-colors"
         style={{
@@ -866,7 +878,7 @@ function StepAutoUpdate({ onNext }) {
         <div>
           <p className="text-sm font-medium" style={{ color: 'var(--color-text)' }}>Enable automatic updates</p>
           <p className="text-xs mt-0.5" style={{ color: 'var(--color-text-muted)' }}>
-            Periodically checks for and installs new InSpectre container images.
+            Periodically pulls and installs new InSpectre container images.
           </p>
         </div>
       </label>
@@ -890,9 +902,17 @@ function StepAutoUpdate({ onNext }) {
               On these days
             </label>
             <div className="flex flex-wrap gap-1.5">
+              <button type="button" onClick={() => setDays([])}
+                className="px-2.5 py-1 rounded-md text-xs font-medium transition-colors"
+                style={{
+                  background: days.length === 0 ? 'var(--color-brand)' : 'transparent',
+                  color: days.length === 0 ? 'white' : 'var(--color-text-muted)',
+                  border: '1px solid var(--color-border)',
+                }}>
+                Every day
+              </button>
               {[[1,'Mon'],[2,'Tue'],[3,'Wed'],[4,'Thu'],[5,'Fri'],[6,'Sat'],[0,'Sun']].map(([dow, lbl]) => {
-                const everyDay = days.length === 0
-                const active = !everyDay && days.includes(dow)
+                const active = days.includes(dow)
                 return (
                   <button key={dow} type="button" onClick={() => toggleDay(dow)}
                     className="px-2.5 py-1 rounded-md text-xs font-medium transition-colors"
@@ -984,6 +1004,7 @@ export function SetupWizard({ onComplete }) {
         auto_update_schedule:  collected.auto_update_schedule  ?? 'daily',
         auto_update_hour:      collected.auto_update_hour      ?? 4,
         auto_update_days:      collected.auto_update_days      ?? [],
+        timezone:              collected.timezone              ?? 'UTC',
       })
     } catch (_) { /* ignore — dashboard still loads */ }
     onComplete()
