@@ -17,7 +17,6 @@
 </head>
 <body>
 
-  <!-- TMUX-STYLE STATUS BAR -->
   <header class="statusbar">
     <div class="sb-inner">
       <a href="index.html" class="sb-session">
@@ -39,7 +38,6 @@
 
   <main class="container">
 
-    <!-- HERO TERMINAL -->
     <section class="term hero-term" aria-label="InSpectre live scan">
       <div class="term-bar">
         <span class="term-dot"></span><span class="term-dot"></span><span class="term-dot"></span>
@@ -61,7 +59,6 @@
       </div>
     </section>
 
-    <!-- STATS — nmap-style summary (all values verified against the codebase) -->
     <section class="scan-summary" data-reveal aria-label="At a glance">
       <p class="comment"># inspectre --summary</p>
       <table class="scan-table">
@@ -74,7 +71,6 @@
       </table>
     </section>
 
-    <!-- FEATURES — man-page / command reference -->
     <section class="manpage" data-reveal>
       <h2 class="block-h"><span class="prefix">$</span> man inspectre <span class="dim">— capabilities(7)</span></h2>
       <div class="man-grid">
@@ -142,7 +138,6 @@
       </div>
     </section>
 
-    <!-- PRESENCE PANEL -->
     <section class="term split-term" data-reveal>
       <div class="term-bar">
         <span class="term-dot"></span><span class="term-dot"></span><span class="term-dot"></span>
@@ -161,29 +156,28 @@
             <li>Arrived-home / left-home notifications</li>
           </ul>
         </div>
-        <pre class="ascii-panel">┌─ presence ───────────────┐
-│                          │
+        <pre class="ascii-panel">┌─ presence ────────────────┐
+│                            │
 │  ● alex      <span class="ok">HOME</span>   4 dev  │
 │  ● sam       <span class="ok">HOME</span>   3 dev  │
 │  ○ jordan    <span class="dim">AWAY</span>   2 dev  │
 │  ● guest     <span class="ok">HOME</span>   1 dev  │
-│                          │
-│  [block] [schedule] [+]  │
-└──────────────────────────┘</pre>
+│                            │
+│  [block] [schedule] [+]    │
+└────────────────────────────┘</pre>
       </div>
     </section>
 
-    <!-- PRIVACY PANEL -->
     <section class="term split-term" data-reveal>
       <div class="term-bar">
         <span class="term-dot"></span><span class="term-dot"></span><span class="term-dot"></span>
         <span class="term-title">inspectre privacy --audit</span>
       </div>
       <div class="term-body split-body rev">
-        <pre class="ascii-panel">┌─ data flow ──────────────┐
+        <pre class="ascii-panel">┌─ data flow ─────────────┐
 │                          │
 │  LAN ─────────► InSpectre│
-│  InSpectre ──►  <span class="dim">∅ cloud</span>   │
+│  InSpectre ──►  <span class="dim">∅ cloud</span>  │
 │                          │
 │  outbound ......  <span class="ok">opt-in</span>  │
 │  accounts ......  <span class="dim">none</span>    │
@@ -204,7 +198,6 @@
       </div>
     </section>
 
-    <!-- CTA TERMINAL -->
     <section class="term cta-term" data-reveal>
       <div class="term-bar">
         <span class="term-dot"></span><span class="term-dot"></span><span class="term-dot"></span>
@@ -224,7 +217,6 @@
 
   </main>
 
-  <!-- FOOTER STATUS LINE -->
   <footer class="footer">
     <div class="foot-inner">
       <div class="foot-cols">
