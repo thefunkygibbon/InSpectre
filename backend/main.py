@@ -701,6 +701,11 @@ DEFAULT_SETTINGS = {
     "ha_mqtt_password":         ("",               "MQTT password for HA integration (optional)."),
     "ha_mqtt_discovery_prefix": ("homeassistant",  "HA MQTT discovery prefix (default: homeassistant)."),
     "ha_mqtt_state_prefix":     ("inspectre",      "InSpectre MQTT state topic prefix (default: inspectre)."),
+    # Appliance auto-update (VM/Pi builds only — ignored on non-appliance installs)
+    "timezone":              ("UTC",    "System timezone for log timestamps (appliance builds). IANA format e.g. Europe/London."),
+    "auto_update_enabled":   ("false",  "Enable scheduled automatic container updates (appliance builds only)."),
+    "auto_update_hour":      ("3",      "Hour of day (0-23) to run scheduled auto-updates."),
+    "auto_update_days":      ("[]",     "JSON array of weekday integers to run auto-updates (0=Sun…6=Sat). Empty array = every day."),
 }
 
 
@@ -2299,6 +2304,95 @@ def _migrate_legacy_ha_mqtt(db: Session):
         db.rollback()
 
 
+async def _run_appliance_update_task():
+    """Run a full appliance update in a thread so it doesn't block the event loop."""
+    global _auto_update_running
+    if _auto_update_running:
+        return
+    _auto_update_running = True
+    try:
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(None, _do_appliance_update)
+    finally:
+        _auto_update_running = False
+
+
+def _do_appliance_update():
+    """Synchronous update worker — pulls and recreates non-self containers, then
+    triggers the helper container for the backend's own self-update."""
+    try:
+        import appliance_update as _au
+        client  = _au.make_client()
+        results = {}
+        for name in _au.NON_SELF_CONTAINERS:
+            try:
+                results[name] = _au.update_container(client, name)
+            except Exception as exc:
+                results[name] = {"name": name, "error": str(exc)}
+        # Self-update: launch the inspectre-updater helper container.
+        try:
+            updater_img = "thefunkygibbon/inspectre-web:latest"
+            client.containers.run(
+                updater_img,
+                command=["python", "-m", "appliance_update"],
+                name=_au.UPDATER_CONTAINER,
+                detach=True,
+                remove=True,
+                volumes={"/var/run/docker.sock": {"bind": "/var/run/docker.sock", "mode": "rw"}},
+                environment={"DATABASE_URL": os.environ.get("DATABASE_URL", "")},
+            )
+            results[_au.WEB_CONTAINER] = {"name": _au.WEB_CONTAINER, "triggered": True}
+        except Exception as exc:
+            results[_au.WEB_CONTAINER] = {"name": _au.WEB_CONTAINER, "self_update_error": str(exc)}
+        _au.write_status("ok", results)
+        print(f"[auto-update] complete: {results}", flush=True)
+    except Exception as exc:
+        print(f"[auto-update] FAILED: {exc}", flush=True)
+        try:
+            import appliance_update as _au
+            _au.write_status("error", {"error": str(exc)})
+        except Exception:
+            pass
+
+
+async def _auto_update_schedule_loop():
+    """Scheduled loop that fires the appliance update at the configured hour/days."""
+    await asyncio.sleep(60)  # startup grace period
+    last_run_date = None
+    while True:
+        try:
+            if _is_appliance():
+                db = SessionLocal()
+                try:
+                    def _s(key, default=""):
+                        row = db.get(Setting, key)
+                        return row.value if row else default
+                    enabled = _s("auto_update_enabled", "false") == "true"
+                    hour    = int(_s("auto_update_hour", "3"))
+                    days_raw = _s("auto_update_days", "[]")
+                    try:
+                        days = json.loads(days_raw)
+                    except Exception:
+                        days = []
+                finally:
+                    db.close()
+
+                if enabled:
+                    now      = datetime.now(timezone.utc)
+                    today    = now.weekday()  # 0=Mon…6=Sun (Python convention)
+                    # Convert Python weekday (0=Mon) to JS/cron dow (0=Sun…6=Sat)
+                    js_dow   = (today + 1) % 7
+                    right_hour   = now.hour == hour
+                    right_day    = not days or js_dow in days
+                    already_ran  = last_run_date == now.date()
+                    if right_hour and right_day and not already_ran and not _auto_update_running:
+                        last_run_date = now.date()
+                        asyncio.ensure_future(_run_appliance_update_task())
+        except Exception as exc:
+            print(f"[auto-update-scheduler] error: {exc}", flush=True)
+        await asyncio.sleep(300)  # check every 5 minutes
+
+
 @app.on_event("startup")
 async def on_startup():
     global _main_loop
@@ -2331,6 +2425,7 @@ async def on_startup():
     asyncio.ensure_future(_docker_event_loop())
     asyncio.ensure_future(_fingerbank_loop())
     asyncio.ensure_future(_plugin_scheduler.run())
+    asyncio.ensure_future(_auto_update_schedule_loop())
 
 
 @app.get("/events/stream")
@@ -2482,6 +2577,11 @@ class SetupCompleteRequest(BaseModel):
     docker_enabled:       bool   = False
     docker_host:          str    = "unix:///var/run/docker.sock"
     fingerbank_api_key:   str    = ""
+    # Appliance-only fields (ignored on non-appliance builds)
+    timezone:             str    = "UTC"
+    auto_update_enabled:  bool   = False
+    auto_update_hour:     int    = 3
+    auto_update_days:     list   = []
 
 
 # ---------------------------------------------------------------------------
@@ -2900,6 +3000,97 @@ def change_password(
 
 
 # ---------------------------------------------------------------------------
+# Appliance / system info routes
+# ---------------------------------------------------------------------------
+
+_APPLIANCE_JSON_PATH = "/opt/inspectre/appliance.json"
+_auto_update_running = False
+
+
+def _is_appliance() -> bool:
+    return os.path.exists(_APPLIANCE_JSON_PATH)
+
+
+def _read_appliance_meta() -> dict:
+    try:
+        with open(_APPLIANCE_JSON_PATH) as f:
+            return json.loads(f.read())
+    except Exception:
+        return {}
+
+
+@app.get("/system/info")
+def get_system_info(db: Session = Depends(get_db), username: str = Depends(get_current_user)):
+    """Return appliance metadata and auto-update configuration."""
+    def _s(key, default=""):
+        row = db.get(Setting, key)
+        return row.value if row else default
+
+    is_appl = _is_appliance()
+    meta    = _read_appliance_meta() if is_appl else {}
+
+    days_raw = _s("auto_update_days", "[]")
+    try:
+        days = json.loads(days_raw)
+    except Exception:
+        days = []
+
+    return {
+        "is_appliance":   is_appl,
+        "appliance_type": meta.get("type"),
+        "timezone":       _s("timezone", "UTC"),
+        "auto_update": {
+            "enabled": _s("auto_update_enabled", "false") == "true",
+            "hour":    int(_s("auto_update_hour", "3")),
+            "days":    days,
+            "updater": {
+                "last_run":    _s("auto_update_last_run") or None,
+                "last_status": _s("auto_update_last_status") or None,
+                "running":     _auto_update_running,
+                "last_logs":   _s("auto_update_last_detail") or None,
+            },
+        },
+    }
+
+
+class AutoUpdateRequest(BaseModel):
+    enabled: bool
+    hour:    int  = 3
+    days:    list = []
+
+
+@app.post("/system/auto-update")
+def set_auto_update(
+    payload:  AutoUpdateRequest,
+    username: str     = Depends(get_current_user),
+    db:       Session = Depends(get_db),
+):
+    """Save auto-update schedule settings."""
+    to_save = {
+        "auto_update_enabled": "true" if payload.enabled else "false",
+        "auto_update_hour":    str(max(0, min(23, payload.hour))),
+        "auto_update_days":    json.dumps(payload.days),
+    }
+    for key, value in to_save.items():
+        s = db.get(Setting, key)
+        if s:
+            s.value = value
+        else:
+            db.add(Setting(key=key, value=value))
+    db.commit()
+    return {"ok": True}
+
+
+@app.post("/system/auto-update/run")
+async def run_auto_update_now(username: str = Depends(get_current_user)):
+    """Trigger an immediate appliance update (appliance builds only)."""
+    if not _is_appliance():
+        raise HTTPException(403, "Not an appliance build")
+    asyncio.ensure_future(_run_appliance_update_task())
+    return {"ok": True, "message": "Update triggered"}
+
+
+# ---------------------------------------------------------------------------
 # Setup wizard routes (no auth required — only usable before setup is done)
 # ---------------------------------------------------------------------------
 @app.get("/setup/status")
@@ -2918,7 +3109,8 @@ def setup_status(db: Session = Depends(get_db)):
                            description="Whether the initial setup wizard has been completed."))
         db.commit()
         setup_done = True
-    return {"setup_complete": setup_done, "has_user": has_user}
+    is_appliance = os.path.exists("/opt/inspectre/appliance.json")
+    return {"setup_complete": setup_done, "has_user": has_user, "is_appliance": is_appliance}
 
 
 @app.post("/setup/create-user")
@@ -2998,6 +3190,11 @@ def setup_complete(
         to_save["docker_host"] = payload.docker_host
     if payload.fingerbank_api_key:
         to_save["fingerbank_api_key"] = payload.fingerbank_api_key
+    if os.path.exists("/opt/inspectre/appliance.json"):
+        to_save["timezone"]            = payload.timezone or "UTC"
+        to_save["auto_update_enabled"] = "true" if payload.auto_update_enabled else "false"
+        to_save["auto_update_hour"]    = str(max(0, min(23, payload.auto_update_hour)))
+        to_save["auto_update_days"]    = json.dumps(payload.auto_update_days)
     for key, value in to_save.items():
         s = db.get(Setting, key)
         if s:
