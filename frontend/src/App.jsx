@@ -30,8 +30,7 @@ import { LoginPage }           from './components/LoginPage'
 import { SetupWizard }         from './components/SetupWizard'
 import { StatusButton }        from './components/StatusButton'
 import { PersonPresencePage }  from './components/PersonPresencePage'
-
-const APP_VERSION = '1.1.0'
+import { APP_VERSION }         from './version'
 
 const SORT_OPTIONS = [
   { value: 'last_seen_desc', label: 'Last changed (newest)' },
