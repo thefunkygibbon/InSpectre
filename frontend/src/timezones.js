@@ -1,0 +1,78 @@
+// Curated list of common IANA timezones for the appliance timezone selector.
+// Kept deliberately short and grouped by region for a usable dropdown.
+export const COMMON_TIMEZONES = [
+  'UTC',
+  'Europe/London',
+  'Europe/Dublin',
+  'Europe/Lisbon',
+  'Europe/Paris',
+  'Europe/Madrid',
+  'Europe/Berlin',
+  'Europe/Amsterdam',
+  'Europe/Brussels',
+  'Europe/Rome',
+  'Europe/Zurich',
+  'Europe/Stockholm',
+  'Europe/Oslo',
+  'Europe/Copenhagen',
+  'Europe/Helsinki',
+  'Europe/Athens',
+  'Europe/Warsaw',
+  'Europe/Prague',
+  'Europe/Vienna',
+  'Europe/Bucharest',
+  'Europe/Kyiv',
+  'Europe/Moscow',
+  'Europe/Istanbul',
+  'Atlantic/Reykjavik',
+  'America/St_Johns',
+  'America/Halifax',
+  'America/New_York',
+  'America/Toronto',
+  'America/Chicago',
+  'America/Mexico_City',
+  'America/Denver',
+  'America/Phoenix',
+  'America/Los_Angeles',
+  'America/Vancouver',
+  'America/Anchorage',
+  'America/Sao_Paulo',
+  'America/Argentina/Buenos_Aires',
+  'America/Bogota',
+  'America/Santiago',
+  'Africa/Casablanca',
+  'Africa/Lagos',
+  'Africa/Johannesburg',
+  'Africa/Nairobi',
+  'Africa/Cairo',
+  'Asia/Jerusalem',
+  'Asia/Dubai',
+  'Asia/Tehran',
+  'Asia/Karachi',
+  'Asia/Kolkata',
+  'Asia/Dhaka',
+  'Asia/Bangkok',
+  'Asia/Jakarta',
+  'Asia/Singapore',
+  'Asia/Hong_Kong',
+  'Asia/Shanghai',
+  'Asia/Taipei',
+  'Asia/Tokyo',
+  'Asia/Seoul',
+  'Australia/Perth',
+  'Australia/Adelaide',
+  'Australia/Brisbane',
+  'Australia/Sydney',
+  'Pacific/Auckland',
+  'Pacific/Honolulu',
+]
+
+// Best-effort guess of the browser's IANA timezone, used to pre-select a
+// sensible default in the setup wizard.
+export function guessTimezone() {
+  try {
+    return Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC'
+  } catch {
+    return 'UTC'
+  }
+}

@@ -5,6 +5,7 @@ import {
   AlertTriangle, ChevronDown, ChevronRight, Paintbrush, Package, RefreshCw,
 } from 'lucide-react'
 import { api } from '../api'
+import { COMMON_TIMEZONES } from '../timezones'
 import { HostsManager } from './HostsManager'
 import { useTheme } from '../hooks/useTheme'
 import { NotificationsTab } from './NotificationsTab'
@@ -225,6 +226,8 @@ export function SettingsPanel({ onClose, onSettingChange }) {
   const [systemInfo,        setSystemInfo]        = useState(null)
   const [autoUpdateSaving,  setAutoUpdateSaving]  = useState(false)
   const [autoUpdateError,   setAutoUpdateError]   = useState('')
+  const [updateRunning,     setUpdateRunning]     = useState(false)
+  const [tzSaving,          setTzSaving]          = useState(false)
 
   const fetchTrivyStatus = useCallback(() => {
     api.trivyDbStatus().then(setTrivyDbStatus).catch(() => {})
@@ -277,12 +280,43 @@ export function SettingsPanel({ onClose, onSettingChange }) {
     }
   }
 
-  // Toggle a single weekday (cron dow: 0=Sun … 6=Sat). All 7 collapses to "every day".
+  // Toggle a single weekday (cron dow: 0=Sun … 6=Sat). Selecting from the
+  // "every day" state ([]) starts a fresh single-day selection; clearing the
+  // last day falls back to "every day".
   function toggleAutoUpdateDay(dow) {
     const { enabled, hour, days } = curAutoUpdate()
-    let next = days.includes(dow) ? days.filter(d => d !== dow) : [...days, dow].sort((a, b) => a - b)
-    if (next.length === 7) next = []
+    const next = days.includes(dow) ? days.filter(d => d !== dow) : [...days, dow].sort((a, b) => a - b)
     handleAutoUpdate(enabled, hour, next)
+  }
+
+  function setAutoUpdateEveryDay() {
+    const { enabled, hour } = curAutoUpdate()
+    handleAutoUpdate(enabled, hour, [])
+  }
+
+  async function handleRunUpdateNow() {
+    setUpdateRunning(true)
+    setAutoUpdateError('')
+    try {
+      await api.runAutoUpdate()
+      const info = await api.getSystemInfo()
+      setSystemInfo(info)
+    } catch (e) {
+      setAutoUpdateError((e?.message || String(e)).replace(/^.*?\d{3}\s*/, ''))
+    } finally {
+      setUpdateRunning(false)
+    }
+  }
+
+  async function handleTimezone(tz) {
+    setTzSaving(true)
+    try {
+      await api.updateSetting('timezone', tz)
+      const info = await api.getSystemInfo()
+      setSystemInfo(info)
+    } catch (_) { /* non-fatal */ } finally {
+      setTzSaving(false)
+    }
   }
 
   async function handleSave() {
@@ -1057,9 +1091,27 @@ export function SettingsPanel({ onClose, onSettingChange }) {
                 <div className="space-y-3 pb-2">
                   <SectionHeader label="Automatic Updates" Icon={RefreshCw} />
                   <p className="text-xs" style={{ color: 'var(--color-text-faint)' }}>
-                    This appliance build can keep its containers up to date automatically
-                    using Watchtower. Updates are disabled by default.
+                    This appliance build can pull the latest InSpectre images and
+                    recreate any changed containers on a schedule. Updates are disabled by default.
                   </p>
+
+                  {/* Timezone (also drives log timestamps + the update schedule) */}
+                  <div className="space-y-1">
+                    <label className="text-xs" style={{ color: 'var(--color-text-muted)' }}>Timezone</label>
+                    <select
+                      className="w-full rounded-lg px-3 py-2 text-sm"
+                      style={{ background: 'var(--color-surface-offset)', border: '1px solid var(--color-border)', color: 'var(--color-text)' }}
+                      value={systemInfo?.timezone || 'UTC'}
+                      disabled={tzSaving}
+                      onChange={e => handleTimezone(e.target.value)}
+                    >
+                      {(COMMON_TIMEZONES.includes(systemInfo?.timezone) ? COMMON_TIMEZONES : [systemInfo?.timezone, ...COMMON_TIMEZONES].filter(Boolean))
+                        .map(tz => <option key={tz} value={tz}>{tz}</option>)}
+                    </select>
+                    <p className="text-xs" style={{ color: 'var(--color-text-faint)' }}>
+                      Used for log timestamps and the update schedule below.
+                    </p>
+                  </div>
 
                   {/* Enable toggle */}
                   <label className="flex items-center justify-between gap-3 rounded-lg px-3 py-2"
@@ -1104,10 +1156,21 @@ export function SettingsPanel({ onClose, onSettingChange }) {
                     <div className="space-y-1">
                       <label className="text-xs" style={{ color: 'var(--color-text-muted)' }}>On these days</label>
                       <div className="flex flex-wrap gap-1.5">
+                        <button
+                          type="button"
+                          disabled={autoUpdateSaving || !systemInfo?.auto_update?.enabled}
+                          onClick={setAutoUpdateEveryDay}
+                          className="px-2.5 py-1 rounded-md text-xs font-medium transition-colors"
+                          style={{
+                            background: curAutoUpdate().days.length === 0 ? 'var(--color-brand)' : 'var(--color-surface-offset)',
+                            color: curAutoUpdate().days.length === 0 ? 'white' : 'var(--color-text-muted)',
+                            border: '1px solid var(--color-border)',
+                          }}
+                        >
+                          Every day
+                        </button>
                         {[[1,'Mon'],[2,'Tue'],[3,'Wed'],[4,'Thu'],[5,'Fri'],[6,'Sat'],[0,'Sun']].map(([dow, lbl]) => {
-                          const { days } = curAutoUpdate()
-                          const everyDay = days.length === 0
-                          const active = everyDay || days.includes(dow)
+                          const active = curAutoUpdate().days.includes(dow)
                           return (
                             <button
                               key={dow}
@@ -1116,8 +1179,8 @@ export function SettingsPanel({ onClose, onSettingChange }) {
                               onClick={() => toggleAutoUpdateDay(dow)}
                               className="px-2.5 py-1 rounded-md text-xs font-medium transition-colors"
                               style={{
-                                background: active && !everyDay ? 'var(--color-brand)' : 'var(--color-surface-offset)',
-                                color: active && !everyDay ? 'white' : 'var(--color-text-muted)',
+                                background: active ? 'var(--color-brand)' : 'var(--color-surface-offset)',
+                                color: active ? 'white' : 'var(--color-text-muted)',
                                 border: '1px solid var(--color-border)',
                               }}
                             >
@@ -1135,29 +1198,49 @@ export function SettingsPanel({ onClose, onSettingChange }) {
 
                     <p className="text-xs" style={{ color: 'var(--color-text-faint)' }}>
                       {systemInfo?.auto_update?.enabled
-                        ? `Updater is ${systemInfo?.auto_update?.watchtower?.running
-                            ? 'running'
-                            : (systemInfo?.auto_update?.watchtower?.restarting ? 'restarting (check logs below)' : 'configured')}.`
+                        ? 'Enabled. The updater checks at the time and on the days selected above.'
                         : 'Turn on automatic updates to choose when to check.'}
                     </p>
+                  </div>
 
-                    {/* Updater diagnostics — visible even when the container restart-loops */}
-                    {systemInfo?.auto_update?.enabled && systemInfo?.auto_update?.watchtower?.last_logs && (
+                  {/* Manual trigger + last result */}
+                  <div className="space-y-2">
+                    <button
+                      type="button"
+                      onClick={handleRunUpdateNow}
+                      disabled={updateRunning}
+                      className="w-full py-2 rounded-lg text-sm font-medium flex items-center justify-center gap-2"
+                      style={{ background: 'var(--color-surface-offset)', border: '1px solid var(--color-border)', color: 'var(--color-text)' }}
+                    >
+                      <RefreshCw size={14} className={updateRunning ? 'animate-spin' : ''} />
+                      {updateRunning ? 'Checking for updates…' : 'Check for updates now'}
+                    </button>
+
+                    {systemInfo?.auto_update?.updater?.last_run && (
+                      <p className="text-xs" style={{ color: 'var(--color-text-faint)' }}>
+                        Last run: {new Date(systemInfo.auto_update.updater.last_run).toLocaleString()}
+                        {systemInfo.auto_update.updater.last_status
+                          ? ` — ${systemInfo.auto_update.updater.last_status === 'no-change'
+                              ? 'already up to date'
+                              : systemInfo.auto_update.updater.last_status}`
+                          : ''}
+                      </p>
+                    )}
+                    {systemInfo?.auto_update?.updater?.running && (
+                      <p className="text-xs" style={{ color: 'var(--color-text-faint)' }}>
+                        An update is currently in progress (the app may briefly restart).
+                      </p>
+                    )}
+
+                    {/* Updater diagnostics — logs from the last helper run */}
+                    {systemInfo?.auto_update?.updater?.last_logs && (
                       <details className="rounded-lg" style={{ border: '1px solid var(--color-border)' }}>
                         <summary className="text-xs cursor-pointer px-3 py-2" style={{ color: 'var(--color-text-muted)' }}>
                           Updater logs
-                          {Number.isInteger(systemInfo?.auto_update?.watchtower?.restart_count) &&
-                            ` (restarts: ${systemInfo.auto_update.watchtower.restart_count}`}
-                          {Number.isInteger(systemInfo?.auto_update?.watchtower?.exit_code) &&
-                            `, exit: ${systemInfo.auto_update.watchtower.exit_code}`}
-                          {Number.isInteger(systemInfo?.auto_update?.watchtower?.restart_count) && ')'}
                         </summary>
                         <pre className="text-xs overflow-auto px-3 py-2 m-0"
                           style={{ maxHeight: 200, color: 'var(--color-text-faint)', whiteSpace: 'pre-wrap' }}>
-                          {systemInfo.auto_update.watchtower.error
-                            ? `error: ${systemInfo.auto_update.watchtower.error}\n\n`
-                            : ''}
-                          {systemInfo.auto_update.watchtower.last_logs}
+                          {systemInfo.auto_update.updater.last_logs}
                         </pre>
                       </details>
                     )}

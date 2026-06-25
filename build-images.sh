@@ -102,9 +102,8 @@ if ! $CLI_TARGET_SPECIFIED; then
   echo -e "  7) Build Everything (All Container & Appliance Images)"
   echo -e "  q) Quit"
   echo ""
-  read -rp "Enter selection [1-7/q, default=4]: " choice
+  read -rp "Enter selection [1-7/q]: " choice
   echo ""
-  choice="${choice:-4}"
 
   case "$choice" in
     1) BUILD_CONTAINERS_AMD=true ;;
@@ -159,7 +158,6 @@ if ! $CLI_TARGET_SPECIFIED; then
     echo ""
     read -rp "Enter selection [1-2, default=1]: " os_choice
     echo ""
-    os_choice="${os_choice:-1}"
     case "${os_choice}" in
       2) VM_BASE_OS="ubuntu"; info "Using Ubuntu 22.04 Jammy as VM base OS." ;;
       *) VM_BASE_OS="debian"; info "Using Debian 13 Trixie as VM base OS." ;;
@@ -176,13 +174,12 @@ if ! $CLI_TARGET_SPECIFIED; then
     echo -e "  2) VMware Workstation/ESXi  — vmdk + ova            (generic base)"
     echo -e "  3) Universal (all hypervisors)— single qcow2 + converter script (generic base)"
     echo ""
-    read -rp "Enter selection [1-3, default=3]: " hv_choice
+    read -rp "Enter selection [1-3, default=1]: " hv_choice
     echo ""
-    hv_choice="${hv_choice:-3}"
     case "${hv_choice}" in
-      1) VM_HV_TARGET="kvm";       info "Target: KVM/Proxmox (qcow2)." ;;
       2) VM_HV_TARGET="vmware";    info "Target: VMware (vmdk + ova)." ;;
-      *) VM_HV_TARGET="universal"; info "Target: Universal (single qcow2 + converter script)." ;;
+      3) VM_HV_TARGET="universal"; info "Target: Universal (single qcow2 + converter script)." ;;
+      *) VM_HV_TARGET="kvm";       info "Target: KVM/Proxmox (qcow2)." ;;
     esac
   fi
 
@@ -433,26 +430,16 @@ cd /opt/inspectre
 
 echo "[InSpectre] Waiting for Docker Hub connectivity..."
 connected=false
-
-# Probe the registry once with a given curl option set. registry-1.docker.io/v2/
-# returns HTTP 401 (auth required) when reachable, so we must NOT use curl -f
-# (which fails on 401). Treat any real HTTP response (200/401) as reachable.
-_probe_registry() {
-  local code
-  code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 "$@" https://registry-1.docker.io/v2/ 2>/dev/null || true)
-  [[ "$code" == "200" || "$code" == "401" ]]
-}
-
 for i in $(seq 1 30); do
-  # Many cloud images (Debian generic on KVM) auto-configure an IPv6 address and
-  # default route via SLAAC that has no real path out. curl prefers IPv6 and
-  # hangs until timeout, so we try IPv4 FIRST, then fall back to the default
-  # resolver order so genuine IPv6-only networks still work.
-  if _probe_registry -4 || _probe_registry; then
+  # NOTE: registry-1.docker.io/v2/ returns HTTP 401 (auth required) when reachable,
+  # so we must NOT use curl -f (which fails on 401). Treat any real HTTP response
+  # code (200/401) as "Docker Hub is reachable".
+  code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 https://registry-1.docker.io/v2/ 2>/dev/null || true)
+  if [[ "$code" == "200" || "$code" == "401" ]]; then
     connected=true
     break
   fi
-  echo "[InSpectre] Attempt ${i}/30 — no connectivity yet, retrying in 10s..."
+  echo "[InSpectre] Attempt ${i}/30 — no connectivity yet (code=${code:-none}), retrying in 10s..."
   sleep 10
 done
 
@@ -732,21 +719,6 @@ systemctl enable systemd-networkd-wait-online
 sed -i 's/^#*PasswordAuthentication .*/PasswordAuthentication yes/' /etc/ssh/sshd_config
 sed -i 's/^#*PermitRootLogin .*/PermitRootLogin yes/' /etc/ssh/sshd_config
 
-# Cloud images ship a drop-in (/etc/ssh/sshd_config.d/50-cloud-init.conf) that
-# sets "PasswordAuthentication no". sshd honours the FIRST value seen and the
-# main config Includes sshd_config.d/*.conf near the top, so that drop-in
-# overrides the edits above - which is why password SSH login failed. Purging
-# cloud-init does NOT remove this file, so delete it and write our own drop-in
-# that sorts first (00-) and therefore wins.
-rm -f /etc/ssh/sshd_config.d/50-cloud-init.conf
-mkdir -p /etc/ssh/sshd_config.d
-cat > /etc/ssh/sshd_config.d/00-inspectre.conf <<'SSHD'
-PasswordAuthentication yes
-PermitRootLogin yes
-KbdInteractiveAuthentication yes
-SSHD
-chmod 0644 /etc/ssh/sshd_config.d/00-inspectre.conf
-
 id inspectre &>/dev/null || useradd -m -s /bin/bash inspectre
 usermod -aG sudo,docker inspectre
 echo "inspectre:inspectre" | chpasswd
@@ -788,21 +760,6 @@ systemctl enable systemd-networkd
 
 sed -i 's/^#*PasswordAuthentication .*/PasswordAuthentication yes/' /etc/ssh/sshd_config
 sed -i 's/^#*PermitRootLogin .*/PermitRootLogin yes/' /etc/ssh/sshd_config
-
-# Cloud images ship a drop-in (/etc/ssh/sshd_config.d/50-cloud-init.conf) that
-# sets "PasswordAuthentication no". sshd honours the FIRST value seen and the
-# main config Includes sshd_config.d/*.conf near the top, so that drop-in
-# overrides the edits above - which is why password SSH login failed. Purging
-# cloud-init does NOT remove this file, so delete it and write our own drop-in
-# that sorts first (00-) and therefore wins.
-rm -f /etc/ssh/sshd_config.d/50-cloud-init.conf
-mkdir -p /etc/ssh/sshd_config.d
-cat > /etc/ssh/sshd_config.d/00-inspectre.conf <<'SSHD'
-PasswordAuthentication yes
-PermitRootLogin yes
-KbdInteractiveAuthentication yes
-SSHD
-chmod 0644 /etc/ssh/sshd_config.d/00-inspectre.conf
 
 id inspectre &>/dev/null || useradd -m -s /bin/bash inspectre
 usermod -aG sudo,docker inspectre
