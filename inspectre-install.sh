@@ -4,8 +4,6 @@
 # writes a .env file, and starts the stack.
 set -euo pipefail
 
-# Ensure the script always reads from the terminal even when piped (e.g. curl | bash)
-[ -t 0 ] || exec bash "$0" "$@" </dev/tty
 
 DEPLOY_YML_URL="https://raw.githubusercontent.com/thefunkygibbon/InSpectre/main/docker-compose.deploy.yml"
 DEFAULT_DIR="$HOME/inspectre"
