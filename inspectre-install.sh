@@ -4,6 +4,9 @@
 # writes a .env file, and starts the stack.
 set -euo pipefail
 
+# Ensure the script always reads from the terminal even when piped (e.g. curl | bash)
+[ -t 0 ] || exec bash "$0" "$@" </dev/tty
+
 DEPLOY_YML_URL="https://raw.githubusercontent.com/thefunkygibbon/InSpectre/main/docker-compose.deploy.yml"
 DEFAULT_DIR="$HOME/inspectre"
 
@@ -41,7 +44,6 @@ if ! command -v docker &>/dev/null; then
   MISSING=1
 else
   ok "Docker found: $(docker --version)"
-  # Docker daemon must be running and reachable by this user
   if ! docker info &>/dev/null; then
     warn "Docker is installed but the daemon is not reachable."
     echo "      Start it with:  sudo systemctl start docker"
@@ -66,7 +68,7 @@ else
   MISSING=1
 fi
 
-# curl (used to download the compose file)
+# curl
 if command -v curl &>/dev/null; then
   ok "curl found"
 else
@@ -75,7 +77,7 @@ else
   MISSING=1
 fi
 
-# openssl (used to generate the DB password and secret key)
+# openssl
 if command -v openssl &>/dev/null; then
   ok "openssl found"
 else
@@ -114,31 +116,29 @@ else
   DEFAULT_CHOICE="1"
 fi
 
-read -rp "  Select platform [${DEFAULT_CHOICE}]: " PLATFORM_CHOICE
+read -rp "  Select platform [${DEFAULT_CHOICE}]: " PLATFORM_CHOICE </dev/tty
 PLATFORM_CHOICE="${PLATFORM_CHOICE:-$DEFAULT_CHOICE}"
 
 case "$PLATFORM_CHOICE" in
-  1|x64|amd64|intel|amd)        INSPECTRE_TAG="latest" ;;
-  2|pi|raspberry|raspi|arm|arm64) INSPECTRE_TAG="raspi" ;;
+  1|x64|amd64|intel|amd)          INSPECTRE_TAG="latest" ;;
+  2|pi|raspberry|raspi|arm|arm64)  INSPECTRE_TAG="raspi"  ;;
   *) die "Invalid selection '${PLATFORM_CHOICE}'. Choose 1 (x64) or 2 (raspberry)." ;;
 esac
 
-# Warn if the chosen platform doesn't match the detected hardware
 if { [ "$INSPECTRE_TAG" = "latest" ] && [ "$DETECTED" = "pi" ]; } || \
-   { [ "$INSPECTRE_TAG" = "raspi" ] && [ "$DETECTED" = "x64" ]; }; then
+   { [ "$INSPECTRE_TAG" = "raspi"  ] && [ "$DETECTED" = "x64" ]; }; then
   warn "You selected images for a different architecture than this host ($HOST_ARCH)."
   warn "The containers will fail to start unless this is intentional (e.g. emulation)."
-  read -rp "  Continue anyway? [y/N]: " ARCH_CONFIRM
+  read -rp "  Continue anyway? [y/N]: " ARCH_CONFIRM </dev/tty
   [[ "$ARCH_CONFIRM" =~ ^[Yy]$ ]] || die "Aborted by user."
 fi
 
-# The raspi images are ARM64-only — a 32-bit OS cannot run them.
 if [ "$INSPECTRE_TAG" = "raspi" ]; then
   case "$HOST_ARCH" in
     armv7l|armv6l|armhf)
       warn "This host is running a 32-bit OS ($HOST_ARCH), but the Raspberry Pi images are 64-bit (ARM64) only."
       warn "Install a 64-bit Raspberry Pi OS (Pi 3/4/5) to run InSpectre."
-      read -rp "  Continue anyway? [y/N]: " BIT_CONFIRM
+      read -rp "  Continue anyway? [y/N]: " BIT_CONFIRM </dev/tty
       [[ "$BIT_CONFIRM" =~ ^[Yy]$ ]] || die "Aborted by user."
       ;;
   esac
@@ -147,7 +147,7 @@ ok "Installing '${INSPECTRE_TAG}' images for ${HOST_ARCH}"
 
 # ── Install directory ────────────────────────────────────────
 header "Install location"
-read -rp "  Install directory [${DEFAULT_DIR}]: " INSTALL_DIR
+read -rp "  Install directory [${DEFAULT_DIR}]: " INSTALL_DIR </dev/tty
 INSTALL_DIR="${INSTALL_DIR:-$DEFAULT_DIR}"
 INSTALL_DIR="${INSTALL_DIR/#\~/$HOME}"
 
@@ -172,7 +172,7 @@ fi
 header "Database password"
 echo "  InSpectre needs a strong password for its internal PostgreSQL database."
 echo "  This is never exposed externally."
-read -rp "  Enter DB password (leave blank to generate): " DB_PASS
+read -rp "  Enter DB password (leave blank to generate): " DB_PASS </dev/tty
 if [ -z "$DB_PASS" ]; then
   DB_PASS="$(openssl rand -hex 20)"
   ok "Generated database password"
@@ -190,8 +190,8 @@ ok "Generated secret key"
 header "Network settings"
 echo "  The probe can auto-detect your network interface and IP range from the"
 echo "  host's routing table. Override only if auto-detection picks the wrong NIC."
-read -rp "  Set IP_RANGE manually? (e.g. 192.168.1.0/24) [leave blank = auto]: " IP_RANGE_INPUT
-read -rp "  Set INTERFACE manually? (e.g. eth0) [leave blank = auto]: "          IFACE_INPUT
+read -rp "  Set IP_RANGE manually? (e.g. 192.168.1.0/24) [leave blank = auto]: " IP_RANGE_INPUT </dev/tty
+read -rp "  Set INTERFACE manually? (e.g. eth0) [leave blank = auto]: "          IFACE_INPUT </dev/tty
 
 # ── Write .env ───────────────────────────────────────────────
 header "Writing .env"
@@ -212,9 +212,6 @@ fi
 
 ok ".env written to ${INSTALL_DIR}/.env"
 
-# Note: if IP_RANGE / INTERFACE are set, the deploy yml reads them from .env
-# via the ${IP_RANGE} / ${INTERFACE} substitution. Since those lines are
-# commented-out in the yml by default, we patch the file if needed.
 if [ -n "$IP_RANGE_INPUT" ]; then
   sed -i "s|# IP_RANGE: \"192.168.1.0/24\"|IP_RANGE: \"${IP_RANGE_INPUT}\"|" docker-compose.deploy.yml
 fi
