@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Downloads — InSpectre</title>
-  <meta name="description" content="Download InSpectre as a Docker stack, a ready-to-run virtual machine image, or a Raspberry Pi image. Free and open source." />
+  <meta name="description" content="Download InSpectre as a Docker stack, a ready-to-run virtual machine image, or a Raspberry Pi script. Free and open source." />
   <link rel="icon" type="image/svg+xml" href="assets/favicon.svg" />
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
@@ -34,35 +34,33 @@
     <section class="page-head">
       <p class="crumb"><span class="dollar">$</span> cd ~/inspectre &amp;&amp; ls dist/</p>
       <h1>Download <span class="hl">InSpectre</span></h1>
-      <p>Pick the format that suits your setup. Docker is the recommended path; a pre-built VM appliance image is available now for VirtualBox, VMware and Proxmox. A Raspberry Pi image is coming soon.</p>
+      <p>Pick the format that suits your setup. Docker is the recommended path; a pre-built VM appliance image is available now for VirtualBox, VMware and Proxmox. A Raspberry Pi installation script is also available.</p>
     </section>
 
     <section class="section" data-reveal>
       <div class="dl-grid">
         <div class="dl-card">
-          <span class="badge ready">available now</span>
           <h3>Docker</h3>
           <p>The full four-container stack (frontend · backend · probe · postgres) via Docker Compose. The recommended way to run InSpectre on any Linux host, NAS, or home server.</p>
-          <a href="https://github.com/thefunkygibbon/InSpectre" class="btn btn-primary" target="_blank" rel="noopener">get from github</a>
+          <a href="#quick-install" class="btn btn-primary">quick install</a>
+          <a href="https://github.com/thefunkygibbon/InSpectre" class="btn btn-ghost" target="_blank" rel="noopener">get from github</a>
           <a href="https://hub.docker.com/u/thefunkygibbon" class="btn btn-ghost" target="_blank" rel="noopener">docker hub images</a>
         </div>
         <div class="dl-card">
-          <span class="badge ready">available now</span>
           <h3>Virtual Machine</h3>
-          <p>A self-contained qcow2 appliance with InSpectre pre-installed. Import into VirtualBox, VMware, or Proxmox and boot straight into the setup wizard. Online variant pulls containers from Docker Hub on first boot.</p>
-          <a href="https://github.com/thefunkygibbon/InSpectre/releases/download/vm-v1.0/inspectre-vm-online.qcow2.xz" class="btn btn-primary">download vm image</a>
+          <p>A self-contained qcow2 appliance with InSpectre pre-installed. Works out of the box on QEMU/KVM, Proxmox, and libvirt. Can be easily converted using the provided script to support VMware (ESXi, Workstation, Fusion), VirtualBox, Hyper-V, and cloud platforms.</p>
+          <a href="https://github.com/thefunkygibbon/InSpectre/releases/latest" class="btn btn-primary" target="_blank" rel="noopener">download vm image</a>
           <a href="https://github.com/thefunkygibbon/InSpectre/releases/tag/vm-v1.0" class="btn btn-ghost" target="_blank" rel="noopener">release notes</a>
         </div>
         <div class="dl-card">
-          <span class="badge soon">coming soon</span>
           <h3>Raspberry Pi</h3>
-          <p>A flashable Raspberry Pi OS image with InSpectre baked in. Write it to an SD card, power on your Pi, and your network monitor is live.</p>
-          <a href="#notify" class="btn btn-ghost" aria-disabled="true">coming soon</a>
+          <p>A lightweight installation script to deploy InSpectre onto an existing Raspberry Pi already running Docker. Run the script, configure your settings, and your network monitor is live.</p>
+          <a href="#quick-install" class="btn btn-primary">quick install</a>
         </div>
       </div>
     </section>
 
-    <section class="section" data-reveal>
+    <section class="section" id="quick-install" data-reveal>
       <div class="section-head">
         <h2><span class="prefix">#</span> Quick install</h2>
         <p>One command downloads InSpectre and walks you through the setup — no git clone required.</p>
@@ -126,21 +124,6 @@ cd InSpectre
         <div><h3>host</h3><p>Any 64-bit Linux host with access to the network you want to monitor. The probe runs on the host network.</p></div>
         <div><h3>software</h3><p>Docker Engine 24+ and the Docker Compose v2 plugin. No other dependencies to install.</p></div>
         <div><h3>network</h3><p>A flat Layer-2 LAN for full ARP discovery &amp; blocking. The probe auto-detects your interface and subnet.</p></div>
-      </div>
-    </section>
-
-    <section class="term cta-term" id="notify" data-reveal>
-      <div class="term-bar">
-        <span class="term-dot"></span><span class="term-dot"></span><span class="term-dot"></span>
-        <span class="term-title">roadmap — pi</span>
-      </div>
-      <div class="term-body">
-        <h2 class="cta-h">Raspberry Pi image is coming.</h2>
-        <p class="lead">A flashable Raspberry Pi OS image is in the works. Watch the repository to be the first to know when it lands. In the meantime, the VM appliance is ready to go.</p>
-        <p class="actions">
-          <a href="https://github.com/thefunkygibbon/InSpectre/releases/download/vm-v1.0/inspectre-vm-online.qcow2.xz" class="btn btn-primary">▸ download vm image</a>
-          <a href="https://github.com/thefunkygibbon/InSpectre" class="btn btn-ghost" target="_blank" rel="noopener">▸ watch on github</a>
-        </p>
       </div>
     </section>
 
