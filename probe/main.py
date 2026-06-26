@@ -1498,8 +1498,9 @@ def _tcp_connect_sweep(ip: str, workers: int | None = None) -> list[int]:
     except Exception as exc:
         print(f"[scan] TCP sweep error for {ip}: {exc}", flush=True)
     finally:
-        # Don't wait for hung threads — they will finish on their own via socket timeout
-        ex.shutdown(wait=False, cancel_futures=True)
+        # Wait for in-flight threads to finish — TIMEOUT=1.0s so this is bounded.
+        # wait=False was leaking hundreds of open sockets on TimeoutError.
+        ex.shutdown(wait=True, cancel_futures=True)
     return sorted(open_ports)
 
 

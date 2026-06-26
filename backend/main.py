@@ -3679,7 +3679,7 @@ def get_ip_history(mac: str, db: Session = Depends(get_db)):
 
 
 @app.post("/devices/{mac}/set-primary-ip")
-def set_primary_ip(mac: str, payload: PrimaryIPUpdate, db: Session = Depends(get_db)):
+async def set_primary_ip(mac: str, payload: PrimaryIPUpdate, db: Session = Depends(get_db)):
     d = db.get(Device, mac.lower())
     if not d:
         raise HTTPException(404, "Device not found")
@@ -3705,12 +3705,17 @@ def set_primary_ip(mac: str, payload: PrimaryIPUpdate, db: Session = Depends(get
     db.commit()
     db.refresh(d)
 
-    try:
-        httpx.post(f"{PROBE_URL}/rescan/{mac.lower()}", timeout=10.0, headers=_probe_headers())
-    except Exception:
-        pass
+    result = {"ok": True, "device": _to_dict(d)}
 
-    return {"ok": True, "device": _to_dict(d)}
+    async def _trigger_rescan():
+        try:
+            async with _probe_client(timeout=3.0) as client:
+                await client.post(f"{PROBE_URL}/rescan/{mac.lower()}")
+        except Exception:
+            pass
+    asyncio.ensure_future(_trigger_rescan())
+
+    return result
 
 
 @app.post("/devices/{mac}/unpin-ip")
