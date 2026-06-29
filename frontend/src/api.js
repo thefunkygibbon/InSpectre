@@ -116,6 +116,11 @@ export const api = {
   getIpHistory:    (mac)        => request('GET',   `/devices/${mac}/ip-history`),
   setPrimaryIp:    (mac, ip)    => request('POST',  `/devices/${mac}/set-primary-ip`, { ip_address: ip }),
   unpinPrimaryIp:  (mac)        => request('POST',  `/devices/${mac}/unpin-ip`),
+  getIpManagement: ()           => request('GET',   '/devices/ip-management'),
+  exportIpsCsv: () => {
+    const token = getToken()
+    return fetch(`${BASE}/export/ips-csv`, { headers: token ? { Authorization: `Bearer ${token}` } : {} })
+  },
   getDeviceEvents: (mac, limit, type) => {
     const p = new URLSearchParams()
     if (limit) p.set('limit', limit)

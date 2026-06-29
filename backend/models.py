@@ -9,6 +9,7 @@ class Device(Base):
     __tablename__ = "devices"
     mac_address          = Column(String, primary_key=True, index=True)
     ip_address           = Column(String, nullable=True)
+    primary_ip           = Column(String, nullable=True)
     hostname             = Column(String, nullable=True)
     vendor               = Column(String, nullable=True)
     custom_name          = Column(String, nullable=True)

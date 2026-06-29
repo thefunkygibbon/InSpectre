@@ -509,6 +509,8 @@ def _migrate(db: Session):
         )""",
         # IP history: differentiate DHCP rotation from multi-homed
         "ALTER TABLE ip_history ADD COLUMN IF NOT EXISTS seen_while_online BOOLEAN",
+        # User-pinned primary IP (probe's source of truth for locked devices)
+        "ALTER TABLE devices ADD COLUMN IF NOT EXISTS primary_ip        VARCHAR",
         # Prevent probe from overriding user-pinned primary IPs
         "ALTER TABLE devices ADD COLUMN IF NOT EXISTS primary_ip_locked BOOLEAN NOT NULL DEFAULT FALSE",
         # DHCP fingerprinting — passively captured by probe sniffer
@@ -599,6 +601,39 @@ def _migrate(db: Session):
         except Exception:
             db.rollback()
     db.commit()
+
+    # Install the primary-IP lock trigger as a DB-level backstop against
+    # the probe ever overwriting a user-pinned IP.
+    # The trigger fires whenever OLD.primary_ip_locked=TRUE (regardless of NEW),
+    # unconditionally restoring primary_ip and ip_address from the OLD row.
+    # The backend's two-step re-pin still works:
+    #   Step 1 — SET locked=FALSE: trigger fires but primary_ip isn't changing
+    #            (NEW.primary_ip == OLD.primary_ip), so no visible effect.
+    #   Step 2 — SET primary_ip=X, locked=TRUE: OLD.locked=FALSE, trigger
+    #            doesn't fire, the new pin is written normally.
+    try:
+        db.execute(text("""
+            CREATE OR REPLACE FUNCTION enforce_primary_ip_lock() RETURNS trigger AS $$
+            BEGIN
+                IF OLD.primary_ip_locked THEN
+                    NEW.primary_ip := OLD.primary_ip;
+                    NEW.ip_address := OLD.ip_address;
+                END IF;
+                RETURN NEW;
+            END;
+            $$ LANGUAGE plpgsql
+        """))
+        db.execute(text("DROP TRIGGER IF EXISTS trg_enforce_primary_ip_lock ON devices"))
+        db.execute(text("""
+            CREATE TRIGGER trg_enforce_primary_ip_lock
+                BEFORE UPDATE ON devices
+                FOR EACH ROW
+                EXECUTE FUNCTION enforce_primary_ip_lock()
+        """))
+        db.commit()
+    except Exception as _te:
+        print(f"[migrate] primary_ip_lock trigger (non-fatal): {_te}", flush=True)
+        db.rollback()
 
 
 # ---------------------------------------------------------------------------
@@ -2574,6 +2609,10 @@ class SetupCompleteRequest(BaseModel):
     notifications_enabled: bool  = True
     ntfy_topic:           str    = ""
     ntfy_url:             str    = "https://ntfy.sh"
+    gotify_url:           str    = ""
+    gotify_token:         str    = ""
+    pushbullet_api_key:   str    = ""
+    alert_webhook_url:    str    = ""
     docker_enabled:       bool   = False
     docker_host:          str    = "unix:///var/run/docker.sock"
     fingerbank_api_key:   str    = ""
@@ -3202,6 +3241,41 @@ def setup_complete(
         else:
             db.add(Setting(key=key, value=value))
     db.commit()
+
+    # Write notification channel directly to notification_channels so it appears
+    # in the Notifications settings panel immediately without requiring a restart.
+    # Build list of (service, display_name, config_dict) tuples from wizard input.
+    new_channels = []
+    if payload.ntfy_topic.strip():
+        new_channels.append(("ntfy", "ntfy", {
+            "server": (payload.ntfy_url or "https://ntfy.sh").strip(),
+            "topic":  payload.ntfy_topic.strip(),
+        }))
+    if payload.gotify_url.strip() and payload.gotify_token.strip():
+        new_channels.append(("gotify", "Gotify", {
+            "server": payload.gotify_url.strip(),
+            "token":  payload.gotify_token.strip(),
+        }))
+    if payload.pushbullet_api_key.strip():
+        new_channels.append(("pushbullet", "Pushbullet", {
+            "api_key": payload.pushbullet_api_key.strip(),
+        }))
+    if payload.alert_webhook_url.strip():
+        new_channels.append(("webhook", "Webhook", {
+            "url": payload.alert_webhook_url.strip(),
+        }))
+
+    for svc, name, cfg in new_channels:
+        # Replace any existing channel of the same service type so re-running
+        # the wizard doesn't create duplicates.
+        db.execute(text("DELETE FROM notification_channels WHERE service = :s"), {"s": svc})
+        db.execute(
+            text("INSERT INTO notification_channels (name, service, config, enabled) VALUES (:n, :s, :c, true)"),
+            {"n": name, "s": svc, "c": json.dumps(cfg)},
+        )
+    if new_channels:
+        db.commit()
+
     return {"ok": True, "setup_complete": True}
 
 
@@ -3427,6 +3501,29 @@ def list_devices(
         pid = dct.get("person_id")
         if pid:
             dct["person_name"] = person_name_map.get(pid)
+        result.append(dct)
+    return result
+
+
+@app.get("/devices/ip-management")
+def get_ip_management(db: Session = Depends(get_db)):
+    devices = db.query(Device).order_by(Device.last_seen.desc()).all()
+    history_rows = db.execute(
+        text("SELECT mac_address, ip_address, first_seen, last_seen, seen_while_online FROM ip_history ORDER BY mac_address, last_seen DESC")
+    ).fetchall()
+    ip_map: dict = {}
+    for r in history_rows:
+        ip_map.setdefault(r[0], []).append({
+            "ip":              r[1],
+            "first_seen":      r[2].isoformat() if r[2] else None,
+            "last_seen":       r[3].isoformat() if r[3] else None,
+            "seen_while_online": bool(r[4]),
+        })
+    result = []
+    for d in devices:
+        dct = _to_dict(d)
+        dct["effective_ip"] = getattr(d, "primary_ip", None) or d.ip_address
+        dct["ips"] = ip_map.get(d.mac_address, [])
         result.append(dct)
     return result
 
@@ -3678,6 +3775,33 @@ def get_ip_history(mac: str, db: Session = Depends(get_db)):
         return []
 
 
+@app.get("/export/ips-csv")
+def export_ips_csv(db: Session = Depends(get_db)):
+    """Export all IP history as CSV."""
+    import io, csv
+    rows = db.execute(text("""
+        SELECT d.mac_address, COALESCE(d.custom_name, d.hostname, d.ip_address) AS name,
+               h.ip_address, h.first_seen, h.last_seen, h.seen_while_online,
+               d.primary_ip, d.primary_ip_locked, d.is_online
+        FROM ip_history h
+        JOIN devices d ON d.mac_address = h.mac_address
+        ORDER BY d.mac_address, h.last_seen DESC
+    """)).fetchall()
+
+    buf = io.StringIO()
+    w = csv.writer(buf)
+    w.writerow(["mac_address", "device_name", "ip_address", "first_seen", "last_seen", "seen_while_online", "primary_ip", "primary_ip_locked", "is_online"])
+    for r in rows:
+        w.writerow([r[0], r[1], r[2],
+                    r[3].isoformat() if r[3] else "",
+                    r[4].isoformat() if r[4] else "",
+                    r[5], r[6], r[7], r[8]])
+
+    from fastapi.responses import StreamingResponse as _SR
+    return _SR(iter([buf.getvalue()]), media_type="text/csv",
+               headers={"Content-Disposition": "attachment; filename=inspectre-ip-management.csv"})
+
+
 @app.post("/devices/{mac}/set-primary-ip")
 async def set_primary_ip(mac: str, payload: PrimaryIPUpdate, db: Session = Depends(get_db)):
     d = db.get(Device, mac.lower())
@@ -3695,15 +3819,43 @@ async def set_primary_ip(mac: str, payload: PrimaryIPUpdate, db: Session = Depen
     if not row and d.ip_address != target_ip:
         raise HTTPException(404, "IP not found in device history")
 
-    old_primary = getattr(d, 'primary_ip', None) or d.ip_address
-    d.primary_ip = target_ip
-    d.primary_ip_locked = True
-    d.ip_address = target_ip
-    d.deep_scanned = False
-    d.scan_results = None
+    old_primary = d.primary_ip or d.ip_address
+
+    # The probe installs a BEFORE UPDATE trigger that reverts primary_ip/ip_address
+    # when both OLD.primary_ip_locked AND NEW.primary_ip_locked are TRUE — to stop
+    # the probe overwriting a user pin.  Re-pinning an already-locked device hits
+    # that condition.  Work around it with two updates in the same transaction:
+    #   1. Unlock (OLD=T→NEW=F): trigger condition False, write succeeds.
+    #   2. Re-pin (OLD=F→NEW=T): trigger condition False, write succeeds.
+    # Both updates are invisible outside this transaction so no race with the probe.
+    db.execute(
+        text("UPDATE devices SET primary_ip_locked = FALSE WHERE mac_address = :mac"),
+        {"mac": mac.lower()},
+    )
+    db.execute(
+        text("""UPDATE devices
+                   SET primary_ip   = :ip,
+                       ip_address   = :ip,
+                       primary_ip_locked = TRUE,
+                       deep_scanned = FALSE,
+                       scan_results = NULL
+                 WHERE mac_address  = :mac"""),
+        {"ip": target_ip, "mac": mac.lower()},
+    )
     _add_event(db, mac.lower(), 'primary_ip_changed', {'old_primary_ip': old_primary, 'new_primary_ip': target_ip})
     db.commit()
     db.refresh(d)
+
+    # Verify the pin was written correctly — the DB trigger or a concurrent
+    # update could silently prevent it.
+    if d.primary_ip != target_ip or not d.primary_ip_locked:
+        print(
+            f"[set-primary-ip] WARN: pin verification failed for {mac}: "
+            f"expected primary={target_ip} locked=True, "
+            f"got primary={d.primary_ip} locked={d.primary_ip_locked}",
+            flush=True,
+        )
+        raise HTTPException(500, "Pin did not take effect — the device may have a conflicting lock. Please try again.")
 
     result = {"ok": True, "device": _to_dict(d)}
 

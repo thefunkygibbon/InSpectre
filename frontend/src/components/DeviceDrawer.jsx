@@ -154,14 +154,16 @@ function IpHistorySection({ mac, primaryIp, primaryIpLocked, currentIp, onPrimar
       {history.map((row, i) => {
         const role  = rowRole(row)
         const badge = ROLE_BADGE[role]
-        // The effective primary (green "Current", or the locked "Pinned" IP) is the
-        // only row that can't be pinned. Every OTHER IP in the device's history —
-        // secondaries and older DHCP IPs alike — can be pinned manually, so a
-        // multi-homed host whose primary was auto-detected wrongly can always be
-        // corrected. The backend validates the IP exists in history.
         const isEffectivePrimary = role === 'pinned' || role === 'primary'
         const isPinnable = !isEffectivePrimary
         const isActive   = isEffectivePrimary || role === 'active_secondary'
+        // Label and tooltip differ depending on whether we're setting a new pin
+        // or changing an existing one — making it obvious that clicking will
+        // override the current pin rather than silently reverting it.
+        const pinLabel   = primaryIpLocked ? 'Change pin' : 'Pin'
+        const pinTitle   = primaryIpLocked
+          ? `Change pin from ${primaryIp} to ${row.ip}`
+          : 'Pin this as the primary IP for scanning'
         return (
           <div key={i} className="flex items-center gap-2 py-1.5 border-b border-border last:border-0">
             <div className="flex-1 min-w-0" style={{ opacity: isActive ? 1 : 0.6 }}>
@@ -185,8 +187,8 @@ function IpHistorySection({ mac, primaryIp, primaryIpLocked, currentIp, onPrimar
                 disabled={setting !== null}
                 className="shrink-0 text-[10px] px-2 py-1 rounded border font-medium transition-colors"
                 style={{ borderColor: 'rgba(245,158,11,0.4)', color: '#f59e0b' }}
-                title="Pin this as the primary IP for scanning">
-                {setting === row.ip ? '…' : 'Pin'}
+                title={pinTitle}>
+                {setting === row.ip ? '…' : pinLabel}
               </button>
             )}
           </div>

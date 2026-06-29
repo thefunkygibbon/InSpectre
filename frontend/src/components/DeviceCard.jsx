@@ -1,4 +1,3 @@
-import { memo } from 'react'
 import {
   Wifi, Laptop, Smartphone, Server, Printer, Tv,
   HelpCircle, Camera, Gamepad2, Cpu, Router,
@@ -96,7 +95,7 @@ function isNewDevice(device) {
   return Date.now() - new Date(device.first_seen).getTime() < NEW_DEVICE_DAYS * 24 * 60 * 60 * 1000
 }
 
-function DeviceCardBase({ device, onClick, onStarToggle, isVulnScanning, isAcknowledged, onAcknowledge }) {
+export function DeviceCard({ device, onClick, onStarToggle, isVulnScanning, isAcknowledged, onAcknowledge }) {
   const name     = deviceDisplayName(device)
   const vendor   = cleanVendor(device.vendor_override || device.vendor || device.vendor_inferred)
   const DevIcon  = getDeviceIcon(device)
@@ -142,26 +141,22 @@ function DeviceCardBase({ device, onClick, onStarToggle, isVulnScanning, isAckno
 
           {/* NEW badge — absolutely overlaid on the right of the name line */}
           {showNew && (
-            onAcknowledge ? (
-              <button
-                type="button"
-                onClick={e => { e.stopPropagation(); onAcknowledge(device.mac_address) }}
-                className="absolute top-0 right-0 flex items-center gap-0.5 text-[10px] font-bold rounded-full px-2 py-0.5 transition-opacity hover:opacity-90"
-                style={{ color: '#10b981', background: 'rgba(16,185,129,0.18)', border: '1px solid rgba(16,185,129,0.4)' }}
-                title="Acknowledge — stop surfacing to top"
-                aria-label="Acknowledge new device"
-              >
-                NEW
-                <X size={8} className="opacity-60" />
-              </button>
-            ) : (
-              <span
-                className="absolute top-0 right-0 flex items-center gap-0.5 text-[10px] font-bold rounded-full px-2 py-0.5"
-                style={{ color: '#10b981', background: 'rgba(16,185,129,0.18)', border: '1px solid rgba(16,185,129,0.4)' }}
-              >
-                NEW
-              </span>
-            )
+            <span
+              className="absolute top-0 right-0 flex items-center gap-0.5 text-[10px] font-bold rounded-full px-2 py-0.5"
+              style={{ color: '#10b981', background: 'rgba(16,185,129,0.18)', border: '1px solid rgba(16,185,129,0.4)' }}
+            >
+              NEW
+              {onAcknowledge && (
+                <button
+                  onClick={e => { e.stopPropagation(); onAcknowledge(device.mac_address) }}
+                  className="opacity-60 hover:opacity-100 transition-opacity ml-0.5"
+                  title="Acknowledge — stop surfacing to top"
+                  aria-label="Acknowledge new device"
+                >
+                  <X size={8} />
+                </button>
+              )}
+            </span>
           )}
 
           {showVendorSubtitle && (
@@ -279,5 +274,3 @@ function DeviceCardBase({ device, onClick, onStarToggle, isVulnScanning, isAckno
     </button>
   )
 }
-
-export const DeviceCard = memo(DeviceCardBase)
