@@ -4,6 +4,7 @@ import {
   Network, HardDrive, Tag, Terminal, ShieldAlert, ShieldCheck,
   Settings2, Clock, ExternalLink, Eye, EyeOff, Loader2, FileText, Download, FileDown,
   Copy, Check, GitMerge, Info, Trash2, RotateCw, AlertTriangle,
+  RefreshCw, ArrowUpCircle, Shield, Pin, PinOff, Database,
 } from 'lucide-react'
 import { api } from '../api'
 import { exportContainerVulnPDF } from '../utils/vulnPdfExport'
@@ -57,6 +58,7 @@ const TABS = [
   { id: 'compose',  label: 'Compose'   },
   { id: 'logs',     label: 'Logs'      },
   { id: 'vuln',     label: 'Vuln Scan' },
+  { id: 'updates',  label: 'Updates'   },
   { id: 'admin',    label: 'Admin'     },
 ]
 
@@ -707,10 +709,619 @@ function ConfigSection({ container, isProxmox, onContainerUpdate }) {
   )
 }
 
-export function ContainerDrawer({ container: initialContainer, trivyScan, updateTrivyScan, initialTab, onClose, onContainerUpdate }) {
+// ── UpdatesTab ─────────────────────────────────────────────────────────────────
+
+function relAge(iso) {
+  if (!iso) return null
+  const diff = Date.now() - new Date(iso).getTime()
+  if (diff < 60000) return 'just now'
+  const mins = Math.floor(diff / 60000)
+  if (mins < 60) return `${mins}m ago`
+  const hrs = Math.floor(mins / 60)
+  if (hrs < 24) return `${hrs}h ago`
+  return `${Math.floor(hrs / 24)}d ago`
+}
+
+function SevBadge({ count, sev }) {
+  if (!count) return null
+  const cfg = {
+    critical: { color: '#ef4444', bg: 'rgba(239,68,68,0.12)'  },
+    high:     { color: '#f97316', bg: 'rgba(249,115,22,0.12)' },
+    medium:   { color: '#f59e0b', bg: 'rgba(245,158,11,0.12)' },
+    low:      { color: '#6b7280', bg: 'rgba(107,114,128,0.1)' },
+  }[sev] || { color: '#6b7280', bg: 'rgba(107,114,128,0.1)' }
+  return (
+    <span className="text-[11px] font-bold rounded-full px-2 py-0.5"
+      style={{ color: cfg.color, background: cfg.bg }}>
+      {count} {sev}
+    </span>
+  )
+}
+
+// Detect InSpectre stack containers by name (matches backend _INSPECTRE_STACK dict)
+const INSPECTRE_STACK = {
+  'inspectre-web':      'self',
+  'inspectre-db':       'db',
+  'inspectre-frontend': 'stack',
+  'inspectre-probe':    'stack',
+}
+
+function InspectreStackNotice({ role, name }) {
+  if (role === 'self') return (
+    <div className="rounded-lg p-3 space-y-1.5"
+      style={{ background: 'rgba(56,189,248,0.07)', border: '1px solid rgba(56,189,248,0.3)' }}>
+      <p className="text-xs font-semibold" style={{ color: '#38bdf8' }}>
+        InSpectre self-update
+      </p>
+      <p className="text-xs" style={{ color: 'var(--color-text-muted)' }}>
+        <strong>{name}</strong> is the InSpectre backend. Updates use a helper container so the
+        process completes safely — the interface will go offline briefly and reconnect automatically.
+        Do not manually interact with the stack while the update is in progress.
+      </p>
+    </div>
+  )
+  if (role === 'db') return (
+    <div className="rounded-lg p-4 space-y-2"
+      style={{ background: 'rgba(239,68,68,0.08)', border: '1px solid rgba(239,68,68,0.3)' }}>
+      <p className="text-xs font-semibold" style={{ color: '#ef4444' }}>
+        Cannot update the database container
+      </p>
+      <p className="text-xs" style={{ color: 'var(--color-text-muted)' }}>
+        Stopping <strong>{name}</strong> mid-update would sever all active database
+        connections and could leave data in an inconsistent state. This is intentionally blocked.
+      </p>
+      <p className="text-xs font-medium" style={{ color: '#f59e0b' }}>
+        Use Settings → About → Update InSpectre for a safe, coordinated stack update.
+      </p>
+    </div>
+  )
+  return (
+    <div className="rounded-lg p-3"
+      style={{ background: 'rgba(245,158,11,0.08)', border: '1px solid rgba(245,158,11,0.3)' }}>
+      <p className="text-xs" style={{ color: '#f59e0b' }}>
+        <strong>{name}</strong> is part of the InSpectre stack. Individual updates are
+        allowed but may disrupt the application. Consider using
+        <strong> Settings → About → Update InSpectre</strong> for a coordinated update instead.
+      </p>
+    </div>
+  )
+}
+
+function UpdatesTab({ container, updateStatus: initialStatus }) {
+  const [status,      setStatus]      = useState(initialStatus || null)
+  const [checking,    setChecking]    = useState(false)
+  const [logs,        setLogs]        = useState([])
+  const [streaming,   setStreaming]   = useState(false)
+  const [streamMode,  setStreamMode]  = useState(null)   // 'scan' | 'update'
+  const [scanResult,  setScanResult]  = useState(null)
+  const [backups,     setBackups]     = useState(null)
+  const [showBackups, setShowBackups] = useState(false)
+
+  const stackRole = INSPECTRE_STACK[container.name] || null
+  const [confirm,          setConfirm]          = useState(null)   // null | 'update' | 'force'
+  const [selfUpdateStarted, setSelfUpdateStarted] = useState(false)
+  const abortRef      = useRef(null)
+  const logEndRef     = useRef(null)
+  const reconnectRef  = useRef(null)
+
+  // Reconnect polling — fires after self-update sends SELF_UPDATE_STARTED
+  useEffect(() => {
+    if (!selfUpdateStarted) return
+    reconnectRef.current = setInterval(async () => {
+      try {
+        const ok = await fetch('/api/ping').then(r => r.ok)
+        if (ok) {
+          clearInterval(reconnectRef.current)
+          window.location.reload()
+        }
+      } catch (_) {}
+    }, 5000)
+    return () => clearInterval(reconnectRef.current)
+  }, [selfUpdateStarted])
+
+  useEffect(() => {
+    if (initialStatus == null) { setStatus(null); return }
+    setStatus(s => {
+      if (!s) return initialStatus
+      // Bulk poll has limited fields — preserve locally-enriched digest/scan data
+      return {
+        ...s,
+        has_update:         initialStatus.has_update,
+        update_blocked:     initialStatus.update_blocked,
+        blocked_reason:     initialStatus.blocked_reason,
+        update_in_progress: initialStatus.update_in_progress,
+        last_update_status: initialStatus.last_update_status,
+        pinned:             initialStatus.pinned,
+        checked_at:         initialStatus.checked_at,
+        last_updated_at:    initialStatus.last_updated_at,
+        // Prefer local (richer) digest over bulk poll ONLY if bulk poll lacks them
+        current_digest: initialStatus.current_digest ?? s.current_digest,
+        latest_digest:  initialStatus.latest_digest  ?? s.latest_digest,
+      }
+    })
+  }, [initialStatus])
+
+  useEffect(() => {
+    if (logEndRef.current) logEndRef.current.scrollIntoView({ behavior: 'smooth' })
+  }, [logs])
+
+  // Refresh status from API
+  async function refreshStatus() {
+    try {
+      const s = await api.dockerContainerUpdateStatus(container.id)
+      setStatus(s)
+    } catch (_) {}
+  }
+
+  async function checkNow() {
+    setChecking(true)
+    try {
+      const res = await api.dockerCheckUpdate(container.id)
+      setStatus(s => ({ ...s, ...res }))
+    } catch (e) {
+      setLogs(l => [...l, `[ERROR] ${e.message}`])
+    } finally {
+      setChecking(false)
+    }
+  }
+
+  function startStream(mode, force = false, scanFirst = true) {
+    if (streaming) return
+    setLogs([])
+    setScanResult(null)
+    setStreamMode(mode)
+    setStreaming(true)
+    setConfirm(null)
+
+    const ctrl = new AbortController()
+    abortRef.current = ctrl
+
+    const onLine = line => {
+      if (line.startsWith('SCAN_RESULT:')) {
+        try { setScanResult(JSON.parse(line.slice(12))) } catch (_) {}
+        return
+      }
+      if (line === 'SELF_UPDATE_STARTED') {
+        setStreaming(false)
+        setSelfUpdateStarted(true)
+        return
+      }
+      if (line.startsWith('UPDATE_ERROR:')) {
+        setLogs(l => [...l, '❌ ' + line.slice(12)])
+        setStreaming(false)
+        refreshStatus()
+        return
+      }
+      if (line.startsWith('UPDATE_DONE:') || line.startsWith('UPDATE_BLOCKED:') || line.startsWith('SCAN_DONE:')) {
+        setStreaming(false)
+        refreshStatus()
+        return
+      }
+      setLogs(l => [...l, line.replace(/^LOG:\s*/, '')])
+    }
+
+    if (mode === 'scan') {
+      api.dockerScanNewImage(container.id, onLine, ctrl.signal).catch(() => setStreaming(false))
+    } else {
+      api.dockerSafeUpdate(container.id, { force, scan_first: scanFirst }, onLine, ctrl.signal)
+        .catch(() => setStreaming(false))
+    }
+  }
+
+  function stopStream() {
+    abortRef.current?.abort()
+    setStreaming(false)
+  }
+
+  async function loadBackups() {
+    try {
+      const b = await api.dockerListBackups(container.id)
+      setBackups(b)
+    } catch (_) {}
+  }
+
+  async function manualBackup() {
+    try {
+      await api.dockerBackupContainer(container.id)
+      loadBackups()
+    } catch (e) {
+      setLogs(l => [...l, `[ERROR] Backup failed: ${e.message}`])
+    }
+  }
+
+  async function togglePin() {
+    try {
+      await api.dockerPinContainer(container.id, !(status?.pinned))
+      refreshStatus()
+    } catch (_) {}
+  }
+
+  async function downloadBackupCompose(backupId, name) {
+    try {
+      const res = await api.dockerGetBackupCompose(backupId)
+      const blob = new Blob([res.compose_yaml], { type: 'text/yaml' })
+      const url  = URL.createObjectURL(blob)
+      const a    = document.createElement('a'); a.href = url
+      a.download = `${name}_backup_${backupId}.yaml`
+      a.click(); URL.revokeObjectURL(url)
+    } catch (_) {}
+  }
+
+  const hasUpdate      = status?.has_update
+  const isBlocked      = status?.update_blocked && hasUpdate
+  const isUpdating     = status?.update_in_progress
+  const isPinned       = status?.pinned
+  const updateDisabled = stackRole === 'db'
+
+  const scanVulns  = status?.new_image_vulns || []
+  const scanCrit   = (scanVulns).filter(v => v.severity === 'critical').length
+  const scanHigh   = (scanVulns).filter(v => v.severity === 'high').length
+
+  // Full-tab reconnect overlay shown after self-update handoff
+  if (selfUpdateStarted) return (
+    <div className="flex flex-col items-center justify-center py-16 gap-5 text-center">
+      <div className="relative w-14 h-14">
+        <div className="absolute inset-0 rounded-full animate-ping opacity-30"
+          style={{ background: 'rgba(56,189,248,0.4)' }} />
+        <div className="relative w-14 h-14 rounded-full flex items-center justify-center"
+          style={{ background: 'rgba(56,189,248,0.12)', border: '2px solid rgba(56,189,248,0.4)' }}>
+          <Loader2 size={22} className="animate-spin" style={{ color: '#38bdf8' }} />
+        </div>
+      </div>
+      <div className="space-y-1.5">
+        <p className="text-sm font-semibold" style={{ color: 'var(--color-text)' }}>
+          InSpectre is restarting…
+        </p>
+        <p className="text-xs max-w-xs" style={{ color: 'var(--color-text-muted)' }}>
+          The helper container is applying the update. This page will reload automatically
+          when the new backend comes online.
+        </p>
+      </div>
+      <p className="text-[10px] font-mono" style={{ color: 'var(--color-text-faint)' }}>
+        Polling /api/ping every 5 s…
+      </p>
+    </div>
+  )
+
+  return (
+    <div className="space-y-4">
+
+      {/* ── InSpectre stack warning ── */}
+      {stackRole && <InspectreStackNotice role={stackRole} name={container.name} />}
+
+      {/* ── Status card ── */}
+      <div className="card p-4 space-y-3">
+        <div className="flex items-center justify-between gap-2">
+          <span className="text-sm font-semibold flex items-center gap-1.5" style={{ color: 'var(--color-text)' }}>
+            <ArrowUpCircle size={14} style={{ color: 'var(--color-brand)' }} />
+            Update Status
+          </span>
+          <div className="flex items-center gap-2">
+            {isPinned && (
+              <span className="text-[10px] font-medium rounded-full px-2 py-0.5"
+                style={{ color: 'var(--color-text-muted)', background: 'rgba(107,114,128,0.1)', border: '1px solid rgba(107,114,128,0.2)' }}>
+                Pinned
+              </span>
+            )}
+            {isUpdating ? (
+              <span className="text-[10px] font-bold rounded-full px-2 py-0.5 animate-pulse"
+                style={{ color: '#60a5fa', background: 'rgba(96,165,250,0.12)', border: '1px solid rgba(96,165,250,0.3)' }}>
+                Updating…
+              </span>
+            ) : isBlocked ? (
+              <span className="text-[10px] font-bold rounded-full px-2 py-0.5"
+                style={{ color: '#f97316', background: 'rgba(249,115,22,0.12)', border: '1px solid rgba(249,115,22,0.3)' }}>
+                ⚠ Update Blocked
+              </span>
+            ) : hasUpdate ? (
+              <span className="text-[10px] font-bold rounded-full px-2 py-0.5"
+                style={{ color: '#38bdf8', background: 'rgba(56,189,248,0.12)', border: '1px solid rgba(56,189,248,0.3)' }}>
+                Update Available
+              </span>
+            ) : status?.last_update_status === 'success' ? (
+              <span className="text-[10px] font-bold rounded-full px-2 py-0.5"
+                style={{ color: '#10b981', background: 'rgba(16,185,129,0.12)', border: '1px solid rgba(16,185,129,0.3)' }}>
+                ✓ Up to date
+              </span>
+            ) : status ? (
+              <span className="text-[10px] rounded-full px-2 py-0.5"
+                style={{ color: 'var(--color-text-muted)', background: 'rgba(107,114,128,0.08)' }}>
+                Not checked
+              </span>
+            ) : null}
+          </div>
+        </div>
+
+        {/* Image + digests */}
+        <div className="grid grid-cols-[auto_1fr] gap-x-3 gap-y-1.5 text-xs">
+          <span style={{ color: 'var(--color-text-muted)' }}>Image</span>
+          <span className="font-mono truncate" style={{ color: 'var(--color-text)' }}>{container.image || '—'}</span>
+
+          {status?.current_digest && (
+            <>
+              <span style={{ color: 'var(--color-text-muted)' }}>Running</span>
+              <span className="font-mono text-[11px]" style={{ color: 'var(--color-text-muted)' }}>
+                {status.current_digest.slice(0, 19)}…
+              </span>
+            </>
+          )}
+          {status?.latest_digest && hasUpdate && (
+            <>
+              <span style={{ color: 'var(--color-text-muted)' }}>Registry</span>
+              <span className="font-mono text-[11px]" style={{ color: '#38bdf8' }}>
+                {status.latest_digest.slice(0, 19)}… (newer)
+              </span>
+            </>
+          )}
+          {status?.checked_at && (
+            <>
+              <span style={{ color: 'var(--color-text-muted)' }}>Checked</span>
+              <span style={{ color: 'var(--color-text-faint)' }}>{relAge(status.checked_at)}</span>
+            </>
+          )}
+          {status?.last_updated_at && (
+            <>
+              <span style={{ color: 'var(--color-text-muted)' }}>Last update</span>
+              <span style={{ color: 'var(--color-text-faint)' }}>{relAge(status.last_updated_at)}</span>
+            </>
+          )}
+        </div>
+
+        {/* Blocked reason */}
+        {isBlocked && status?.blocked_reason && (
+          <div className="rounded-lg px-3 py-2 text-xs"
+            style={{ background: 'rgba(249,115,22,0.08)', border: '1px solid rgba(249,115,22,0.25)', color: '#f97316' }}>
+            <strong>Blocked:</strong> {status.blocked_reason}
+          </div>
+        )}
+
+        {/* Last update error */}
+        {status?.last_update_status === 'failed' && status?.last_update_error && (
+          <div className="rounded-lg px-3 py-2 text-xs"
+            style={{ background: 'rgba(239,68,68,0.08)', border: '1px solid rgba(239,68,68,0.25)', color: '#ef4444' }}>
+            <strong>Last update failed:</strong> {status.last_update_error}
+          </div>
+        )}
+        {status?.last_update_status === 'rolled_back' && (
+          <div className="rounded-lg px-3 py-2 text-xs"
+            style={{ background: 'rgba(249,115,22,0.08)', border: '1px solid rgba(249,115,22,0.25)', color: '#f97316' }}>
+            Last update failed — container was automatically rolled back to the previous version.
+          </div>
+        )}
+
+        {/* Check now button */}
+        <div className="flex items-center gap-2 pt-1">
+          <button onClick={checkNow} disabled={checking || streaming}
+            className="btn-ghost flex items-center gap-1.5 text-xs">
+            <RefreshCw size={12} className={checking ? 'animate-spin' : ''} />
+            {checking ? 'Checking…' : 'Check Now'}
+          </button>
+          <button onClick={togglePin} disabled={streaming}
+            className="btn-ghost flex items-center gap-1.5 text-xs">
+            {isPinned ? <PinOff size={12} /> : <Pin size={12} />}
+            {isPinned ? 'Unpin' : 'Pin'}
+          </button>
+        </div>
+      </div>
+
+      {/* ── Action buttons ── */}
+      <div className="card p-4 space-y-3">
+        <span className="text-sm font-semibold flex items-center gap-1.5" style={{ color: 'var(--color-text)' }}>
+          <Settings2 size={14} style={{ color: 'var(--color-brand)' }} />
+          Actions
+        </span>
+        <div className="flex flex-wrap gap-2">
+          <button onClick={() => startStream('scan')} disabled={streaming || isUpdating}
+            className="btn-ghost flex items-center gap-1.5 text-xs">
+            <Shield size={12} />
+            Scan New Image
+          </button>
+
+          {hasUpdate && !isBlocked && (
+            <button onClick={() => setConfirm('update')} disabled={streaming || isUpdating || isPinned || updateDisabled}
+              className="flex items-center gap-1.5 text-xs px-3 py-1.5 rounded-lg font-medium"
+              style={{ background: 'rgba(56,189,248,0.12)', color: '#38bdf8', border: '1px solid rgba(56,189,248,0.3)',
+                       opacity: updateDisabled ? 0.4 : 1 }}>
+              <ArrowUpCircle size={12} />
+              Update
+            </button>
+          )}
+
+          {hasUpdate && !isBlocked && (
+            <button onClick={() => setConfirm('scanupdate')} disabled={streaming || isUpdating || isPinned || updateDisabled}
+              className="flex items-center gap-1.5 text-xs px-3 py-1.5 rounded-lg font-medium"
+              style={{ background: 'rgba(56,189,248,0.12)', color: '#38bdf8', border: '1px solid rgba(56,189,248,0.3)',
+                       opacity: updateDisabled ? 0.4 : 1 }}>
+              <Shield size={12} />
+              Scan &amp; Update
+            </button>
+          )}
+
+          {isBlocked && (
+            <button onClick={() => setConfirm('force')} disabled={streaming || isUpdating || isPinned || updateDisabled}
+              className="flex items-center gap-1.5 text-xs px-3 py-1.5 rounded-lg font-medium"
+              style={{ background: 'rgba(249,115,22,0.12)', color: '#f97316', border: '1px solid rgba(249,115,22,0.3)',
+                       opacity: updateDisabled ? 0.4 : 1 }}>
+              <AlertTriangle size={12} />
+              Force Update
+            </button>
+          )}
+
+          <button onClick={manualBackup} disabled={streaming}
+            className="btn-ghost flex items-center gap-1.5 text-xs">
+            <Database size={12} />
+            Backup Now
+          </button>
+
+          {streaming && (
+            <button onClick={stopStream}
+              className="btn-ghost flex items-center gap-1.5 text-xs"
+              style={{ color: '#ef4444' }}>
+              <Square size={12} />
+              Stop
+            </button>
+          )}
+        </div>
+
+        {/* Confirm dialogs */}
+        {confirm === 'update' && (
+          <div className="rounded-lg p-3 text-xs space-y-2"
+            style={{ background: 'rgba(56,189,248,0.08)', border: '1px solid rgba(56,189,248,0.25)' }}>
+            <p style={{ color: 'var(--color-text)' }}>
+              Pull the latest image and recreate <strong>{container.name}</strong>?
+              The current config will be backed up first. If the new container fails to start,
+              the original will be automatically restored.
+            </p>
+            <div className="flex gap-2">
+              <button onClick={() => startStream('update', false, false)}
+                className="text-xs px-3 py-1 rounded font-medium"
+                style={{ background: '#38bdf8', color: '#000' }}>
+                Update (skip scan)
+              </button>
+              <button onClick={() => setConfirm(null)} className="btn-ghost text-xs">Cancel</button>
+            </div>
+          </div>
+        )}
+        {confirm === 'scanupdate' && (
+          <div className="rounded-lg p-3 text-xs space-y-2"
+            style={{ background: 'rgba(56,189,248,0.08)', border: '1px solid rgba(56,189,248,0.25)' }}>
+            <p style={{ color: 'var(--color-text)' }}>
+              Scan the new image with Trivy, then update <strong>{container.name}</strong> only if
+              no critical CVEs are found. A full config backup will be taken first.
+            </p>
+            <div className="flex gap-2">
+              <button onClick={() => startStream('update', false, true)}
+                className="text-xs px-3 py-1 rounded font-medium"
+                style={{ background: '#38bdf8', color: '#000' }}>
+                Scan &amp; Update
+              </button>
+              <button onClick={() => setConfirm(null)} className="btn-ghost text-xs">Cancel</button>
+            </div>
+          </div>
+        )}
+        {confirm === 'force' && (
+          <div className="rounded-lg p-3 text-xs space-y-2"
+            style={{ background: 'rgba(249,115,22,0.08)', border: '1px solid rgba(249,115,22,0.3)' }}>
+            <p style={{ color: '#f97316' }}>
+              <strong>Warning:</strong> This image contains critical vulnerabilities.
+              Force-updating <strong>{container.name}</strong> will proceed despite the security risk.
+              A full backup will still be taken and the update will roll back automatically if the container fails to start.
+            </p>
+            <div className="flex gap-2">
+              <button onClick={() => startStream('update', true, true)}
+                className="text-xs px-3 py-1 rounded font-medium"
+                style={{ background: '#f97316', color: '#fff' }}>
+                Force Update Anyway
+              </button>
+              <button onClick={() => setConfirm(null)} className="btn-ghost text-xs">Cancel</button>
+            </div>
+          </div>
+        )}
+      </div>
+
+      {/* ── Pre-scan CVE results ── */}
+      {(scanResult || (scanVulns.length > 0 && status?.new_image_scanned_at)) && (
+        <div className="card p-4 space-y-3">
+          <div className="flex items-center justify-between">
+            <span className="text-sm font-semibold flex items-center gap-1.5" style={{ color: 'var(--color-text)' }}>
+              <ShieldAlert size={14} style={{ color: 'var(--color-brand)' }} />
+              New Image Scan Results
+            </span>
+            {status?.new_image_scanned_at && (
+              <span className="text-[10px]" style={{ color: 'var(--color-text-faint)' }}>
+                {relAge(status.new_image_scanned_at)}
+              </span>
+            )}
+          </div>
+          <div className="flex flex-wrap gap-2">
+            <SevBadge count={(scanResult?.vulns || scanVulns).filter(v => v.severity === 'critical').length} sev="critical" />
+            <SevBadge count={(scanResult?.vulns || scanVulns).filter(v => v.severity === 'high').length} sev="high" />
+            <SevBadge count={(scanResult?.vulns || scanVulns).filter(v => v.severity === 'medium').length} sev="medium" />
+            <SevBadge count={(scanResult?.vulns || scanVulns).filter(v => v.severity === 'low').length} sev="low" />
+          </div>
+          {(scanResult?.vulns || scanVulns).length === 0 && (
+            <p className="text-xs" style={{ color: '#10b981' }}>✓ No vulnerabilities found in the new image.</p>
+          )}
+        </div>
+      )}
+
+      {/* ── Stream log ── */}
+      {(logs.length > 0 || streaming) && (
+        <div className="card p-4 space-y-2">
+          <span className="text-xs font-semibold flex items-center gap-1.5" style={{ color: 'var(--color-text)' }}>
+            <Terminal size={12} />
+            {streamMode === 'scan' ? 'Scan Log' : 'Update Log'}
+            {streaming && <Loader2 size={10} className="animate-spin ml-1" />}
+          </span>
+          <div className="rounded-lg p-3 font-mono text-[11px] space-y-0.5 max-h-56 overflow-y-auto"
+            style={{ background: 'var(--color-surface-offset)', border: '1px solid var(--color-border)' }}>
+            {logs.map((l, i) => (
+              <div key={i} style={{
+                color: l.includes('[ERROR]') || l.includes('[FAIL]') || l.includes('FAILED') ? '#ef4444'
+                  : l.includes('[WARNING]') || l.includes('BLOCKED') ? '#f97316'
+                  : l.includes('[ROLLBACK]') ? '#f59e0b'
+                  : l.includes('✓') || l.includes('complete') || l.includes('success') ? '#10b981'
+                  : 'var(--color-text-muted)',
+              }}>
+                {l}
+              </div>
+            ))}
+            <div ref={logEndRef} />
+          </div>
+        </div>
+      )}
+
+      {/* ── Backup history ── */}
+      <div className="card p-4 space-y-3">
+        <button
+          className="w-full flex items-center justify-between text-sm font-semibold"
+          style={{ color: 'var(--color-text)' }}
+          onClick={() => { setShowBackups(v => !v); if (!backups) loadBackups() }}>
+          <span className="flex items-center gap-1.5">
+            <Database size={14} style={{ color: 'var(--color-brand)' }} />
+            Backup History
+          </span>
+          {showBackups ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
+        </button>
+        {showBackups && (
+          <div className="space-y-1.5">
+            {backups === null && <p className="text-xs" style={{ color: 'var(--color-text-faint)' }}>Loading…</p>}
+            {backups?.length === 0 && <p className="text-xs" style={{ color: 'var(--color-text-faint)' }}>No backups yet.</p>}
+            {backups?.map(b => (
+              <div key={b.id} className="flex items-center justify-between gap-2 text-xs py-1.5 border-b"
+                style={{ borderColor: 'var(--color-border)' }}>
+                <div className="min-w-0">
+                  <span className="font-mono text-[11px]" style={{ color: 'var(--color-text-muted)' }}>
+                    {b.backed_up_at ? new Date(b.backed_up_at).toLocaleString() : '—'}
+                  </span>
+                  <span className="ml-2 text-[10px] rounded px-1.5 py-0.5"
+                    style={{ background: 'rgba(107,114,128,0.1)', color: 'var(--color-text-muted)' }}>
+                    {b.reason}
+                  </span>
+                </div>
+                {b.has_compose && (
+                  <button onClick={() => downloadBackupCompose(b.id, b.container_name)}
+                    className="btn-ghost flex items-center gap-1 text-[11px] shrink-0"
+                    title="Download compose YAML for this backup">
+                    <Download size={10} />
+                    YAML
+                  </button>
+                )}
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+    </div>
+  )
+}
+
+export function ContainerDrawer({ container: initialContainer, trivyScan, updateTrivyScan, initialTab, onClose, onContainerUpdate, updateStatus }) {
   const [container,   setContainer]   = useState(initialContainer)
   const isProxmox   = container.host_type === 'proxmox'
-  const visibleTabs = isProxmox ? TABS.filter(t => t.id !== 'logs' && t.id !== 'vuln' && t.id !== 'compose') : TABS
+  const visibleTabs = isProxmox
+    ? TABS.filter(t => !['logs', 'vuln', 'compose', 'updates'].includes(t.id))
+    : TABS
   const startTab    = initialTab || 'overview'
   const [activeTab,   setActiveTab]   = useState(
     isProxmox && (startTab === 'logs' || startTab === 'vuln') ? 'overview' : startTab
@@ -971,6 +1582,11 @@ export function ContainerDrawer({ container: initialContainer, trivyScan, update
               trivyScan={trivyScan}
               updateTrivyScan={updateTrivyScan}
             />
+          )}
+
+          {/* ── Updates tab ── */}
+          {activeTab === 'updates' && (
+            <UpdatesTab container={container} updateStatus={updateStatus} />
           )}
 
           {/* ── Admin tab ── */}

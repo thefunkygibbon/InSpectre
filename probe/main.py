@@ -1713,14 +1713,15 @@ _host_ips_lock = threading.Lock()
 
 def _get_host_ipv4s(ttl: int = 120) -> set:
     """
-    IPv4 addresses bound to the probe host's own interfaces (cached `ttl`s).
+    IPv4 addresses bound to the probe's active scanning interface only (cached `ttl`s).
 
-    The probe runs in the host network namespace, so these are the Docker host's
-    own addresses (its primary NIC, macvlan shims, bridges, etc.). A host never
-    answers ARP for its own IPs the way a remote device does, so such devices can
-    never be confirmed "online" via the ARP sweep — yet they are, by definition,
-    always reachable. Presence treats any device holding one of these IPs as
-    online, which fixes the "host shows offline but pings fine" case.
+    Scoped intentionally to INTERFACE (the LAN-facing NIC) rather than every
+    interface on the host.  Scanning all interfaces would include Docker bridge
+    addresses (docker0, br-xxx, compose networks, macvlan shims, VPN tuns, etc.)
+    which can overlap with real LAN device IPs and falsely pin those devices online.
+
+    The only address that genuinely can't be ARP-confirmed is the host's own IP
+    on the interface the probe sweeps — that's all we need to protect.
     """
     global _host_ips_cache
     now = time.time()
@@ -1730,20 +1731,18 @@ def _get_host_ipv4s(ttl: int = 120) -> set:
             return cached
     ips: set = set()
     try:
-        from scapy.all import get_if_list, get_if_addr
-        for iface in get_if_list():
-            try:
-                a = get_if_addr(iface)
-                if a and a != "0.0.0.0" and _is_valid_ip(a):
-                    ips.add(a)
-            except Exception:
-                continue
+        from scapy.all import get_if_addr
+        a = get_if_addr(INTERFACE)
+        if a and a != "0.0.0.0" and _is_valid_ip(a):
+            ips.add(a)
     except Exception:
         pass
     if not ips:
         try:
-            out = subprocess.run(["ip", "-4", "-o", "addr", "show"],
-                                 capture_output=True, text=True, timeout=5).stdout
+            out = subprocess.run(
+                ["ip", "-4", "-o", "addr", "show", "dev", INTERFACE],
+                capture_output=True, text=True, timeout=5,
+            ).stdout
             for line in out.splitlines():
                 parts = line.split()
                 for i, tok in enumerate(parts):

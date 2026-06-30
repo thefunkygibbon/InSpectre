@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback, useMemo, useRef } from 'react'
-import { Box, RefreshCw, Search, AlertCircle, Play, Square, Loader2, LayoutGrid, List, ArrowUpDown, ShieldAlert, Network, GitBranch, X, Sparkles } from 'lucide-react'
+import { Box, RefreshCw, Search, AlertCircle, Play, Square, Loader2, LayoutGrid, List, ArrowUpDown, ShieldAlert, Network, GitBranch, X, Sparkles, ChevronDown, ChevronRight, Settings2, ArrowUpCircle, Download } from 'lucide-react'
 import { api } from '../api'
 import { ContainerCard } from './ContainerCard'
 import { ContainerDrawer } from './ContainerDrawer'
@@ -181,6 +181,208 @@ function ContainerRow({ container, onClick, isAcknowledged, onAcknowledge }) {
   )
 }
 
+const AUTO_UPDATE_MODES = [
+  { value: 'disabled',         label: 'Disabled — check only, no action' },
+  { value: 'notify',           label: 'Notify only — send alert when update found' },
+  { value: 'scan_then_update', label: 'Scan then update — Trivy scan, then auto-update if clean' },
+  { value: 'auto',             label: 'Auto — update immediately when detected' },
+]
+
+function UpdateSchedulePanel() {
+  const [open,        setOpen]        = useState(false)
+  const [saving,      setSaving]      = useState(false)
+  const [enabled,     setEnabled]     = useState(false)
+  const [hour,        setHour]        = useState(3)
+  const [days,        setDays]        = useState([])   // [] = every day
+  const [autoMode,    setAutoMode]    = useState('disabled')
+  const [loaded,      setLoaded]      = useState(false)
+
+  useEffect(() => {
+    api.getSettings().then(settings => {
+      const get = (key, def) => {
+        const s = settings.find(x => x.key === key)
+        return s ? s.value : def
+      }
+      setEnabled(get('container_check_enabled', 'false') === 'true')
+      setHour(parseInt(get('container_check_hour', '3'), 10) || 3)
+      try { setDays(JSON.parse(get('container_check_days', '[]'))) } catch { setDays([]) }
+      setAutoMode(get('container_auto_update', 'disabled'))
+      setLoaded(true)
+    }).catch(() => {})
+  }, [])
+
+  async function save(key, value) {
+    setSaving(true)
+    try {
+      await api.updateSetting(key, value)
+    } catch (_) {}
+    finally { setSaving(false) }
+  }
+
+  function toggleEnabled(val) {
+    setEnabled(val)
+    save('container_check_enabled', val ? 'true' : 'false')
+  }
+
+  function changeHour(h) {
+    setHour(h)
+    save('container_check_hour', String(h))
+  }
+
+  function toggleDay(dow) {
+    const next = days.includes(dow) ? days.filter(d => d !== dow) : [...days, dow].sort((a, b) => a - b)
+    setDays(next)
+    save('container_check_days', JSON.stringify(next))
+  }
+
+  function setEveryDay() {
+    setDays([])
+    save('container_check_days', '[]')
+  }
+
+  function changeAutoMode(val) {
+    setAutoMode(val)
+    save('container_auto_update', val)
+  }
+
+  if (!loaded) return null
+
+  return (
+    <div className="rounded-xl border" style={{ background: 'var(--color-surface)', borderColor: 'var(--color-border)' }}>
+      <button
+        type="button"
+        onClick={() => setOpen(o => !o)}
+        className="w-full flex items-center gap-2 px-4 py-3 text-sm font-semibold text-left"
+        style={{ color: 'var(--color-text)' }}
+      >
+        <Settings2 size={15} style={{ color: 'var(--color-brand)' }} />
+        Update Schedule
+        <span className="ml-auto" style={{ color: 'var(--color-text-faint)' }}>
+          {open ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
+        </span>
+      </button>
+
+      {open && (
+        <div className="px-4 pb-4 space-y-4 border-t" style={{ borderColor: 'var(--color-border)' }}>
+          <p className="text-xs pt-3" style={{ color: 'var(--color-text-faint)' }}>
+            Schedule automated checks for newer container image versions.
+            All updates use a blue/green strategy with automatic rollback.
+          </p>
+
+          {/* Enable toggle */}
+          <label className="flex items-center justify-between gap-3 cursor-pointer">
+            <div>
+              <span className="text-sm font-medium" style={{ color: 'var(--color-text)' }}>Enable scheduled checks</span>
+              <p className="text-xs mt-0.5" style={{ color: 'var(--color-text-faint)' }}>
+                Check container registries for newer image versions on a schedule.
+              </p>
+            </div>
+            <button
+              type="button"
+              role="switch"
+              aria-checked={enabled}
+              disabled={saving}
+              onClick={() => toggleEnabled(!enabled)}
+              className="relative inline-flex h-6 w-11 shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors duration-200"
+              style={{ background: enabled ? 'var(--color-brand)' : 'var(--color-surface-offset)' }}
+            >
+              <span
+                className="inline-block h-5 w-5 rounded-full bg-white shadow transition-transform duration-200"
+                style={{ transform: enabled ? 'translateX(20px)' : 'translateX(0)' }}
+              />
+            </button>
+          </label>
+
+          {/* Hour + days (dimmed when disabled) */}
+          <div className="space-y-3" style={{ opacity: enabled ? 1 : 0.5, pointerEvents: enabled ? 'auto' : 'none' }}>
+            {/* Hour selector */}
+            <div className="space-y-1">
+              <label className="text-xs" style={{ color: 'var(--color-text-muted)' }}>Check at (UTC)</label>
+              <select
+                className="w-full rounded-lg px-3 py-2 text-sm"
+                style={{ background: 'var(--color-surface-offset)', border: '1px solid var(--color-border)', color: 'var(--color-text)' }}
+                value={hour}
+                disabled={saving || !enabled}
+                onChange={e => changeHour(parseInt(e.target.value, 10))}
+              >
+                {Array.from({ length: 24 }, (_, h) => (
+                  <option key={h} value={h}>{String(h).padStart(2, '0')}:00 UTC</option>
+                ))}
+              </select>
+            </div>
+
+            {/* Day pills */}
+            <div className="space-y-1">
+              <label className="text-xs" style={{ color: 'var(--color-text-muted)' }}>On these days</label>
+              <div className="flex flex-wrap gap-1.5">
+                <button
+                  type="button"
+                  disabled={saving || !enabled}
+                  onClick={setEveryDay}
+                  className="px-2.5 py-1 rounded-md text-xs font-medium transition-colors"
+                  style={{
+                    background: days.length === 0 ? 'var(--color-brand)' : 'var(--color-surface-offset)',
+                    color: days.length === 0 ? 'white' : 'var(--color-text-muted)',
+                    border: '1px solid var(--color-border)',
+                  }}
+                >
+                  Every day
+                </button>
+                {[[1,'Mon'],[2,'Tue'],[3,'Wed'],[4,'Thu'],[5,'Fri'],[6,'Sat'],[0,'Sun']].map(([dow, lbl]) => {
+                  const active = days.includes(dow)
+                  return (
+                    <button
+                      key={dow}
+                      type="button"
+                      disabled={saving || !enabled}
+                      onClick={() => toggleDay(dow)}
+                      className="px-2.5 py-1 rounded-md text-xs font-medium transition-colors"
+                      style={{
+                        background: active ? 'var(--color-brand)' : 'var(--color-surface-offset)',
+                        color: active ? 'white' : 'var(--color-text-muted)',
+                        border: '1px solid var(--color-border)',
+                      }}
+                    >
+                      {lbl}
+                    </button>
+                  )
+                })}
+              </div>
+              <p className="text-xs" style={{ color: 'var(--color-text-faint)' }}>
+                {days.length === 0
+                  ? 'Every day. Tap days to limit which days it checks.'
+                  : `Selected: ${days.slice().sort((a,b)=>a-b).map(d => ['Sun','Mon','Tue','Wed','Thu','Fri','Sat'][d]).join(', ')}.`}
+              </p>
+            </div>
+
+            {/* Auto-update mode */}
+            <div className="space-y-1">
+              <label className="text-xs" style={{ color: 'var(--color-text-muted)' }}>When an update is found</label>
+              <select
+                className="w-full rounded-lg px-3 py-2 text-sm"
+                style={{ background: 'var(--color-surface-offset)', border: '1px solid var(--color-border)', color: 'var(--color-text)' }}
+                value={autoMode}
+                disabled={saving || !enabled}
+                onChange={e => changeAutoMode(e.target.value)}
+              >
+                {AUTO_UPDATE_MODES.map(m => (
+                  <option key={m.value} value={m.value}>{m.label}</option>
+                ))}
+              </select>
+            </div>
+
+            <p className="text-xs" style={{ color: 'var(--color-text-faint)' }}>
+              {enabled
+                ? `Checks run daily at ${String(hour).padStart(2,'0')}:00 UTC${days.length > 0 ? ` on ${days.slice().sort((a,b)=>a-b).map(d=>['Sun','Mon','Tue','Wed','Thu','Fri','Sat'][d]).join(', ')}` : ''}.`
+                : 'Enable scheduled checks above to configure the schedule.'}
+            </p>
+          </div>
+        </div>
+      )}
+    </div>
+  )
+}
+
 export function ContainersPage({ openContainer, skin }) {
   const [containers,    setContainers]    = useState([])
   const [stats,         setStats]         = useState(null)
@@ -201,6 +403,38 @@ export function ContainersPage({ openContainer, skin }) {
 
   // Vuln scan state keyed by container ID — persists across drawer open/close
   const [trivyScansByContainer, setTrivyScansByContainer] = useState({})
+
+  // Update status keyed by container name
+  const [updateStatuses, setUpdateStatuses] = useState({})
+  const [checkingAll,   setCheckingAll]   = useState(false)
+  const [updatingAll,   setUpdatingAll]   = useState(false)
+
+  const pendingUpdateCount = useMemo(
+    () => Object.values(updateStatuses).filter(
+      s => s.has_update && !s.pinned && !s.update_blocked && !s.update_in_progress
+    ).length,
+    [updateStatuses]
+  )
+
+  async function checkAllUpdates() {
+    setCheckingAll(true)
+    try {
+      await api.dockerCheckAllUpdates()
+      setTimeout(() => load(true), 4000)
+    } catch (_) {}
+    finally { setCheckingAll(false) }
+  }
+
+  async function updateAllPending() {
+    if (pendingUpdateCount === 0) return
+    setUpdatingAll(true)
+    try {
+      await api.dockerUpdateAll()
+      setTimeout(() => load(true), 2000)
+    } catch (_) {}
+    finally { setUpdatingAll(false) }
+  }
+
   function updateTrivyScan(containerId, patchOrFn) {
     setTrivyScansByContainer(prev => {
       const cur = prev[containerId] || { logs: [], vulns: null, scanning: false, scannedAt: null }
@@ -232,14 +466,20 @@ export function ContainersPage({ openContainer, skin }) {
     setError(null)
     setDisabled(false)
     try {
-      const [statsData, containerList, vulnData] = await Promise.all([
+      const [statsData, containerList, vulnData, updateData] = await Promise.all([
         api.dockerStats(),
         api.dockerContainers(),
         api.dockerVulnSummary().catch(() => []),
+        api.dockerUpdateStatus().catch(() => []),
       ])
       setStats(statsData)
       setContainers(containerList)
       setVulnSummary(Array.isArray(vulnData) ? vulnData : [])
+      if (Array.isArray(updateData)) {
+        const byName = {}
+        updateData.forEach(u => { byName[u.container_name] = u })
+        setUpdateStatuses(byName)
+      }
     } catch (e) {
       if (e.message?.includes('503') || e.message?.toLowerCase().includes('disabled')) {
         setDisabled(true)
@@ -301,9 +541,10 @@ export function ContainersPage({ openContainer, skin }) {
     if (filter === 'other' && !['paused', 'restarting'].includes(c.status)) return false
     if (filter !== 'all' && filter !== 'stopped' && filter !== 'other' && c.status !== filter) return false
     const _sfMatch = {
-      vulnerable: () => vulnNameSet.has(c.name),
-      host_net:   () => (c.networks || []).includes('host'),
-      bridge_net: () => (c.networks || []).includes('bridge'),
+      vulnerable:  () => vulnNameSet.has(c.name),
+      host_net:    () => (c.networks || []).includes('host'),
+      bridge_net:  () => (c.networks || []).includes('bridge'),
+      has_update:  () => updateStatuses[c.name]?.has_update === true,
     }
     for (const [key, mode] of Object.entries(smartFilters)) {
       const fn = _sfMatch[key]
@@ -383,6 +624,9 @@ export function ContainersPage({ openContainer, skin }) {
         </section>
       )}
 
+      {/* Update Schedule panel */}
+      {!disabled && !loading && <UpdateSchedulePanel />}
+
       {/* Error */}
       {error && (
         <div className="flex items-center gap-3 px-4 py-3 rounded-xl text-sm"
@@ -426,6 +670,7 @@ export function ContainersPage({ openContainer, skin }) {
           <div className="flex items-center gap-1 flex-wrap">
             {[
               { key: 'vulnerable',  label: 'Vulnerable',     icon: ShieldAlert },
+              { key: 'has_update',  label: 'Has Update',     icon: ArrowUpCircle },
               { key: 'host_net',    label: 'Host Network',   icon: Network },
               { key: 'bridge_net',  label: 'Bridge Network', icon: GitBranch },
             ].map(({ key, label, icon: Icon }) => {
@@ -515,6 +760,30 @@ export function ContainersPage({ openContainer, skin }) {
               style={{ color: layout === 'list' ? 'var(--color-brand)' : undefined }}>
               <List size={15} />
             </button>
+            <button
+              onClick={checkAllUpdates}
+              disabled={checkingAll}
+              title="Check all containers for image updates"
+              className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-xl text-xs font-medium border transition-colors"
+              style={{ background: 'var(--color-surface-offset)', color: 'var(--color-text-muted)', borderColor: 'var(--color-border)' }}>
+              <RefreshCw size={11} className={checkingAll ? 'animate-spin' : ''} />
+              Check
+            </button>
+            {pendingUpdateCount > 0 && (
+              <button
+                onClick={updateAllPending}
+                disabled={updatingAll}
+                title={`Update all ${pendingUpdateCount} container${pendingUpdateCount !== 1 ? 's' : ''} with available updates`}
+                className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-xl text-xs font-medium border transition-colors"
+                style={{ background: 'rgba(59,130,246,0.15)', color: '#3b82f6', borderColor: 'rgba(59,130,246,0.4)' }}>
+                <Download size={11} className={updatingAll ? 'animate-pulse' : ''} />
+                Update all
+                <span className="ml-0.5 px-1.5 py-0.5 rounded-full text-[10px] font-bold"
+                  style={{ background: '#3b82f6', color: 'white' }}>
+                  {pendingUpdateCount}
+                </span>
+              </button>
+            )}
             <button onClick={() => load(true)} disabled={refreshing}
               className="btn-ghost p-2" title="Refresh" aria-label="Refresh containers">
               <RefreshCw size={15} className={refreshing ? 'animate-spin' : ''} />
@@ -546,7 +815,8 @@ export function ContainersPage({ openContainer, skin }) {
                 <ContainerCard key={c.id} container={c} onClick={() => setSelected(c)}
                   isAcknowledged={acknowledgedContainers.has(c.id)}
                   isTrivyScanning={trivyScansByContainer[c.id]?.scanning || false}
-                  onAcknowledge={acknowledgeContainer} />
+                  onAcknowledge={acknowledgeContainer}
+                  updateStatus={updateStatuses[c.name]} />
               ))}
             </div>
           ) : (
@@ -582,6 +852,7 @@ export function ContainersPage({ openContainer, skin }) {
           initialTab={openContainer && openContainer === selected.name ? 'vuln' : undefined}
           onClose={() => setSelected(null)}
           onContainerUpdate={handleContainerUpdate}
+          updateStatus={updateStatuses[selected.name]}
         />
       )}
     </div>

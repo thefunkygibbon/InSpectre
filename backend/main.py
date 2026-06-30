@@ -36,6 +36,7 @@ from plugin_engine import (
     verify_webhook_signature,
 )
 from email_analysis import run_email_analysis
+import container_updates as _cu
 
 DATABASE_URL = os.environ.get("DATABASE_URL", "postgresql://admin:password123@db:5432/inspectre")
 # PROBE_API_URL is the name used in docker-compose; PROBE_URL is the legacy fallback.
@@ -634,6 +635,8 @@ def _migrate(db: Session):
     except Exception as _te:
         print(f"[migrate] primary_ip_lock trigger (non-fatal): {_te}", flush=True)
         db.rollback()
+    # Container update management tables (container_update_status, container_backups)
+    _cu.migrate(db)
 
 
 # ---------------------------------------------------------------------------
@@ -706,6 +709,16 @@ DEFAULT_SETTINGS = {
     "trivy_db_update_frequency": ("1d",   "How often to refresh the Trivy vulnerability database. Options: disabled, 1d, 2d, 7d, 30d."),
     "docker_scan_on_new":        ("false", "Automatically run a Trivy vuln scan when a new container is created."),
     "docker_scan_on_update":     ("false", "Automatically run a Trivy vuln scan when a container is recreated with an updated image."),
+    # Container update management
+    "container_auto_update":           ("disabled", "What to do when an update is detected. Options: disabled, notify, scan_then_update, auto."),
+    "container_update_block_critical": ("true",     "Block container updates if the new image contains critical-severity CVEs."),
+    "container_backup_enabled":        ("true",     "Automatically save a full config backup before any container update."),
+    "container_update_health_timeout": ("30",       "Seconds to wait for a container health check after an update before triggering rollback."),
+    "container_update_stagger_seconds":("30",       "Delay in seconds between sequential container updates when running an auto-update batch."),
+    "container_update_pin_labels":     ("true",     "Honour the com.inspectre.update.pin=true Docker label to exclude containers from auto-updates."),
+    "container_check_enabled": ("false", "Enable scheduled container image update checks."),
+    "container_check_hour":    ("3",     "Hour of day (0-23, UTC) to run container update checks."),
+    "container_check_days":    ("[]",    "JSON array of JS day-of-week ints (0=Sun…6=Sat) to run checks. Empty = every day."),
     # Notification — speed test alert thresholds
     "speedtest_expected_download":   ("0",   "Expected/contracted download speed in Mbps. Set to 0 to disable speed test alerts."),
     "speedtest_expected_upload":     ("0",   "Expected/contracted upload speed in Mbps. Set to 0 to disable upload speed alerts."),
@@ -983,6 +996,10 @@ NOTIFICATION_EVENT_DEFS = [
     ("block.schedule_start",        "Block Schedule Started",   "Blocking",        "A block schedule became active"),
     ("block.schedule_end",          "Block Schedule Ended",     "Blocking",        "A block schedule deactivated"),
     ("container.crashed",           "Container Crashed",        "Containers",      "A container exited with a non-zero exit code"),
+    ("container.update_available",  "Container Update Available","Containers",      "A newer image version is available for a container"),
+    ("container.updated",           "Container Updated",         "Containers",      "A container was successfully updated to a new image version"),
+    ("container.update_blocked",    "Container Update Blocked",  "Containers",      "A container update was blocked due to critical CVEs in the new image"),
+    ("container.update_failed",     "Container Update Failed",   "Containers",      "A container update failed and the original was automatically restored"),
     ("traffic.unusual_port",        "Unusual Port Traffic",     "Traffic",         "A device communicated on an unusual port"),
     ("traffic.suspicious_country",  "Suspicious Country Traffic","Traffic",        "A device communicated with a flagged country"),
     ("person.home",                 "Person Arrived Home",      "Person Presence", "A tracked person's device came online (person is home)"),
@@ -1623,6 +1640,7 @@ async def _notification_loop():
 
 
 app = FastAPI(title="InSpectre API", version="1.0.0")
+app.include_router(_cu.router)
 
 _CORS_ORIGINS = [o.strip() for o in os.environ.get(
     "CORS_ORIGINS",
@@ -2461,6 +2479,18 @@ async def on_startup():
     asyncio.ensure_future(_fingerbank_loop())
     asyncio.ensure_future(_plugin_scheduler.run())
     asyncio.ensure_future(_auto_update_schedule_loop())
+    _cu.init(
+        session_local        = SessionLocal,
+        get_enabled_hosts    = _get_enabled_hosts,
+        make_docker_client   = _make_docker_client,
+        fmt_container        = _fmt_container,
+        add_host_meta        = _add_docker_host_meta,
+        gen_compose_yaml     = _generate_compose_yaml,
+        parse_proxmox_id     = _parse_proxmox_id,
+        notification_dispatch = _notification_dispatch,
+        main_loop_getter     = lambda: _main_loop,
+    )
+    asyncio.ensure_future(_cu.container_update_check_loop())
 
 
 @app.get("/events/stream")
@@ -9191,8 +9221,19 @@ def _generate_compose_yaml(c) -> tuple[str, dict]:
     net_names   = list(networks.keys())
     _std_nets   = {"bridge", "host", "none"}
     custom_nets = [n for n in net_names if n not in _std_nets]
-    if "host" in net_names:
+    _hc_net_mode = (hcfg.get("NetworkMode") or "").lower()
+    if _hc_net_mode == "host" or "host" in net_names:
         svc["network_mode"] = "host"
+    elif _hc_net_mode == "none":
+        svc["network_mode"] = "none"
+    elif _hc_net_mode.startswith("container:"):
+        _parent_ref = hcfg["NetworkMode"].split(":", 1)[1]
+        try:
+            _parent = c.client.containers.get(_parent_ref)
+            _parent_name = _parent.name.lstrip("/")
+        except Exception:
+            _parent_name = _parent_ref  # fall back to raw ID/name
+        svc["network_mode"] = f"container:{_parent_name}"
     elif custom_nets:
         net_block = {}
         for n in custom_nets:

@@ -1,4 +1,4 @@
-import { Box, X } from 'lucide-react'
+import { Box, X, Pin } from 'lucide-react'
 
 const STATUS_CONFIG = {
   running:    { color: '#22c55e', bg: 'rgba(34,197,94,0.12)',   border: 'rgba(34,197,94,0.3)',   dot: '#22c55e', label: 'Running'    },
@@ -34,11 +34,20 @@ function shortImage(image) {
   return noReg || image
 }
 
-export function ContainerCard({ container, onClick, isAcknowledged, isTrivyScanning, onAcknowledge }) {
+export function ContainerCard({ container, onClick, isAcknowledged, isTrivyScanning, onAcknowledge, updateStatus }) {
   const cfg       = STATUS_CONFIG[container.status] || STATUS_CONFIG.exited
   const isRunning = container.status === 'running'
   const exposedPorts = (container.ports || []).filter(p => p.host_port).slice(0, 3)
   const showNew   = isNewContainer(container) && !isAcknowledged
+
+  // Update state badges derived from updateStatus prop
+  const hasUpdate       = updateStatus?.has_update && !updateStatus?.update_in_progress
+  const isBlocked       = updateStatus?.update_blocked && updateStatus?.has_update
+  const isUpdating      = updateStatus?.update_in_progress
+  const isPinned        = updateStatus?.pinned
+  const justUpdated     = updateStatus?.last_update_status === 'success' &&
+    updateStatus?.last_updated_at &&
+    (Date.now() - new Date(updateStatus.last_updated_at).getTime()) < 24 * 60 * 60 * 1000
 
   const footerTime = isRunning
     ? (container.state?.started_at ? `started · ${relativeTime(container.state.started_at)}` : 'running')
@@ -94,6 +103,40 @@ export function ContainerCard({ container, onClick, isAcknowledged, isTrivyScann
             <span className="text-[10px] font-medium rounded-full px-2 py-0.5 whitespace-nowrap"
               style={{ color: 'var(--color-brand)', background: 'color-mix(in srgb, var(--color-brand) 12%, transparent)', border: '1px solid color-mix(in srgb, var(--color-brand) 25%, transparent)' }}>
               Vuln Scan
+            </span>
+          )}
+          {isUpdating && (
+            <span className="text-[10px] font-medium rounded-full px-2 py-0.5 whitespace-nowrap animate-pulse"
+              style={{ color: '#60a5fa', background: 'rgba(96,165,250,0.12)', border: '1px solid rgba(96,165,250,0.3)' }}>
+              Updating…
+            </span>
+          )}
+          {!isUpdating && isBlocked && (
+            <span className="text-[10px] font-bold rounded-full px-2 py-0.5 whitespace-nowrap"
+              title={updateStatus?.blocked_reason || 'Update blocked — critical CVEs in new image'}
+              style={{ color: '#f97316', background: 'rgba(249,115,22,0.12)', border: '1px solid rgba(249,115,22,0.3)' }}>
+              ⚠ BLOCKED
+            </span>
+          )}
+          {!isUpdating && !isBlocked && hasUpdate && (
+            <span className="text-[10px] font-bold rounded-full px-2 py-0.5 whitespace-nowrap"
+              title="New image version available"
+              style={{ color: '#38bdf8', background: 'rgba(56,189,248,0.12)', border: '1px solid rgba(56,189,248,0.3)' }}>
+              UPDATE
+            </span>
+          )}
+          {!isUpdating && !hasUpdate && justUpdated && (
+            <span className="text-[10px] font-bold rounded-full px-2 py-0.5 whitespace-nowrap"
+              title="Recently updated to latest image"
+              style={{ color: '#10b981', background: 'rgba(16,185,129,0.12)', border: '1px solid rgba(16,185,129,0.3)' }}>
+              ✓ UPDATED
+            </span>
+          )}
+          {isPinned && (
+            <span className="flex items-center gap-0.5 text-[10px] font-medium rounded-full px-2 py-0.5 whitespace-nowrap"
+              title="Pinned — excluded from auto-updates"
+              style={{ color: 'var(--color-text-muted)', background: 'rgba(107,114,128,0.1)', border: '1px solid rgba(107,114,128,0.2)' }}>
+              <Pin size={8} /> Pinned
             </span>
           )}
         </div>

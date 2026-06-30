@@ -60,6 +60,12 @@ Check the [Wiki](https://github.com/thefunkygibbon/InSpectre/wiki) for full admi
 - **Proxmox VE integration** — monitor LXC containers from Proxmox VE nodes via REST API (API token auth)
 - **Host filter** — filter the container list by configured host; each container card shows which host it came from
 - **Auto-scan results** — last Trivy scan result for each image is stored and shown immediately when you open the drawer
+- **Container image update management** — check registries for newer image versions using lightweight digest comparison (no unnecessary pulls); update containers safely using a blue/green strategy — the original container is renamed to a timestamped backup before the new one starts, and automatically rolled back if the new container fails its health check. An optional Trivy pre-scan gate blocks updates that introduce critical CVEs
+- **Scheduled update checks** — configure a daily check at a specific hour and day(s) of the week; auto-update mode (notify only, scan-then-update, or fully automatic) runs without manual intervention
+- **Bulk update controls** — the Containers page toolbar includes a **Check** button to trigger an immediate registry scan across all containers, and an **Update all** button (with a live count badge) to start updates for every container that has one available
+- **Smart filter: Has Update** — filter the container list to show only containers with a newer image available
+- **Update-aware admin tab** — per-container admin panel shows current vs latest image digest, update/rollback controls, pin toggle (exclude from auto-updates), network mode management, and restart policy configuration
+- **Config backups** — before every update a full backup of `docker inspect` JSON and a reconstructed compose YAML is saved; view and restore from the container drawer
 
 ### Device Blocking
 - **Per-device blocking** — cut any device off from the internet with one click using ARP MITM

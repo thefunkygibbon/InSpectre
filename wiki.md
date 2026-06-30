@@ -88,6 +88,12 @@
     - 12.7 [Container Drawer](#127-container-drawer)
     - 12.8 [Container Vulnerability Scanning (Trivy)](#128-container-vulnerability-scanning-trivy)
     - 12.9 [Container Vulns in the Security Dashboard](#129-container-vulns-in-the-security-dashboard)
+    - 12.10 [Container Image Update Management](#1210-container-image-update-management)
+    - 12.11 [Updating a Container](#1211-updating-a-container)
+    - 12.12 [Scheduled Update Checks](#1212-scheduled-update-checks)
+    - 12.13 [Bulk Update Controls](#1213-bulk-update-controls)
+    - 12.14 [Container Update Settings](#1214-container-update-settings)
+    - 12.15 [Container Update Limitations](#1215-container-update-limitations)
 13. [Home Assistant MQTT Integration](#13-home-assistant-mqtt-integration)
     - 13.1 [Overview](#131-overview)
     - 13.2 [Requirements](#132-requirements)
@@ -1391,10 +1397,19 @@ The token format InSpectre expects is `TOKENID=SECRET` — for example: `inspect
 
 The **Containers** page is accessible from the main navigation bar (the box/cube icon). It shows all containers from all enabled hosts.
 
+**Update Schedule panel** — at the top of the page (above the toolbar) is the update schedule configuration. See [12.12 Scheduled Update Checks](#1212-scheduled-update-checks).
+
 **Toolbar:**
 - **Search** — filter by container name, image, network, or short ID
 - **Status filter chips** — All, Running, Stopped, Paused, Restarting
+- **Smart filters** — click to cycle through include / exclude / off:
+  - **Vulnerable** — containers with CVE findings from Trivy
+  - **Has Update** — containers with a newer image available in the registry
+  - **Host Network** — containers using the host network mode
+  - **Bridge Network** — containers using the bridge network
 - **Host filter chips** — when more than one host is configured, per-host filter chips appear to narrow the list to containers from a specific host
+- **Check** — triggers an immediate registry digest check across all containers (see [12.13](#1213-bulk-update-controls))
+- **Update all** — appears with a count badge when updates are available; starts bulk updates (see [12.13](#1213-bulk-update-controls))
 - **Layout toggle** — grid view (cards) or list view (compact table)
 - **Refresh** — manually reload all container data (auto-refreshes every 15 seconds)
 
@@ -1407,12 +1422,13 @@ The **Containers** page is accessible from the main navigation bar (the box/cube
 - Port bindings, networks, and restart policy
 - Host name (bottom-left of the card footer)
 - Time since started or stopped
+- Update badge (top-right corner) when a newer image is available, an update is in progress, or the container is pinned/blocked
 
 **Container rows** (list view) show name, status, image, port bindings, networks, host name, and uptime.
 
 ### 12.7 Container Drawer
 
-Click any container to open its detail drawer. The drawer has up to four tabs depending on the host type:
+Click any container to open its detail drawer. The drawer has up to five tabs depending on the host type:
 
 **Overview tab** (all containers):
 - Status badge and restart policy
@@ -1429,9 +1445,15 @@ Click any container to open its detail drawer. The drawer has up to four tabs de
 **Vuln Scan tab** (Docker only):
 - Scan the container image for CVEs using Trivy (see [Section 12.8](#128-container-vulnerability-scanning-trivy))
 
+**Update tab** (Docker only):
+- Check for newer image versions and update the container safely (see [Section 12.10–12.15](#1210-container-image-update-management))
+- Shows current vs latest digest, last check timestamp, update status, and streaming update log
+
 **Admin tab** (all containers):
 - Start, stop, restart the container
 - View the full command and image ID
+- (Docker only) Change network mode and restart policy
+- (Docker only) View and download config backups (JSON and compose YAML)
 
 ### 12.8 Container Vulnerability Scanning (Trivy)
 
@@ -1482,6 +1504,138 @@ The **Container Vulnerabilities** section at the bottom of the dashboard shows:
 - Count of clean (no findings) images
 - CVE findings grouped by severity (Critical, High, Medium, Low) — click a severity group to expand the list of affected containers and their CVE counts
 - Click a container name in the expanded list to jump directly to that container's Vuln Scan tab
+
+### 12.10 Container Image Update Management
+
+InSpectre can check Docker registries for newer versions of container images and update containers using a safe blue/green strategy. All update activity is Docker-only (Proxmox LXC containers are not supported for updates).
+
+**How image checking works:**
+
+InSpectre compares the digest of the image currently running in a container against the latest digest published to the registry. This is a lightweight metadata call — no image data is downloaded until you choose to update. Digests are fetched using registry credentials where the image was originally pulled with authentication, and fall back to anonymous access for public registries (Docker Hub, ghcr.io, etc.).
+
+**Update status badges:**
+
+Container cards on the Containers page show a coloured badge in the top-right corner:
+
+| Badge | Meaning |
+|---|---|
+| **Update available** (blue) | A newer image digest was found in the registry |
+| **Updating…** (amber, pulsing) | An update is currently in progress |
+| **Pinned** (grey lock) | Container is excluded from auto-updates |
+| **Blocked** (red) | Update was blocked because the new image contains critical CVEs |
+| **Up to date** | No badge shown; the running image matches the latest registry digest |
+
+### 12.11 Updating a Container
+
+Open the container's drawer and go to the **Update** tab (visible for Docker containers only).
+
+**What is shown:**
+- **Current digest** — the image digest the container is running
+- **Latest digest** — the most recent registry digest (populated after a check)
+- **Last checked** timestamp
+- **Last update status** — success, failed, or blocked, with any error detail
+- **Update available / Up to date** indicator
+
+**Running an update:**
+
+1. Click **Check Now** to do an immediate registry check for this container. The digest fields update within a few seconds.
+2. If an update is available, click **Update** to start the blue/green update flow.
+
+**The update flow (7 stages):**
+
+| Stage | What happens |
+|---|---|
+| 1. Backup | Full `docker inspect` JSON and a reconstructed compose YAML are saved to the backups volume and the database |
+| 2. Pull | The latest image tag is pulled from the registry |
+| 3. Trivy scan | (If Scan-then-update mode is on) The new image is scanned for CVEs before the running container is touched |
+| 4. Stop | The current container is stopped and renamed to `<name>_inspectre_bak_<timestamp>` |
+| 5. Create | A new container is created from the latest image, preserving all original configuration: ports, volumes, networks, environment, restart policy, labels, capabilities, etc. |
+| 6. Start | The new container is started |
+| 7. Health check | InSpectre waits (up to the configured timeout) for the container to be in a healthy/running state. If it becomes healthy, the backup is cleaned up. If it fails, the new container is removed and the backup is renamed back to the original name (automatic rollback). |
+
+All progress messages stream live to the Update tab log panel.
+
+**Cascade restart for shared-network containers:**
+
+If other containers share the updated container's network namespace via `network_mode: container:<name>`, InSpectre automatically recreates those dependent containers after the health check passes so they reference the new container's identity. This is logged as an additional stage in the stream.
+
+**Forced updates:**
+
+If a container's update was blocked due to critical CVEs, you can override the block with the **Force update** button. This bypasses the CVE gate but still runs the full blue/green flow.
+
+**Pinning a container:**
+
+Click the **Pin** toggle in the Update tab to exclude a container from all automatic update checks and auto-update runs. Pinned containers are shown with a lock badge and skipped entirely by the scheduled update loop. You can still update them manually at any time.
+
+You can also pin via a Docker label on the container itself:
+```
+com.inspectre.update.pin=true
+```
+This label-level pin takes precedence over the database toggle.
+
+### 12.12 Scheduled Update Checks
+
+The **Update Schedule** panel on the Containers page (above the toolbar) configures automatic update checks.
+
+**Settings:**
+
+| Setting | Description |
+|---|---|
+| **Enable scheduled checks** | Master toggle. When off, no automatic checks run. |
+| **Check at hour (UTC)** | The hour of day (0–23, UTC) when the check runs. |
+| **Days** | Which days of the week to run the check. Select individual days or leave all unselected to run every day. |
+| **Auto-update mode** | What to do when an update is found (see below). |
+
+**Auto-update modes:**
+
+| Mode | Behaviour |
+|---|---|
+| **Disabled — check only** | Update availability is recorded and shown as a badge, but no update is applied. |
+| **Notify only** | Same as disabled, but also sends a notification to all configured channels when an update is first detected. |
+| **Scan then update** | Pulls the new image, runs a Trivy scan, and only applies the update if no critical CVEs are found. Notifies on blocked updates. |
+| **Auto — update immediately** | Applies the update as soon as a newer image is detected. No scan gate. |
+
+The check runs **once per calendar day** at the configured hour. If InSpectre is restarted mid-day after a check has already run, it will not run a second time on the same calendar date.
+
+### 12.13 Bulk Update Controls
+
+The Containers page toolbar includes two action controls when update checking is in use:
+
+**Check button** — triggers an immediate registry digest check across all containers on all configured Docker hosts, regardless of the scheduled check time. Runs in the background; status badges update within a few seconds as results come in. The button shows a spinning icon while the check is in progress.
+
+**Update all button** — appears only when one or more containers have an update available (and are not pinned, blocked, or already updating). Shows a blue badge with the count of updatable containers. Clicking it fires background updates for each of those containers in sequence, with the configured stagger delay between them (see Settings below). Containers that complete their health check successfully move on; any that fail roll back automatically.
+
+**Has Update smart filter** — in the filter bar alongside Vulnerable / Host Network / Bridge Network, the **Has Update** chip filters the container list to show only containers with a newer image available. Click once to include only updated containers, click again to exclude them, click a third time to clear.
+
+### 12.14 Container Update Settings
+
+Update-related settings live in **Settings → Docker → Container Updates**.
+
+| Setting | Description |
+|---|---|
+| **Block Updates with Critical CVEs** | When enabled (default), any update where the new image contains at least one critical-severity CVE is blocked. The container's badge shows **Blocked** and the reason. You can still force the update from the drawer. |
+| **Auto-Backup Before Update** | When enabled (default), a full config backup (JSON + compose YAML) is saved before every update, whether triggered manually or by the schedule. |
+| **Health Check Timeout (seconds)** | How long to wait for the new container to reach a healthy/running state before triggering automatic rollback. Default: 30 seconds. Increase this for containers with slow startup sequences. |
+| **Stagger Between Updates (seconds)** | Delay between sequential container updates when running a scheduled or bulk auto-update batch. Default: 30 seconds. Prevents hammering the registry and host resources simultaneously. |
+| **Honour pin labels** | When enabled (default), the `com.inspectre.update.pin=true` Docker label on a container excludes it from all auto-update activity, in addition to the per-container database pin toggle. |
+
+Schedule settings (hour, days, auto-update mode) and the enable/disable toggle are on the **Containers** page itself, not in Settings.
+
+### 12.15 Container Update Limitations
+
+**Compose stacks with shared network namespaces:**
+
+When a container uses `network_mode: "service:X"` in a Docker Compose file, Docker translates this to `network_mode: "container:<ID>"` at creation time — baking in the parent container's ID. If the parent container is later recreated (e.g. by running `docker compose up -d` after a change), its container ID changes. The dependent container now holds a stale reference to a container ID that no longer exists.
+
+InSpectre detects this situation during the pre-flight check and will **block the update** with a clear explanation rather than attempting the update and failing. The error will read:
+
+> *Cannot update 'container-name' automatically — it shares another container's network namespace (container: mode) and the parent container (ID…) no longer exists. This happens when the parent was recreated by docker compose, giving it a new ID. To fix: re-run `docker compose up -d` in your original compose project directory to recreate the whole stack with correct references, then update from there.*
+
+The correct resolution is to update such containers by re-running `docker compose pull && docker compose up -d` in the project directory on the Docker host. This lets Docker Compose handle the inter-container dependency correctly.
+
+**Proxmox LXC containers:**
+
+Image update management is not available for Proxmox LXC containers. The Update tab is only shown in the drawer for Docker containers.
 
 ---
 

@@ -93,6 +93,34 @@ const SETTING_META = {
   docker_scan_on_update: { label: 'Scan Updated Containers', type: 'toggle', tab: 'docker',
     description: 'Automatically run a Trivy vulnerability scan when a container is recreated with an updated image.' },
 
+  // Container update management
+  container_update_check_interval: { label: 'Update Check Interval', type: 'select', tab: 'docker',
+    options: [
+      { value: 'disabled', label: 'Disabled' },
+      { value: '1h',       label: 'Every hour' },
+      { value: '6h',       label: 'Every 6 hours' },
+      { value: '12h',      label: 'Every 12 hours' },
+      { value: '24h',      label: 'Every 24 hours' },
+    ],
+    description: 'How often to check Docker registries for newer image versions. Uses only registry manifest calls — no image pulls.' },
+  container_auto_update: { label: 'Auto-Update Mode', type: 'select', tab: 'docker',
+    options: [
+      { value: 'disabled',        label: 'Disabled — notify only' },
+      { value: 'scan_then_update', label: 'Scan then update (block on critical CVEs)' },
+      { value: 'auto',            label: 'Auto-update (no scan gate)' },
+    ],
+    description: 'What to do when an update is detected. Scan-then-update runs Trivy on the new image before deploying.' },
+  container_update_block_critical: { label: 'Block Updates with Critical CVEs', type: 'toggle', tab: 'docker',
+    description: 'Prevent container updates if the new image contains critical-severity CVEs. The update can still be forced manually from the drawer.' },
+  container_backup_enabled: { label: 'Auto-Backup Before Update', type: 'toggle', tab: 'docker',
+    description: 'Always capture a full config backup (docker inspect JSON + compose YAML) before any container update.' },
+  container_update_health_timeout: { label: 'Health Check Timeout (seconds)', type: 'text', tab: 'docker',
+    description: 'How long to wait for a container to become healthy after an update before triggering automatic rollback. Default: 30.' },
+  container_update_stagger_seconds: { label: 'Stagger Between Updates (seconds)', type: 'text', tab: 'docker',
+    description: 'Delay between each container when running a batch auto-update, to avoid hammering the registry and the Docker host simultaneously.' },
+  container_update_pin_labels: { label: 'Honour Pin Labels', type: 'toggle', tab: 'docker',
+    description: 'Respect the com.inspectre.update.pin=true Docker label on containers to exclude them from auto-updates.' },
+
   // Data tab — traffic monitoring
   traffic_enabled:        { label: 'Enable Traffic Monitoring',  type: 'toggle', tab: 'data',
     description: 'Allow per-device traffic capture sessions. Disable to prevent all traffic monitoring.' },
@@ -927,6 +955,38 @@ export function SettingsPanel({ onClose, onSettingChange }) {
                 {settingsByKeys(['trivy_db_update_frequency','docker_scan_on_new','docker_scan_on_update']).map(s => (
                   <SettingRow key={s.key} s={s} dirty={dirty} onchange={handleChange} />
                 ))}
+              </CollapsibleSection>
+
+              <CollapsibleSection label="Container Updates" Icon={RefreshCw} defaultOpen={false}>
+                <p className="text-xs mb-3" style={{ color: 'var(--color-text-faint)' }}>
+                  Automatically check registries for newer image versions and optionally update containers.
+                  All updates use a blue/green strategy with automatic rollback — the original container
+                  is preserved until the new one passes a health check.
+                </p>
+                <p className="text-xs mb-3 px-3 py-2 rounded" style={{ color: 'var(--color-text-muted)', background: 'var(--color-surface-raised)' }}>
+                  Update schedule and auto-update mode are configured in the <strong>Containers</strong> page.
+                </p>
+                {settingsByKeys([
+                  'container_update_block_critical',
+                  'container_backup_enabled',
+                  'container_update_health_timeout',
+                  'container_update_stagger_seconds',
+                  'container_update_pin_labels',
+                ]).map(s => (
+                  <SettingRow key={s.key} s={s} dirty={dirty} onchange={handleChange} />
+                ))}
+                <div className="mt-3">
+                  <button
+                    onClick={async () => {
+                      try {
+                        await api.dockerCheckAllUpdates()
+                      } catch (_) {}
+                    }}
+                    className="btn-ghost flex items-center gap-1.5 text-xs">
+                    <RefreshCw size={12} />
+                    Check All Containers Now
+                  </button>
+                </div>
               </CollapsibleSection>
             </>
           )}
