@@ -261,6 +261,18 @@ cd InSpectre
           <li><strong>Host filter</strong> — filter the container list by configured host</li>
         </ul>
 
+        <h3>Container image updates</h3>
+        <p>InSpectre checks Docker registries for newer image versions using lightweight digest comparison — no unnecessary pulls — and can update containers safely from the UI.</p>
+        <ul>
+          <li><strong>Blue/green updates</strong> — the original container is renamed to a timestamped backup before the new one starts; if the new container fails its health check it is removed and the backup is automatically restored</li>
+          <li><strong>CVE pre-scan gate</strong> — optionally run Trivy on the new image before touching the running container; updates containing critical CVEs are blocked automatically (override available)</li>
+          <li><strong>Scheduled checks</strong> — configure a daily check at a specific hour and day(s) of the week with four auto-update modes: check only, notify, scan-then-update, or fully automatic</li>
+          <li><strong>Bulk controls</strong> — the Containers page toolbar shows a <em>Check</em> button for an immediate registry scan across all containers, and an <em>Update all</em> button (with a live count badge) to update every container that has one available</li>
+          <li><strong>Has Update smart filter</strong> — filter the container list to show only containers with a newer image waiting</li>
+          <li><strong>Config backups</strong> — a full <code class="mono">docker inspect</code> JSON and reconstructed compose YAML are saved before every update, viewable and restorable from the container drawer</li>
+          <li><strong>Pin support</strong> — exclude individual containers from all automatic update activity via the UI toggle or a <code class="mono">com.inspectre.update.pin=true</code> Docker label</li>
+        </ul>
+
         <h2 id="nettools">Network tools</h2>
         <p>The <strong>Network Tools</strong> page provides 25 diagnostic utilities that run from the probe container — giving you the perspective of a device on your LAN.</p>
         <table>
