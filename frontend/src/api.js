@@ -395,6 +395,7 @@ export const api = {
   dockerGetBackupCompose:   (bid)                    => request('GET',  `/docker/backups/${bid}/compose`),
   dockerPinContainer:       (id, pinned)             => request('POST', `/docker/containers/${id}/pin`, { pinned }),
   dockerCheckAllUpdates:    ()                       => request('POST', '/docker/check-all-updates'),
+  dockerCheckAllStatus:     ()                       => request('GET',  '/docker/check-all-status'),
   dockerUpdateAll:          ()                       => request('POST', '/docker/update-all'),
   ping:                     ()                       => fetch('/api/ping').then(r => r.ok),
 

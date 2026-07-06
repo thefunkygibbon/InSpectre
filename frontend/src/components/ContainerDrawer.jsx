@@ -846,9 +846,9 @@ function UpdatesTab({ container, updateStatus: initialStatus }) {
   }, [logs])
 
   // Refresh status from API
-  async function refreshStatus() {
+  async function refreshStatus(containerId = container.id) {
     try {
-      const s = await api.dockerContainerUpdateStatus(container.id)
+      const s = await api.dockerContainerUpdateStatus(containerId)
       setStatus(s)
     } catch (_) {}
   }
@@ -857,7 +857,21 @@ function UpdatesTab({ container, updateStatus: initialStatus }) {
     setChecking(true)
     setLogs(l => [...l, 'Starting update check…'])
     try {
-      const res = await api.dockerCheckUpdate(container.id)
+      let targetId = container.id
+      let res
+      try {
+        res = await api.dockerCheckUpdate(targetId)
+      } catch (e) {
+        const msg = String(e?.message || '')
+        if (!msg.includes('404')) throw e
+        const all = await api.dockerContainers()
+        const match = (all || []).find(c => c.name === container.name)
+        if (!match?.id) {
+          throw new Error(`Container '${container.name}' was recreated and could not be resolved by name.`)
+        }
+        targetId = match.id
+        res = await api.dockerCheckUpdate(targetId)
+      }
       setStatus(s => ({
         ...s,
         ...res,
@@ -871,7 +885,7 @@ function UpdatesTab({ container, updateStatus: initialStatus }) {
       } else {
         setLogs(l => [...l, 'No new image found (up to date).'])
       }
-      await refreshStatus()
+      await refreshStatus(targetId)
     } catch (e) {
       setLogs(l => [...l, `[ERROR] ${e.message}`])
     } finally {

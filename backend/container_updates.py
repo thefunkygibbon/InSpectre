@@ -24,6 +24,7 @@ import os
 import shutil
 import socket
 import subprocess
+import threading
 import time
 from datetime import datetime, timezone
 from typing import Optional
@@ -115,6 +116,21 @@ _JSONB_COLS_STATUS = {"new_image_vulns"}
 # Per-container update locks (created lazily on first use)
 _update_locks: dict[str, asyncio.Lock] = {}
 
+_check_all_status_lock = threading.Lock()
+_check_all_status = {
+    "running": False,
+    "total": 0,
+    "completed": 0,
+    "current_container": None,
+    "current_host": None,
+    "hosts_total": 0,
+    "hosts_completed": 0,
+    "started_at": None,
+    "finished_at": None,
+    "error_count": 0,
+    "last_error": None,
+}
+
 router = APIRouter()
 
 
@@ -134,6 +150,31 @@ def _resolve_net_mode_parent(client, container, raw_net_mode: str) -> str:
         return f"container:{parent.name.lstrip('/')}"
     except Exception:
         return raw_net_mode
+
+
+def _utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _set_check_all_status(**updates) -> None:
+    with _check_all_status_lock:
+        _check_all_status.update(updates)
+
+
+def _get_check_all_status() -> dict:
+    with _check_all_status_lock:
+        return dict(_check_all_status)
+
+
+def _count_running_containers_for_host(host_url: str) -> int:
+    client = _make_docker_client(host_url)
+    try:
+        return len(client.containers.list(filters={"status": "running"}))
+    except Exception as exc:
+        print(f"[check-all] count failed on {host_url}: {exc}", flush=True)
+        return 0
+    finally:
+        client.close()
 
 # ── Self-update helper script ──────────────────────────────────────────────────
 # Written to the backups volume and executed by a short-lived sidecar container
@@ -653,12 +694,33 @@ def _check_update_sync(image_name: str, host_url: str) -> dict:
             "error": "Container is using a digest-only image reference; registry update checks require repo:tag.",
         }
 
+    def _repo_name(ref: str) -> str:
+        base = ref.split("@", 1)[0]
+        last_colon = base.rfind(":")
+        last_slash = base.rfind("/")
+        if last_colon > last_slash:
+            base = base[:last_colon]
+        return base
+
+    def _local_manifest_digest(local_img, image_ref: str) -> str | None:
+        attrs = local_img.attrs or {}
+        repo_digests = attrs.get("RepoDigests") or []
+        if not repo_digests:
+            return None
+        repo = _repo_name(image_ref)
+        for rd in repo_digests:
+            if rd.startswith(f"{repo}@"):
+                return rd.split("@", 1)[1]
+        # Fallback: first available manifest digest
+        return repo_digests[0].split("@", 1)[1] if "@" in repo_digests[0] else None
+
     client = _make_docker_client(host_url)
     try:
-        # Digest of the locally-cached image for this tag
+        # Manifest digest of the locally-cached image tag.
+        # NOTE: local_img.id is the image config digest, not manifest digest.
         try:
             local_img = client.images.get(image_name)
-            current_digest = local_img.id
+            current_digest = _local_manifest_digest(local_img, image_name)
         except docker_sdk.errors.ImageNotFound:
             current_digest = None
 
@@ -674,9 +736,16 @@ def _check_update_sync(image_name: str, host_url: str) -> dict:
                 "error": f"Registry check failed: {exc}",
             }
 
-        has_update = bool(
-            latest_digest and current_digest and latest_digest != current_digest
-        )
+        # Compare like-for-like manifest digests only.
+        if not current_digest:
+            return {
+                "current_digest": None,
+                "latest_digest": latest_digest,
+                "has_update": False,
+                "error": "Local manifest digest unavailable (RepoDigests missing); unable to reliably compare against registry.",
+            }
+
+        has_update = bool(latest_digest and latest_digest != current_digest)
         return {
             "current_digest": current_digest,
             "latest_digest":  latest_digest,
@@ -831,12 +900,17 @@ def _trivy_scan_image(image_name: str) -> tuple[list, int, int]:
 
 # ── Notification helper ────────────────────────────────────────────────────────
 
-def _fire_notification(event: str, title: str, body: str) -> None:
+def _fire_notification(
+    event: str,
+    title: str,
+    body: str,
+    device_mac: str | None = None,
+) -> None:
     """Thread-safe: schedule a notification dispatch on the main event loop."""
     loop = _main_loop_getter() if _main_loop_getter else None
     if loop and not loop.is_closed():
         asyncio.run_coroutine_threadsafe(
-            _notification_dispatch(event, title, body), loop
+            _notification_dispatch(event, title, body, device_mac), loop
         )
 
 
@@ -1829,6 +1903,7 @@ def _check_all_containers_for_host(
     host_url: str,
     host_id,
     auto_update: str = "disabled",
+    progress_cb=None,
 ) -> None:
     """
     Iterate every running container on a host, compare image digests against
@@ -1844,77 +1919,90 @@ def _check_all_containers_for_host(
     finally:
         client.close()
 
+    total = len(containers)
     for c in containers:
         cname      = c.name.lstrip("/")
         image_name = _container_image_ref(c)
+        if progress_cb:
+            try:
+                progress_cb("start", cname, host_url, host_id, total)
+            except Exception:
+                pass
 
-        # Never auto-update InSpectre's own critical containers
-        role = _stack_role(cname, c.id)
-        if role in ("self", "db"):
-            continue
-
-        # Respect label-level pin
-        if (c.labels or {}).get("com.inspectre.update.pin") == "true":
-            continue
-
-        # Respect DB-level pin
-        db = _SessionLocal()
         try:
-            row = db.execute(
-                text("""SELECT pinned, update_in_progress
-                        FROM container_update_status
-                        WHERE container_name=:n AND COALESCE(host_id,-1)=COALESCE(:h,-1)"""),
-                {"n": cname, "h": host_id},
-            ).fetchone()
-            if row and (row[0] or row[1]):
-                db.close()
+            # Never auto-update InSpectre's own critical containers
+            role = _stack_role(cname, c.id)
+            if role in ("self", "db"):
                 continue
-        finally:
-            db.close()
 
-        try:
-            had_update = False
-            image_for_check = image_name
+            # Respect label-level pin
+            if (c.labels or {}).get("com.inspectre.update.pin") == "true":
+                continue
 
+            # Respect DB-level pin
             db = _SessionLocal()
             try:
-                image_for_check = _resolve_registry_image_ref(db, cname, host_id, image_name)
-                prev = db.execute(
-                    text("""SELECT has_update FROM container_update_status
+                row = db.execute(
+                    text("""SELECT pinned, update_in_progress
+                            FROM container_update_status
                             WHERE container_name=:n AND COALESCE(host_id,-1)=COALESCE(:h,-1)"""),
                     {"n": cname, "h": host_id},
                 ).fetchone()
-                had_update = bool(prev and prev[0])
+                if row and (row[0] or row[1]):
+                    db.close()
+                    continue
             finally:
                 db.close()
 
-            result = _check_update_sync(image_for_check, host_url)
-
-            db = _SessionLocal()
             try:
-                kw = dict(
-                    image          = image_for_check,
-                    current_digest = result.get("current_digest"),
-                    latest_digest  = result.get("latest_digest"),
-                    has_update     = result.get("has_update", False),
-                    checked_at     = datetime.now(timezone.utc),
-                )
-                if not result.get("has_update"):
-                    kw["update_blocked"] = False
-                _upsert_update_status(db, cname, host_id, **kw)
-            finally:
-                db.close()
+                had_update = False
+                image_for_check = image_name
 
-            # Notify once when an update first appears
-            if result.get("has_update") and not had_update:
-                _fire_notification(
-                    "container.update_available",
-                    "Container Update Available",
-                    f"New image version available for {cname} ({image_for_check})",
-                )
+                db = _SessionLocal()
+                try:
+                    image_for_check = _resolve_registry_image_ref(db, cname, host_id, image_name)
+                    prev = db.execute(
+                        text("""SELECT has_update FROM container_update_status
+                                WHERE container_name=:n AND COALESCE(host_id,-1)=COALESCE(:h,-1)"""),
+                        {"n": cname, "h": host_id},
+                    ).fetchone()
+                    had_update = bool(prev and prev[0])
+                finally:
+                    db.close()
 
-        except Exception as exc:
-            print(f"[update-check] {cname}: {exc}", flush=True)
+                result = _check_update_sync(image_for_check, host_url)
+
+                db = _SessionLocal()
+                try:
+                    kw = dict(
+                        image          = image_for_check,
+                        current_digest = result.get("current_digest"),
+                        latest_digest  = result.get("latest_digest"),
+                        has_update     = result.get("has_update", False),
+                        checked_at     = datetime.now(timezone.utc),
+                    )
+                    if not result.get("has_update"):
+                        kw["update_blocked"] = False
+                    _upsert_update_status(db, cname, host_id, **kw)
+                finally:
+                    db.close()
+
+                # Notify once when an update first appears
+                if result.get("has_update") and not had_update:
+                    _fire_notification(
+                        "container.update_available",
+                        "Container Update Available",
+                        f"New image version available for {cname} ({image_for_check})",
+                    )
+
+            except Exception as exc:
+                print(f"[update-check] {cname}: {exc}", flush=True)
+        finally:
+            if progress_cb:
+                try:
+                    progress_cb("done", cname, host_url, host_id, total)
+                except Exception:
+                    pass
 
         time.sleep(1)   # small inter-container delay to respect rate limits
 
@@ -2065,7 +2153,10 @@ async def check_container_update(container_id: str, request: Request):
             finally:
                 client.close()
 
-        container_name, image_name = await asyncio.to_thread(_get_info)
+        try:
+            container_name, image_name = await asyncio.to_thread(_get_info)
+        except docker_sdk.errors.NotFound:
+            raise HTTPException(404, "Container not found. It may have been recreated with a new ID; refresh the container list and try again.")
         raw_image_name = image_name
         image_name = _resolve_registry_image_ref(db, container_name, host_id, image_name)
         print(
@@ -2335,17 +2426,68 @@ async def check_all_updates_endpoint(request: Request):
     finally:
         db.close()
 
+    current = _get_check_all_status()
+    if current.get("running"):
+        return {"status": "already_running", **current}
+
+    _set_check_all_status(
+        running=True,
+        total=0,
+        completed=0,
+        current_container=None,
+        current_host=None,
+        hosts_total=len(docker_hosts),
+        hosts_completed=0,
+        started_at=_utc_now_iso(),
+        finished_at=None,
+        error_count=0,
+        last_error=None,
+    )
+
     async def _run():
-        for host in docker_hosts:
-            host_url = host.get("url") or "unix:///var/run/docker.sock"
-            host_id  = host.get("id")
-            try:
-                await asyncio.to_thread(_check_all_containers_for_host, host_url, host_id)
-            except Exception as e:
-                print(f"[check-all] {host_url}: {e}", flush=True)
+        try:
+            total = 0
+            for host in docker_hosts:
+                host_url = host.get("url") or "unix:///var/run/docker.sock"
+                total += await asyncio.to_thread(_count_running_containers_for_host, host_url)
+            _set_check_all_status(total=total)
+
+            def _progress(event, cname, hurl, _hid, _host_total):
+                with _check_all_status_lock:
+                    if event == "start":
+                        _check_all_status["current_container"] = cname
+                        _check_all_status["current_host"] = hurl
+                    elif event == "done":
+                        _check_all_status["completed"] = (_check_all_status.get("completed") or 0) + 1
+
+            for i, host in enumerate(docker_hosts, start=1):
+                host_url = host.get("url") or "unix:///var/run/docker.sock"
+                host_id  = host.get("id")
+                _set_check_all_status(current_host=host_url, hosts_completed=i - 1)
+                try:
+                    await asyncio.to_thread(_check_all_containers_for_host, host_url, host_id, "disabled", _progress)
+                except Exception as e:
+                    print(f"[check-all] {host_url}: {e}", flush=True)
+                    with _check_all_status_lock:
+                        _check_all_status["error_count"] = (_check_all_status.get("error_count") or 0) + 1
+                        _check_all_status["last_error"] = str(e)
+            _set_check_all_status(hosts_completed=len(docker_hosts))
+        finally:
+            _set_check_all_status(
+                running=False,
+                current_container=None,
+                current_host=None,
+                finished_at=_utc_now_iso(),
+            )
 
     asyncio.ensure_future(_run())
     return {"status": "check_started", "hosts": len(docker_hosts)}
+
+
+@router.get("/docker/check-all-status")
+async def check_all_updates_status(request: Request):
+    _verify_token(request)
+    return _get_check_all_status()
 
 
 @router.post("/docker/update-all")

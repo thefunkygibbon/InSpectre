@@ -408,6 +408,9 @@ export function ContainersPage({ openContainer, skin }) {
   const [updateStatuses, setUpdateStatuses] = useState({})
   const [checkingAll,   setCheckingAll]   = useState(false)
   const [updatingAll,   setUpdatingAll]   = useState(false)
+  const [checkAllStatus, setCheckAllStatus] = useState(null)
+
+  const checkAllRunning = checkingAll || !!checkAllStatus?.running
 
   const pendingUpdateCount = useMemo(
     () => Object.values(updateStatuses).filter(
@@ -420,7 +423,14 @@ export function ContainersPage({ openContainer, skin }) {
     setCheckingAll(true)
     try {
       await api.dockerCheckAllUpdates()
-      setTimeout(() => load(true), 4000)
+      let status = null
+      const started = Date.now()
+      do {
+        await new Promise(resolve => setTimeout(resolve, 900))
+        status = await api.dockerCheckAllStatus().catch(() => null)
+        if (status) setCheckAllStatus(status)
+      } while (status?.running && (Date.now() - started) < (10 * 60 * 1000))
+      await load(true)
     } catch (_) {}
     finally { setCheckingAll(false) }
   }
@@ -498,6 +508,20 @@ export function ContainersPage({ openContainer, skin }) {
     const id = setInterval(() => load(true), 15000)
     return () => clearInterval(id)
   }, [load])
+
+  useEffect(() => {
+    let cancelled = false
+    const pull = async () => {
+      const status = await api.dockerCheckAllStatus().catch(() => null)
+      if (!cancelled && status) setCheckAllStatus(status)
+    }
+    pull()
+    const id = setInterval(pull, 2000)
+    return () => {
+      cancelled = true
+      clearInterval(id)
+    }
+  }, [])
 
   // Open a specific container's drawer on the vuln tab (used from SecurityDashboard).
   // consumed ref prevents containers auto-refresh from re-opening a drawer the user closed.
@@ -762,13 +786,19 @@ export function ContainersPage({ openContainer, skin }) {
             </button>
             <button
               onClick={checkAllUpdates}
-              disabled={checkingAll}
+              disabled={checkAllRunning}
               title="Check all containers for image updates"
               className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-xl text-xs font-medium border transition-colors"
               style={{ background: 'var(--color-surface-offset)', color: 'var(--color-text-muted)', borderColor: 'var(--color-border)' }}>
-              <RefreshCw size={11} className={checkingAll ? 'animate-spin' : ''} />
-              Check
+              <RefreshCw size={11} className={checkAllRunning ? 'animate-spin' : ''} />
+              {checkAllRunning ? 'Checking…' : 'Check all'}
             </button>
+            {checkAllRunning && (
+              <div className="max-w-[240px] truncate text-[11px]" style={{ color: 'var(--color-text-faint)' }}>
+                Checking {checkAllStatus?.completed || 0}/{checkAllStatus?.total || '…'}
+                {checkAllStatus?.current_container ? `: ${checkAllStatus.current_container}` : ''}
+              </div>
+            )}
             {pendingUpdateCount > 0 && (
               <button
                 onClick={updateAllPending}
