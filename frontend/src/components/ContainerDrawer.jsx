@@ -855,9 +855,23 @@ function UpdatesTab({ container, updateStatus: initialStatus }) {
 
   async function checkNow() {
     setChecking(true)
+    setLogs(l => [...l, 'Starting update check…'])
     try {
       const res = await api.dockerCheckUpdate(container.id)
-      setStatus(s => ({ ...s, ...res }))
+      setStatus(s => ({
+        ...s,
+        ...res,
+        has_update: res?.has_update ?? s?.has_update ?? false,
+        checked_at: new Date().toISOString(),
+      }))
+      if (res?.error) {
+        setLogs(l => [...l, `Check warning: ${res.error}`])
+      } else if (res?.has_update) {
+        setLogs(l => [...l, 'Update found in registry.'])
+      } else {
+        setLogs(l => [...l, 'No new image found (up to date).'])
+      }
+      await refreshStatus()
     } catch (e) {
       setLogs(l => [...l, `[ERROR] ${e.message}`])
     } finally {
@@ -1023,6 +1037,11 @@ function UpdatesTab({ container, updateStatus: initialStatus }) {
                 style={{ color: '#10b981', background: 'rgba(16,185,129,0.12)', border: '1px solid rgba(16,185,129,0.3)' }}>
                 ✓ Up to date
               </span>
+            ) : status?.checked_at ? (
+              <span className="text-[10px] font-bold rounded-full px-2 py-0.5"
+                style={{ color: '#10b981', background: 'rgba(16,185,129,0.12)', border: '1px solid rgba(16,185,129,0.3)' }}>
+                ✓ Checked
+              </span>
             ) : status ? (
               <span className="text-[10px] rounded-full px-2 py-0.5"
                 style={{ color: 'var(--color-text-muted)', background: 'rgba(107,114,128,0.08)' }}>
@@ -1076,6 +1095,12 @@ function UpdatesTab({ container, updateStatus: initialStatus }) {
         )}
 
         {/* Last update error */}
+        {status?.last_update_status === 'checked' && status?.last_update_error && (
+          <div className="rounded-lg px-3 py-2 text-xs"
+            style={{ background: 'rgba(245,158,11,0.08)', border: '1px solid rgba(245,158,11,0.25)', color: '#f59e0b' }}>
+            <strong>Check warning:</strong> {status.last_update_error}
+          </div>
+        )}
         {status?.last_update_status === 'failed' && status?.last_update_error && (
           <div className="rounded-lg px-3 py-2 text-xs"
             style={{ background: 'rgba(239,68,68,0.08)', border: '1px solid rgba(239,68,68,0.25)', color: '#ef4444' }}>

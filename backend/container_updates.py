@@ -577,6 +577,60 @@ def _resolve_host(db, container_id: str) -> tuple[str, dict, int | None]:
 
 # ── Image update detection ────────────────────────────────────────────────────
 
+def _container_image_ref(c) -> str:
+    """
+    Best-effort registry reference for a running container image.
+    Prefer Config.Image (what container was started with), then non-digest tags.
+    """
+    attrs = c.attrs or {}
+    config = attrs.get("Config") or {}
+
+    ref = (config.get("Image") or "").strip()
+    if ref and not ref.startswith("sha256:"):
+        return ref
+
+    for tag in (c.image.tags or []):
+        if tag and not tag.startswith("sha256:"):
+            return tag
+
+    # Last resort (may be digest-only and not checkable against registry APIs).
+    return ref or (c.image.tags[0] if c.image.tags else str(c.image.id))
+
+
+def _resolve_registry_image_ref(db, container_name: str, host_id, candidate_ref: str) -> str:
+    """
+    Ensure we use a registry-checkable image ref (repo:tag).
+    If the live container only exposes a digest ref, fall back to the last known
+    tagged image from update status or backups for this container.
+    """
+    if candidate_ref and not candidate_ref.startswith("sha256:"):
+        return candidate_ref
+
+    row = db.execute(text("""
+        SELECT image
+        FROM container_update_status
+        WHERE container_name=:n AND COALESCE(host_id,-1)=COALESCE(:h,-1)
+          AND image IS NOT NULL
+        ORDER BY checked_at DESC NULLS LAST, id DESC
+        LIMIT 1
+    """), {"n": container_name, "h": host_id}).fetchone()
+    if row and row[0] and not str(row[0]).startswith("sha256:"):
+        return row[0]
+
+    row = db.execute(text("""
+        SELECT image
+        FROM container_backups
+        WHERE container_name=:n AND COALESCE(host_id,-1)=COALESCE(:h,-1)
+          AND image IS NOT NULL
+        ORDER BY backed_up_at DESC, id DESC
+        LIMIT 1
+    """), {"n": container_name, "h": host_id}).fetchone()
+    if row and row[0] and not str(row[0]).startswith("sha256:"):
+        return row[0]
+
+    return candidate_ref
+
+
 def _check_update_sync(image_name: str, host_url: str) -> dict:
     """
     Compare the locally-cached image digest with the remote registry manifest.
@@ -584,6 +638,21 @@ def _check_update_sync(image_name: str, host_url: str) -> dict:
 
     Returns: {current_digest, latest_digest, has_update, error?}
     """
+    if not image_name:
+        return {
+            "current_digest": None,
+            "latest_digest": None,
+            "has_update": False,
+            "error": "Container has no image reference.",
+        }
+    if image_name.startswith("sha256:"):
+        return {
+            "current_digest": image_name,
+            "latest_digest": None,
+            "has_update": False,
+            "error": "Container is using a digest-only image reference; registry update checks require repo:tag.",
+        }
+
     client = _make_docker_client(host_url)
     try:
         # Digest of the locally-cached image for this tag
@@ -637,7 +706,7 @@ def _backup_container_sync(
     try:
         c           = client.containers.get(container_id)
         attrs       = c.attrs or {}
-        image_name  = (c.image.tags or [str(c.image.id)])[0]
+        image_name  = _container_image_ref(c)
         image_id    = c.image.id
         networks    = list((attrs.get("NetworkSettings") or {}).get("Networks", {}).keys())
         mounts      = attrs.get("Mounts") or []
@@ -919,7 +988,7 @@ async def _self_update_via_helper_stream(
                 target_c = client.containers.get(container_id)
 
                 # Use the current inspectre-web image — it already has docker + psycopg2
-                helper_img = (target_c.image.tags or [str(target_c.image.id)])[0]
+                helper_img = _container_image_ref(target_c)
 
                 # Resolve actual host paths from the running container's mounts
                 # (BACKUP_DIR is /app/backups inside the container, not on the host)
@@ -1187,12 +1256,17 @@ async def _safe_update_stream(
                     c = client.containers.get(container_id)
                     return (
                         c.name.lstrip("/"),
-                        (c.image.tags or [str(c.image.id)])[0],
+                        _container_image_ref(c),
                     )
                 finally:
                     client.close()
 
             container_name, image_name = await asyncio.to_thread(_get_info)
+            db_for_ref = _SessionLocal()
+            try:
+                image_name = _resolve_registry_image_ref(db_for_ref, container_name, host_id, image_name)
+            finally:
+                db_for_ref.close()
 
             # ── Pre-flight: verify container: network parent is resolvable ──
             def _check_network_parent():
@@ -1772,7 +1846,7 @@ def _check_all_containers_for_host(
 
     for c in containers:
         cname      = c.name.lstrip("/")
-        image_name = (c.image.tags or [str(c.image.id)])[0]
+        image_name = _container_image_ref(c)
 
         # Never auto-update InSpectre's own critical containers
         role = _stack_role(cname, c.id)
@@ -1799,20 +1873,27 @@ def _check_all_containers_for_host(
             db.close()
 
         try:
-            result       = _check_update_sync(image_name, host_url)
-            had_update   = False
+            had_update = False
+            image_for_check = image_name
 
             db = _SessionLocal()
             try:
+                image_for_check = _resolve_registry_image_ref(db, cname, host_id, image_name)
                 prev = db.execute(
                     text("""SELECT has_update FROM container_update_status
                             WHERE container_name=:n AND COALESCE(host_id,-1)=COALESCE(:h,-1)"""),
                     {"n": cname, "h": host_id},
                 ).fetchone()
                 had_update = bool(prev and prev[0])
+            finally:
+                db.close()
 
+            result = _check_update_sync(image_for_check, host_url)
+
+            db = _SessionLocal()
+            try:
                 kw = dict(
-                    image          = image_name,
+                    image          = image_for_check,
                     current_digest = result.get("current_digest"),
                     latest_digest  = result.get("latest_digest"),
                     has_update     = result.get("has_update", False),
@@ -1829,7 +1910,7 @@ def _check_all_containers_for_host(
                 _fire_notification(
                     "container.update_available",
                     "Container Update Available",
-                    f"New image version available for {cname} ({image_name})",
+                    f"New image version available for {cname} ({image_for_check})",
                 )
 
         except Exception as exc:
@@ -1980,11 +2061,18 @@ async def check_container_update(container_id: str, request: Request):
             client = _make_docker_client(host_url)
             try:
                 c = client.containers.get(container_id)
-                return c.name.lstrip("/"), (c.image.tags or [str(c.image.id)])[0]
+                return c.name.lstrip("/"), _container_image_ref(c)
             finally:
                 client.close()
 
         container_name, image_name = await asyncio.to_thread(_get_info)
+        raw_image_name = image_name
+        image_name = _resolve_registry_image_ref(db, container_name, host_id, image_name)
+        print(
+            "[update-check] manual check: "
+            f"container={container_name} image={image_name} raw_image={raw_image_name} host={host_url}",
+            flush=True,
+        )
         result = await asyncio.to_thread(_check_update_sync, image_name, host_url)
 
         prev = _get_update_status_row(db, container_name, host_id)
@@ -1996,10 +2084,19 @@ async def check_container_update(container_id: str, request: Request):
             latest_digest  = result.get("latest_digest"),
             has_update     = result.get("has_update", False),
             checked_at     = datetime.now(timezone.utc),
+            last_update_status = "update_available" if result.get("has_update", False) else "checked",
+            last_update_error = result.get("error"),
         )
         if not result.get("has_update"):
             kw["update_blocked"] = False
         _upsert_update_status(db, container_name, host_id, **kw)
+        print(
+            "[update-check] manual result: "
+            f"container={container_name} has_update={bool(result.get('has_update'))} "
+            f"current={result.get('current_digest')} latest={result.get('latest_digest')} "
+            f"error={result.get('error')}",
+            flush=True,
+        )
 
         if result.get("has_update") and not had_update:
             asyncio.ensure_future(_notification_dispatch(
@@ -2030,11 +2127,12 @@ async def scan_new_image_endpoint(container_id: str, request: Request):
             client = _make_docker_client(host_url)
             try:
                 c = client.containers.get(container_id)
-                return c.name.lstrip("/"), (c.image.tags or [str(c.image.id)])[0]
+                return c.name.lstrip("/"), _container_image_ref(c)
             finally:
                 client.close()
 
         container_name, image_name = await asyncio.to_thread(_get_info)
+        image_name = _resolve_registry_image_ref(db, container_name, host_id, image_name)
     finally:
         db.close()
 

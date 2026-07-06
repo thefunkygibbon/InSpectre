@@ -1469,19 +1469,28 @@ async def _notification_loop():
                             if days_absent >= returned_days:
                                 dispatches.append(("device.returned", "Device Returned",
                                                    f"{name} ({ip}) reappeared after {days_absent} days", mac))
-                        # person.home: check if this mac belongs to a person now home
+                        # person.home: check if this mac (or any grouped sibling) belongs to a person
                         person_row = db.execute(text("""
                             SELECT p.id::text, p.name FROM persons p
                             JOIN person_devices pd ON pd.person_id = p.id
-                            WHERE pd.mac_address = :mac LIMIT 1
+                            JOIN devices pd_dev ON pd_dev.mac_address = pd.mac_address
+                            JOIN devices trigger_dev ON trigger_dev.mac_address = :mac
+                            WHERE pd.mac_address = :mac
+                               OR (pd_dev.group_id IS NOT NULL
+                                   AND pd_dev.group_id = trigger_dev.group_id)
+                            LIMIT 1
                         """), {"mac": mac}).fetchone()
                         if person_row:
                             pid, pname = person_row
-                            # Person is home if at least one of their devices is online
+                            # Person is home if at least one of their devices (or grouped siblings) is online
                             any_online = db.execute(text("""
                                 SELECT 1 FROM person_devices pd
                                 JOIN devices d ON d.mac_address = pd.mac_address
-                                WHERE pd.person_id = :pid AND d.is_online = true LIMIT 1
+                                LEFT JOIN devices sibling ON sibling.group_id = d.group_id
+                                    AND sibling.group_id IS NOT NULL
+                                WHERE pd.person_id = :pid
+                                  AND (d.is_online = true OR sibling.is_online = true)
+                                LIMIT 1
                             """), {"pid": pid}).fetchone()
                             if any_online:
                                 dispatches.append(("person.home", "Person Arrived Home",
@@ -1493,19 +1502,28 @@ async def _notification_loop():
                         if is_important:
                             dispatches.append(("device.offline.watched", "Watched Device Offline",
                                                f"{name} ({ip}) went offline", mac))
-                        # person.away: check if this mac belongs to a person now away
+                        # person.away: check if this mac (or any grouped sibling) belongs to a person
                         person_row = db.execute(text("""
                             SELECT p.id::text, p.name FROM persons p
                             JOIN person_devices pd ON pd.person_id = p.id
-                            WHERE pd.mac_address = :mac LIMIT 1
+                            JOIN devices pd_dev ON pd_dev.mac_address = pd.mac_address
+                            JOIN devices trigger_dev ON trigger_dev.mac_address = :mac
+                            WHERE pd.mac_address = :mac
+                               OR (pd_dev.group_id IS NOT NULL
+                                   AND pd_dev.group_id = trigger_dev.group_id)
+                            LIMIT 1
                         """), {"mac": mac}).fetchone()
                         if person_row:
                             pid, pname = person_row
-                            # Person is away if none of their devices are online
+                            # Person is away if none of their devices (or grouped siblings) are online
                             any_online = db.execute(text("""
                                 SELECT 1 FROM person_devices pd
                                 JOIN devices d ON d.mac_address = pd.mac_address
-                                WHERE pd.person_id = :pid AND d.is_online = true LIMIT 1
+                                LEFT JOIN devices sibling ON sibling.group_id = d.group_id
+                                    AND sibling.group_id IS NOT NULL
+                                WHERE pd.person_id = :pid
+                                  AND (d.is_online = true OR sibling.is_online = true)
+                                LIMIT 1
                             """), {"pid": pid}).fetchone()
                             if not any_online:
                                 dispatches.append(("person.away", "Person Left Home",
@@ -8616,6 +8634,16 @@ def _get_docker_host(db: Session) -> str:
     s = db.get(Setting, "docker_host")
     return (s.value if s else None) or "unix:///var/run/docker.sock"
 
+def _parse_extra_hosts(extra_hosts):
+    """Docker stores ExtraHosts as ['host:ip', ...]; the SDK wants {host: ip}."""
+    out = {}
+    for item in (extra_hosts or []):
+        if ":" in item:
+            host, ip = item.rsplit(":", 1)
+            out[host] = ip
+    return out or None
+
+
 def _make_docker_client(host: str):
     try:
         import docker as _docker
@@ -8965,20 +8993,42 @@ async def docker_update(container_id: str, db: Session = Depends(get_db)):
         client = _make_docker_client(host_url)
         try:
             c = client.containers.get(container_id)
-            # Store current container config before deletion
-            image_name = c.image.tags[0] if c.image.tags else str(c.image.id)
-            
-            # Pull latest image
-            try:
-                client.images.pull(image_name)
-            except Exception as pull_err:
-                # If pull fails, continue anyway - might use cached image
-                pass
-            
-            # Get current container config
             attrs = c.attrs or {}
             config = attrs.get("Config", {})
             host_cfg = attrs.get("HostConfig", {})
+            
+            # Use the original image reference from the container config (not digest)
+            image_name = config.get("Image", "")
+            if not image_name:
+                raise Exception("Could not determine container image reference")
+            
+            # Pull latest image with 5-minute timeout
+            try:
+                import signal
+                def _timeout_handler(signum, frame):
+                    raise TimeoutError("Image pull timed out after 5 minutes")
+                
+                old_handler = signal.signal(signal.SIGALRM, _timeout_handler)
+                signal.alarm(300)  # 5 minutes
+                try:
+                    client.images.pull(image_name)
+                finally:
+                    signal.alarm(0)
+                    signal.signal(signal.SIGALRM, old_handler)
+            except (TimeoutError, Exception) as pull_err:
+                raise Exception(f"Failed to pull image '{image_name}': {pull_err}")
+            
+            # Preserve network attachments + aliases for user-defined networks
+            networks_to_attach = {}
+            net_settings = attrs.get("NetworkSettings", {}) or {}
+            networks = (net_settings.get("Networks") or {})
+            if networks:
+                ordered_nets = list(networks.items())
+                if ordered_nets:
+                    first_name, first_info = ordered_nets[0]
+                    first_aliases = [a for a in (first_info.get("Aliases") or []) if a]
+                    if first_name not in ("bridge", "host", "none"):
+                        networks_to_attach[first_name] = first_aliases
             
             # Stop container
             if c.status != "exited":
@@ -8987,35 +9037,88 @@ async def docker_update(container_id: str, db: Session = Depends(get_db)):
             # Remove old container
             c.remove(force=True)
             
-            # Create new container with same config
-            new_c = client.containers.create(
-                image=image_name,
-                command=config.get("Cmd"),
-                environment=config.get("Env"),
-                labels=config.get("Labels"),
-                hostname=config.get("Hostname"),
-                working_dir=config.get("WorkingDir"),
-                name=c.name.lstrip("/"),
-                ports=None,  # Will be handled by port bindings in host_config
-                volumes=None,  # Will be handled by binds in host_config
-                restart_policy={"Name": host_cfg.get("RestartPolicy", {}).get("Name", "no")},
-                host_config=client.api.create_host_config(
-                    port_bindings={
-                        p.split("/")[0]: int(b.get("HostPort", 0)) 
-                        for p, bindings in (attrs.get("NetworkSettings", {}).get("Ports") or {}).items()
-                        if bindings
-                        for b in bindings
-                    },
-                    binds={
-                        m.get("Source", ""): {"bind": m.get("Destination", ""), "mode": m.get("Mode", "rw")}
-                        for m in (attrs.get("Mounts") or [])
-                        if m.get("Type") == "bind"
-                    },
-                ),
+            # Parse port bindings correctly from HostConfig
+            port_bindings = None
+            pb = host_cfg.get("PortBindings") or {}
+            if pb:
+                port_bindings = {}
+                for cport, binds in pb.items():
+                    if binds:
+                        hostport = binds[0].get("HostPort")
+                        hostip = binds[0].get("HostIp") or ""
+                        if hostport:
+                            port_bindings[cport] = (hostip, int(hostport)) if hostip else int(hostport)
+                    else:
+                        port_bindings[cport] = None
+            
+            # Parse devices if any
+            devices = []
+            for d in (host_cfg.get("Devices") or []):
+                devices.append(
+                    f"{d.get('PathOnHost')}:{d.get('PathInContainer')}:{d.get('CgroupPermissions', 'rwm')}"
+                )
+            
+            # Get restart policy
+            restart = host_cfg.get("RestartPolicy") or {}
+            restart_policy = None
+            if restart.get("Name"):
+                restart_policy = {
+                    "Name": restart.get("Name"),
+                    "MaximumRetryCount": restart.get("MaximumRetryCount", 0),
+                }
+            
+            # Build host config
+            host_config = client.api.create_host_config(
+                binds=host_cfg.get("Binds") or None,
+                port_bindings=port_bindings,
+                privileged=bool(host_cfg.get("Privileged")),
+                cap_add=host_cfg.get("CapAdd") or None,
+                cap_drop=host_cfg.get("CapDrop") or None,
+                extra_hosts=_parse_extra_hosts(host_cfg.get("ExtraHosts")),
+                restart_policy=restart_policy,
+                network_mode=host_cfg.get("NetworkMode") or "bridge",
+                devices=devices or None,
             )
             
+            # Exposed ports
+            exposed = list((config.get("ExposedPorts") or {}).keys()) or None
+            
+            # Create networking config for first network
+            networking_config = None
+            if networks_to_attach:
+                first_net_name = list(networks_to_attach.keys())[0]
+                first_net_aliases = networks_to_attach[first_net_name]
+                networking_config = client.api.create_networking_config(
+                    {first_net_name: client.api.create_endpoint_config(aliases=first_net_aliases)}
+                )
+            
+            # Create new container
+            new_c = client.containers.create(
+                image=image_name,
+                name=c.name.lstrip("/"),
+                command=config.get("Cmd"),
+                entrypoint=config.get("Entrypoint"),
+                environment=config.get("Env"),
+                labels=config.get("Labels"),
+                hostname=None if host_cfg.get("NetworkMode") in ("host", "none") else config.get("Hostname"),
+                working_dir=config.get("WorkingDir") or None,
+                ports=exposed,
+                host_config=host_config,
+                networking_config=networking_config,
+            )
+            
+            # Attach additional networks (skip first, already attached)
+            if len(networks_to_attach) > 1:
+                for i, (net_name, aliases) in enumerate(list(networks_to_attach.items())[1:]):
+                    try:
+                        client.api.connect_container_to_network(
+                            new_c.id, net_name, aliases=aliases
+                        )
+                    except Exception:
+                        pass
+            
             # Start new container
-            new_c.start()
+            client.api.start(new_c.id)
             new_c.reload()
             return _add_docker_host_meta(_fmt_container(new_c), docker_hosts[0], host_url)
         finally:
