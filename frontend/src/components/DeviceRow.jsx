@@ -58,7 +58,7 @@ function DeviceRowBase({ device, onClick, striped, onStarToggle, isVulnScanning,
       </span>
 
       <span className="hidden sm:block text-xs truncate" style={{ color: 'var(--color-text-muted)' }}>
-        {cleanVendor(device.vendor_override || device.vendor)}
+        {cleanVendor(device.vendor_override || device.vendor || device.vendor_inferred)}
       </span>
 
       <span className="hidden sm:block text-xs" style={{ color: 'var(--color-text-faint)' }}>

@@ -2080,6 +2080,7 @@ _FB_TYPE_MAP: list[tuple[list[str], str]] = [
     (["android tablet", "galaxy tab", "kindle fire"],               "tablet"),
     (["android", "mobile device", "smartphone"],                    "phone"),
     # PCs
+    (["chromebook", "chrome os", "chromeos"],                       "laptop"),
     (["macbook", "imac", "mac mini", "mac pro"],                    "laptop"),
     (["laptop", "notebook"],                                        "laptop"),
     (["mac os", "macos", "os x"],                                   "laptop"),
@@ -2258,6 +2259,7 @@ async def _fingerbank_loop():
                         device.fingerbank_result = result
                         from sqlalchemy.orm.attributes import flag_modified
                         flag_modified(device, "fingerbank_result")
+                        _apply_fingerbank_enrichment(device, result)
                         db.commit()
                         await asyncio.sleep(0.5)
             finally:
@@ -2824,6 +2826,46 @@ def _infer_vendor(d: Device) -> str | None:
         if tok and len(tok) > 2:
             return tok
     return None
+
+
+def _apply_fingerbank_enrichment(d: Device, result: dict | None) -> None:
+    """
+    Persist conservative identity hints from Fingerbank when local identity is missing.
+    Never overrides explicit user identity overrides.
+    """
+    if not result or result.get("error"):
+        return
+
+    score = result.get("score") or 0
+    if score < 50:
+        return
+
+    # Fill vendor from Fingerbank only when no existing vendor is known.
+    current_vendor = (getattr(d, "vendor", None) or "").strip()
+    if not getattr(d, "vendor_override", None) and (not current_vendor or current_vendor.lower() == "unknown"):
+        inferred_vendor = _infer_vendor(d)
+        if inferred_vendor:
+            d.vendor = inferred_vendor
+
+    # Persist inferred type into scan_results for consistency with existing UI paths.
+    if not getattr(d, "device_type_override", None):
+        mapped_type = result.get("mapped_type")
+        if mapped_type:
+            scan = dict(d.scan_results or {})
+            current_type = (scan.get("device_type") or "").strip().lower()
+            current_source = (scan.get("device_type_source") or "").strip().lower()
+            should_set = (
+                not current_type
+                or current_type == "unknown"
+                or current_source in ("", "heuristic", "dhcp")
+            )
+            if should_set:
+                scan["device_type"] = mapped_type
+                scan["device_type_source"] = "fingerbank"
+                scan["device_type_conf"] = round(min(float(score), 100.0) / 100.0, 2)
+                d.scan_results = scan
+                from sqlalchemy.orm.attributes import flag_modified
+                flag_modified(d, "scan_results")
 
 
 # ---------------------------------------------------------------------------
@@ -3782,6 +3824,7 @@ async def fingerbank_lookup(mac: str, db: Session = Depends(get_db)):
     device.fingerbank_result = result
     from sqlalchemy.orm.attributes import flag_modified
     flag_modified(device, "fingerbank_result")
+    _apply_fingerbank_enrichment(device, result)
     db.commit()
     return {"result": result, "device": _to_dict(device)}
 
@@ -9141,6 +9184,19 @@ async def stream_docker_logs(container_id: str, tail: int = 100, db: Session = D
         raise HTTPException(503, "No container hosts configured.")
     docker_hosts = [h for h in _get_enabled_hosts(db) if h["type"] != "proxmox"]
     host = docker_hosts[0]["url"] if docker_hosts else _get_docker_host(db)
+
+    def _ensure_exists():
+        client = _make_docker_client(host)
+        try:
+            client.containers.get(container_id)
+        finally:
+            client.close()
+
+    try:
+        await asyncio.to_thread(_ensure_exists)
+    except Exception as e:
+        code = 404 if "404" in str(e) or "Not Found" in str(e) else 503
+        raise HTTPException(code, str(e))
 
     line_queue: asyncio.Queue = asyncio.Queue()
     loop = asyncio.get_event_loop()

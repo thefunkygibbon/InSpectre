@@ -484,6 +484,13 @@ export function ContainersPage({ openContainer, skin }) {
       ])
       setStats(statsData)
       setContainers(containerList)
+      setSelected(prev => {
+        if (!prev) return prev
+        const refreshed = (containerList || []).find(c =>
+          c.name === prev.name && (c.host_id || null) === (prev.host_id || null)
+        )
+        return refreshed || prev
+      })
       setVulnSummary(Array.isArray(vulnData) ? vulnData : [])
       if (Array.isArray(updateData)) {
         const byName = {}

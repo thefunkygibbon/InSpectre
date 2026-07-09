@@ -449,17 +449,26 @@ function MainApp({ onLogout }) {
           (d.scan_results?.open_ports || []).some(p => p.port === portNum)
         )
       } else {
-        list = list.filter(d =>
-          (d.ip_address   || '').toLowerCase().includes(q) ||
-          (d.mac_address  || '').toLowerCase().includes(q) ||
-          (d.hostname     || '').toLowerCase().includes(q) ||
-          (d.custom_name  || '').toLowerCase().includes(q) ||
-          (d.vendor       || '').toLowerCase().includes(q) ||
-          (d.display_name || '').toLowerCase().includes(q) ||
-          (d.tags         || '').toLowerCase().includes(q) ||
-          (d.location     || '').toLowerCase().includes(q) ||
-          (d.zone         || '').toLowerCase().includes(q)
-        )
+        list = list.filter(d => {
+          const sr = d.scan_results || {}
+          const fb = d.fingerbank_result || {}
+          const haystack = [
+            d.ip_address, d.primary_ip, d.mac_address,
+            d.hostname, d.custom_name, d.display_name,
+            d.vendor, d.vendor_override, d.vendor_inferred,
+            d.device_type, d.device_type_inferred, d.device_type_override,
+            d.tags, d.location, d.zone, d.notes,
+            d.dhcp_hostname, d.dhcp_vendor_class, d.dhcp_fingerprint,
+            fb.device_name, fb.mapped_type,
+            ...(fb.parents || []),
+            ...(sr.open_ports || []).map(p => `${p.port || ''} ${p.service || ''} ${p.product || ''} ${p.version || ''}`),
+            ...(sr.os_matches || []).map(m => m.name || ''),
+          ]
+            .filter(Boolean)
+            .join(' ')
+            .toLowerCase()
+          return haystack.includes(q)
+        })
       }
     }
     list = applyFilters(list)

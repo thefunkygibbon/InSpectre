@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef } from 'react'
+import { useState, useEffect, useRef, useCallback } from 'react'
 import {
   X, Box, Play, Square, RotateCcw, ChevronDown, ChevronRight,
   Network, HardDrive, Tag, Terminal, ShieldAlert, ShieldCheck,
@@ -100,23 +100,41 @@ function formatLogLine(line) {
   return line
 }
 
-function LogsTab({ containerId, containerName, isRunning }) {
+function LogsTab({ containerId, containerName, isRunning, resolveCurrentContainerId }) {
   const [lines,   setLines]   = useState([])
   const [running, setRunning] = useState(false)
   const [tail,    setTail]    = useState(100)
   const abortRef = useRef(null)
   const endRef   = useRef(null)
 
-  function startStream() {
+  async function startStream() {
     if (abortRef.current) abortRef.current.abort()
     const ctrl = new AbortController()
     abortRef.current = ctrl
     setLines([])
     setRunning(true)
     const tailVal = tail === 0 ? undefined : tail
-    api.dockerLogs(containerId, tailVal, (line) => {
-      setLines(prev => [...prev.slice(-4999), line])
-    }, ctrl.signal).catch(() => {}).finally(() => setRunning(false))
+    let targetId = containerId
+    try {
+      await api.dockerLogs(targetId, tailVal, (line) => {
+        setLines(prev => [...prev.slice(-4999), line])
+      }, ctrl.signal)
+    } catch (e) {
+      const msg = String(e?.message || '')
+      if (msg.includes('404') && resolveCurrentContainerId) {
+        try {
+          const resolved = await resolveCurrentContainerId()
+          if (resolved) {
+            targetId = resolved
+            await api.dockerLogs(targetId, tailVal, (line) => {
+              setLines(prev => [...prev.slice(-4999), line])
+            }, ctrl.signal)
+          }
+        } catch (_) {}
+      }
+    } finally {
+      setRunning(false)
+    }
   }
 
   function stopStream() {
@@ -474,18 +492,37 @@ function VulnTab({ container, trivyScan, updateTrivyScan }) {
 // ---------------------------------------------------------------------------
 // Compose tab
 // ---------------------------------------------------------------------------
-function ComposeTab({ containerId, containerName, labels }) {
+function ComposeTab({ containerId, containerName, labels, resolveCurrentContainerId }) {
   const [data,     setData]     = useState(null)
   const [loading,  setLoading]  = useState(false)
   const [error,    setError]    = useState(null)
   const [copied,   setCopied]   = useState(false)
 
   useEffect(() => {
-    setLoading(true)
-    api.dockerCompose(containerId)
-      .then(r => { setData(r); setError(null) })
-      .catch(e => setError(e.message || 'Failed to generate compose file'))
-      .finally(() => setLoading(false))
+    let cancelled = false
+    ;(async () => {
+      setLoading(true)
+      try {
+        const res = await api.dockerCompose(containerId)
+        if (!cancelled) { setData(res); setError(null) }
+      } catch (e) {
+        const msg = String(e?.message || '')
+        if (msg.includes('404') && resolveCurrentContainerId) {
+          try {
+            const resolved = await resolveCurrentContainerId()
+            if (resolved) {
+              const res2 = await api.dockerCompose(resolved)
+              if (!cancelled) { setData(res2); setError(null) }
+              return
+            }
+          } catch (_) {}
+        }
+        if (!cancelled) setError(e.message || 'Failed to generate compose file')
+      } finally {
+        if (!cancelled) setLoading(false)
+      }
+    })()
+    return () => { cancelled = true }
   }, [containerId])
 
   function handleCopy() {
@@ -1378,6 +1415,20 @@ export function ContainerDrawer({ container: initialContainer, trivyScan, update
   const isStopped = STOPPED_STATES.includes(container.status)
   const hostIp    = container.host_local_ip || hostIpFromUrl(container.host_url)
 
+  const resolveCurrentContainerId = useCallback(async () => {
+    const all = await api.dockerContainers()
+    const match = (all || []).find(c =>
+      c.name === container.name &&
+      (c.host_id || null) === (container.host_id || null)
+    ) || (all || []).find(c => c.name === container.name)
+    if (!match?.id) return null
+    if (match.id !== container.id) {
+      setContainer(match)
+      if (onContainerUpdate) onContainerUpdate(match)
+    }
+    return match.id
+  }, [container.id, container.name, container.host_id, onContainerUpdate])
+
   async function doAction(action) {
     setActioning(action)
     setActionMsg('')
@@ -1606,12 +1657,18 @@ export function ContainerDrawer({ container: initialContainer, trivyScan, update
               containerId={container.id}
               containerName={container.name}
               labels={container.labels}
+              resolveCurrentContainerId={resolveCurrentContainerId}
             />
           )}
 
           {/* ── Logs tab ── */}
           {activeTab === 'logs' && (
-            <LogsTab containerId={container.id} containerName={container.name} isRunning={isRunning} />
+            <LogsTab
+              containerId={container.id}
+              containerName={container.name}
+              isRunning={isRunning}
+              resolveCurrentContainerId={resolveCurrentContainerId}
+            />
           )}
 
           {/* ── Vuln tab ── */}

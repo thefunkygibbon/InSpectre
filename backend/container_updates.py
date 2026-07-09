@@ -152,6 +152,57 @@ def _resolve_net_mode_parent(client, container, raw_net_mode: str) -> str:
         return raw_net_mode
 
 
+def _extract_ports_from_network_settings(net_ports: dict | None) -> tuple[dict, list]:
+    """
+    Build Docker SDK-compatible host port bindings plus exposed ports list.
+    Preserves HostIp + HostPort mappings (including multi-bind entries).
+    """
+    port_bindings: dict = {}
+    exposed_ports: list = []
+
+    for port_proto, bindings in (net_ports or {}).items():
+        exposed_ports.append(port_proto)
+        if not bindings:
+            continue
+
+        mapped = []
+        for b in bindings:
+            hp = b.get("HostPort")
+            if not hp:
+                continue
+            try:
+                host_port = int(hp)
+            except Exception:
+                host_port = hp
+            host_ip = b.get("HostIp")
+            mapped.append((host_ip, host_port) if host_ip else host_port)
+
+        if len(mapped) == 1:
+            port_bindings[port_proto] = mapped[0]
+        elif mapped:
+            port_bindings[port_proto] = mapped
+
+    return port_bindings, exposed_ports
+
+
+def _build_extra_network_attachments(net_cfg: dict | None, primary_mode: str | None) -> list[tuple[str, list]]:
+    """
+    Return additional networks that should be re-attached after container create.
+    Keeps aliases where possible.
+    """
+    primary_key = (primary_mode or "").split(":", 1)[0]
+    attachments: list[tuple[str, list]] = []
+    for net_name, endpoint in ((net_cfg or {}).get("Networks") or {}).items():
+        if net_name in ("host", "none", "", primary_key):
+            continue
+        aliases = []
+        for a in (endpoint or {}).get("Aliases") or []:
+            if a and a not in aliases:
+                aliases.append(a)
+        attachments.append((net_name, aliases))
+    return attachments
+
+
 def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -262,14 +313,28 @@ try:
     net_cfg = attrs.get("NetworkSettings", {})
     all_nets = list((net_cfg.get("Networks") or {}).keys())
 
-    # Port bindings
+    # Port bindings + exposed ports
     port_bindings = {}
+    exposed_ports = []
     for port_proto, bindings in (net_cfg.get("Ports") or {}).items():
-        if bindings:
-            for b in bindings:
-                hp = b.get("HostPort")
-                if hp:
-                    port_bindings[port_proto] = int(hp)
+        exposed_ports.append(port_proto)
+        if not bindings:
+            continue
+        mapped = []
+        for b in bindings:
+            hp = b.get("HostPort")
+            if not hp:
+                continue
+            try:
+                host_port = int(hp)
+            except Exception:
+                host_port = hp
+            host_ip = b.get("HostIp")
+            mapped.append((host_ip, host_port) if host_ip else host_port)
+        if len(mapped) == 1:
+            port_bindings[port_proto] = mapped[0]
+        elif mapped:
+            port_bindings[port_proto] = mapped
 
     # Bind mounts + named volumes
     binds = {}
@@ -314,6 +379,7 @@ try:
         command        = config.get("Cmd"),
         environment    = config.get("Env"),
         labels         = config.get("Labels"),
+        ports          = exposed_ports or list((config.get("ExposedPorts") or {}).keys()) or None,
         hostname       = _custom_hostname,
         working_dir    = config.get("WorkingDir") or None,
         entrypoint     = config.get("Entrypoint"),
@@ -354,7 +420,11 @@ try:
         if net_name in ("host", "none", primary_net_key, ""):
             continue
         try:
-            client.networks.get(net_name).connect(new_container)
+            endpoint = (net_cfg.get("Networks") or {}).get(net_name) or {}
+            aliases = [a for a in (endpoint.get("Aliases") or []) if a]
+            client.api.connect_container_to_network(
+                new_container.id, net_name, aliases=aliases or None
+            )
             log(f"Connected to network: {net_name}")
         except Exception as ne:
             log(f"Could not connect to network {net_name}: {ne}")
@@ -1166,14 +1236,8 @@ def _recreate_container_with_net(client, dep, new_net_mode: str) -> None:
     hcfg     = attrs.get("HostConfig", {})
     net_sets = attrs.get("NetworkSettings", {})
 
-    # Port bindings
-    port_bindings = {}
-    for port_proto, bindings in (net_sets.get("Ports") or {}).items():
-        if bindings:
-            for b in bindings:
-                hp = b.get("HostPort")
-                if hp:
-                    port_bindings[port_proto] = int(hp)
+    # Port bindings + exposed ports
+    port_bindings, exposed_ports = _extract_ports_from_network_settings(net_sets.get("Ports"))
 
     # Bind mounts + named volumes
     binds = {}
@@ -1216,6 +1280,7 @@ def _recreate_container_with_net(client, dep, new_net_mode: str) -> None:
             command       = config.get("Cmd"),
             environment   = config.get("Env"),
             labels        = config.get("Labels"),
+            ports         = exposed_ports or list((config.get("ExposedPorts") or {}).keys()) or None,
             hostname      = _hostname,
             working_dir   = config.get("WorkingDir") or None,
             entrypoint    = config.get("Entrypoint"),
@@ -1563,14 +1628,8 @@ async def _safe_update_stream(
                     hcfg     = attrs.get("HostConfig", {})
                     net_cfg  = attrs.get("NetworkSettings", {})
 
-                    # Reconstruct port bindings from NetworkSettings
-                    port_bindings = {}
-                    for port_proto, bindings in (net_cfg.get("Ports") or {}).items():
-                        if bindings:
-                            for b in bindings:
-                                hp = b.get("HostPort")
-                                if hp:
-                                    port_bindings[port_proto] = int(hp)
+                    # Reconstruct published ports from the old container
+                    port_bindings, exposed_ports = _extract_ports_from_network_settings(net_cfg.get("Ports"))
 
                     # Reconstruct bind mounts
                     binds = {}
@@ -1615,6 +1674,7 @@ async def _safe_update_stream(
                         command       = config.get("Cmd"),
                         environment   = config.get("Env"),
                         labels        = config.get("Labels"),
+                        ports         = exposed_ports or list((config.get("ExposedPorts") or {}).keys()) or None,
                         hostname      = _hostname,
                         working_dir   = config.get("WorkingDir") or None,
                         entrypoint    = config.get("Entrypoint"),
@@ -1648,6 +1708,15 @@ async def _safe_update_stream(
                         ),
                     )
                     new_c = client.containers.get(_cres["Id"])
+                    for net_name, aliases in _build_extra_network_attachments(net_cfg, _raw_net_mode):
+                        try:
+                            client.api.connect_container_to_network(
+                                new_c.id,
+                                net_name,
+                                aliases=aliases or None,
+                            )
+                        except Exception:
+                            pass
                     try:
                         new_c.start()
                     except Exception:
