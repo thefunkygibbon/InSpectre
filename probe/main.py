@@ -412,6 +412,8 @@ _sniffer_queue: queue.Queue = queue.Queue()
 _dhcp_queue:    queue.Queue = queue.Queue(maxsize=500)
 _upsert_locks: dict[str, threading.Lock] = {}
 _upsert_locks_lock = threading.Lock()
+_pending_dhcp_lock = threading.Lock()
+_pending_dhcp_by_mac: dict[str, tuple[str | None, str | None, list[int] | None]] = {}
 
 # Track the last time each MAC was seen by the sniffer within the current sweep
 # window, so we don't falsely increment miss counts for devices the sniffer saw.
@@ -2256,6 +2258,10 @@ def upsert_seen_device(mac: str, ip: str, source: str) -> None:
         finally:
             session.close()
 
+    pending_dhcp = _pop_pending_dhcp(mac)
+    if pending_dhcp is not None:
+        _upsert_dhcp_info(mac, pending_dhcp[0], pending_dhcp[1], pending_dhcp[2])
+
     # Persist hostname_last_attempted if we attempted resolution this call
     if hostname_resolution_attempted:
         sess_hn = Session()
@@ -2466,8 +2472,17 @@ def process_dhcp_packet(packet) -> None:
         if isinstance(opt, tuple) and len(opt) == 2:
             opts[opt[0]] = opt[1]
 
-    msg_type = opts.get('message-type', 0)
-    if msg_type not in (1, 3):  # Discover or Request only
+    raw_msg_type = opts.get('message-type', 0)
+    if isinstance(raw_msg_type, bytes):
+        msg_type = int(raw_msg_type[0]) if raw_msg_type else 0
+    else:
+        try:
+            msg_type = int(raw_msg_type)
+        except Exception:
+            msg_type = 0
+    # Client-originated DHCP flows worth processing for fingerprinting:
+    # Discover, Request, Inform.
+    if msg_type not in (1, 3, 8):
         return
 
     def _decode(v) -> str | None:
@@ -2488,7 +2503,8 @@ def process_dhcp_packet(packet) -> None:
     else:
         opt55 = []
 
-    print(f"[dhcp] {mac}  type={'Discover' if msg_type==1 else 'Request'}"
+    _msg_name = {1: "Discover", 3: "Request", 8: "Inform"}.get(msg_type, str(msg_type))
+    print(f"[dhcp] {mac}  type={_msg_name}"
           f"  vc={vendor_class!r}  host={hostname!r}  opt55_len={len(opt55)}", flush=True)
     try:
         _dhcp_queue.put_nowait((mac, hostname, vendor_class, opt55 if opt55 else None))
@@ -2505,6 +2521,17 @@ def _is_ip_derived_hostname(h: str | None) -> bool:
     return bool(_IP_DERIVED_RE.match(h))
 
 
+def _store_pending_dhcp(mac: str, hostname: str | None, vendor_class: str | None, opt55: list[int] | None) -> None:
+    """Cache DHCP fingerprint data when the device row does not exist yet."""
+    with _pending_dhcp_lock:
+        _pending_dhcp_by_mac[mac] = (hostname, vendor_class, opt55)
+
+
+def _pop_pending_dhcp(mac: str) -> tuple[str | None, str | None, list[int] | None] | None:
+    with _pending_dhcp_lock:
+        return _pending_dhcp_by_mac.pop(mac, None)
+
+
 def _upsert_dhcp_info(mac: str, hostname: str | None, vendor_class: str | None, opt55: list[int] | None) -> None:
     """Write DHCP fingerprint data to the device row and optionally refine device_type."""
     fingerprint_str = ','.join(str(x) for x in opt55) if opt55 else None
@@ -2514,7 +2541,8 @@ def _upsert_dhcp_info(mac: str, hostname: str | None, vendor_class: str | None, 
     try:
         device = session.get(Device, mac)
         if device is None:
-            return  # device not seen by ARP yet; skip (no orphan rows)
+            _store_pending_dhcp(mac, hostname, vendor_class, opt55)
+            return  # device not seen yet — apply once the row exists
 
         changed = False
 

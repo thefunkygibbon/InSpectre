@@ -2232,9 +2232,8 @@ async def _fingerbank_loop():
                 key_row = db.get(Setting, "fingerbank_api_key")
                 api_key = (key_row.value or "").strip() if key_row else ""
                 if api_key:
-                    # Query devices that have never been looked up, or had a transient error.
-                    # Permanent outcomes (no_match, auth_error) and successes are never re-queried
-                    # automatically — only the manual "Fetch now" button can override those.
+                    # Query devices that have never been looked up, had a transient error,
+                    # or whose DHCP fingerprint changed since the last no_match/auth_error.
                     rows = db.execute(text("""
                         SELECT mac_address FROM devices
                         WHERE (dhcp_fingerprint IS NOT NULL
@@ -2243,6 +2242,10 @@ async def _fingerbank_loop():
                           AND (
                             fingerbank_result IS NULL
                             OR fingerbank_result->>'status' = 'error'
+                            OR (
+                              fingerbank_result->>'status' IN ('no_match', 'auth_error')
+                              AND COALESCE(fingerbank_result->>'dhcp_fp_used', '') IS DISTINCT FROM COALESCE(dhcp_fingerprint, '')
+                            )
                           )
                         ORDER BY last_seen DESC
                     """)).fetchall()
@@ -7452,16 +7455,61 @@ def delete_block_schedule(schedule_id: int, db: Session = Depends(get_db)):
 # Person Presence API
 # ---------------------------------------------------------------------------
 
+def _fetch_person_devices(db: Session, person_id: str | None = None) -> dict:
+    where = ""
+    params = {}
+    if person_id is not None:
+        where = "WHERE pd.person_id::text = :pid"
+        params["pid"] = person_id
+    rows = db.execute(text(f"""
+        WITH expanded AS (
+            SELECT
+                pd.person_id::text AS person_id,
+                CASE WHEN sib.mac_address IS NOT NULL THEN sib.mac_address ELSE d.mac_address END AS mac_address,
+                CASE WHEN sib.mac_address IS NOT NULL THEN sib.is_online ELSE d.is_online END AS is_online,
+                CASE WHEN sib.mac_address IS NOT NULL
+                    THEN COALESCE(sib.custom_name, sib.hostname, sib.ip_address)
+                    ELSE COALESCE(d.custom_name, d.hostname, d.ip_address)
+                END AS display_name,
+                CASE WHEN sib.mac_address IS NOT NULL THEN sib.ip_address ELSE d.ip_address END AS ip_address,
+                CASE WHEN sib.mac_address IS NOT NULL THEN sib.device_type_override ELSE d.device_type_override END AS device_type,
+                CASE WHEN sib.mac_address IS NOT NULL
+                    THEN COALESCE(sib.vendor_override, sib.vendor)
+                    ELSE COALESCE(d.vendor_override, d.vendor)
+                END AS vendor,
+                CASE WHEN sib.mac_address IS NOT NULL THEN sib.is_blocked ELSE d.is_blocked END AS is_blocked,
+                CASE WHEN sib.mac_address IS NOT NULL THEN sib.status_changed_at ELSE d.status_changed_at END AS status_changed_at
+            FROM person_devices pd
+            JOIN devices d ON d.mac_address = pd.mac_address
+            LEFT JOIN devices sib ON d.group_id IS NOT NULL AND sib.group_id = d.group_id
+            {where}
+        )
+        SELECT DISTINCT ON (person_id, mac_address)
+            person_id, mac_address, is_online, display_name, ip_address,
+            device_type, vendor, is_blocked, status_changed_at
+        FROM expanded
+        ORDER BY person_id, mac_address
+    """), params).fetchall()
+    devs_by_person: dict = {}
+    for r in rows:
+        devs_by_person.setdefault(r[0], []).append({
+            "mac_address": r[1],
+            "is_online": r[2],
+            "display_name": r[3],
+            "ip_address": r[4],
+            "device_type": r[5],
+            "vendor": r[6],
+            "is_blocked": bool(r[7]),
+            "status_changed_at": r[8].isoformat() if r[8] else None,
+        })
+    return devs_by_person
+
+
 def _person_row_to_dict(row, devices=None, schedules=None) -> dict:
     """Convert a persons row to a dict. devices and schedules are pre-fetched lists."""
     pid = str(row[0])
-    primary_mac = row[2]
     devs = devices or []
-    is_home = False
-    if primary_mac:
-        is_home = any(d["mac_address"] == primary_mac and d.get("is_online") for d in devs)
-    elif devs:
-        is_home = any(d.get("is_online") for d in devs)
+    is_home = any(d.get("is_online") for d in devs)
     is_blocked = bool(devs) and all(d.get("is_blocked", False) for d in devs)
     timed_block_remaining = None
     task = _person_timed_blocks.get(pid)
@@ -7476,7 +7524,7 @@ def _person_row_to_dict(row, devices=None, schedules=None) -> dict:
     return {
         "id":                    pid,
         "name":                  row[1],
-        "primary_mac":           primary_mac,
+        "primary_mac":           row[2],
         "photo":                 row[3],
         "notes":                 row[4],
         "created_at":            row[5].isoformat() if row[5] else None,
@@ -7495,22 +7543,7 @@ def list_persons(db: Session = Depends(get_db)):
     persons = db.execute(text(
         "SELECT id::text, name, primary_mac, photo, notes, created_at, updated_at FROM persons ORDER BY name"
     )).fetchall()
-    # Fetch all devices assigned to any person in one query
-    dev_rows = db.execute(text("""
-        SELECT pd.person_id::text, d.mac_address, d.is_online,
-               COALESCE(d.custom_name, d.hostname, d.ip_address) AS display_name,
-               d.ip_address, d.device_type_override, d.vendor, d.is_blocked,
-               d.status_changed_at
-        FROM person_devices pd
-        JOIN devices d ON d.mac_address = pd.mac_address
-    """)).fetchall()
-    devs_by_person: dict = {}
-    for r in dev_rows:
-        devs_by_person.setdefault(r[0], []).append({
-            "mac_address":        r[1], "is_online": r[2], "display_name": r[3],
-            "ip_address":         r[4], "device_type": r[5], "vendor": r[6], "is_blocked": bool(r[7]),
-            "status_changed_at":  r[8].isoformat() if r[8] else None,
-        })
+    devs_by_person = _fetch_person_devices(db)
     # Fetch person-targeted schedules (both person_id and person_ids)
     try:
         sched_rows = db.execute(text(
@@ -7583,35 +7616,29 @@ def get_persons_timeline(days: int = Query(7, ge=1, le=365), db: Session = Depen
         return {"window_start": window_start.isoformat(), "window_end": now.isoformat(),
                 "days": days, "persons": []}
 
-    # Resolve which MAC to track for each person (primary_mac or first assigned device)
-    person_macs: dict = {}
-    for p in persons:
-        pid = p[0]
-        if p[2]:
-            person_macs[pid] = p[2]
-        else:
-            row = db.execute(text(
-                "SELECT mac_address FROM person_devices WHERE person_id = :pid LIMIT 1"
-            ), {"pid": pid}).fetchone()
-            if row:
-                person_macs[pid] = row[0]
+    devs_by_person = _fetch_person_devices(db)
+    person_macs = {
+        p[0]: [d["mac_address"] for d in devs_by_person.get(p[0], [])]
+        for p in persons
+    }
 
-    all_macs = list(set(person_macs.values()))
-    events_by_mac: dict = {}
-    prior_by_mac:  dict = {}
+    all_macs = sorted({mac for macs in person_macs.values() for mac in macs})
+    events_by_mac: dict = defaultdict(list)
+    prior_by_mac: dict = {}
 
     if all_macs:
         mac_params = {f"mac{i}": m for i, m in enumerate(all_macs)}
         mac_in     = ", ".join(f":mac{i}" for i in range(len(all_macs)))
 
-        for r in db.execute(text(f"""
+        rows = db.execute(text(f"""
             SELECT mac_address, type, created_at FROM device_events
             WHERE mac_address IN ({mac_in})
               AND type IN ('online', 'offline', 'joined')
               AND created_at >= :window_start
             ORDER BY mac_address, created_at ASC
-        """), {"window_start": window_start, **mac_params}).fetchall():
-            events_by_mac.setdefault(r[0], []).append({"type": r[1], "ts": r[2]})
+        """), {"window_start": window_start, **mac_params}).fetchall()
+        for r in rows:
+            events_by_mac[r[0]].append({"type": r[1], "ts": r[2]})
 
         for r in db.execute(text(f"""
             SELECT DISTINCT ON (mac_address) mac_address, type
@@ -7623,47 +7650,59 @@ def get_persons_timeline(days: int = Query(7, ge=1, le=365), db: Session = Depen
         """), {"window_start": window_start, **mac_params}).fetchall():
             prior_by_mac[r[0]] = "online" if r[1] in ("online", "joined") else "offline"
 
-    def build_segments(mac):
-        evts    = events_by_mac.get(mac, [])
-        initial = prior_by_mac.get(mac, "unknown")
-        segs    = []
-        ss      = window_start
-        st      = initial
+    def _overall_state(states: dict) -> str:
+        vals = list(states.values())
+        if any(v == "online" for v in vals):
+            return "online"
+        if any(v == "offline" for v in vals):
+            return "offline"
+        return "unknown"
+
+    def build_segments(macs: list[str]):
+        if not macs:
+            return [], 0
+        state_by_mac = {m: prior_by_mac.get(m, "unknown") for m in macs}
+        merged_events = []
+        for m in macs:
+            for ev in events_by_mac.get(m, []):
+                merged_events.append({"mac": m, "ts": ev["ts"], "type": ev["type"]})
+        merged_events.sort(key=lambda x: x["ts"])
+
+        segs = []
+        seg_start = window_start
+        state = _overall_state(state_by_mac)
         home_ms = 0.0
         known_ms = 0.0
-
-        for ev in evts:
-            se = ev["ts"]
-            if se > ss:
-                segs.append({"from": ss.isoformat(), "to": se.isoformat(), "status": st})
-                dur = (se - ss).total_seconds() * 1000
-                if st == "online":
+        idx = 0
+        while idx < len(merged_events):
+            ts = merged_events[idx]["ts"]
+            if ts > seg_start:
+                segs.append({"from": seg_start.isoformat(), "to": ts.isoformat(), "status": state})
+                dur = (ts - seg_start).total_seconds() * 1000
+                if state == "online":
                     home_ms += dur
-                if st != "unknown":
+                if state != "unknown":
                     known_ms += dur
-            ss = se
-            st = "online" if ev["type"] in ("online", "joined") else "offline"
+            while idx < len(merged_events) and merged_events[idx]["ts"] == ts:
+                ev = merged_events[idx]
+                state_by_mac[ev["mac"]] = "online" if ev["type"] in ("online", "joined") else "offline"
+                idx += 1
+            seg_start = ts
+            state = _overall_state(state_by_mac)
 
-        segs.append({"from": ss.isoformat(), "to": now.isoformat(), "status": st})
-        final_dur = (now - ss).total_seconds() * 1000
-        if st == "online":
+        segs.append({"from": seg_start.isoformat(), "to": now.isoformat(), "status": state})
+        final_dur = (now - seg_start).total_seconds() * 1000
+        if state == "online":
             home_ms += final_dur
-        if st != "unknown":
+        if state != "unknown":
             known_ms += final_dur
-
-        # Percentage is computed over the period we actually have data for
-        # (i.e. since the device/person was first known), not the whole window.
-        home_pct   = round((home_ms / known_ms) * 100) if known_ms > 0 else 0
+        home_pct = round((home_ms / known_ms) * 100) if known_ms > 0 else 0
         return segs, home_pct
 
     result = []
     for p in persons:
         pid = p[0]
-        mac = person_macs.get(pid)
-        if mac:
-            segs, pct = build_segments(mac)
-        else:
-            segs, pct = [], 0
+        segs, pct = build_segments(person_macs.get(pid, []))
         result.append({
             "id":          pid,
             "name":        p[1],
@@ -7689,16 +7728,7 @@ def get_person(person_id: str, db: Session = Depends(get_db)):
     ), {"id": person_id}).fetchone()
     if not row:
         raise HTTPException(404, "Person not found")
-    dev_rows = db.execute(text("""
-        SELECT pd.person_id::text, d.mac_address, d.is_online,
-               COALESCE(d.custom_name, d.hostname, d.ip_address) AS display_name,
-               d.ip_address, d.device_type_override, d.vendor, d.is_blocked
-        FROM person_devices pd
-        JOIN devices d ON d.mac_address = pd.mac_address
-        WHERE pd.person_id = :pid
-    """), {"pid": person_id}).fetchall()
-    devs = [{"mac_address": r[1], "is_online": r[2], "display_name": r[3],
-             "ip_address": r[4], "device_type": r[5], "vendor": r[6], "is_blocked": bool(r[7])} for r in dev_rows]
+    devs = _fetch_person_devices(db, person_id).get(person_id, [])
     try:
         sched_rows = db.execute(text(
             "SELECT id, person_id::text, label, days_of_week, start_time, end_time, enabled, person_ids "
