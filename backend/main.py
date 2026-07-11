@@ -2901,6 +2901,7 @@ def _to_dict(d: Device) -> dict:
         "services":             (d.scan_results or {}).get("services"),
         "pipeline_stage":       (d.scan_results or {}).get("pipeline_stage"),
         "display_name":         d.custom_name or d.hostname or d.ip_address,
+        "name_candidates":      [],
         "identity_score":       id_score["score"],
         "identity_reasons":     id_score["reasons"],
         "device_type":          getattr(d, 'device_type_override', None) or inferred,
@@ -2932,6 +2933,76 @@ def _to_dict(d: Device) -> dict:
         "person_id":               str(getattr(d, "person_id", None)) if getattr(d, "person_id", None) else None,
         "person_name":             None,  # populated by list_devices
     }
+
+
+def _clean_name_candidate(value: str | None) -> str | None:
+    value = (value or '').strip()
+    return value or None
+
+
+def _build_name_candidates(db: Session, d: Device) -> list[dict]:
+    scan = dict(d.scan_results or {})
+    plugin_candidates: list[tuple[str, str]] = []
+    try:
+        rows = db.execute(text("SELECT plugin_id, data FROM plugin_device_data WHERE mac_address = :mac"), {"mac": d.mac_address}).fetchall()
+        for plugin_id, data in rows:
+            if isinstance(data, dict):
+                cand = _clean_name_candidate(data.get('_inspectre_hostname_candidate'))
+                if cand:
+                    plugin_candidates.append((plugin_id, cand))
+    except Exception:
+        plugin_candidates = []
+
+    current_name = _clean_name_candidate(d.custom_name or d.hostname)
+    current_source = None
+    if d.custom_name and current_name:
+        current_source = 'manual'
+    elif current_name:
+        if _clean_name_candidate(getattr(d, 'dhcp_hostname', None)) == current_name:
+            current_source = 'dhcp'
+        elif _clean_name_candidate(scan.get('mdns_name')) == current_name:
+            current_source = 'mdns'
+        else:
+            for plugin_id, cand in plugin_candidates:
+                if _clean_name_candidate(cand) == current_name:
+                    current_source = f'plugin:{plugin_id}'
+                    break
+            if current_source is None and _clean_name_candidate(scan.get('rdns_hostname')) == current_name:
+                current_source = 'rdns'
+
+    out: list[dict] = []
+    seen: set[tuple[str, str]] = set()
+
+    def add(value: str | None, source: str, label: str):
+        nonlocal current_source
+        clean = _clean_name_candidate(value)
+        if not clean:
+            return
+        key = (source, clean.lower())
+        if key in seen:
+            return
+        seen.add(key)
+        out.append({
+            'value': clean,
+            'source': source,
+            'source_label': label,
+            'is_pinned': bool(d.custom_name and clean == _clean_name_candidate(d.custom_name)),
+            'is_current': current_source == source and clean == current_name,
+        })
+
+    add(d.custom_name, 'manual', 'Pinned name')
+    add(getattr(d, 'dhcp_hostname', None), 'dhcp', 'DHCP hostname')
+    add(scan.get('mdns_name'), 'mdns', 'mDNS / Bonjour')
+    for plugin_id, cand in plugin_candidates:
+        add(cand, f'plugin:{plugin_id}', f'Plugin ({plugin_id})')
+    add(scan.get('rdns_hostname'), 'rdns', 'Reverse DNS')
+
+    if current_name and not any(c['is_current'] for c in out):
+        add(current_name, 'stored', 'Stored hostname')
+        if out:
+            out[-1]['is_current'] = True
+
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -3657,6 +3728,7 @@ def get_device(mac: str, db: Session = Depends(get_db)):
         .first()
     )
     result["latest_vuln_findings"] = latest.findings if latest else []
+    result["name_candidates"] = _build_name_candidates(db, d)
     return result
 
 
@@ -3667,13 +3739,15 @@ def update_device(mac: str, payload: DeviceUpdate, db: Session = Depends(get_db)
         raise HTTPException(404, "Device not found")
     old_name = d.custom_name
     if payload.custom_name is not None:
-        d.custom_name = payload.custom_name
+        d.custom_name = (payload.custom_name or '').strip() or None
     if payload.hostname is not None:
-        d.hostname = payload.hostname
-    if payload.custom_name is not None and payload.custom_name != old_name:
-        _add_event(db, mac.lower(), 'renamed', {'old': old_name, 'new': payload.custom_name})
+        d.hostname = (payload.hostname or '').strip() or None
+    if payload.custom_name is not None and d.custom_name != old_name:
+        _add_event(db, mac.lower(), 'renamed', {'old': old_name, 'new': d.custom_name})
     db.commit(); db.refresh(d)
-    return _to_dict(d)
+    result = _to_dict(d)
+    result['name_candidates'] = _build_name_candidates(db, d)
+    return result
 
 
 @app.patch("/devices/{mac}/identity")
@@ -3747,10 +3821,16 @@ async def resolve_name(mac: str, db: Session = Depends(get_db)):
                     name = r.json().get("hostname")
         except Exception:
             pass
-    if name and not d.custom_name:
-        d.hostname = name
+    if name:
+        scan = dict(d.scan_results or {})
+        scan['rdns_hostname'] = name
+        d.scan_results = scan
+        if not d.custom_name:
+            d.hostname = name
         db.commit(); db.refresh(d)
-    return {"mac": mac, "resolved": name, "device": _to_dict(d)}
+    detail = _to_dict(d)
+    detail['name_candidates'] = _build_name_candidates(db, d)
+    return {"mac": mac, "resolved": name, "device": detail}
 
 
 @app.post("/devices/resolve-all-names")

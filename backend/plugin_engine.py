@@ -1339,9 +1339,14 @@ class PluginScheduler:
                         ON CONFLICT (mac_address) DO UPDATE SET
                             ip_address = COALESCE(EXCLUDED.ip_address, devices.ip_address),
                             hostname   = CASE
+                                            -- User custom_name is the absolute override — never touch
                                             WHEN devices.custom_name IS NOT NULL THEN devices.hostname
-                                            WHEN devices.hostname IS NOT NULL AND devices.hostname != '' THEN devices.hostname
-                                            ELSE EXCLUDED.hostname
+                                            -- Already has DHCP hostname (probe already wrote it) — keep it;
+                                            -- DHCP is self-reported by the device and wins over rDNS/plugin
+                                            WHEN devices.dhcp_hostname IS NOT NULL AND devices.dhcp_hostname != '' THEN devices.hostname
+                                            -- Plugin data beats stale rDNS on a home network
+                                            WHEN EXCLUDED.hostname IS NOT NULL AND EXCLUDED.hostname != '' THEN EXCLUDED.hostname
+                                            ELSE devices.hostname
                                          END,
                             is_online  = EXCLUDED.is_online,
                             miss_count = CASE WHEN EXCLUDED.is_online = TRUE THEN 0 ELSE devices.miss_count END,
@@ -1373,8 +1378,9 @@ class PluginScheduler:
                             ip_address = COALESCE(EXCLUDED.ip_address, devices.ip_address),
                             hostname   = CASE
                                             WHEN devices.custom_name IS NOT NULL THEN devices.hostname
-                                            WHEN devices.hostname IS NOT NULL AND devices.hostname != '' THEN devices.hostname
-                                            ELSE EXCLUDED.hostname
+                                            WHEN devices.dhcp_hostname IS NOT NULL AND devices.dhcp_hostname != '' THEN devices.hostname
+                                            WHEN EXCLUDED.hostname IS NOT NULL AND EXCLUDED.hostname != '' THEN EXCLUDED.hostname
+                                            ELSE devices.hostname
                                          END,
                             last_seen  = NOW()
                     """), {
@@ -1385,6 +1391,8 @@ class PluginScheduler:
 
                 # Store full enrichment payload in plugin_device_data
                 enrichment = {k: v for k, v in dev.items() if k not in INSPECTRE_DEVICE_FIELDS}
+                if dev.get("hostname"):
+                    enrichment["_inspectre_hostname_candidate"] = dev.get("hostname")
                 if enrichment:
                     db.execute(text("""
                         INSERT INTO plugin_device_data (plugin_id, mac_address, data, updated_at)

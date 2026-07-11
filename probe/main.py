@@ -25,10 +25,11 @@ from sqlalchemy import (
     cast, create_engine, text,
 )
 from sqlalchemy.dialects.postgresql import JSONB, insert as pg_insert
-from sqlalchemy.orm import declarative_base, sessionmaker
+from sqlalchemy.orm import declarative_base, sessionmaker, synonym
 from sqlalchemy.orm.attributes import flag_modified
 import traffic_monitor as _tm
 import dhcp_classify as _dhcp_cls
+from presence_guard import is_locked_secondary_sighting, apply_secondary_ip_sighting
 
 # ---------------------------------------------------------------------------
 # Version (single source of truth: repo-root VERSION → probe/_version.py)
@@ -379,6 +380,9 @@ class Device(Base):
     is_online    = Column(Boolean, default=True)
     first_seen   = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
     last_seen    = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+    status_changed_at = Column(DateTime(timezone=True), nullable=True)
+    # Backward-compat alias for any legacy code paths still using old key style
+    statuschangedat = synonym("status_changed_at")
     scan_results = Column(JSON,    nullable=True)
     deep_scanned = Column(Boolean, default=False)
     miss_count   = Column(Integer, default=0)
@@ -468,6 +472,7 @@ def init_db() -> None:
             conn.execute(text("ALTER TABLE devices ADD COLUMN IF NOT EXISTS vuln_severity VARCHAR"))
             conn.execute(text("ALTER TABLE devices ADD COLUMN IF NOT EXISTS device_type_override VARCHAR"))
             conn.execute(text("ALTER TABLE devices ADD COLUMN IF NOT EXISTS hostname_last_attempted TIMESTAMPTZ"))
+            conn.execute(text("ALTER TABLE devices ADD COLUMN IF NOT EXISTS status_changed_at TIMESTAMPTZ"))
             conn.execute(text("ALTER TABLE devices ADD COLUMN IF NOT EXISTS deep_scan_last_run TIMESTAMPTZ"))
             conn.execute(text("ALTER TABLE devices ADD COLUMN IF NOT EXISTS baseline_ports JSONB"))
             conn.execute(text("ALTER TABLE devices ADD COLUMN IF NOT EXISTS baseline_scan_count INTEGER NOT NULL DEFAULT 0"))
@@ -1062,9 +1067,30 @@ def _apply_mdns_enrichment(mdns_data: dict[str, dict]) -> None:
             if not dev:
                 continue
             changed = False
-            if info.get("mdns_name") and not dev.hostname:
-                dev.hostname = info["mdns_name"]
-                changed = True
+            mdns_name = info.get("mdns_name")
+            if mdns_name:
+                if _remember_name_source(dev, 'mdns_name', mdns_name):
+                    changed = True
+                # mDNS is device-advertised, but it can surface container IDs and
+                # other transient labels on a homelab host. Only let it replace the
+                # stored hostname when it reinforces DHCP, or when the current name is
+                # blank / IP-derived / generic. It must not clobber a meaningful rDNS
+                # hostname on its own.
+                current_hn = dev.hostname or ""
+                dhcp_name = (dev.dhcp_hostname or '').strip()
+                if (
+                    not dev.custom_name
+                    and mdns_name != current_hn
+                    and not _is_generic_hostname(mdns_name)
+                    and (
+                        not current_hn
+                        or _is_ip_derived_hostname(current_hn)
+                        or _is_generic_hostname(current_hn)
+                        or (dhcp_name and mdns_name == dhcp_name)
+                    )
+                ):
+                    dev.hostname = mdns_name
+                    changed = True
             if info.get("services"):
                 scan = dict(dev.scan_results) if dev.scan_results else {}
                 existing = scan.get("mdns_services", [])
@@ -1682,7 +1708,13 @@ def trigger_deep_scan(ip: str, mac: str) -> None:
 # Device grouping helpers
 # ---------------------------------------------------------------------------
 _GENERIC_HOSTNAME_RE = re.compile(
-    r'^(?:android[\-_]|iphone|ipad|localhost|dhcp|unknown|desktop[\-_]?|'
+    # Match truly generic bases only — NOT unique machine IDs like "desktop-rp3c0ja".
+    # Entries with a trailing word-boundary anchor ('$') must not be followed by
+    # a long random suffix; numeric-only suffixes (desktop-1, desktop-02) are still
+    # generic, but alphanumeric Windows/Linux IDs (desktop-rp3c0ja) are unique and
+    # should be allowed through for grouping.
+    r'^(?:android[\-_]|iphone|ipad|localhost|dhcp|unknown|'
+    r'desktop(?:[\-_]?\d{0,4})?$|'   # "desktop", "desktop-1", "desktop01" — NOT "desktop-rp3c0ja"
     r'workgroup|raspberrypi|my[\-_]pc|workpc|user[\-_]pc|my[\-_]laptop|'
     r'pc$|host$|node$|client$|device$)',
     re.IGNORECASE,
@@ -1705,6 +1737,10 @@ def _is_generic_hostname(hostname: str) -> bool:
     # "192-168-0-180.lan" or a bare numeric label) carry no identity — two
     # unrelated devices that lack real DNS names must never merge on them.
     if re.match(r'^\d{1,3}-\d{1,3}-\d{1,3}-\d{1,3}$', base) or re.match(r'^\d+$', base):
+        return True
+    # Container / machine IDs like '798df7a249fe4e2db4c217dbfbc169d2' are not
+    # meaningful hostnames for humans and should never override a better name.
+    if re.match(r'^[0-9a-f]{12,}$', base, re.I):
         return True
     return bool(_GENERIC_HOSTNAME_RE.match(base))
 
@@ -1948,7 +1984,7 @@ def _try_auto_group_by_hostname(mac: str, hostname: str) -> bool:
 # ---------------------------------------------------------------------------
 # Device upsert
 # ---------------------------------------------------------------------------
-def upsert_seen_device(mac: str, ip: str, source: str) -> None:
+def upsert_seen_device(mac: str, ip: str, source: str) -> bool:
     """
     Insert-or-update a device row.
 
@@ -1957,9 +1993,9 @@ def upsert_seen_device(mac: str, ip: str, source: str) -> None:
     but the ARP sweep missed.
     """
     if not mac or mac == "00:00:00:00:00:00":
-        return
+        return False
     if not _is_valid_ip(ip):
-        return
+        return False
 
     # Mark this MAC as seen in the current sweep interval regardless of source
     with _sniffer_seen_lock:
@@ -1986,7 +2022,7 @@ def upsert_seen_device(mac: str, ip: str, source: str) -> None:
                 ).fetchone()
                 if owner:
                     print(f"[upsert] Skipping IP {ip} for {mac} — already primary IP of {owner[0]}", flush=True)
-                    return
+                    return False
 
             # Track how long device was offline (used after commit to decide rescan)
             offline_duration_s = 0.0
@@ -2070,6 +2106,7 @@ def upsert_seen_device(mac: str, ip: str, source: str) -> None:
                         is_important             = False,
                         hostname_last_attempted  = now,
                         baseline_scan_count      = 0,
+                        status_changed_at        = now,
                     )
                     .on_conflict_do_update(
                         index_elements=["mac_address"],
@@ -2081,6 +2118,7 @@ def upsert_seen_device(mac: str, ip: str, source: str) -> None:
                             primary_ip = text(_new_primary_ip_case),
                             is_online  = True,
                             last_seen  = text("CASE WHEN devices.is_online = false THEN NOW() ELSE devices.last_seen END"),
+                            status_changed_at = text("CASE WHEN devices.is_online = false THEN NOW() ELSE devices.status_changed_at END"),
                             miss_count = 0,
                             hostname   = text(_hostname_case),
                         ),
@@ -2116,6 +2154,23 @@ def upsert_seen_device(mac: str, ip: str, source: str) -> None:
                         locked = bool(_lk[1])
                 except Exception as _e:
                     print(f"[upsert] lock re-read failed for {mac}: {_e}", flush=True)
+
+                # Locked-primary + non-primary sighting is metadata only.
+                # It must never influence presence transitions or timers.
+                if is_locked_secondary_sighting(locked, cur_primary, ip):
+                    new_scan = apply_secondary_ip_sighting(existing.scan_results, ip, source, now.isoformat())
+                    if new_scan != (existing.scan_results or {}):
+                        existing.scan_results = new_scan
+                        flag_modified(existing, "scan_results")
+                    session.commit()
+                    with _sniffer_seen_lock:
+                        _sniffer_seen_this_interval.discard(mac)
+                    print(
+                        f"[upsert] Locked secondary sighting for {mac}: {ip} (primary {cur_primary}) — metadata only",
+                        flush=True,
+                    )
+                    return False
+
                 # A user-pinned primary IP is the strongest, most explicit signal
                 # of intent and must ALWAYS win — including in "dynamic" mode.
                 # PRIMARY_IP_MODE only governs how UNpinned devices behave. Without
@@ -2178,6 +2233,7 @@ def upsert_seen_device(mac: str, ip: str, source: str) -> None:
                         deep_scanned = existing.deep_scanned,
                         miss_count   = 0,
                         is_important = existing.is_important,
+                        status_changed_at = existing.status_changed_at or now,
                     )
                     .on_conflict_do_update(
                         index_elements=["mac_address"],
@@ -2200,6 +2256,7 @@ def upsert_seen_device(mac: str, ip: str, source: str) -> None:
                             ).bindparams(computed_primary=new_primary),
                             is_online  = True,
                             last_seen  = text("CASE WHEN devices.is_online = false THEN NOW() ELSE devices.last_seen END"),
+                            status_changed_at = text("CASE WHEN devices.is_online = false THEN NOW() ELSE devices.status_changed_at END"),
                             miss_count = 0,
                             hostname   = text(_hostname_case),
                         ),
@@ -2254,7 +2311,7 @@ def upsert_seen_device(mac: str, ip: str, source: str) -> None:
         except Exception as e:
             session.rollback()
             print(f"[DB] Upsert error {mac}: {e}", flush=True)
-            return
+            return False
         finally:
             session.close()
 
@@ -2262,10 +2319,16 @@ def upsert_seen_device(mac: str, ip: str, source: str) -> None:
     if pending_dhcp is not None:
         _upsert_dhcp_info(mac, pending_dhcp[0], pending_dhcp[1], pending_dhcp[2])
 
+    # Presence-eligible sighting was processed
+    sighting_counts_for_presence = True
+
     # Persist hostname_last_attempted if we attempted resolution this call
     if hostname_resolution_attempted:
         sess_hn = Session()
         try:
+            dev_hn = sess_hn.get(Device, mac)
+            if dev_hn and hostname:
+                _remember_name_source(dev_hn, 'rdns_hostname', hostname)
             sess_hn.execute(
                 text("UPDATE devices SET hostname_last_attempted = NOW() WHERE mac_address = :mac"),
                 {"mac": mac},
@@ -2338,6 +2401,9 @@ def upsert_seen_device(mac: str, ip: str, source: str) -> None:
             session2.close()
 
 
+    return sighting_counts_for_presence
+
+
 def refresh_missing_vendors() -> None:
     if not _mac_vendor_db:
         return
@@ -2389,6 +2455,8 @@ def refresh_missing_hostnames() -> None:
             # Always update hostname_last_attempted (prevents tight retry loops)
             dev.hostname_last_attempted = now
             if name:
+                if _remember_name_source(dev, 'rdns_hostname', name):
+                    changed = True
                 dev.hostname = name
                 updated += 1
                 print(f"[hostname] Resolved: {scan_ip} -> {name}", flush=True)
@@ -2532,6 +2600,20 @@ def _pop_pending_dhcp(mac: str) -> tuple[str | None, str | None, list[int] | Non
         return _pending_dhcp_by_mac.pop(mac, None)
 
 
+def _remember_name_source(device: Device, source_key: str, value: str | None) -> bool:
+    """Persist a discovered hostname candidate without losing scan_results structure."""
+    value = (value or '').strip()
+    if not value:
+        return False
+    sr = dict(device.scan_results or {})
+    if sr.get(source_key) == value:
+        return False
+    sr[source_key] = value
+    device.scan_results = sr
+    flag_modified(device, 'scan_results')
+    return True
+
+
 def _upsert_dhcp_info(mac: str, hostname: str | None, vendor_class: str | None, opt55: list[int] | None) -> None:
     """Write DHCP fingerprint data to the device row and optionally refine device_type."""
     fingerprint_str = ','.join(str(x) for x in opt55) if opt55 else None
@@ -2545,13 +2627,20 @@ def _upsert_dhcp_info(mac: str, hostname: str | None, vendor_class: str | None, 
             return  # device not seen yet — apply once the row exists
 
         changed = False
+        hostname_updated = False
 
         if hostname:
             if device.dhcp_hostname != hostname:
                 device.dhcp_hostname = hostname
                 changed = True
-            # Replace hostname when it looks auto-generated from the IP address
-            if _is_ip_derived_hostname(device.hostname) and hostname != device.hostname:
+            # DHCP hostname is the device's self-reported name and is the most
+            # reliable source on a home/homelab network.  rDNS reverse lookups are
+            # notoriously stale on home routers (old PTR records linger after IP
+            # reassignment), so DHCP always wins over rDNS — unless the user
+            # explicitly set a custom_name, which is the absolute override.
+            current_hn = device.hostname or ""
+            should_replace = not device.custom_name and hostname != current_hn
+            if should_replace:
                 conflict = session.query(Device).filter(
                     Device.hostname == hostname,
                     Device.mac_address != mac,
@@ -2559,6 +2648,9 @@ def _upsert_dhcp_info(mac: str, hostname: str | None, vendor_class: str | None, 
                 if not conflict:
                     device.hostname = hostname
                     changed = True
+                    hostname_updated = True
+                    if current_hn:
+                        print(f"[dhcp] {mac}: hostname {current_hn!r} → {hostname!r} (DHCP overrides rDNS)", flush=True)
 
         if vendor_class and device.dhcp_vendor_class != vendor_class:
             device.dhcp_vendor_class = vendor_class
@@ -2585,6 +2677,11 @@ def _upsert_dhcp_info(mac: str, hostname: str | None, vendor_class: str | None, 
             session.commit()
             dtype_msg = f"  → type={dtype}({conf:.0%})" if dtype != "unknown" else ""
             print(f"[dhcp] saved {mac}  vc={vendor_class!r}  host={hostname!r}{dtype_msg}", flush=True)
+            # If the hostname was updated from DHCP, try auto-grouping now — the
+            # device may have been discovered with a bad rDNS name and only now
+            # has a correct hostname that matches a peer.
+            if hostname_updated and hostname and not _is_generic_hostname(hostname):
+                _try_auto_group_by_hostname(mac, hostname)
     except Exception as exc:
         session.rollback()
         print(f"[dhcp-worker] DB error for {mac}: {exc}", flush=True)
@@ -2655,6 +2752,8 @@ def update_presence_from_sweep(session, active_macs: set) -> None:
     for dev in session.query(Device).all():
         dev_ip = (getattr(dev, "primary_ip", None) or dev.ip_address or "")
         if dev.mac_address in seen_this_cycle or (dev_ip and dev_ip in own_ips):
+            if not dev.is_online:
+                dev.status_changed_at = now
             dev.is_online = True
             dev.miss_count = 0
             continue
@@ -2677,6 +2776,7 @@ def update_presence_from_sweep(session, active_macs: set) -> None:
             continue
 
         dev.is_online = False
+        dev.status_changed_at = now
         print(
             f"[-] Offline: {confirm_ip or dev.ip_address} ({dev.mac_address}) "
             f"after {dev.miss_count} missed sweeps + ping confirm",
@@ -4231,8 +4331,8 @@ def main() -> None:
                 found        = arp_scan(INTERFACE, IP_RANGE)
                 active_macs: set[str] = set()
                 for entry in found:
-                    active_macs.add(entry["mac"])
-                    upsert_seen_device(entry["mac"], entry["ip"], "sweep")
+                    if upsert_seen_device(entry["mac"], entry["ip"], "sweep"):
+                        active_macs.add(entry["mac"])
                 update_presence_from_sweep(session, active_macs)
                 session.commit()
                 print(f"[*] Sweep done -- {len(active_macs)} online", flush=True)

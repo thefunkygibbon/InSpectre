@@ -1,7 +1,7 @@
 {
   "id": "opnsense",
   "name": "OPNsense",
-  "version": "1.0.0",
+  "version": "1.0.2",
   "author": "InSpectre Community",
   "description": "Integrates with OPNsense firewall via its built-in REST API. Discovers ARP table entries for device inventory, and blocks/unblocks devices by managing a dedicated firewall alias (inspectre_blocked) that feeds a LAN block rule.",
   "homepage": "https://opnsense.org",
@@ -44,7 +44,7 @@
       "type": "string",
       "default": "inspectre_blocked",
       "required": true,
-      "help": "Name of the OPNsense Host alias that InSpectre will add/remove blocked IPs from. Create this alias in Firewall > Aliases (type: Host) and add a LAN block rule sourcing it before enabling blocking."
+      "help": "Name of the OPNsense Host alias that InSpectre will add/remove blocked IPs from. You must manually create this alias in Firewall > Aliases (type: Host) AND add an enabled LAN 'Block' rule with Source = this alias BEFORE enabling blocking. This plugin only adds/removes IPs from the alias's live table - it does not create the alias or the firewall rule for you."
     },
     {
       "key": "verify_ssl",
@@ -61,15 +61,19 @@
     "username_field": "api_key",
     "password_field": "api_secret",
     "headers": {
-      "Content-Type": "application/json",
       "Accept": "application/json"
     }
   },
   "actions": {
+    "test_connection": {
+      "description": "Verify API credentials by fetching core system status. Uses a lightweight GET-only endpoint so it works regardless of firmware state.",
+      "method": "GET",
+      "path": "/api/core/system/status"
+    },
     "get_arp_table": {
       "description": "Fetch the ARP table from OPNsense diagnostics. Returns all known LAN hosts with IP and MAC.",
       "method": "GET",
-      "path": "/api/diagnostics/interface/getArp",
+      "path": "/api/diagnostics/interface/get_arp",
       "response_mapping": {
         "root_path": "",
         "fields": {
@@ -84,7 +88,7 @@
     "get_dhcp_leases": {
       "description": "Fetch active DHCPv4 leases from OPNsense for richer hostname and MAC data.",
       "method": "GET",
-      "path": "/api/dhcpv4/leases/searchLease",
+      "path": "/api/dhcpv4/leases/search_lease",
       "response_mapping": {
         "root_path": "rows",
         "fields": {
@@ -97,7 +101,7 @@
     "get_alias_uuid": {
       "description": "Resolve the UUID for the configured block alias by name. Required before adding/removing IPs.",
       "method": "GET",
-      "path": "/api/firewall/alias/getAliasUUID/{block_alias}",
+      "path": "/api/firewall/alias/get_alias_u_u_i_d/{block_alias}",
       "session_extract": {
         "from": "response_body",
         "json_path": "uuid",
@@ -105,9 +109,12 @@
       }
     },
     "block_client": {
-      "description": "Add the device IP to the block alias using alias_util, then apply the alias to the live pf tables immediately (no full rule reload needed).",
+      "description": "Add the device IP to the block alias using alias_util. Takes effect immediately in the live pf table - no filter reload/apply needed. Requires the alias and a LAN block rule sourcing it to already exist.",
       "method": "POST",
       "path": "/api/firewall/alias_util/add/{block_alias}",
+      "headers": {
+        "Content-Type": "application/json"
+      },
       "body": {
         "address": "{ip}"
       }
@@ -116,6 +123,9 @@
       "description": "Remove the device IP from the block alias using alias_util. Takes effect immediately in the live pf table.",
       "method": "POST",
       "path": "/api/firewall/alias_util/delete/{block_alias}",
+      "headers": {
+        "Content-Type": "application/json"
+      },
       "body": {
         "address": "{ip}"
       }
@@ -126,14 +136,9 @@
       "path": "/api/firewall/alias_util/list/{block_alias}"
     },
     "flush_blocked": {
-      "description": "Flush (clear) all IPs from the block alias. Use with caution — unblocks everything.",
+      "description": "Flush (clear) all IPs from the block alias. Use with caution - unblocks everything.",
       "method": "POST",
       "path": "/api/firewall/alias_util/flush/{block_alias}"
-    },
-    "test_connection": {
-      "description": "Verify API credentials by fetching firmware version info.",
-      "method": "GET",
-      "path": "/api/core/firmware/status"
     }
   },
   "event_hooks": {},

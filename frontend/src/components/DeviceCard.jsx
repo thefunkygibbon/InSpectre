@@ -267,8 +267,8 @@ export function DeviceCard({ device, onClick, onStarToggle, isVulnScanning, isAc
         ) : <span />}
         <span className="text-xs" style={{ color: device.is_online ? 'var(--color-text-faint)' : '#ef4444' }}>
           {device.is_online
-            ? `online · ${relativeTime(device.status_changed_at || device.last_seen)}`
-            : `offline · ${relativeTime(device.status_changed_at || device.last_seen)}`}
+            ? `online · ${relativeTime(device.status_changed_at || device.first_seen || device.last_seen)}`
+            : `offline · ${relativeTime(device.status_changed_at || device.first_seen || device.last_seen)}`}
         </span>
       </div>
     </button>

@@ -66,8 +66,8 @@ function ipToNum(ip) {
 function sortDevices(list, sort) {
   const copy = [...list]
   switch (sort) {
-    case 'last_seen_asc':  return copy.sort((a, b) => new Date(a.last_seen) - new Date(b.last_seen))
-    case 'last_seen_desc': return copy.sort((a, b) => new Date(b.last_seen) - new Date(a.last_seen))
+    case 'last_seen_asc':  return copy.sort((a, b) => new Date(a.status_changed_at || a.first_seen || a.last_seen || 0) - new Date(b.status_changed_at || b.first_seen || b.last_seen || 0))
+    case 'last_seen_desc': return copy.sort((a, b) => new Date(b.status_changed_at || b.first_seen || b.last_seen || 0) - new Date(a.status_changed_at || a.first_seen || a.last_seen || 0))
     case 'ip_asc':         return copy.sort((a, b) => ipToNum(a.ip_address) - ipToNum(b.ip_address))
     case 'ip_desc':        return copy.sort((a, b) => ipToNum(b.ip_address) - ipToNum(a.ip_address))
     case 'name_asc':       return copy.sort((a, b) => (a.display_name||'').localeCompare(b.display_name||''))

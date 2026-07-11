@@ -58,6 +58,7 @@ COPY _version.py .
 COPY vuln_scanner.py .
 COPY traffic_monitor.py .
 COPY dhcp_classify.py .
+COPY presence_guard.py .
 COPY mac-vendors-export.csv .
 
 ARG MAXMIND_LICENSE_KEY=""
