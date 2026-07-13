@@ -313,28 +313,14 @@ try:
     net_cfg = attrs.get("NetworkSettings", {})
     all_nets = list((net_cfg.get("Networks") or {}).keys())
 
-    # Port bindings + exposed ports
-    port_bindings = {}
-    exposed_ports = []
-    for port_proto, bindings in (net_cfg.get("Ports") or {}).items():
-        exposed_ports.append(port_proto)
-        if not bindings:
-            continue
-        mapped = []
-        for b in bindings:
-            hp = b.get("HostPort")
-            if not hp:
-                continue
-            try:
-                host_port = int(hp)
-            except Exception:
-                host_port = hp
-            host_ip = b.get("HostIp")
-            mapped.append((host_ip, host_port) if host_ip else host_port)
-        if len(mapped) == 1:
-            port_bindings[port_proto] = mapped[0]
-        elif mapped:
-            port_bindings[port_proto] = mapped
+    # Port bindings + exposed ports.
+    # HostConfig.PortBindings is the authoritative config-time source and is
+    # never cleared by Docker when a container stops. NetworkSettings.Ports is
+    # only populated while the container is running, so it is empty here since
+    # we stopped the container before reading attrs.
+    port_bindings, exposed_ports = _extract_ports_from_network_settings(
+        hcfg.get("PortBindings") or net_cfg.get("Ports")
+    )
 
     # Bind mounts + named volumes
     binds = {}
@@ -600,6 +586,8 @@ def migrate(db) -> None:
         "ALTER TABLE container_update_status ADD COLUMN IF NOT EXISTS new_image_vulns JSONB",
         "ALTER TABLE container_update_status ADD COLUMN IF NOT EXISTS new_image_scanned_at TIMESTAMPTZ",
         "ALTER TABLE container_update_status ADD COLUMN IF NOT EXISTS last_update_error TEXT",
+        "ALTER TABLE container_update_status ADD COLUMN IF NOT EXISTS update_started_at TIMESTAMPTZ",
+        "ALTER TABLE container_update_status ADD COLUMN IF NOT EXISTS running_image_id VARCHAR",
     ]:
         try:
             db.execute(text(stmt))
@@ -651,7 +639,7 @@ def _get_update_status_row(db, container_name: str, host_id=None) -> dict | None
         SELECT id, container_name, host_id, image, current_digest, latest_digest,
                has_update, checked_at, last_updated_at, update_blocked, blocked_reason,
                new_image_vulns, new_image_scanned_at, update_in_progress,
-               last_update_status, last_update_error, pinned
+               last_update_status, last_update_error, pinned, update_started_at, running_image_id
         FROM container_update_status
         WHERE container_name=:n AND COALESCE(host_id,-1)=COALESCE(:h,-1)
     """), {"n": container_name, "h": host_id}).fetchone()
@@ -661,10 +649,10 @@ def _get_update_status_row(db, container_name: str, host_id=None) -> dict | None
         "id", "container_name", "host_id", "image", "current_digest", "latest_digest",
         "has_update", "checked_at", "last_updated_at", "update_blocked", "blocked_reason",
         "new_image_vulns", "new_image_scanned_at", "update_in_progress",
-        "last_update_status", "last_update_error", "pinned",
+        "last_update_status", "last_update_error", "pinned", "update_started_at", "running_image_id",
     ]
     d = dict(zip(keys, row))
-    for k in ("checked_at", "last_updated_at", "new_image_scanned_at"):
+    for k in ("checked_at", "last_updated_at", "new_image_scanned_at", "update_started_at"):
         if d[k]:
             d[k] = d[k].isoformat()
     return d
@@ -742,18 +730,23 @@ def _resolve_registry_image_ref(db, container_name: str, host_id, candidate_ref:
     return candidate_ref
 
 
-def _check_update_sync(image_name: str, host_url: str) -> dict:
+def _check_update_sync(image_name: str, host_url: str, running_image_id: str | None = None) -> dict:
     """
     Compare the locally-cached image digest with the remote registry manifest.
     Uses get_registry_data() which fetches only the manifest header — no pull needed.
 
-    Returns: {current_digest, latest_digest, has_update, error?}
+    If running_image_id is provided, also checks whether the running container's image
+    differs from the locally-cached image — this catches the case where a new image was
+    already pulled but the container was never restarted (stuck update).
+
+    Returns: {current_digest, latest_digest, has_update, local_image_id, error?}
     """
     if not image_name:
         return {
             "current_digest": None,
             "latest_digest": None,
             "has_update": False,
+            "local_image_id": None,
             "error": "Container has no image reference.",
         }
     if image_name.startswith("sha256:"):
@@ -761,6 +754,7 @@ def _check_update_sync(image_name: str, host_url: str) -> dict:
             "current_digest": image_name,
             "latest_digest": None,
             "has_update": False,
+            "local_image_id": None,
             "error": "Container is using a digest-only image reference; registry update checks require repo:tag.",
         }
 
@@ -788,11 +782,25 @@ def _check_update_sync(image_name: str, host_url: str) -> dict:
     try:
         # Manifest digest of the locally-cached image tag.
         # NOTE: local_img.id is the image config digest, not manifest digest.
+        local_image_id = None
         try:
             local_img = client.images.get(image_name)
             current_digest = _local_manifest_digest(local_img, image_name)
+            local_image_id = local_img.id
         except docker_sdk.errors.ImageNotFound:
             current_digest = None
+
+        # If the running container's image ID differs from the locally-cached image ID,
+        # a new image was pulled but the container was never restarted.
+        if running_image_id and local_image_id and running_image_id != local_image_id:
+            return {
+                "current_digest": current_digest,
+                "latest_digest":  current_digest,
+                "has_update":     True,
+                "local_image_id": local_image_id,
+                "pending_restart": True,
+                "error": "A newer image is already downloaded but the container has not been restarted yet.",
+            }
 
         # Digest of the latest manifest in the registry (no download)
         try:
@@ -803,6 +811,7 @@ def _check_update_sync(image_name: str, host_url: str) -> dict:
                 "current_digest": current_digest,
                 "latest_digest":  None,
                 "has_update":     False,
+                "local_image_id": local_image_id,
                 "error": f"Registry check failed: {exc}",
             }
 
@@ -812,6 +821,7 @@ def _check_update_sync(image_name: str, host_url: str) -> dict:
                 "current_digest": None,
                 "latest_digest": latest_digest,
                 "has_update": False,
+                "local_image_id": local_image_id,
                 "error": "Local manifest digest unavailable (RepoDigests missing); unable to reliably compare against registry.",
             }
 
@@ -820,6 +830,7 @@ def _check_update_sync(image_name: str, host_url: str) -> dict:
             "current_digest": current_digest,
             "latest_digest":  latest_digest,
             "has_update":     has_update,
+            "local_image_id": local_image_id,
         }
     finally:
         client.close()
@@ -1024,6 +1035,7 @@ async def _self_update_via_helper_stream(
         try:
             _upsert_update_status(db, container_name, host_id,
                                   update_in_progress=True,
+                                  update_started_at=datetime.now(timezone.utc),
                                   last_update_status=None,
                                   last_update_error=None)
         finally:
@@ -1237,7 +1249,9 @@ def _recreate_container_with_net(client, dep, new_net_mode: str) -> None:
     net_sets = attrs.get("NetworkSettings", {})
 
     # Port bindings + exposed ports
-    port_bindings, exposed_ports = _extract_ports_from_network_settings(net_sets.get("Ports"))
+    port_bindings, exposed_ports = _extract_ports_from_network_settings(
+        hcfg.get("PortBindings") or net_sets.get("Ports")
+    )
 
     # Bind mounts + named volumes
     binds = {}
@@ -1504,6 +1518,7 @@ async def _safe_update_stream(
             try:
                 _upsert_update_status(db, container_name, host_id,
                                       update_in_progress=True,
+                                      update_started_at=datetime.now(timezone.utc),
                                       last_update_status=None,
                                       last_update_error=None)
             finally:
@@ -1629,7 +1644,9 @@ async def _safe_update_stream(
                     net_cfg  = attrs.get("NetworkSettings", {})
 
                     # Reconstruct published ports from the old container
-                    port_bindings, exposed_ports = _extract_ports_from_network_settings(net_cfg.get("Ports"))
+                    port_bindings, exposed_ports = _extract_ports_from_network_settings(
+                        hcfg.get("PortBindings") or net_cfg.get("Ports")
+                    )
 
                     # Reconstruct bind mounts
                     binds = {}
@@ -2104,6 +2121,27 @@ async def container_update_check_loop() -> None:
     last_check_date = None
     while True:
         try:
+            # Reset any update_in_progress flags that have been stuck for > 30 minutes.
+            # This handles crashes or hung pulls that never cleared the flag.
+            _stale_db = _SessionLocal()
+            try:
+                _stale_db.execute(text("""
+                    UPDATE container_update_status
+                    SET update_in_progress = FALSE,
+                        has_update         = TRUE,
+                        last_update_status = 'failed',
+                        last_update_error  = COALESCE(last_update_error,
+                            'Update timed out — the process may have crashed. Please retry.')
+                    WHERE update_in_progress = TRUE
+                      AND update_started_at IS NOT NULL
+                      AND update_started_at < NOW() - INTERVAL '30 minutes'
+                """))
+                _stale_db.commit()
+            except Exception:
+                _stale_db.rollback()
+            finally:
+                _stale_db.close()
+
             db = _SessionLocal()
             try:
                 enabled     = _setting(db, "container_check_enabled", "false") == "true"
@@ -2218,34 +2256,39 @@ async def check_container_update(container_id: str, request: Request):
             client = _make_docker_client(host_url)
             try:
                 c = client.containers.get(container_id)
-                return c.name.lstrip("/"), _container_image_ref(c)
+                # c.image.id is the config digest of the running image layer
+                running_img_id = getattr(c, "image", None)
+                running_img_id = running_img_id.id if running_img_id else None
+                return c.name.lstrip("/"), _container_image_ref(c), running_img_id
             finally:
                 client.close()
 
         try:
-            container_name, image_name = await asyncio.to_thread(_get_info)
+            container_name, image_name, running_image_id = await asyncio.to_thread(_get_info)
         except docker_sdk.errors.NotFound:
             raise HTTPException(404, "Container not found. It may have been recreated with a new ID; refresh the container list and try again.")
         raw_image_name = image_name
         image_name = _resolve_registry_image_ref(db, container_name, host_id, image_name)
         print(
             "[update-check] manual check: "
-            f"container={container_name} image={image_name} raw_image={raw_image_name} host={host_url}",
+            f"container={container_name} image={image_name} raw_image={raw_image_name} "
+            f"running_image_id={running_image_id} host={host_url}",
             flush=True,
         )
-        result = await asyncio.to_thread(_check_update_sync, image_name, host_url)
+        result = await asyncio.to_thread(_check_update_sync, image_name, host_url, running_image_id)
 
         prev = _get_update_status_row(db, container_name, host_id)
         had_update = bool(prev and prev.get("has_update"))
 
         kw = dict(
-            image          = image_name,
-            current_digest = result.get("current_digest"),
-            latest_digest  = result.get("latest_digest"),
-            has_update     = result.get("has_update", False),
-            checked_at     = datetime.now(timezone.utc),
+            image            = image_name,
+            current_digest   = result.get("current_digest"),
+            latest_digest    = result.get("latest_digest"),
+            has_update       = result.get("has_update", False),
+            checked_at       = datetime.now(timezone.utc),
+            running_image_id = running_image_id,
             last_update_status = "update_available" if result.get("has_update", False) else "checked",
-            last_update_error = result.get("error"),
+            last_update_error  = result.get("error"),
         )
         if not result.get("has_update"):
             kw["update_blocked"] = False
@@ -2477,6 +2520,37 @@ async def pin_container(container_id: str, body: PinBody, request: Request):
         container_name = await asyncio.to_thread(_get_name)
         _upsert_update_status(db, container_name, host_id, pinned=body.pinned)
         return {"container_name": container_name, "pinned": body.pinned}
+    finally:
+        db.close()
+
+
+@router.post("/docker/containers/{container_id}/reset-update")
+async def reset_container_update(container_id: str, request: Request):
+    """
+    Clear a stuck update_in_progress flag for a container.
+    Sets has_update=True so the user can immediately retry the update.
+    """
+    _verify_token(request)
+    if _parse_proxmox_id(container_id):
+        raise HTTPException(400, "Update management is not available for Proxmox containers.")
+    db = _SessionLocal()
+    try:
+        host_url, _, host_id = _resolve_host(db, container_id)
+
+        def _get_name():
+            client = _make_docker_client(host_url)
+            try:
+                return client.containers.get(container_id).name.lstrip("/")
+            finally:
+                client.close()
+
+        container_name = await asyncio.to_thread(_get_name)
+        _upsert_update_status(db, container_name, host_id,
+                              update_in_progress=False,
+                              has_update=True,
+                              last_update_status="failed",
+                              last_update_error="Update reset manually — the previous update attempt did not complete.")
+        return {"container_name": container_name, "reset": True}
     finally:
         db.close()
 

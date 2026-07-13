@@ -673,11 +673,12 @@ function PersonDrawer({ person, onClose }) {
       for (let i = 0; i < segs.length; i++) {
         const seg = segs[i]
         const prev = i > 0 ? segs[i - 1] : null
-        if (seg.status === 'home') {
-          const awayDur = prev && prev.status === 'away' ? fmtDuration(new Date(seg.from) - new Date(prev.from)) : null
+        // Only emit a transition event when direction changes (offline→online or online→offline).
+        if (seg.status === 'online' && prev?.status === 'offline') {
+          const awayDur = fmtDuration(new Date(seg.from) - new Date(prev.from))
           evts.push({ type: 'arrived', at: seg.from, detail: awayDur ? `Was away for ${awayDur}` : null })
-        } else if (seg.status === 'away') {
-          const homeDur = prev && prev.status === 'home' ? fmtDuration(new Date(seg.from) - new Date(prev.from)) : null
+        } else if (seg.status === 'offline' && prev?.status === 'online') {
+          const homeDur = fmtDuration(new Date(seg.from) - new Date(prev.from))
           evts.push({ type: 'left', at: seg.from, detail: homeDur ? `Was home for ${homeDur}` : null })
         }
       }
@@ -973,11 +974,12 @@ function PersonRecentEvents({ persons }) {
         for (let i = 0; i < segs.length; i++) {
           const seg = segs[i]
           const prev = i > 0 ? segs[i - 1] : null
-          if (seg.status === 'home') {
-            const awayDur = prev && prev.status === 'away' ? fmtDuration(new Date(seg.from) - new Date(prev.from)) : null
+          // Only emit a transition event when direction actually changes.
+          if (seg.status === 'online' && prev?.status === 'offline') {
+            const awayDur = fmtDuration(new Date(seg.from) - new Date(prev.from))
             allEvts.push({ personId: p.id, personName: p.name, type: 'arrived', at: seg.from, detail: awayDur ? `Away for ${awayDur}` : null })
-          } else if (seg.status === 'away') {
-            const homeDur = prev && prev.status === 'home' ? fmtDuration(new Date(seg.from) - new Date(prev.from)) : null
+          } else if (seg.status === 'offline' && prev?.status === 'online') {
+            const homeDur = fmtDuration(new Date(seg.from) - new Date(prev.from))
             allEvts.push({ personId: p.id, personName: p.name, type: 'left', at: seg.from, detail: homeDur ? `Home for ${homeDur}` : null })
           }
         }

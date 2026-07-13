@@ -930,6 +930,16 @@ function UpdatesTab({ container, updateStatus: initialStatus }) {
     }
   }
 
+  async function resetStuckUpdate() {
+    try {
+      await api.dockerResetUpdate(container.id)
+      setLogs(l => [...l, 'Stuck update reset — you can now retry.'])
+      await refreshStatus(container.id)
+    } catch (e) {
+      setLogs(l => [...l, `[ERROR] ${e.message}`])
+    }
+  }
+
   function startStream(mode, force = false, scanFirst = true) {
     if (streaming) return
     setLogs([])
@@ -1165,9 +1175,17 @@ function UpdatesTab({ container, updateStatus: initialStatus }) {
           </div>
         )}
 
+        {/* Stuck update warning */}
+        {isUpdating && (
+          <div className="rounded-lg px-3 py-2 text-xs"
+            style={{ background: 'rgba(96,165,250,0.08)', border: '1px solid rgba(96,165,250,0.25)', color: '#60a5fa' }}>
+            Update in progress. If this has been stuck for more than 30 minutes, use <strong>Reset Stuck Update</strong> below to clear it and retry.
+          </div>
+        )}
+
         {/* Check now button */}
-        <div className="flex items-center gap-2 pt-1">
-          <button onClick={checkNow} disabled={checking || streaming}
+        <div className="flex items-center gap-2 pt-1 flex-wrap">
+          <button onClick={checkNow} disabled={checking || streaming || isUpdating}
             className="btn-ghost flex items-center gap-1.5 text-xs">
             <RefreshCw size={12} className={checking ? 'animate-spin' : ''} />
             {checking ? 'Checking…' : 'Check Now'}
@@ -1177,6 +1195,14 @@ function UpdatesTab({ container, updateStatus: initialStatus }) {
             {isPinned ? <PinOff size={12} /> : <Pin size={12} />}
             {isPinned ? 'Unpin' : 'Pin'}
           </button>
+          {isUpdating && (
+            <button onClick={resetStuckUpdate} disabled={streaming}
+              className="btn-ghost flex items-center gap-1.5 text-xs"
+              style={{ color: '#f97316' }}>
+              <RefreshCw size={12} />
+              Reset Stuck Update
+            </button>
+          )}
         </div>
       </div>
 

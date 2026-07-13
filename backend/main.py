@@ -595,6 +595,8 @@ def _migrate(db: Session):
         "ALTER TABLE block_schedules ADD COLUMN IF NOT EXISTS person_ids TEXT[] DEFAULT '{}'",
         "ALTER TABLE devices ADD COLUMN IF NOT EXISTS person_id UUID REFERENCES persons(id) ON DELETE SET NULL",
         "CREATE INDEX IF NOT EXISTS ix_devices_person_id ON devices(person_id)",
+        # Persists the last-notified presence state so backend restarts don't cause spurious notifications.
+        "ALTER TABLE persons ADD COLUMN IF NOT EXISTS presence_state VARCHAR(10) DEFAULT 'unknown'",
     ]
     for sql in migrations:
         try:
@@ -644,7 +646,10 @@ def _migrate(db: Session):
 # ---------------------------------------------------------------------------
 DEFAULT_SETTINGS = {
     "scan_interval":           ("60",    "How often to sweep the network, in seconds."),
-    "offline_miss_threshold":  ("3",     "Number of missed sweeps before a device is marked offline."),
+    "offline_miss_threshold":  ("8",     "Legacy: number of missed sweeps before offline (superseded by presence_grace_seconds)."),
+    "presence_grace_seconds":  ("240",   "Seconds without any network signal before a device is marked offline (default 4 minutes)."),
+    "person_presence_cooldown":    ("600",  "Minimum seconds between repeated 'Arrived home' notifications for the same person."),
+    "person_away_confirm_seconds": ("180",  "Seconds all devices must stay offline before 'Left home' is sent. Prevents spurious notifications from brief wifi dropouts. Default 3 min."),
     "sniffer_workers":         ("4",     "Number of parallel scanner threads."),
     "ip_range":                ("192.168.0.0/24", "CIDR range to scan."),
     "arp_scan_retry":          ("1", "ARP sweep retry rounds (0 = single pass, 1 = two rounds). Higher values increase broadcast traffic but may catch more sleeping devices. The passive sniffer catches most devices that miss sweeps."),
@@ -1010,6 +1015,18 @@ NOTIFICATION_EVENT_DEFS = [
 
 _last_alert_event_id: int = 0
 _last_network_paused: str = ""
+# Tracks current known home/away state per person (person_id -> bool).
+# Only send person.home when transitioning False→True, and person.away when True→False.
+# None = not yet initialized (will be set on first loop iteration).
+_person_home_state: dict[str, bool] = {}
+# Deferred "Left home" confirmation: pid -> (pending_since, pname).
+# "Left home" is not sent immediately — we wait PERSON_AWAY_CONFIRM_SECONDS first.
+# If the person returns during that window, both the pending Left and the return Arrived
+# are suppressed (wifi dropout, not a real departure).
+_person_away_pending: dict[str, tuple] = {}
+# Cooldown on "Arrived home" after a confirmed departure — safety net for rapid re-arrivals.
+_person_last_home_notified: dict[str, datetime] = {}
+PERSON_PRESENCE_COOLDOWN_SECONDS = 600  # 10 minutes
 _pending_browser_notifications: list = []
 _traffic_notif_cooldowns: dict = {}   # (mac, event_type) → datetime of last notification
 _main_loop: asyncio.AbstractEventLoop | None = None
@@ -1374,7 +1391,8 @@ def _is_suppressed(mac: str, event_type: str, cache: dict) -> bool:
 
 
 async def _notification_loop():
-    global _last_alert_event_id, _last_network_paused
+    global _last_alert_event_id, _last_network_paused, _person_home_state, \
+           _person_away_pending, _person_last_home_notified
     await asyncio.sleep(20)  # startup grace
 
     db = SessionLocal()
@@ -1383,6 +1401,23 @@ async def _notification_loop():
         _last_alert_event_id = int(row or 0)
         s = db.get(Setting, "network_paused")
         _last_network_paused = s.value if s else "false"
+
+        # Initialize person home state from persisted presence_state column.
+        # This survives backend restarts — we don't re-derive from is_online because
+        # the device may be momentarily offline at restart time, which would cause a
+        # spurious "Arrived home" when it returns seconds later.
+        try:
+            person_rows = db.execute(text(
+                "SELECT id::text, presence_state FROM persons"
+            )).fetchall()
+            for pid, pstate in person_rows:
+                if pstate == "home":
+                    _person_home_state[pid] = True
+                elif pstate == "away":
+                    _person_home_state[pid] = False
+                # 'unknown' → not set; first real event will initialise it cleanly
+        except Exception:
+            pass
     except Exception:
         pass
     finally:
@@ -1407,7 +1442,9 @@ async def _notification_loop():
                 vuln_on_port   = settings.get("vuln_scan_on_port_change", "false") == "true"
                 auto_block_new = settings.get("auto_block_new_devices",   "false") == "true"
                 auto_block_sev = settings.get("auto_block_vuln_severity", "none")
-                returned_days  = int(settings.get("device_returned_days", "7") or "7")
+                returned_days       = int(settings.get("device_returned_days", "7") or "7")
+                person_cooldown     = int(settings.get("person_presence_cooldown", str(PERSON_PRESENCE_COOLDOWN_SECONDS)) or str(PERSON_PRESENCE_COOLDOWN_SECONDS))
+                person_away_confirm = int(settings.get("person_away_confirm_seconds", "600") or "600")
                 SEV_ORDER      = ["none", "info", "clean", "low", "medium", "high", "critical"]
 
                 rows = db.execute(text("""
@@ -1482,19 +1519,46 @@ async def _notification_loop():
                         """), {"mac": mac}).fetchone()
                         if person_row:
                             pid, pname = person_row
-                            # Person is home if at least one of their devices (or grouped siblings) is online
-                            any_online = db.execute(text("""
-                                SELECT 1 FROM person_devices pd
-                                JOIN devices d ON d.mac_address = pd.mac_address
-                                LEFT JOIN devices sibling ON sibling.group_id = d.group_id
-                                    AND sibling.group_id IS NOT NULL
-                                WHERE pd.person_id = :pid
-                                  AND (d.is_online = true OR sibling.is_online = true)
-                                LIMIT 1
-                            """), {"pid": pid}).fetchone()
-                            if any_online:
-                                dispatches.append(("person.home", "Person Arrived Home",
-                                                   f"{pname} is now home", None))
+                            if pid in _person_away_pending:
+                                # Device returned during the away-confirmation window —
+                                # this is a wifi dropout, not a real departure. Cancel
+                                # the pending "Left home" and restore home state silently.
+                                del _person_away_pending[pid]
+                                _person_home_state[pid] = True
+                                db.execute(text(
+                                    "UPDATE persons SET presence_state='home' WHERE id=:pid"
+                                ), {"pid": pid})
+                                db.commit()
+                            elif not _person_home_state.get(pid, False):
+                                # Person was confirmed away (notification already sent).
+                                # Only fire "Arrived home" if not within cooldown window.
+                                last_home_ts = _person_last_home_notified.get(pid)
+                                in_cooldown = (
+                                    last_home_ts is not None and
+                                    (datetime.now(timezone.utc) - last_home_ts).total_seconds()
+                                    < person_cooldown
+                                )
+                                if not in_cooldown:
+                                    any_online = db.execute(text("""
+                                        SELECT 1 FROM person_devices pd
+                                        JOIN devices d ON d.mac_address = pd.mac_address
+                                        LEFT JOIN devices sibling ON sibling.group_id = d.group_id
+                                            AND sibling.group_id IS NOT NULL
+                                        WHERE pd.person_id = :pid
+                                          AND (d.is_online = true OR sibling.is_online = true)
+                                        LIMIT 1
+                                    """), {"pid": pid}).fetchone()
+                                    if any_online:
+                                        _person_home_state[pid] = True
+                                        _person_last_home_notified[pid] = datetime.now(timezone.utc)
+                                        db.execute(text(
+                                            "UPDATE persons SET presence_state='home' WHERE id=:pid"
+                                        ), {"pid": pid})
+                                        db.commit()
+                                        dispatches.append(("person.home", "Person Arrived Home",
+                                                           f"{pname} is now home", None))
+                                else:
+                                    _person_home_state[pid] = True  # silent update
 
                     elif etype == "offline":
                         dispatches.append(("device.offline.all", "Device Offline",
@@ -1515,19 +1579,25 @@ async def _notification_loop():
                         """), {"mac": mac}).fetchone()
                         if person_row:
                             pid, pname = person_row
-                            # Person is away if none of their devices (or grouped siblings) are online
-                            any_online = db.execute(text("""
-                                SELECT 1 FROM person_devices pd
-                                JOIN devices d ON d.mac_address = pd.mac_address
-                                LEFT JOIN devices sibling ON sibling.group_id = d.group_id
-                                    AND sibling.group_id IS NOT NULL
-                                WHERE pd.person_id = :pid
-                                  AND (d.is_online = true OR sibling.is_online = true)
-                                LIMIT 1
-                            """), {"pid": pid}).fetchone()
-                            if not any_online:
-                                dispatches.append(("person.away", "Person Left Home",
-                                                   f"{pname} is away (all devices offline)", None))
+                            was_home = _person_home_state.get(pid, True)
+                            if was_home and pid not in _person_away_pending:
+                                # Person was home and no pending window yet.
+                                # Check if ALL devices are now offline before starting the window.
+                                any_online = db.execute(text("""
+                                    SELECT 1 FROM person_devices pd
+                                    JOIN devices d ON d.mac_address = pd.mac_address
+                                    LEFT JOIN devices sibling ON sibling.group_id = d.group_id
+                                        AND sibling.group_id IS NOT NULL
+                                    WHERE pd.person_id = :pid
+                                      AND (d.is_online = true OR sibling.is_online = true)
+                                    LIMIT 1
+                                """), {"pid": pid}).fetchone()
+                                if not any_online:
+                                    # Start deferred confirmation — don't notify yet.
+                                    # "Left home" only fires if they stay offline for
+                                    # person_away_confirm seconds (checked below each loop).
+                                    _person_away_pending[pid] = (datetime.now(timezone.utc), pname)
+                                    _person_home_state[pid] = False
 
                     elif etype == "vuln_scan_complete":
                         severity = d.get("severity", "clean")
@@ -1628,6 +1698,29 @@ async def _notification_loop():
                         _ha_db.close()
                 except Exception as _ha_exc:
                     print(f"[ha-mqtt] System stats error: {_ha_exc}", flush=True)
+
+            # ── Deferred "Left home" confirmation ───────────────────────────
+            # Fire person.away only after devices have been offline for the full
+            # confirmation window, suppressing transient wifi dropouts entirely.
+            _now = datetime.now(timezone.utc)
+            _away_db = None
+            for _pid in list(_person_away_pending.keys()):
+                _pending_since, _pname = _person_away_pending[_pid]
+                if (_now - _pending_since).total_seconds() >= person_away_confirm:
+                    del _person_away_pending[_pid]
+                    try:
+                        if _away_db is None:
+                            _away_db = SessionLocal()
+                        _away_db.execute(text(
+                            "UPDATE persons SET presence_state='away' WHERE id=:pid"
+                        ), {"pid": _pid})
+                        _away_db.commit()
+                    except Exception:
+                        pass
+                    dispatches.append(("person.away", "Person Left Home",
+                                       f"{_pname} is away (all devices offline)", None))
+            if _away_db:
+                _away_db.close()
 
             for event_type, title, body, mac in dispatches:
                 if not _is_suppressed(mac, event_type, suppression_cache):
@@ -5069,6 +5162,8 @@ async def apply_settings(db: Session = Depends(get_db)):
 
     if "scan_interval" in settings:
         payload["scan_interval"] = int(settings["scan_interval"])
+    if "presence_grace_seconds" in settings:
+        payload["presence_grace_seconds"] = int(settings["presence_grace_seconds"])
     if "offline_miss_threshold" in settings:
         payload["offline_miss_threshold"] = int(settings["offline_miss_threshold"])
     if "sniffer_workers" in settings:
@@ -7536,39 +7631,34 @@ def delete_block_schedule(schedule_id: int, db: Session = Depends(get_db)):
 # ---------------------------------------------------------------------------
 
 def _fetch_person_devices(db: Session, person_id: str | None = None) -> dict:
+    # Show only directly assigned MACs (not group siblings — they are the same physical
+    # device and showing them separately is confusing).  is_online is group-level:
+    # true if this device OR any of its grouped siblings is online.
     where = ""
     params = {}
     if person_id is not None:
         where = "WHERE pd.person_id::text = :pid"
         params["pid"] = person_id
     rows = db.execute(text(f"""
-        WITH expanded AS (
-            SELECT
-                pd.person_id::text AS person_id,
-                CASE WHEN sib.mac_address IS NOT NULL THEN sib.mac_address ELSE d.mac_address END AS mac_address,
-                CASE WHEN sib.mac_address IS NOT NULL THEN sib.is_online ELSE d.is_online END AS is_online,
-                CASE WHEN sib.mac_address IS NOT NULL
-                    THEN COALESCE(sib.custom_name, sib.hostname, sib.ip_address)
-                    ELSE COALESCE(d.custom_name, d.hostname, d.ip_address)
-                END AS display_name,
-                CASE WHEN sib.mac_address IS NOT NULL THEN sib.ip_address ELSE d.ip_address END AS ip_address,
-                CASE WHEN sib.mac_address IS NOT NULL THEN sib.device_type_override ELSE d.device_type_override END AS device_type,
-                CASE WHEN sib.mac_address IS NOT NULL
-                    THEN COALESCE(sib.vendor_override, sib.vendor)
-                    ELSE COALESCE(d.vendor_override, d.vendor)
-                END AS vendor,
-                CASE WHEN sib.mac_address IS NOT NULL THEN sib.is_blocked ELSE d.is_blocked END AS is_blocked,
-                CASE WHEN sib.mac_address IS NOT NULL THEN sib.status_changed_at ELSE d.status_changed_at END AS status_changed_at
-            FROM person_devices pd
-            JOIN devices d ON d.mac_address = pd.mac_address
-            LEFT JOIN devices sib ON d.group_id IS NOT NULL AND sib.group_id = d.group_id
-            {where}
-        )
-        SELECT DISTINCT ON (person_id, mac_address)
-            person_id, mac_address, is_online, display_name, ip_address,
-            device_type, vendor, is_blocked, status_changed_at
-        FROM expanded
-        ORDER BY person_id, mac_address
+        SELECT
+            pd.person_id::text,
+            d.mac_address,
+            CASE
+                WHEN d.group_id IS NOT NULL THEN
+                    EXISTS (SELECT 1 FROM devices sib
+                            WHERE sib.group_id = d.group_id AND sib.is_online = true)
+                ELSE d.is_online
+            END AS is_online,
+            COALESCE(d.custom_name, d.hostname, d.ip_address) AS display_name,
+            d.ip_address,
+            d.device_type_override AS device_type,
+            COALESCE(d.vendor_override, d.vendor) AS vendor,
+            d.is_blocked,
+            d.status_changed_at
+        FROM person_devices pd
+        JOIN devices d ON d.mac_address = pd.mac_address
+        {where}
+        ORDER BY pd.person_id::text, d.mac_address
     """), params).fetchall()
     devs_by_person: dict = {}
     for r in rows:
@@ -7702,7 +7792,31 @@ def get_persons_timeline(days: int = Query(7, ge=1, le=365), db: Session = Depen
         for p in persons
     }
 
-    all_macs = sorted({mac for macs in person_macs.values() for mac in macs})
+    # Expand each person's assigned MACs to include all group siblings so that
+    # events from any interface (2.4 GHz, 5 GHz, etc.) are captured.
+    assigned_macs_flat = sorted({mac for macs in person_macs.values() for mac in macs})
+    expanded_person_macs: dict[str, list[str]] = {}
+    if assigned_macs_flat:
+        ap_params = {f"ap{i}": m for i, m in enumerate(assigned_macs_flat)}
+        ap_in     = ", ".join(f":ap{i}" for i in range(len(assigned_macs_flat)))
+        sib_rows  = db.execute(text(f"""
+            SELECT d.mac_address AS assigned, sib.mac_address AS sibling
+            FROM devices d
+            JOIN devices sib ON d.group_id IS NOT NULL AND sib.group_id = d.group_id
+            WHERE d.mac_address IN ({ap_in})
+        """), ap_params).fetchall()
+        sibling_map: dict[str, set] = {m: {m} for m in assigned_macs_flat}
+        for assigned, sibling in sib_rows:
+            sibling_map.setdefault(assigned, {assigned}).add(sibling)
+        for pid, pmacs in person_macs.items():
+            expanded: set = set()
+            for m in pmacs:
+                expanded |= sibling_map.get(m, {m})
+            expanded_person_macs[pid] = sorted(expanded)
+    else:
+        expanded_person_macs = {pid: [] for pid in person_macs}
+
+    all_macs = sorted({mac for macs in expanded_person_macs.values() for mac in macs})
     events_by_mac: dict = defaultdict(list)
     prior_by_mac: dict = {}
 
@@ -7738,6 +7852,11 @@ def get_persons_timeline(days: int = Query(7, ge=1, le=365), db: Session = Depen
             return "offline"
         return "unknown"
 
+    # Short offline gaps (wifi dropouts) should not appear as departures.
+    # Read the same threshold used by the notification confirmation window.
+    _conf_row = db.execute(text("SELECT value FROM settings WHERE key='person_away_confirm_seconds'")).fetchone()
+    min_gap_seconds = int((_conf_row[0] if _conf_row else None) or 180)
+
     def build_segments(macs: list[str]):
         if not macs:
             return [], 0
@@ -7751,38 +7870,53 @@ def get_persons_timeline(days: int = Query(7, ge=1, le=365), db: Session = Depen
         segs = []
         seg_start = window_start
         state = _overall_state(state_by_mac)
-        home_ms = 0.0
-        known_ms = 0.0
         idx = 0
         while idx < len(merged_events):
             ts = merged_events[idx]["ts"]
-            if ts > seg_start:
-                segs.append({"from": seg_start.isoformat(), "to": ts.isoformat(), "status": state})
-                dur = (ts - seg_start).total_seconds() * 1000
-                if state == "online":
-                    home_ms += dur
-                if state != "unknown":
-                    known_ms += dur
+            # Apply all events at this timestamp first, then check if state changed.
             while idx < len(merged_events) and merged_events[idx]["ts"] == ts:
                 ev = merged_events[idx]
                 state_by_mac[ev["mac"]] = "online" if ev["type"] in ("online", "joined") else "offline"
                 idx += 1
-            seg_start = ts
-            state = _overall_state(state_by_mac)
-
+            new_state = _overall_state(state_by_mac)
+            if new_state != state:
+                # Only create a segment boundary when the group-level state actually changes.
+                if ts > seg_start:
+                    segs.append({"from": seg_start.isoformat(), "to": ts.isoformat(), "status": state})
+                seg_start = ts
+                state = new_state
         segs.append({"from": seg_start.isoformat(), "to": now.isoformat(), "status": state})
-        final_dur = (now - seg_start).total_seconds() * 1000
-        if state == "online":
-            home_ms += final_dur
-        if state != "unknown":
-            known_ms += final_dur
+
+        # Merge short offline gaps: online → offline(< threshold) → online becomes one online segment.
+        i = 0
+        while i < len(segs) - 2:
+            if (segs[i]["status"] == "online" and
+                    segs[i + 1]["status"] == "offline" and
+                    segs[i + 2]["status"] == "online"):
+                t_from = datetime.fromisoformat(segs[i + 1]["from"])
+                t_to   = datetime.fromisoformat(segs[i + 1]["to"])
+                if (t_to - t_from).total_seconds() < min_gap_seconds:
+                    segs[i] = {"from": segs[i]["from"], "to": segs[i + 2]["to"], "status": "online"}
+                    segs.pop(i + 1)
+                    segs.pop(i + 1)
+                    continue
+            i += 1
+
+        home_ms  = sum(
+            (datetime.fromisoformat(s["to"]) - datetime.fromisoformat(s["from"])).total_seconds() * 1000
+            for s in segs if s["status"] == "online"
+        )
+        known_ms = sum(
+            (datetime.fromisoformat(s["to"]) - datetime.fromisoformat(s["from"])).total_seconds() * 1000
+            for s in segs if s["status"] != "unknown"
+        )
         home_pct = round((home_ms / known_ms) * 100) if known_ms > 0 else 0
         return segs, home_pct
 
     result = []
     for p in persons:
         pid = p[0]
-        segs, pct = build_segments(person_macs.get(pid, []))
+        segs, pct = build_segments(expanded_person_macs.get(pid, []))
         result.append({
             "id":          pid,
             "name":        p[1],

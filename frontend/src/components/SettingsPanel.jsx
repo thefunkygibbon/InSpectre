@@ -17,8 +17,12 @@ const SETTING_META = {
   // Scanner tab
   scan_interval:           { label: 'Scan Interval',       unit: 'seconds',       type: 'number', min: 5,  max: 3600, tab: 'scanner',
     description: 'How often the probe sweeps the network looking for devices.' },
-  offline_miss_threshold:  { label: 'Offline Threshold',   unit: 'missed sweeps', type: 'number', min: 1,  max: 20,   tab: 'scanner',
-    description: 'How many consecutive missed ARP sweeps before a device is marked offline.' },
+  presence_grace_seconds:  { label: 'Offline Grace Period', unit: 'seconds',       type: 'number', min: 60, max: 1800, tab: 'scanner',
+    description: 'How long without any network signal (ARP, passive traffic, DHCP, mDNS) before a device is marked offline. Default 240s (4 min) covers typical phone sleep cycles.' },
+  person_presence_cooldown: { label: 'Person Arrival Cooldown', unit: 'seconds', type: 'number', min: 60, max: 3600, tab: 'scanner',
+    description: 'Minimum time between repeated "Arrived Home" notifications for the same person. Safety net for rapid re-arrivals. Default 600s (10 min).' },
+  person_away_confirm_seconds: { label: 'Departure Confirmation Window', unit: 'seconds', type: 'number', min: 30, max: 1800, tab: 'scanner',
+    description: 'How long all of a person\'s devices must stay offline before "Left Home" fires. Devices returning within this window are treated as wifi dropouts — no notification at all. Default 180s (3 min).' },
   sniffer_workers:         { label: 'Sniffer Workers',     unit: 'threads',       type: 'number', min: 1,  max: 16,   tab: 'scanner',
     description: 'Number of parallel packet capture threads. Requires probe restart to take effect.' },
   arp_scan_retry:          { label: 'ARP Sweep Retries',   unit: 'extra rounds',  type: 'number', min: 0,  max: 3,    tab: 'scanner',
@@ -198,7 +202,7 @@ const SETTING_META = {
 const DOCKER_KEYS = new Set(['docker_enabled','docker_host','docker_tls_verify'])
 
 const TABS = [
-  { id: 'scanner',       label: 'Scanner',       Icon: ScanLine  },
+  { id: 'scanner',       label: 'General',       Icon: ScanLine  },
   { id: 'notifications', label: 'Notifications', Icon: Bell      },
   { id: 'plugins',       label: 'Plugins',       Icon: Package   },
   { id: 'docker',        label: 'Docker',        Icon: Box       },
@@ -480,7 +484,7 @@ export function SettingsPanel({ onClose, onSettingChange }) {
   }
 
   // ── Scanner tab grouping ────────────────────────────────────────────────────
-  const networkScanKeys   = ['scan_interval','offline_miss_threshold']
+  const networkScanKeys   = ['scan_interval','presence_grace_seconds']
   const networkConfigKeys = ['ip_range','dns_server','probe_interface']
 
   function settingsByKeys(keys) {

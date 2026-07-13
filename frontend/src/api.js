@@ -388,6 +388,7 @@ export const api = {
   dockerUpdateStatus:       ()                       => request('GET',  '/docker/update-status'),
   dockerContainerUpdateStatus: (id)                  => request('GET',  `/docker/containers/${id}/update-status`),
   dockerCheckUpdate:        (id)                     => request('POST', `/docker/containers/${id}/check-update`),
+  dockerResetUpdate:        (id)                     => request('POST', `/docker/containers/${id}/reset-update`),
   dockerScanNewImage:       (id, onLine, signal)     => streamSSEPost(`/docker/containers/${id}/scan-new-image`, {}, onLine, signal),
   dockerSafeUpdate:         (id, body, onLine, signal) => streamSSEPost(`/docker/containers/${id}/safe-update`, body, onLine, signal),
   dockerBackupContainer:    (id)                     => request('POST', `/docker/containers/${id}/backup`),

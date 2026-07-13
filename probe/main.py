@@ -86,7 +86,9 @@ PORT_SCAN_WORKERS       = int(os.environ.get("PORT_SCAN_WORKERS", 200))
 GATEWAY_SCAN_WORKERS    = int(os.environ.get("GATEWAY_SCAN_WORKERS", 50))
 PORT_SCAN_METHOD        = os.environ.get("PORT_SCAN_METHOD", "tcp_connect")
 OS_CONFIDENCE_THRESHOLD = int(os.environ.get("OS_CONFIDENCE_THRESHOLD", 85))
-OFFLINE_MISS_THRESHOLD  = int(os.environ.get("OFFLINE_MISS_THRESHOLD",   3))
+OFFLINE_MISS_THRESHOLD  = int(os.environ.get("OFFLINE_MISS_THRESHOLD",   8))  # legacy, derived from PRESENCE_GRACE_SECONDS
+PRESENCE_GRACE_SECONDS  = int(os.environ.get("PRESENCE_GRACE_SECONDS",   240))  # 4 minutes default
+FLAP_SUPPRESS_SECONDS   = int(os.environ.get("FLAP_SUPPRESS_SECONDS",    120))  # suppress online event if back within 2 min
 SNIFFER_WORKERS         = int(os.environ.get("SNIFFER_WORKERS",          4))
 ARP_SCAN_RETRY          = int(os.environ.get("ARP_SCAN_RETRY",           1))
 PRIMARY_IP_MODE         = os.environ.get("PRIMARY_IP_MODE",         "locked")
@@ -169,6 +171,10 @@ def _load_settings_from_db() -> None:
         if "gateway_scan_workers"    in db: GATEWAY_SCAN_WORKERS    = int(db["gateway_scan_workers"])
         if "port_scan_method"        in db: PORT_SCAN_METHOD        = db["port_scan_method"].strip()
         if "os_confidence_threshold" in db: OS_CONFIDENCE_THRESHOLD = int(db["os_confidence_threshold"])
+        if "presence_grace_seconds"  in db: PRESENCE_GRACE_SECONDS  = int(db["presence_grace_seconds"])
+        elif "offline_miss_threshold" in db:
+            # Legacy: derive grace period from missed-sweep count × interval
+            PRESENCE_GRACE_SECONDS = int(db["offline_miss_threshold"]) * SCAN_INTERVAL
         if "offline_miss_threshold"  in db: OFFLINE_MISS_THRESHOLD  = int(db["offline_miss_threshold"])
         if "sniffer_workers"         in db: SNIFFER_WORKERS         = int(db["sniffer_workers"])
         if "arp_scan_retry"          in db: ARP_SCAN_RETRY          = int(db["arp_scan_retry"])
@@ -241,6 +247,7 @@ def apply_runtime_config(payload: dict) -> dict:
     global HOSTNAME_COOLDOWN_HOURS, ENABLE_ARP_SWEEP, ENABLE_PASSIVE_SNIFFER, ENABLE_HOSTNAME_RESOLUTION, ENABLE_PORT_SCANNING
     global ENABLE_SERVICE_FINGERPRINTING, ENABLE_MDNS, ENABLE_NIGHTLY_SCAN, ENABLE_UNSCANNED_RETRY
     global AUTO_GROUP_BY_HOSTNAME, SCAN_GROUPED_MEMBERS
+    global PRESENCE_GRACE_SECONDS
     global _DNS_SERVER
 
     changes = {}
@@ -263,9 +270,16 @@ def apply_runtime_config(payload: dict) -> dict:
     if "os_confidence_threshold" in payload:
         OS_CONFIDENCE_THRESHOLD = int(payload["os_confidence_threshold"])
         changes["os_confidence_threshold"] = OS_CONFIDENCE_THRESHOLD
+    if "presence_grace_seconds" in payload:
+        PRESENCE_GRACE_SECONDS = int(payload["presence_grace_seconds"])
+        changes["presence_grace_seconds"] = PRESENCE_GRACE_SECONDS
     if "offline_miss_threshold" in payload:
         OFFLINE_MISS_THRESHOLD = int(payload["offline_miss_threshold"])
         changes["offline_miss_threshold"] = OFFLINE_MISS_THRESHOLD
+        # Legacy: if no explicit presence_grace_seconds, derive from miss threshold × interval
+        if "presence_grace_seconds" not in payload:
+            PRESENCE_GRACE_SECONDS = OFFLINE_MISS_THRESHOLD * SCAN_INTERVAL
+            changes["presence_grace_seconds"] = PRESENCE_GRACE_SECONDS
     if "sniffer_workers" in payload:
         changes["sniffer_workers"] = {
             "requested": int(payload["sniffer_workers"]),
@@ -398,6 +412,7 @@ class Device(Base):
     dhcp_hostname           = Column(String,  nullable=True)
     dhcp_vendor_class       = Column(String,  nullable=True)
     dhcp_fingerprint        = Column(String,  nullable=True)
+    presence_last_seen_at   = Column(DateTime(timezone=True), nullable=True)
 
 class IPHistory(Base):
     __tablename__ = "ip_history"
@@ -430,6 +445,12 @@ _sniffer_seen_lock = threading.Lock()
 # Intentionally in-memory only — resets on probe restart.
 _confirmed_offline_macs: set[str] = set()
 _confirmed_offline_lock = threading.Lock()
+
+# Tracks when a device was last marked offline, used for flap suppression:
+# if a device comes back online within FLAP_SUPPRESS_SECONDS of going offline,
+# we suppress the "online" event log entry (the device never really left).
+_offline_at: dict[str, datetime] = {}
+_offline_lock = threading.Lock()
 
 def _get_mac_lock(mac: str) -> threading.Lock:
     with _upsert_locks_lock:
@@ -480,6 +501,12 @@ def init_db() -> None:
             conn.execute(text("ALTER TABLE devices ADD COLUMN IF NOT EXISTS suppress_presence_events BOOLEAN NOT NULL DEFAULT FALSE"))
             conn.execute(text("ALTER TABLE devices ADD COLUMN IF NOT EXISTS group_manual BOOLEAN NOT NULL DEFAULT FALSE"))
             conn.execute(text("ALTER TABLE devices ADD COLUMN IF NOT EXISTS auto_group_optout BOOLEAN NOT NULL DEFAULT FALSE"))
+            conn.execute(text("ALTER TABLE devices ADD COLUMN IF NOT EXISTS presence_last_seen_at TIMESTAMPTZ"))
+            # Backfill: seed presence_last_seen_at from last_seen for existing devices
+            conn.execute(text("""
+                UPDATE devices SET presence_last_seen_at = last_seen
+                WHERE presence_last_seen_at IS NULL AND last_seen IS NOT NULL
+            """))
             conn.commit()
         except Exception as e:
             print(f"[DB] Column migration note: {e}", flush=True)
@@ -1742,6 +1769,11 @@ def _is_generic_hostname(hostname: str) -> bool:
     # meaningful hostnames for humans and should never override a better name.
     if re.match(r'^[0-9a-f]{12,}$', base, re.I):
         return True
+    # UUID-format strings (e.g. WebRTC/browser privacy names like
+    # 95b0e2ad-6e89-42d2-9cc1-d2f7193c0865) are ephemeral and meaningless —
+    # browsers generate a fresh one per session so they never stabilise.
+    if re.match(r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$', base, re.I):
+        return True
     return bool(_GENERIC_HOSTNAME_RE.match(base))
 
 
@@ -2107,6 +2139,7 @@ def upsert_seen_device(mac: str, ip: str, source: str) -> bool:
                         hostname_last_attempted  = now,
                         baseline_scan_count      = 0,
                         status_changed_at        = now,
+                        presence_last_seen_at    = now,
                     )
                     .on_conflict_do_update(
                         index_elements=["mac_address"],
@@ -2121,6 +2154,7 @@ def upsert_seen_device(mac: str, ip: str, source: str) -> bool:
                             status_changed_at = text("CASE WHEN devices.is_online = false THEN NOW() ELSE devices.status_changed_at END"),
                             miss_count = 0,
                             hostname   = text(_hostname_case),
+                            presence_last_seen_at = text("NOW()"),
                         ),
                     )
                 )
@@ -2233,7 +2267,8 @@ def upsert_seen_device(mac: str, ip: str, source: str) -> bool:
                         deep_scanned = existing.deep_scanned,
                         miss_count   = 0,
                         is_important = existing.is_important,
-                        status_changed_at = existing.status_changed_at or now,
+                        status_changed_at     = existing.status_changed_at or now,
+                        presence_last_seen_at = now,
                     )
                     .on_conflict_do_update(
                         index_elements=["mac_address"],
@@ -2259,6 +2294,7 @@ def upsert_seen_device(mac: str, ip: str, source: str) -> bool:
                             status_changed_at = text("CASE WHEN devices.is_online = false THEN NOW() ELSE devices.status_changed_at END"),
                             miss_count = 0,
                             hostname   = text(_hostname_case),
+                            presence_last_seen_at = text("NOW()"),
                         ),
                     )
                 )
@@ -2292,8 +2328,14 @@ def upsert_seen_device(mac: str, ip: str, source: str) -> bool:
                     # so a future genuine offline transition will be recorded.
                     with _confirmed_offline_lock:
                         _confirmed_offline_macs.discard(mac)
-                    # Suppressed devices: keep status accurate but don't log the event.
-                    if not getattr(existing, "suppress_presence_events", False):
+                    # Flap suppression: if the device went offline and came back within
+                    # FLAP_SUPPRESS_SECONDS, suppress the online event. With the new
+                    # staleness-based detection the grace period should prevent most of
+                    # these, but timing variance can still cause edge-case flips.
+                    with _offline_lock:
+                        offline_ts = _offline_at.pop(mac, None)
+                    flap = offline_ts is not None and (now - offline_ts).total_seconds() < FLAP_SUPPRESS_SECONDS
+                    if not flap and not getattr(existing, "suppress_presence_events", False):
                         _write_event(mac, "online", {"ip": ip, "source": source})
                 if ip_changed:
                     if is_secondary_sighting:
@@ -2730,12 +2772,17 @@ def start_arp_sniffer() -> None:
 # ---------------------------------------------------------------------------
 def update_presence_from_sweep(session, active_macs: set) -> None:
     """
-    Mark devices online/offline based on the current ARP sweep results,
-    combined with anything the passive sniffer saw since the last sweep.
+    Mark devices online/offline based on accumulated evidence across all signal
+    sources (ARP sweep, passive sniffer, mDNS, DHCP).
 
-    When a device first hits the offline miss threshold, do a one-shot ICMP
-    confirmation against its current scan IP before marking it offline. This
-    avoids false offline events for devices that go ARP-quiet temporarily.
+    The approach: every signal source updates device.presence_last_seen_at via
+    _upsert_device. This function then asks a single question per device:
+    "how long since we last had solid evidence this device was alive?"
+    If that gap exceeds PRESENCE_GRACE_SECONDS, mark offline.
+
+    This is more robust than miss-count + ping because no single failed probe
+    can cause a false offline event — the decision is based on accumulated
+    silence across ALL signal types over the full grace period.
     """
     now = datetime.now(timezone.utc)
 
@@ -2749,44 +2796,56 @@ def update_presence_from_sweep(session, active_macs: set) -> None:
     # being trivially reachable.
     own_ips = _get_host_ipv4s()
 
+    # Purge stale _offline_at entries (devices that went offline long ago and
+    # never came back — prevent unbounded memory growth).
+    with _offline_lock:
+        stale_macs = [m for m, ts in _offline_at.items() if (now - ts).total_seconds() > 600]
+        for m in stale_macs:
+            _offline_at.pop(m, None)
+
     for dev in session.query(Device).all():
         dev_ip = (getattr(dev, "primary_ip", None) or dev.ip_address or "")
+
+        # Devices seen this cycle: update presence timestamp and mark online.
+        # presence_last_seen_at is also written in _upsert_device (called for
+        # each ARP/sniffer sighting), so this is belt-and-suspenders for the
+        # combined seen_this_cycle set.
         if dev.mac_address in seen_this_cycle or (dev_ip and dev_ip in own_ips):
             if not dev.is_online:
                 dev.status_changed_at = now
             dev.is_online = True
             dev.miss_count = 0
+            dev.presence_last_seen_at = now
             continue
 
-        suppressed = getattr(dev, "suppress_presence_events", False)
-
-        dev.miss_count = (dev.miss_count or 0) + 1
-
+        # Device not seen this cycle — check evidence staleness.
         if not dev.is_online:
             continue
 
-        if dev.miss_count < OFFLINE_MISS_THRESHOLD:
+        # Use presence_last_seen_at as the evidence clock. Fall back to last_seen
+        # (the last offline→online transition) for devices that pre-date this column.
+        presence_ts = getattr(dev, "presence_last_seen_at", None) or dev.last_seen
+        if presence_ts and (now - presence_ts).total_seconds() < PRESENCE_GRACE_SECONDS:
+            # Still within grace period — not enough evidence of absence yet.
             continue
 
-        confirm_ip = dev.primary_ip or dev.ip_address
-        if confirm_ip and ping_once(confirm_ip, timeout_s=2):
-            dev.is_online = True
-            dev.miss_count = 0
-            print(f"[~] Offline check rescued by ping: {confirm_ip} ({dev.mac_address})", flush=True)
-            continue
-
+        # Grace period expired: mark offline.
         dev.is_online = False
         dev.status_changed_at = now
+        elapsed = f"{(now - presence_ts).total_seconds():.0f}s" if presence_ts else "unknown"
         print(
-            f"[-] Offline: {confirm_ip or dev.ip_address} ({dev.mac_address}) "
-            f"after {dev.miss_count} missed sweeps + ping confirm",
+            f"[-] Offline: {dev_ip} ({dev.mac_address}) "
+            f"— no signal for {elapsed} (grace={PRESENCE_GRACE_SECONDS}s)",
             flush=True,
         )
 
-        # Suppressed devices: is_online is updated above for accurate status display
-        # but no event is written and the confirmed-offline set is not touched.
+        suppressed = getattr(dev, "suppress_presence_events", False)
         if suppressed:
             continue
+
+        # Record when this device went offline for flap suppression.
+        with _offline_lock:
+            _offline_at[dev.mac_address] = now
 
         # Only write an offline event if the device has come online since the
         # last offline event was written. This suppresses repeated offline
@@ -2797,9 +2856,9 @@ def update_presence_from_sweep(session, active_macs: set) -> None:
             _confirmed_offline_macs.add(dev.mac_address)
         if not already_offline:
             _write_event(dev.mac_address, "offline", {
-                "ip": confirm_ip or dev.ip_address,
+                "ip": dev_ip,
                 "source": "sweep",
-                "confirmation": "icmp" if confirm_ip else None,
+                "elapsed_s": int((now - presence_ts).total_seconds()) if presence_ts else None,
             })
 
 # ---------------------------------------------------------------------------
