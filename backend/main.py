@@ -597,6 +597,10 @@ def _migrate(db: Session):
         "CREATE INDEX IF NOT EXISTS ix_devices_person_id ON devices(person_id)",
         # Persists the last-notified presence state so backend restarts don't cause spurious notifications.
         "ALTER TABLE persons ADD COLUMN IF NOT EXISTS presence_state VARCHAR(10) DEFAULT 'unknown'",
+        # Reset person_away_confirm_seconds to the new default (60s) if it still holds
+        # the original seeded value of 180. Users who deliberately set it to 180 are unaffected
+        # since the UI would have saved a different value.
+        "UPDATE settings SET value='60' WHERE key='person_away_confirm_seconds' AND value='180'",
     ]
     for sql in migrations:
         try:
@@ -649,7 +653,7 @@ DEFAULT_SETTINGS = {
     "offline_miss_threshold":  ("8",     "Legacy: number of missed sweeps before offline (superseded by presence_grace_seconds)."),
     "presence_grace_seconds":  ("240",   "Seconds without any network signal before a device is marked offline (default 4 minutes)."),
     "person_presence_cooldown":    ("600",  "Minimum seconds between repeated 'Arrived home' notifications for the same person."),
-    "person_away_confirm_seconds": ("180",  "Seconds all devices must stay offline before 'Left home' is sent. Prevents spurious notifications from brief wifi dropouts. Default 3 min."),
+    "person_away_confirm_seconds": ("60",   "Seconds all devices must stay offline before 'Left home' is sent. The probe's offline grace period already filters very short dropouts; this adds a small extra buffer. Default 60s."),
     "sniffer_workers":         ("4",     "Number of parallel scanner threads."),
     "ip_range":                ("192.168.0.0/24", "CIDR range to scan."),
     "arp_scan_retry":          ("1", "ARP sweep retry rounds (0 = single pass, 1 = two rounds). Higher values increase broadcast traffic but may catch more sleeping devices. The passive sniffer catches most devices that miss sweeps."),
@@ -1444,7 +1448,7 @@ async def _notification_loop():
                 auto_block_sev = settings.get("auto_block_vuln_severity", "none")
                 returned_days       = int(settings.get("device_returned_days", "7") or "7")
                 person_cooldown     = int(settings.get("person_presence_cooldown", str(PERSON_PRESENCE_COOLDOWN_SECONDS)) or str(PERSON_PRESENCE_COOLDOWN_SECONDS))
-                person_away_confirm = int(settings.get("person_away_confirm_seconds", "600") or "600")
+                person_away_confirm = int(settings.get("person_away_confirm_seconds", "60") or "60")
                 SEV_ORDER      = ["none", "info", "clean", "low", "medium", "high", "critical"]
 
                 rows = db.execute(text("""
@@ -7654,7 +7658,13 @@ def _fetch_person_devices(db: Session, person_id: str | None = None) -> dict:
             d.device_type_override AS device_type,
             COALESCE(d.vendor_override, d.vendor) AS vendor,
             d.is_blocked,
-            d.status_changed_at
+            CASE
+                WHEN d.group_id IS NOT NULL THEN (
+                    SELECT MAX(sib.status_changed_at) FROM devices sib
+                    WHERE sib.group_id = d.group_id
+                )
+                ELSE d.status_changed_at
+            END AS status_changed_at
         FROM person_devices pd
         JOIN devices d ON d.mac_address = pd.mac_address
         {where}
@@ -7852,10 +7862,11 @@ def get_persons_timeline(days: int = Query(7, ge=1, le=365), db: Session = Depen
             return "offline"
         return "unknown"
 
-    # Short offline gaps (wifi dropouts) should not appear as departures.
-    # Read the same threshold used by the notification confirmation window.
-    _conf_row = db.execute(text("SELECT value FROM settings WHERE key='person_away_confirm_seconds'")).fetchone()
-    min_gap_seconds = int((_conf_row[0] if _conf_row else None) or 180)
+    # Merge offline gaps shorter than the probe's grace period in the history display.
+    # We use presence_grace_seconds (the probe's offline threshold) rather than the
+    # notification confirmation window — these two are now separate concerns.
+    _grace_row = db.execute(text("SELECT value FROM settings WHERE key='presence_grace_seconds'")).fetchone()
+    min_gap_seconds = int((_grace_row[0] if _grace_row else None) or 240)
 
     def build_segments(macs: list[str]):
         if not macs:

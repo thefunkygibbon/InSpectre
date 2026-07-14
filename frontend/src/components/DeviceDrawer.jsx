@@ -583,7 +583,12 @@ export function DeviceDrawer({ device, onClose, onRename, onResolveName, onRefre
     let cancelled = false
     if (!mac) return () => {}
     api.getDevice(mac).then(detailed => {
-      if (!cancelled) setLocalDevice(prev => ({ ...(prev || {}), ...detailed }))
+      if (!cancelled) setLocalDevice(prev => {
+        // Preserve presence-state fields from the parent's live-polled data so
+        // the drawer's one-shot fetch doesn't overwrite the freshest known state.
+        const { is_online, status_changed_at, last_seen } = prev || {}
+        return { ...(prev || {}), ...detailed, is_online, status_changed_at, last_seen }
+      })
     }).catch(() => {})
     return () => { cancelled = true }
   }, [mac])
