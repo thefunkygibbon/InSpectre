@@ -1712,6 +1712,8 @@ async def _notification_loop():
                 _pending_since, _pname = _person_away_pending[_pid]
                 if (_now - _pending_since).total_seconds() >= person_away_confirm:
                     del _person_away_pending[_pid]
+                    # Reset cooldown so the very next return always fires "Arrived home"
+                    _person_last_home_notified.pop(_pid, None)
                     try:
                         if _away_db is None:
                             _away_db = SessionLocal()
@@ -1725,6 +1727,46 @@ async def _notification_loop():
                                        f"{_pname} is away (all devices offline)", None))
             if _away_db:
                 _away_db.close()
+
+            # ── Presence reconciliation safety-net ──────────────────────────
+            # If our in-memory state says a person is away (and no pending window)
+            # but their device is actually online, we missed the "online" event
+            # (e.g. probe flap suppression). Fire "Arrived home" now.
+            _recon_db = None
+            try:
+                _recon_db = SessionLocal()
+                _person_rows = _recon_db.execute(text(
+                    "SELECT id::text, name, presence_state FROM persons"
+                )).fetchall()
+                for _rpid, _rpname, _rpstate in _person_rows:
+                    if _person_home_state.get(_rpid, False):
+                        continue  # already think they're home
+                    if _rpid in _person_away_pending:
+                        continue  # pending confirmation, handled above
+                    # Check if any assigned device (or sibling) is online
+                    _any = _recon_db.execute(text("""
+                        SELECT 1 FROM person_devices pd
+                        JOIN devices d ON d.mac_address = pd.mac_address
+                        LEFT JOIN devices sib ON sib.group_id = d.group_id
+                            AND sib.group_id IS NOT NULL
+                        WHERE pd.person_id = :pid
+                          AND (d.is_online = true OR sib.is_online = true)
+                        LIMIT 1
+                    """), {"pid": _rpid}).fetchone()
+                    if _any:
+                        _person_home_state[_rpid] = True
+                        _person_last_home_notified[_rpid] = _now
+                        _recon_db.execute(text(
+                            "UPDATE persons SET presence_state='home' WHERE id=:pid"
+                        ), {"pid": _rpid})
+                        _recon_db.commit()
+                        dispatches.append(("person.home", "Person Arrived Home",
+                                           f"{_rpname} is now home", None))
+            except Exception as _recon_exc:
+                print(f"[notify] Presence reconciliation error: {_recon_exc}", flush=True)
+            finally:
+                if _recon_db:
+                    _recon_db.close()
 
             for event_type, title, body, mac in dispatches:
                 if not _is_suppressed(mac, event_type, suppression_cache):
