@@ -161,10 +161,14 @@ def _extract_ports_from_network_settings(net_ports: dict | None) -> tuple[dict, 
     exposed_ports: list = []
 
     for port_proto, bindings in (net_ports or {}).items():
+        # Bug 2: skip phantom /0 protocol entries created by Docker on recreation
+        if port_proto.endswith("/0"):
+            continue
         exposed_ports.append(port_proto)
         if not bindings:
             continue
 
+        seen_host_ports: set = set()
         mapped = []
         for b in bindings:
             hp = b.get("HostPort")
@@ -174,7 +178,15 @@ def _extract_ports_from_network_settings(net_ports: dict | None) -> tuple[dict, 
                 host_port = int(hp)
             except Exception:
                 host_port = hp
-            host_ip = b.get("HostIp")
+            # Bug 3: normalize 0.0.0.0 and :: to empty string (all-interfaces)
+            host_ip = b.get("HostIp") or ""
+            if host_ip in ("0.0.0.0", "::"):
+                host_ip = ""
+            # Bug 1: deduplicate IPv4/IPv6 bindings for the same host port
+            dedup_key = (host_ip, host_port)
+            if dedup_key in seen_host_ports:
+                continue
+            seen_host_ports.add(dedup_key)
             mapped.append((host_ip, host_port) if host_ip else host_port)
 
         if len(mapped) == 1:

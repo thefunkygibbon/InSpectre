@@ -1511,18 +1511,29 @@ async def _notification_loop():
                                 dispatches.append(("device.returned", "Device Returned",
                                                    f"{name} ({ip}) reappeared after {days_absent} days", mac))
                         # person.home: check if this mac (or any grouped sibling) belongs to a person
+                        # as the PRIMARY device — non-primary assigned devices do not trigger presence.
                         person_row = db.execute(text("""
-                            SELECT p.id::text, p.name FROM persons p
+                            SELECT p.id::text, p.name, p.primary_mac FROM persons p
                             JOIN person_devices pd ON pd.person_id = p.id
                             JOIN devices pd_dev ON pd_dev.mac_address = pd.mac_address
                             JOIN devices trigger_dev ON trigger_dev.mac_address = :mac
-                            WHERE pd.mac_address = :mac
-                               OR (pd_dev.group_id IS NOT NULL
-                                   AND pd_dev.group_id = trigger_dev.group_id)
+                            WHERE (pd.mac_address = :mac
+                                   OR (pd_dev.group_id IS NOT NULL
+                                       AND pd_dev.group_id = trigger_dev.group_id))
+                              AND (
+                                p.primary_mac IS NULL
+                                OR p.primary_mac = :mac
+                                OR EXISTS (
+                                    SELECT 1 FROM devices primary_dev
+                                    WHERE primary_dev.mac_address = p.primary_mac
+                                      AND primary_dev.group_id IS NOT NULL
+                                      AND primary_dev.group_id = trigger_dev.group_id
+                                )
+                              )
                             LIMIT 1
                         """), {"mac": mac}).fetchone()
                         if person_row:
-                            pid, pname = person_row
+                            pid, pname, person_primary_mac = person_row
                             if pid in _person_away_pending:
                                 # Device returned during the away-confirmation window —
                                 # this is a wifi dropout, not a real departure. Cancel
@@ -1543,15 +1554,25 @@ async def _notification_loop():
                                     < person_cooldown
                                 )
                                 if not in_cooldown:
-                                    any_online = db.execute(text("""
-                                        SELECT 1 FROM person_devices pd
-                                        JOIN devices d ON d.mac_address = pd.mac_address
-                                        LEFT JOIN devices sibling ON sibling.group_id = d.group_id
-                                            AND sibling.group_id IS NOT NULL
-                                        WHERE pd.person_id = :pid
-                                          AND (d.is_online = true OR sibling.is_online = true)
-                                        LIMIT 1
-                                    """), {"pid": pid}).fetchone()
+                                    if person_primary_mac:
+                                        any_online = db.execute(text("""
+                                            SELECT 1 FROM devices primary_d
+                                            LEFT JOIN devices sib ON sib.group_id = primary_d.group_id
+                                                AND primary_d.group_id IS NOT NULL
+                                            WHERE primary_d.mac_address = :pmac
+                                              AND (primary_d.is_online = true OR sib.is_online = true)
+                                            LIMIT 1
+                                        """), {"pmac": person_primary_mac}).fetchone()
+                                    else:
+                                        any_online = db.execute(text("""
+                                            SELECT 1 FROM person_devices pd
+                                            JOIN devices d ON d.mac_address = pd.mac_address
+                                            LEFT JOIN devices sibling ON sibling.group_id = d.group_id
+                                                AND sibling.group_id IS NOT NULL
+                                            WHERE pd.person_id = :pid
+                                              AND (d.is_online = true OR sibling.is_online = true)
+                                            LIMIT 1
+                                        """), {"pid": pid}).fetchone()
                                     if any_online:
                                         _person_home_state[pid] = True
                                         _person_last_home_notified[pid] = datetime.now(timezone.utc)
@@ -1571,31 +1592,52 @@ async def _notification_loop():
                             dispatches.append(("device.offline.watched", "Watched Device Offline",
                                                f"{name} ({ip}) went offline", mac))
                         # person.away: check if this mac (or any grouped sibling) belongs to a person
+                        # as the PRIMARY device — non-primary assigned devices do not trigger presence.
                         person_row = db.execute(text("""
-                            SELECT p.id::text, p.name FROM persons p
+                            SELECT p.id::text, p.name, p.primary_mac FROM persons p
                             JOIN person_devices pd ON pd.person_id = p.id
                             JOIN devices pd_dev ON pd_dev.mac_address = pd.mac_address
                             JOIN devices trigger_dev ON trigger_dev.mac_address = :mac
-                            WHERE pd.mac_address = :mac
-                               OR (pd_dev.group_id IS NOT NULL
-                                   AND pd_dev.group_id = trigger_dev.group_id)
+                            WHERE (pd.mac_address = :mac
+                                   OR (pd_dev.group_id IS NOT NULL
+                                       AND pd_dev.group_id = trigger_dev.group_id))
+                              AND (
+                                p.primary_mac IS NULL
+                                OR p.primary_mac = :mac
+                                OR EXISTS (
+                                    SELECT 1 FROM devices primary_dev
+                                    WHERE primary_dev.mac_address = p.primary_mac
+                                      AND primary_dev.group_id IS NOT NULL
+                                      AND primary_dev.group_id = trigger_dev.group_id
+                                )
+                              )
                             LIMIT 1
                         """), {"mac": mac}).fetchone()
                         if person_row:
-                            pid, pname = person_row
+                            pid, pname, person_primary_mac = person_row
                             was_home = _person_home_state.get(pid, True)
                             if was_home and pid not in _person_away_pending:
                                 # Person was home and no pending window yet.
-                                # Check if ALL devices are now offline before starting the window.
-                                any_online = db.execute(text("""
-                                    SELECT 1 FROM person_devices pd
-                                    JOIN devices d ON d.mac_address = pd.mac_address
-                                    LEFT JOIN devices sibling ON sibling.group_id = d.group_id
-                                        AND sibling.group_id IS NOT NULL
-                                    WHERE pd.person_id = :pid
-                                      AND (d.is_online = true OR sibling.is_online = true)
-                                    LIMIT 1
-                                """), {"pid": pid}).fetchone()
+                                # Check if the primary device (and its group) is offline.
+                                if person_primary_mac:
+                                    any_online = db.execute(text("""
+                                        SELECT 1 FROM devices primary_d
+                                        LEFT JOIN devices sib ON sib.group_id = primary_d.group_id
+                                            AND primary_d.group_id IS NOT NULL
+                                        WHERE primary_d.mac_address = :pmac
+                                          AND (primary_d.is_online = true OR sib.is_online = true)
+                                        LIMIT 1
+                                    """), {"pmac": person_primary_mac}).fetchone()
+                                else:
+                                    any_online = db.execute(text("""
+                                        SELECT 1 FROM person_devices pd
+                                        JOIN devices d ON d.mac_address = pd.mac_address
+                                        LEFT JOIN devices sibling ON sibling.group_id = d.group_id
+                                            AND sibling.group_id IS NOT NULL
+                                        WHERE pd.person_id = :pid
+                                          AND (d.is_online = true OR sibling.is_online = true)
+                                        LIMIT 1
+                                    """), {"pid": pid}).fetchone()
                                 if not any_online:
                                     # Start deferred confirmation — don't notify yet.
                                     # "Left home" only fires if they stay offline for
@@ -1736,23 +1778,33 @@ async def _notification_loop():
             try:
                 _recon_db = SessionLocal()
                 _person_rows = _recon_db.execute(text(
-                    "SELECT id::text, name, presence_state FROM persons"
+                    "SELECT id::text, name, presence_state, primary_mac FROM persons"
                 )).fetchall()
-                for _rpid, _rpname, _rpstate in _person_rows:
+                for _rpid, _rpname, _rpstate, _rprimary_mac in _person_rows:
                     if _person_home_state.get(_rpid, False):
                         continue  # already think they're home
                     if _rpid in _person_away_pending:
                         continue  # pending confirmation, handled above
-                    # Check if any assigned device (or sibling) is online
-                    _any = _recon_db.execute(text("""
-                        SELECT 1 FROM person_devices pd
-                        JOIN devices d ON d.mac_address = pd.mac_address
-                        LEFT JOIN devices sib ON sib.group_id = d.group_id
-                            AND sib.group_id IS NOT NULL
-                        WHERE pd.person_id = :pid
-                          AND (d.is_online = true OR sib.is_online = true)
-                        LIMIT 1
-                    """), {"pid": _rpid}).fetchone()
+                    # Check if the primary device (or its group siblings) is online.
+                    if _rprimary_mac:
+                        _any = _recon_db.execute(text("""
+                            SELECT 1 FROM devices primary_d
+                            LEFT JOIN devices sib ON sib.group_id = primary_d.group_id
+                                AND primary_d.group_id IS NOT NULL
+                            WHERE primary_d.mac_address = :pmac
+                              AND (primary_d.is_online = true OR sib.is_online = true)
+                            LIMIT 1
+                        """), {"pmac": _rprimary_mac}).fetchone()
+                    else:
+                        _any = _recon_db.execute(text("""
+                            SELECT 1 FROM person_devices pd
+                            JOIN devices d ON d.mac_address = pd.mac_address
+                            LEFT JOIN devices sib ON sib.group_id = d.group_id
+                                AND sib.group_id IS NOT NULL
+                            WHERE pd.person_id = :pid
+                              AND (d.is_online = true OR sib.is_online = true)
+                            LIMIT 1
+                        """), {"pid": _rpid}).fetchone()
                     if _any:
                         _person_home_state[_rpid] = True
                         _person_last_home_notified[_rpid] = _now
@@ -7731,7 +7783,11 @@ def _person_row_to_dict(row, devices=None, schedules=None) -> dict:
     """Convert a persons row to a dict. devices and schedules are pre-fetched lists."""
     pid = str(row[0])
     devs = devices or []
-    is_home = any(d.get("is_online") for d in devs)
+    primary_mac = row[2]
+    if primary_mac:
+        is_home = any(d.get("is_online") for d in devs if d.get("mac_address") == primary_mac)
+    else:
+        is_home = any(d.get("is_online") for d in devs)
     is_blocked = bool(devs) and all(d.get("is_blocked", False) for d in devs)
     timed_block_remaining = None
     task = _person_timed_blocks.get(pid)
@@ -9001,12 +9057,25 @@ def _fmt_container(c) -> dict:
     net        = attrs.get("NetworkSettings", {})
 
     ports = []
+    seen_port_entries: set = set()
     for cport, bindings in (net.get("Ports") or {}).items():
+        if cport.endswith("/0"):
+            continue
         if bindings:
             for b in bindings:
-                ports.append({"host_ip": b.get("HostIp",""), "host_port": b.get("HostPort",""), "container_port": cport})
+                hip   = b.get("HostIp", "") or ""
+                hport = b.get("HostPort", "") or ""
+                if hip in ("0.0.0.0", "::"):
+                    hip = ""
+                key = (hip, hport, cport)
+                if key in seen_port_entries:
+                    continue
+                seen_port_entries.add(key)
+                ports.append({"host_ip": hip, "host_port": hport, "container_port": cport})
         else:
-            ports.append({"host_ip": "", "host_port": "", "container_port": cport})
+            if cport not in seen_port_entries:
+                seen_port_entries.add(cport)
+                ports.append({"host_ip": "", "host_port": "", "container_port": cport})
 
     mounts = [
         {"type": m.get("Type",""), "source": m.get("Source",""), "destination": m.get("Destination",""), "mode": m.get("Mode","")}
@@ -9597,18 +9666,31 @@ def _generate_compose_yaml(c) -> tuple[str, dict]:
 
     # ports
     ports = []
+    seen_port_entries: set = set()
     for cport, bindings in (net_sets.get("Ports") or {}).items():
+        # Bug 2: skip phantom /0 protocol entries Docker creates on recreation
+        if cport.endswith("/0"):
+            continue
         if bindings:
             for b in bindings:
                 hip   = b.get("HostIp", "") or ""
                 hport = b.get("HostPort", "") or ""
-                if hip and hip not in ("0.0.0.0", "::", ""):
-                    ports.append(f"{hip}:{hport}:{cport}" if hport else cport)
+                # Bug 3: normalize all-interfaces addresses to empty string
+                if hip in ("0.0.0.0", "::"):
+                    hip = ""
+                if hip:
+                    entry = f"{hip}:{hport}:{cport}" if hport else cport
                 else:
-                    ports.append(f"{hport}:{cport}" if hport else cport)
+                    entry = f"{hport}:{cport}" if hport else cport
+                # Bug 1: deduplicate IPv4 and IPv6 bindings for the same port
+                if entry not in seen_port_entries:
+                    seen_port_entries.add(entry)
+                    ports.append(entry)
         else:
             # exposed but not published
-            ports.append(cport)
+            if cport not in seen_port_entries:
+                seen_port_entries.add(cport)
+                ports.append(cport)
     if ports:
         svc["ports"] = ports
 

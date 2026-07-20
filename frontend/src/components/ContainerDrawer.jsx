@@ -831,8 +831,10 @@ function UpdatesTab({ container, updateStatus: initialStatus }) {
   const [streaming,   setStreaming]   = useState(false)
   const [streamMode,  setStreamMode]  = useState(null)   // 'scan' | 'update'
   const [scanResult,  setScanResult]  = useState(null)
-  const [backups,     setBackups]     = useState(null)
-  const [showBackups, setShowBackups] = useState(false)
+  const [backups,           setBackups]           = useState(null)
+  const [showBackups,       setShowBackups]       = useState(false)
+  const [confirmRecreate,   setConfirmRecreate]   = useState(null)  // null | backup id
+  const [recreatingBackup,  setRecreatingBackup] = useState(false)
 
   const stackRole = INSPECTRE_STACK[container.name] || null
   const [confirm,          setConfirm]          = useState(null)   // null | 'update' | 'force'
@@ -1020,6 +1022,39 @@ function UpdatesTab({ container, updateStatus: initialStatus }) {
       a.download = `${name}_backup_${backupId}.yaml`
       a.click(); URL.revokeObjectURL(url)
     } catch (_) {}
+  }
+
+  function startRecreateStream(backupId) {
+    if (streaming || recreatingBackup) return
+    setConfirmRecreate(null)
+    setLogs([])
+    setScanResult(null)
+    setStreamMode('recreate')
+    setStreaming(true)
+    setRecreatingBackup(true)
+
+    const ctrl = new AbortController()
+    abortRef.current = ctrl
+
+    const onLine = line => {
+      if (line.startsWith('RECREATE_ERROR:')) {
+        setLogs(l => [...l, '❌ ' + line.slice(15)])
+        setStreaming(false)
+        setRecreatingBackup(false)
+        return
+      }
+      if (line === 'RECREATE_DONE') {
+        setLogs(l => [...l, '✅ Container recreated successfully.'])
+        setStreaming(false)
+        setRecreatingBackup(false)
+        loadBackups()
+        return
+      }
+      setLogs(l => [...l, line.replace(/^LOG:\s*/, '')])
+    }
+
+    api.dockerRecreateFromBackup(backupId, onLine, ctrl.signal)
+      .catch(() => { setStreaming(false); setRecreatingBackup(false) })
   }
 
   const hasUpdate      = status?.has_update
@@ -1352,7 +1387,7 @@ function UpdatesTab({ container, updateStatus: initialStatus }) {
         <div className="card p-4 space-y-2">
           <span className="text-xs font-semibold flex items-center gap-1.5" style={{ color: 'var(--color-text)' }}>
             <Terminal size={12} />
-            {streamMode === 'scan' ? 'Scan Log' : 'Update Log'}
+            {streamMode === 'scan' ? 'Scan Log' : streamMode === 'recreate' ? 'Recreate Log' : 'Update Log'}
             {streaming && <Loader2 size={10} className="animate-spin ml-1" />}
           </span>
           <div className="rounded-lg p-3 font-mono text-[11px] space-y-0.5 max-h-56 overflow-y-auto"
@@ -1401,14 +1436,39 @@ function UpdatesTab({ container, updateStatus: initialStatus }) {
                     {b.reason}
                   </span>
                 </div>
-                {b.has_compose && (
-                  <button onClick={() => downloadBackupCompose(b.id, b.container_name)}
-                    className="btn-ghost flex items-center gap-1 text-[11px] shrink-0"
-                    title="Download compose YAML for this backup">
-                    <Download size={10} />
-                    YAML
-                  </button>
-                )}
+                <div className="flex items-center gap-1 shrink-0">
+                  {b.has_compose && (
+                    <button onClick={() => downloadBackupCompose(b.id, b.container_name)}
+                      className="btn-ghost flex items-center gap-1 text-[11px]"
+                      title="Download compose YAML for this backup">
+                      <Download size={10} />
+                      YAML
+                    </button>
+                  )}
+                  {confirmRecreate === b.id ? (
+                    <span className="flex items-center gap-1">
+                      <span className="text-[10px]" style={{ color: 'var(--color-text-muted)' }}>Recreate?</span>
+                      <button onClick={() => startRecreateStream(b.id)}
+                        className="text-[10px] px-1.5 py-0.5 rounded font-semibold"
+                        style={{ background: 'rgba(239,68,68,0.15)', color: '#ef4444' }}>
+                        Yes
+                      </button>
+                      <button onClick={() => setConfirmRecreate(null)}
+                        className="btn-ghost text-[10px] px-1">
+                        No
+                      </button>
+                    </span>
+                  ) : (
+                    <button
+                      onClick={() => setConfirmRecreate(b.id)}
+                      disabled={streaming || recreatingBackup}
+                      className="btn-ghost flex items-center gap-1 text-[11px]"
+                      title="Recreate this container from backup config (ports auto-fixed)">
+                      <RotateCcw size={10} />
+                      Recreate
+                    </button>
+                  )}
+                </div>
               </div>
             ))}
           </div>
