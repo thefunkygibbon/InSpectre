@@ -161,10 +161,14 @@ def _extract_ports_from_network_settings(net_ports: dict | None) -> tuple[dict, 
     exposed_ports: list = []
 
     for port_proto, bindings in (net_ports or {}).items():
+        # Bug 2: skip phantom /0 protocol entries created by Docker on recreation
+        if port_proto.endswith("/0"):
+            continue
         exposed_ports.append(port_proto)
         if not bindings:
             continue
 
+        seen_host_ports: set = set()
         mapped = []
         for b in bindings:
             hp = b.get("HostPort")
@@ -174,7 +178,15 @@ def _extract_ports_from_network_settings(net_ports: dict | None) -> tuple[dict, 
                 host_port = int(hp)
             except Exception:
                 host_port = hp
-            host_ip = b.get("HostIp")
+            # Bug 3: normalize 0.0.0.0 and :: to empty string (all-interfaces)
+            host_ip = b.get("HostIp") or ""
+            if host_ip in ("0.0.0.0", "::"):
+                host_ip = ""
+            # Bug 1: deduplicate IPv4/IPv6 bindings for the same host port
+            dedup_key = (host_ip, host_port)
+            if dedup_key in seen_host_ports:
+                continue
+            seen_host_ports.add(dedup_key)
             mapped.append((host_ip, host_port) if host_ip else host_port)
 
         if len(mapped) == 1:
@@ -359,6 +371,9 @@ try:
         None if _host_mode in ("host", "none") or _host_mode.startswith("container:")
         else (config.get("Hostname") or TARGET_NAME)
     )
+    # host/none/container: network modes don't support port bindings
+    if _host_mode in ("host", "none") or _host_mode.startswith("container:"):
+        port_bindings, exposed_ports = None, []
     _result = client.api.create_container(
         image          = NEW_IMAGE,
         name           = TARGET_NAME,
@@ -1286,6 +1301,9 @@ def _recreate_container_with_net(client, dep, new_net_mode: str) -> None:
         None if _net_lo in ("host","none") or _net_lo.startswith("container:")
         else (config.get("Hostname") or dep_name)
     )
+    # host/none/container: network modes don't support port bindings
+    if _net_lo in ("host", "none") or _net_lo.startswith("container:"):
+        port_bindings, exposed_ports = None, []
 
     try:
         _cres = client.api.create_container(
@@ -1524,19 +1542,88 @@ async def _safe_update_stream(
             finally:
                 db.close()
 
-            # ── Stage 2: Pull latest image ─────────────────────────────────
+            # ── Stage 2: Pull latest image (streaming so SSE stays alive) ──
             yield emit(f"LOG: [2/7] Pulling latest image: {image_name}…")
 
-            def _pull():
-                client = _make_docker_client(host_url)
+            loop      = asyncio.get_running_loop()
+            pull_q: asyncio.Queue = asyncio.Queue()
+            _pull_exc: list       = []
+
+            def _streaming_pull():
+                # Use APIClient directly with an explicit timeout so that if the
+                # Docker daemon goes silent mid-pull (e.g. stuck on extraction or
+                # a hung registry connection), the socket raises ReadTimeout instead
+                # of blocking the thread forever.  300 s per-chunk is generous
+                # enough for slow hardware but will catch genuine daemon hangs.
                 try:
-                    img = client.images.pull(image_name)
-                    return img.id
+                    import docker as _docker
+                    pull_client = _docker.APIClient(base_url=host_url, timeout=300)
+                except Exception as e:
+                    _pull_exc.append(e)
+                    loop.call_soon_threadsafe(pull_q.put_nowait, None)
+                    return
+                try:
+                    for evt in pull_client.pull(image_name, stream=True, decode=True):
+                        loop.call_soon_threadsafe(pull_q.put_nowait, evt)
+                except Exception as e:
+                    _pull_exc.append(e)
                 finally:
-                    client.close()
+                    try:
+                        pull_client.close()
+                    except Exception:
+                        pass
+                    loop.call_soon_threadsafe(pull_q.put_nowait, None)  # sentinel
+
+            _pull_task   = asyncio.create_task(asyncio.to_thread(_streaming_pull))
+            _layer_done: set[str]      = set()
+            _dl_pct:     dict[str,int] = {}
+            _ex_pct:     dict[str,int] = {}
 
             try:
-                new_image_id = await asyncio.to_thread(_pull)
+                while True:
+                    # Use a timeout so we can send SSE keepalive comments during
+                    # long silent phases (e.g. extraction). Without this, nginx's
+                    # proxy_read_timeout (typically 60s) kills the connection.
+                    try:
+                        evt = await asyncio.wait_for(pull_q.get(), timeout=15)
+                    except asyncio.TimeoutError:
+                        # No Docker event for 15s — send a keepalive SSE comment
+                        # to prevent any upstream proxy from timing out.
+                        yield ": keep-alive\n\n"
+                        continue
+                    if evt is None:
+                        break
+                    status = evt.get('status', '')
+                    layer  = evt.get('id', '')
+                    detail = evt.get('progressDetail') or {}
+                    if status in ('Pull complete', 'Already exists', 'Download complete', 'Verifying Checksum'):
+                        if layer and layer not in _layer_done:
+                            _layer_done.add(layer)
+                            yield emit(f"LOG:   [{layer[:12]}] {status}")
+                    elif status == 'Downloading' and layer and detail.get('total'):
+                        pct       = int(detail['current'] / detail['total'] * 100)
+                        milestone = (pct // 25) * 25
+                        if _dl_pct.get(layer, -1) != milestone:
+                            _dl_pct[layer] = milestone
+                            yield emit(f"LOG:   [{layer[:12]}] downloading {milestone}%")
+                    elif status == 'Extracting' and layer and detail.get('total'):
+                        pct       = int(detail['current'] / detail['total'] * 100)
+                        milestone = (pct // 50) * 50  # emit at 0%, 50%, 100%
+                        if _ex_pct.get(layer, -1) != milestone:
+                            _ex_pct[layer] = milestone
+                            yield emit(f"LOG:   [{layer[:12]}] extracting {milestone}%")
+                await _pull_task
+                if _pull_exc:
+                    raise _pull_exc[0]
+
+                def _get_image_id():
+                    client = _make_docker_client(host_url)
+                    try:
+                        return client.images.get(image_name).id
+                    finally:
+                        client.close()
+
+                new_image_id = await asyncio.to_thread(_get_image_id)
                 yield emit(f"LOG: [2/7] ✓ Pull complete. Digest: {new_image_id[:19]}…")
             except Exception as pull_err:
                 yield emit(f"LOG: [ERROR] Image pull failed: {pull_err}")
@@ -1617,6 +1704,7 @@ async def _safe_update_stream(
                 try:
                     c         = client.containers.get(container_id)
                     orig_name = c.name.lstrip("/")
+                    was_running = c.status == "running"
                     if c.status not in ("exited", "created"):
                         c.stop(timeout=30)
                         c.reload()
@@ -1624,12 +1712,13 @@ async def _safe_update_stream(
                     bname = f"{orig_name}_inspectre_bak_{ts}"
                     c.rename(bname)
                     c.reload()
-                    return orig_name, bname, c.id
+                    return orig_name, bname, c.id, was_running
                 finally:
                     client.close()
 
-            orig_name, backup_cname, old_id = await asyncio.to_thread(_stop_and_rename)
-            yield emit(f"LOG: [4/7] ✓ Stopped. Old container preserved as '{backup_cname}'.")
+            orig_name, backup_cname, old_id, was_running = await asyncio.to_thread(_stop_and_rename)
+            _stopped_verb = "Stopped" if was_running else "Preserved (was already stopped)"
+            yield emit(f"LOG: [4/7] ✓ {_stopped_verb}. Old container preserved as '{backup_cname}'.")
 
             # ── Stage 5+6: Create and start new container ──────────────────
             yield emit("LOG: [5/7] Creating new container with updated image…")
@@ -1685,6 +1774,9 @@ async def _safe_update_stream(
                         None if _net_mode in ("host", "none") or _net_mode.startswith("container:")
                         else (config.get("Hostname") or orig_name)
                     )
+                    # host/none/container: network modes don't support port bindings
+                    if _net_mode in ("host", "none") or _net_mode.startswith("container:"):
+                        port_bindings, exposed_ports = None, []
                     _cres = client.api.create_container(
                         image         = image_name,
                         name          = orig_name,
@@ -1734,14 +1826,15 @@ async def _safe_update_stream(
                             )
                         except Exception:
                             pass
-                    try:
-                        new_c.start()
-                    except Exception:
+                    if was_running:
                         try:
-                            new_c.remove(force=True)
+                            new_c.start()
                         except Exception:
-                            pass
-                        raise
+                            try:
+                                new_c.remove(force=True)
+                            except Exception:
+                                pass
+                            raise
                     new_c.reload()
                     return new_c
                 finally:
@@ -1749,7 +1842,12 @@ async def _safe_update_stream(
 
             try:
                 new_container = await asyncio.to_thread(_create_and_start)
-                yield emit(f"LOG: [5/7] ✓ New container '{orig_name}' created and started.")
+                _created_msg = (
+                    f"New container '{orig_name}' created and started."
+                    if was_running else
+                    f"New container '{orig_name}' created (left stopped — was not running before update)."
+                )
+                yield emit(f"LOG: [5/7] ✓ {_created_msg}")
             except Exception as create_err:
                 yield emit(f"LOG: [ERROR] Container creation failed: {create_err}")
                 yield emit("LOG: [ROLLBACK] Restoring original container…")
@@ -1765,20 +1863,23 @@ async def _safe_update_stream(
                             client.close()
                     bak_c = await asyncio.to_thread(_rollback_rename)
                     yield emit(f"LOG: [ROLLBACK] ✓ Renamed '{backup_cname}' back to '{orig_name}'.")
-                    try:
-                        def _rollback_start():
-                            client = _make_docker_client(host_url)
-                            try:
-                                client.containers.get(orig_name).start()
-                            finally:
-                                client.close()
-                        await asyncio.to_thread(_rollback_start)
-                        yield emit("LOG: [ROLLBACK] ✓ Original container is running again.")
-                    except Exception as start_err:
-                        yield emit(
-                            f"LOG: [ROLLBACK] Container renamed but could not auto-start "
-                            f"(likely container-mode networking — start '{orig_name}' manually). Error: {start_err}"
-                        )
+                    if was_running:
+                        try:
+                            def _rollback_start():
+                                client = _make_docker_client(host_url)
+                                try:
+                                    client.containers.get(orig_name).start()
+                                finally:
+                                    client.close()
+                            await asyncio.to_thread(_rollback_start)
+                            yield emit("LOG: [ROLLBACK] ✓ Original container is running again.")
+                        except Exception as start_err:
+                            yield emit(
+                                f"LOG: [ROLLBACK] Container renamed but could not auto-start "
+                                f"(likely container-mode networking — start '{orig_name}' manually). Error: {start_err}"
+                            )
+                    else:
+                        yield emit(f"LOG: [ROLLBACK] ✓ Original container restored (left stopped — was not running before update).")
                 except Exception as rb_err:
                     yield emit(
                         f"LOG: [ROLLBACK FAILED] Could not rename backup — "
@@ -1795,7 +1896,45 @@ async def _safe_update_stream(
                     db.close()
                 return
 
-            # ── Stage 7: Health check ──────────────────────────────────────
+            # ── Stage 7: Health check (skipped for containers that were not running) ──
+            if not was_running:
+                yield emit("LOG: [6/7] Health check skipped — container was not running before update.")
+                yield emit("LOG: [7/7] Image updated successfully. Container left in stopped state.")
+                new_container.reload()
+                new_digest = new_container.image.id
+                db = _SessionLocal()
+                try:
+                    _upsert_update_status(db, container_name, host_id,
+                                          image               = image_name,
+                                          current_digest      = new_digest,
+                                          latest_digest       = new_digest,
+                                          has_update          = False,
+                                          update_blocked      = False,
+                                          blocked_reason      = None,
+                                          update_in_progress  = False,
+                                          last_updated_at     = datetime.now(timezone.utc),
+                                          last_update_status  = "success",
+                                          last_update_error   = None)
+                finally:
+                    db.close()
+                def _cleanup_backup_stopped():
+                    client = _make_docker_client(host_url)
+                    try:
+                        client.containers.get(backup_cname).remove(force=True)
+                    except Exception:
+                        pass
+                    finally:
+                        client.close()
+                await asyncio.to_thread(_cleanup_backup_stopped)
+                yield emit(f"LOG: ✓ Update complete! {container_name} image updated to {image_name} ({new_digest[:19]}…) — start it manually when ready.")
+                yield emit("UPDATE_DONE:success")
+                _fire_notification(
+                    "container.updated",
+                    "Container Updated",
+                    f"{container_name} image updated to {image_name} ({new_digest[:19]}…) — container left stopped.",
+                )
+                return
+
             yield emit("LOG: [6/7] Running health check…")
 
             db = _SessionLocal()
@@ -1929,13 +2068,15 @@ async def _safe_update_stream(
                         # Restore backup
                         bak = client.containers.get(backup_cname)
                         bak.rename(orig_name)
-                        bak.start()
+                        if was_running:
+                            bak.start()
                     finally:
                         client.close()
 
                 try:
                     await asyncio.to_thread(_rollback)
-                    yield emit(f"LOG: [ROLLBACK] ✓ '{orig_name}' restored to previous version and running.")
+                    _rb_state = "running" if was_running else "stopped"
+                    yield emit(f"LOG: [ROLLBACK] ✓ '{orig_name}' restored to previous version ({_rb_state}).")
                     yield emit("UPDATE_DONE:rolled_back")
                     rollback_status = "rolled_back"
                 except Exception as rb_err:
@@ -2715,14 +2856,33 @@ async def get_container_networks(container_id: str, request: Request):
         try:
             c        = client.containers.get(container_id)
             hcfg     = c.attrs.get("HostConfig") or {}
+            net_sets = c.attrs.get("NetworkSettings") or {}
             net_mode = hcfg.get("NetworkMode") or "bridge"
             all_nets = [n.name for n in client.networks.list()]
-            return all_nets, net_mode
+
+            # Live network connections from NetworkSettings.Networks — this is
+            # the authoritative current state. NetworkMode is set at creation
+            # time and never updated, so it's stale after any network change.
+            live_nets = list((net_sets.get("Networks") or {}).keys())
+            if net_mode in ("host", "none"):
+                # Special modes aren't in NetworkSettings.Networks
+                current_nets = [net_mode]
+            else:
+                # Use live NetworkSettings.Networks — this is authoritative.
+                # Do NOT fall back to NetworkMode: it's set at creation time and
+                # never updated, so it shows stale data after any network change.
+                current_nets = live_nets  # may be [] if not connected to anything
+
+            return all_nets, current_nets
         finally:
             client.close()
 
-    all_nets, current = await asyncio.to_thread(_fetch)
-    return {"networks": sorted(all_nets), "current": current}
+    all_nets, current_nets = await asyncio.to_thread(_fetch)
+    return {
+        "networks":     sorted(all_nets),
+        "current":      current_nets[0] if current_nets else "",
+        "current_nets": current_nets,
+    }
 
 
 class SetNetworkBody(BaseModel):
@@ -2730,13 +2890,8 @@ class SetNetworkBody(BaseModel):
 
 
 @router.post("/docker/containers/{container_id}/network")
-async def set_container_network(container_id: str, body: SetNetworkBody, request: Request):
-    """
-    Connect a container to a different Docker network.
-    Named networks are switched live (disconnect old, connect new).
-    Switching to/from host or none requires a container recreate and is not
-    supported here — use the update flow instead.
-    """
+async def connect_container_network(container_id: str, body: SetNetworkBody, request: Request):
+    """Connect a container to an additional named network (additive — does not disconnect existing ones)."""
     _verify_token(request)
     db = _SessionLocal()
     try:
@@ -2750,33 +2905,52 @@ async def set_container_network(container_id: str, body: SetNetworkBody, request
     if target_net in ("host", "none"):
         raise HTTPException(
             status_code=400,
-            detail="Switching to host/none requires recreating the container — not supported via this endpoint.",
+            detail="Switching to host/none requires recreating the container.",
         )
 
-    def _switch():
+    def _connect():
         client = _make_docker_client(host_url)
         try:
-            c    = client.containers.get(container_id)
-            hcfg = c.attrs.get("HostConfig") or {}
+            c = client.containers.get(container_id)
             net_sets = c.attrs.get("NetworkSettings") or {}
-            current_nets = list((net_sets.get("Networks") or {}).keys())
-
-            new_net_obj = client.networks.get(target_net)
-            # Connect to new network first so there's no connectivity gap
-            new_net_obj.connect(c)
-            # Disconnect from all previous non-target networks
-            for n in current_nets:
-                if n != target_net:
-                    try:
-                        client.networks.get(n).disconnect(c)
-                    except Exception:
-                        pass
+            already = list((net_sets.get("Networks") or {}).keys())
+            if target_net in already:
+                raise Exception(f"Container is already connected to '{target_net}'.")
+            client.networks.get(target_net).connect(c)
             c.reload()
             return _fmt_container(c)
         finally:
             client.close()
 
-    updated = await asyncio.to_thread(_switch)
+    updated = await asyncio.to_thread(_connect)
+    return updated
+
+
+@router.post("/docker/containers/{container_id}/network/disconnect")
+async def disconnect_container_network(container_id: str, body: SetNetworkBody, request: Request):
+    """Disconnect a container from a named network."""
+    _verify_token(request)
+    db = _SessionLocal()
+    try:
+        host_url, _, _ = _resolve_host(db, container_id)
+    finally:
+        db.close()
+
+    target_net = body.network.strip()
+    if not target_net:
+        raise HTTPException(status_code=400, detail="network is required")
+
+    def _disconnect():
+        client = _make_docker_client(host_url)
+        try:
+            c = client.containers.get(container_id)
+            client.networks.get(target_net).disconnect(c)
+            c.reload()
+            return _fmt_container(c)
+        finally:
+            client.close()
+
+    updated = await asyncio.to_thread(_disconnect)
     return updated
 
 

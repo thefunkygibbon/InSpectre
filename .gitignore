@@ -36,3 +36,4 @@ dataold/
 
 # Local env overrides (e.g. INSPECTRE_DATA_DIR)
 .env
+*_rev*

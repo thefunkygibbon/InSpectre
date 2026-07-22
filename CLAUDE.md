@@ -59,7 +59,7 @@ Browser → [frontend :3000] → nginx → [backend :8000] → PostgreSQL
                                       [probe :8666] ← host network, privileged
 ```
 
-**Probe** (`probe/main.py`) is the only container with raw network access. It:
+**Probe** (`probe/`) is the only container with raw network access. It:
 - Runs ARP sweeps and passive packet sniffing to discover devices
 - Writes device records and `device_events` directly to Postgres
 - Exposes a small FastAPI on port 8666 for the backend to call (ping, traceroute, vuln scan, config reload, block/unblock)
@@ -101,9 +101,37 @@ Settings live in the `settings` Postgres table. The frontend calls `PUT /api/set
 
 | File | Purpose |
 |---|---|
-| `backend/main.py` | Entire backend: routes, migrations, background loops, helper functions |
-| `backend/models.py` | SQLAlchemy ORM models shared by backend (`Device`, `DeviceEvent`, `VulnReport`, `Alert`, `Setting`, `FingerprintEntry`) |
-| `probe/main.py` | Probe: ARP scanner, sniffer, nmap wrapper, ARP-block, probe API |
+| `backend/main.py` | Thin FastAPI orchestrator: app setup, middleware, router includes, startup event |
+| `backend/config.py` | Environment variables and constants (DATABASE_URL, PROBE_URL, SECRET_KEY, etc.) |
+| `backend/database.py` | SQLAlchemy engine, SessionLocal, get_db, all `_migrate()` SQL migrations, DEFAULT_SETTINGS, legacy migrations |
+| `backend/models.py` | SQLAlchemy ORM models (`Device`, `DeviceEvent`, `VulnReport`, `Alert`, `Setting`, `FingerprintEntry`, `TrafficStat`) |
+| `backend/auth_utils.py` | JWT helpers, bcrypt password hashing, `get_current_user` dependency |
+| `backend/state.py` | Shared mutable singletons: `_ha_mqtt`, plugin registry/runner/bus/scheduler, SSE client set, notification state |
+| `backend/schemas.py` | All Pydantic request/response models |
+| `backend/probe_client.py` | `_probe_client()` httpx wrapper with shared secret, `_execute_block_bg()` |
+| `backend/sse.py` | `_sse_publish()` fan-out, `_sse_event_watcher()` background loop |
+| `backend/ha_mqtt.py` | `HAMQTTManager` class and `_ha_startup_connect()` |
+| `backend/notifications_core.py` | Apprise notification dispatch, channel/profile logic, `_notification_loop()` background loop |
+| `backend/device_utils.py` | `_to_dict()`, `_identity_score()`, `_infer_device_type()`, `_build_name_candidates()`, `_add_event()` |
+| `backend/fingerprint_utils.py` | `_match_fingerprints()`, `_upsert_manual_fingerprint()`, `_fingerbank_loop()` |
+| `backend/vuln_utils.py` | `_run_single_vuln_scan()`, `_save_vuln_result()`, `_scheduled_vuln_scan_loop()` |
+| `backend/background_loops.py` | Traffic flush, speedtest schedule, block schedule loop, Trivy DB update, Docker event watcher, auto-update |
+| `backend/routes/` | One file per feature area (see below) |
+| `probe/main.py` | Thin orchestrator: startup, scan loop, group backfill, graceful shutdown |
+| `probe/probe_config.py` | All config globals, `_load_settings_from_db()`, `apply_runtime_config()`, utility fns |
+| `probe/probe_models.py` | ORM models (`Device`, `IPHistory`), engine/Session, all shared in-memory state and locks |
+| `probe/probe_db.py` | `wait_for_db()`, `init_db()` with all ALTER TABLE migrations |
+| `probe/probe_ip.py` | `record_ip()`, `_primary_ip_is_stale()`, `_write_event()` |
+| `probe/probe_hostname.py` | DNS resolver, mDNS hostname strip, MAC vendor DB lookup |
+| `probe/probe_grouping.py` | `retroactive_auto_group()`, `_try_auto_group_by_hostname()`, `_choose_group_primary()` |
+| `probe/probe_scanner.py` | `arp_scan()`, SYN/TCP port scan, `trigger_deep_scan()` |
+| `probe/probe_device.py` | `upsert_seen_device()`, `update_presence_from_sweep()`, DHCP info upsert |
+| `probe/probe_sniffer.py` | Passive ARP+DHCP sniffer, worker threads, `start_arp_sniffer()` |
+| `probe/probe_mdns.py` | mDNS browse + passive listener, `_apply_mdns_enrichment()` |
+| `probe/probe_ssdp.py` | SSDP browse + passive listener, `_apply_ssdp_enrichment()` |
+| `probe/probe_blocking.py` | ARP-spoof block/unblock, iptables FORWARD DROP, `_arp_spoof_loop()` |
+| `probe/probe_fingerprint.py` | Nerva service fingerprinting, Nuclei template management |
+| `probe/probe_routes.py` | FastAPI app (`probe_api`), all probe API routes, `start_probe_api()` |
 | `probe/vuln_scanner.py` | NSE-based vuln scan logic called by the probe |
 | `frontend/src/App.jsx` | Root component: layout, toasts, notification dispatch |
 | `frontend/src/api.js` | All `fetch` calls to the backend — single source of truth for API shape |
@@ -111,6 +139,33 @@ Settings live in the `settings` Postgres table. The frontend calls `PUT /api/set
 | `frontend/src/components/DeviceDrawer.jsx` | Per-device detail panel (actions, scan results, timeline, notes) |
 | `frontend/src/components/SettingsPanel.jsx` | Tabbed settings UI (Scanner / Notifications / Data) |
 | `docker-compose.yml` | Service definitions, env vars, port mappings |
+
+### Backend route modules (`backend/routes/`)
+
+| File | Routes |
+|---|---|
+| `auth.py` | `GET /`, `GET /health`, `POST /auth/login`, `GET /auth/me`, `POST /auth/change-password` |
+| `setup.py` | `GET|POST /setup/*` — setup wizard |
+| `system.py` | `GET /system/info`, `POST /system/auto-update*` |
+| `devices.py` | `GET|PATCH|POST|DELETE /devices/*`, device groups, ping, block, traceroute |
+| `vuln.py` | `GET /devices/{mac}/vuln-scan` (SSE), vuln reports, `/vulns/*` |
+| `services.py` | `/devices/{mac}/services`, mDNS/SSDP refresh |
+| `zones.py` | `/zones` CRUD |
+| `saved_views.py` | `/saved-views` CRUD |
+| `suppressions.py` | `/suppressions` CRUD |
+| `events.py` | `/events/stream` (SSE), `/events`, `/changes`, `/dashboard/summary`, `/vendors`, `/stats` |
+| `settings.py` | `/settings` CRUD, apply, restart |
+| `notifications.py` | `/notifications/channels|profiles`, `/ha-mqtt/*` |
+| `plugins.py` | `/plugins/*` — upload, config, webhooks |
+| `fingerprints.py` | `/fingerprints` CRUD |
+| `export.py` | `/export/*`, `/import/*`, `/reports/*` |
+| `tools.py` | `/tools/*` network diagnostics, `/speedtest/*` |
+| `schedules.py` | `/block-schedules` CRUD |
+| `persons.py` | `/persons/*` — presence tracking, block |
+| `network.py` | `/network/status|pause|resume` |
+| `timeline.py` | `GET /timeline`, `GET /devices/{mac}/timeline` |
+| `traffic.py` | `/traffic/*` — start/stop/history/stream |
+| `docker.py` | `/docker/*`, `/container-hosts/*`, `/trivy/*`, `/nuclei/*` |
 
 ---
 
@@ -124,19 +179,27 @@ Settings live in the `settings` Postgres table. The frontend calls `PUT /api/set
 - **`settings`** — key/value store; seeded with defaults on startup, writable via API
 - **`alerts`** — model exists in `models.py` but is not yet actively written; `device_events` is used instead
 
-Schema migrations run automatically on startup via `_migrate()` in `backend/main.py` using raw `ALTER TABLE … ADD COLUMN IF NOT EXISTS` statements. **Add new columns there, not via Alembic.**
+Schema migrations run automatically on startup via `_migrate()` in `backend/database.py` using raw `ALTER TABLE … ADD COLUMN IF NOT EXISTS` statements. **Add new columns there, not via Alembic.**
 
 ---
 
 ## Adding a new backend setting
 
-1. Add to `DEFAULT_SETTINGS` dict in `backend/main.py`
+1. Add to `DEFAULT_SETTINGS` dict in `backend/database.py`
 2. Add to `SETTING_META` in `frontend/src/components/SettingsPanel.jsx` with the correct `tab` and `type`
-3. If it affects probe behaviour, handle it in `apply_runtime_config()` in `probe/main.py`
+3. If it affects probe behaviour, handle it in `apply_runtime_config()` in `probe/probe_config.py`
 
 ## Adding a new API endpoint
 
-Follow the existing pattern: route decorator → Pydantic model for request body → `db: Session = Depends(get_db)` → SQLAlchemy query → return dict. The backend has no separate router modules — everything is in `main.py`.
+Follow the existing pattern: route decorator → Pydantic model for request body (add to `schemas.py`) → `db: Session = Depends(get_db)` → SQLAlchemy query → return dict. Add to the relevant `routes/` module or create a new one and include it in `main.py`.
+
+## Schema migrations
+
+Run automatically on startup via `_migrate()` in `backend/database.py` using raw `ALTER TABLE … ADD COLUMN IF NOT EXISTS` statements. **Add new columns there, not via Alembic.**
+
+> `backend/main_original.py` is the original 10k-line backend monolith kept for reference during the refactor. It is not used at runtime.
+
+> `probe/main_original.py` is the original 4,447-line probe monolith kept for reference during the refactor. It is not used at runtime.
 
 ## Frontend conventions
 

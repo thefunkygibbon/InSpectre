@@ -882,7 +882,7 @@ export function ContainersPage({ openContainer, skin }) {
 
       {selected && (
         <ContainerDrawer
-          key={selected.id}
+          key={`${selected.host_id ?? 'local'}-${selected.name}`}
           container={selected}
           trivyScan={trivyScansByContainer[selected.id] || { logs: [], vulns: null, scanning: false, scannedAt: null }}
           updateTrivyScan={patch => updateTrivyScan(selected.id, patch)}

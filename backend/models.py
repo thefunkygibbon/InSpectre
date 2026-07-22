@@ -43,6 +43,8 @@ class Device(Base):
 
     # Tracks when is_online last changed (online↔offline transitions)
     status_changed_at        = Column(DateTime(timezone=True), nullable=True)
+    # Last time probe confirmed the device was present (used for person presence tracking)
+    presence_last_seen_at    = Column(DateTime(timezone=True), nullable=True)
 
     # Phase 7: scan performance & port baseline
     hostname_last_attempted = Column(DateTime(timezone=True), nullable=True)
