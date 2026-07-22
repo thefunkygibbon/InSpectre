@@ -17,7 +17,7 @@ from sqlalchemy import text
 
 import probe_config as _cfg
 import traffic_monitor as _tm
-from probe_models import Session, Device
+from probe_models import Session, Device, _scan_lock, _scanning
 from probe_config import VERSION, apply_runtime_config
 from probe_hostname import resolve_hostname, _get_default_gateway
 from probe_mdns import _mdns_browse, _apply_mdns_enrichment
@@ -26,7 +26,7 @@ from probe_blocking import (
     _blocked_devices, _blocked_lock,
     _get_mac_for_ip, _arp_spoof_loop,
 )
-from probe_scanner import trigger_deep_scan, _scan_lock, _scanning
+from probe_scanner import trigger_deep_scan
 from probe_fingerprint import (
     _nuclei_templates_exist, _nuclei_update_lock,
     _last_nuclei_template_update,

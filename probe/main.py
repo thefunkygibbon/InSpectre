@@ -170,23 +170,24 @@ def _backfill_hostname_groups() -> None:
 
 
 def _cleanup_bad_hostname_groups() -> None:
-    """One-shot repair for groups created by over-eager grouping logic that
-    merged devices on DHCP-hostname coincidence. Splits any group whose members
-    have conflicting DNS hostnames; re-forms groups only where >=2 devices
-    genuinely share a DNS base."""
+    """One-shot repair for groups whose members share neither DNS nor DHCP hostname.
+    A group is valid if >=2 members share a non-generic DNS base OR a non-generic
+    DHCP hostname base (the latter covers MAC-randomised phones that present
+    different mDNS names per interface but send the same DHCP Option 12 name).
+    Only truly unrelated groups (no shared signal at all) are dissolved."""
     sess = Session()
     try:
         rows = sess.execute(text("""
-            SELECT mac_address, hostname, group_id, group_manual
+            SELECT mac_address, hostname, dhcp_hostname, group_id, group_manual
             FROM devices
             WHERE group_id IS NOT NULL
         """)).fetchall()
 
         groups: dict[str, list] = {}
         group_is_manual: dict[str, bool] = {}
-        for mac, hn, gid, gmanual in rows:
+        for mac, hn, dhcp_hn, gid, gmanual in rows:
             key = str(gid)
-            groups.setdefault(key, []).append({"mac": mac, "hostname": hn})
+            groups.setdefault(key, []).append({"mac": mac, "hostname": hn, "dhcp_hostname": dhcp_hn})
             if gmanual:
                 group_is_manual[key] = True
 
@@ -196,22 +197,37 @@ def _cleanup_bad_hostname_groups() -> None:
                 continue
             if group_is_manual.get(gid):
                 continue
-            bases = {}
+
+            # Collect non-generic DNS hostname bases
+            dns_bases: dict[str, list] = {}
             for m in members:
                 base = _hostname_base(m["hostname"] or "")
-                if base and not _is_generic_hostname(base):
-                    bases.setdefault(base, []).append(m["mac"])
+                if base and not _is_generic_hostname(m["hostname"] or ""):
+                    dns_bases.setdefault(base, []).append(m["mac"])
 
-            if len(bases) == 1:
+            # Collect non-generic DHCP hostname bases
+            dhcp_bases: dict[str, list] = {}
+            for m in members:
+                base = _hostname_base(m["dhcp_hostname"] or "")
+                if base and not _is_generic_hostname(m["dhcp_hostname"] or ""):
+                    dhcp_bases.setdefault(base, []).append(m["mac"])
+
+            # Group is valid if any signal unifies >=2 members
+            dns_unified  = any(len(v) >= 2 for v in dns_bases.values())
+            dhcp_unified = any(len(v) >= 2 for v in dhcp_bases.values())
+            if dns_unified or dhcp_unified:
                 continue
 
+            # No shared hostname signal → dissolve
             for m in members:
                 sess.execute(text(
                     "UPDATE devices SET group_id = NULL, group_primary = false WHERE mac_address = :mac"
                 ), {"mac": m["mac"]})
                 repaired += 1
 
-            for base, macs in bases.items():
+            # Re-form sub-groups from DNS matches only (DHCP matches are handled
+            # by retroactive_auto_group which runs every scan cycle)
+            for base, macs in dns_bases.items():
                 if len(macs) < 2:
                     continue
                 new_gid = str(_uuid.uuid4())

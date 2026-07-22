@@ -618,12 +618,12 @@ const RESTART_POLICIES = [
 ]
 
 function ConfigSection({ container, isProxmox, onContainerUpdate }) {
-  const [networks, setNetworks]   = useState(null)
-  const [curNet, setCurNet]       = useState('')
-  const [selNet, setSelNet]       = useState('')
+  const [networks, setNetworks]   = useState(null)  // all available Docker networks
+  const [curNets, setCurNets]     = useState([])     // live connected networks
+  const [selNet, setSelNet]       = useState('')     // selection in the "add" dropdown
   const [selPolicy, setSelPolicy] = useState(container.restart_policy || 'no')
   const [retries, setRetries]     = useState(0)
-  const [busy, setBusy]           = useState(null) // 'network' | 'policy'
+  const [busy, setBusy]           = useState(null)   // 'connect:<net>' | 'disconnect:<net>' | 'policy'
   const [msg, setMsg]             = useState('')
 
   useEffect(() => {
@@ -631,21 +631,56 @@ function ConfigSection({ container, isProxmox, onContainerUpdate }) {
     api.dockerContainerNetworks(container.id)
       .then(r => {
         if (!alive) return
-        setNetworks(r.networks || [])
-        setCurNet(r.current || '')
-        setSelNet(r.current || (r.networks && r.networks[0]) || '')
+        const nets = r.networks     || []
+        const live = r.current_nets || (r.current ? [r.current] : [])
+        setNetworks(nets)
+        setCurNets(live)
+        setSelNet('')  // always start with placeholder, user must explicitly choose
       })
       .catch(() => { if (alive) setNetworks([]) })
     return () => { alive = false }
   }, [container.id])
 
-  async function applyNetwork() {
-    setBusy('network'); setMsg('')
+  // Merge host metadata back — _fmt_container() doesn't include host_id/host_name,
+  // but the drawer's key is `${host_id}-${name}`, so losing host_id causes a remount.
+  function mergeHostMeta(updated) {
+    if (!updated) return updated
+    return {
+      ...updated,
+      host_id:       container.host_id,
+      host_name:     container.host_name,
+      host_url:      container.host_url,
+      host_local_ip: container.host_local_ip,
+      host_type:     container.host_type,
+    }
+  }
+
+  async function connectNetwork() {
+    if (!selNet) return
+    setBusy(`connect:${selNet}`); setMsg('')
     try {
-      const updated = await api.dockerSetNetwork(container.id, selNet)
+      const raw     = await api.dockerConnectNetwork(container.id, selNet)
+      const updated = mergeHostMeta(raw)
       if (updated && onContainerUpdate) onContainerUpdate(updated)
-      setCurNet(selNet)
-      setMsg(`[OK] Network changed to "${selNet}".`)
+      const newNets = [...curNets, selNet]
+      setCurNets(newNets)
+      setSelNet('')  // reset to placeholder after adding
+      setMsg(`[OK] Connected to "${selNet}".`)
+    } catch (e) {
+      setMsg(`[ERROR] ${e.message}`)
+    } finally { setBusy(null) }
+  }
+
+  async function disconnectNetwork(net) {
+    setBusy(`disconnect:${net}`); setMsg('')
+    try {
+      const raw     = await api.dockerDisconnectNetwork(container.id, net)
+      const updated = mergeHostMeta(raw)
+      if (updated && onContainerUpdate) onContainerUpdate(updated)
+      const newNets = curNets.filter(n => n !== net)
+      setCurNets(newNets)
+      setSelNet('')  // reset to placeholder
+      setMsg(`[OK] Disconnected from "${net}".`)
     } catch (e) {
       setMsg(`[ERROR] ${e.message}`)
     } finally { setBusy(null) }
@@ -676,26 +711,62 @@ function ConfigSection({ container, isProxmox, onContainerUpdate }) {
           {networks === null ? (
             <p className="text-[11px] text-text-faint flex items-center gap-1.5"><Loader2 size={11} className="animate-spin" /> Loading…</p>
           ) : (
-            <>
-              <select className={selectCls} style={selectStyle} value={selNet}
-                onChange={e => setSelNet(e.target.value)} disabled={!!busy}>
-                {networks.length === 0 && <option value="">No networks found</option>}
-                {!networks.includes(curNet) && curNet && <option value={curNet}>{curNet} (current)</option>}
-                {networks.map(n => (
-                  <option key={n} value={n}>{n}{n === curNet ? ' (current)' : ''}</option>
-                ))}
-              </select>
+            <div className="space-y-2">
+              {/* Connected networks list */}
+              {curNets.length === 0 ? (
+                <p className="text-[11px] italic" style={{ color: 'var(--color-text-faint)' }}>
+                  Not connected to any network
+                </p>
+              ) : curNets.map(n => (
+                <div key={n} className="flex items-center justify-between gap-2 rounded-lg px-3 py-2 text-xs"
+                  style={{ background: 'var(--color-surface-offset)', border: '1px solid var(--color-border)' }}>
+                  <span className="font-mono" style={{ color: 'var(--color-text)' }}>{n}</span>
+                  <button
+                    onClick={() => disconnectNetwork(n)}
+                    disabled={!!busy}
+                    title={`Disconnect from ${n}`}
+                    className="flex-shrink-0 rounded p-0.5 transition-colors disabled:opacity-40"
+                    style={{ color: '#ef4444' }}>
+                    {busy === `disconnect:${n}`
+                      ? <Loader2 size={12} className="animate-spin" />
+                      : <X size={12} />}
+                  </button>
+                </div>
+              ))}
+
+              {/* Add network */}
+              {!isProxmox && (() => {
+                const available = networks.filter(n => !curNets.includes(n))
+                return (
+                  <div className="flex gap-2 pt-1">
+                    <select className={selectCls} style={{ ...selectStyle, flex: 1 }}
+                      value={selNet} onChange={e => setSelNet(e.target.value)} disabled={!!busy}>
+                      <option value="">
+                        {available.length === 0 ? '— all networks connected —' : '— select network —'}
+                      </option>
+                      {available.map(n => <option key={n} value={n}>{n}</option>)}
+                    </select>
+                    <button
+                      onClick={connectNetwork}
+                      disabled={!!busy || !selNet}
+                      className="flex items-center justify-center gap-1.5 px-3 py-2 rounded-lg border text-xs font-medium flex-shrink-0
+                                 transition-colors border-indigo-500/40 bg-indigo-500/10 text-indigo-400
+                                 hover:bg-indigo-500/20 disabled:opacity-40 disabled:cursor-not-allowed">
+                      {busy?.startsWith('connect:')
+                        ? <Loader2 size={12} className="animate-spin" />
+                        : <Check size={12} />}
+                      Add
+                    </button>
+                  </div>
+                )
+              })()}
               {!isProxmox && (
-                <p className="text-[10px] text-text-faint">User networks attach live. Switching to <span className="font-mono">host</span>/<span className="font-mono">none</span> recreates the container (config preserved).</p>
+                <p className="text-[10px]" style={{ color: 'var(--color-text-faint)' }}>
+                  Containers can be connected to multiple networks simultaneously.
+                  Switching to <span className="font-mono">host</span>/<span className="font-mono">none</span> requires recreating the container.
+                </p>
               )}
-              <button onClick={applyNetwork} disabled={!!busy || !selNet || selNet === curNet}
-                className="flex items-center justify-center gap-2 px-3 py-2 rounded-lg border text-xs font-medium w-full
-                           transition-colors border-indigo-500/40 bg-indigo-500/10 text-indigo-400
-                           hover:bg-indigo-500/20 disabled:opacity-40 disabled:cursor-not-allowed">
-                {busy === 'network' ? <Loader2 size={12} className="animate-spin" /> : <Check size={12} />}
-                {busy === 'network' ? 'Applying…' : 'Apply Network'}
-              </button>
-            </>
+            </div>
           )}
         </div>
 
@@ -972,6 +1043,9 @@ function UpdatesTab({ container, updateStatus: initialStatus }) {
       if (line.startsWith('UPDATE_DONE:') || line.startsWith('UPDATE_BLOCKED:') || line.startsWith('SCAN_DONE:')) {
         setStreaming(false)
         refreshStatus()
+        if (line.startsWith('UPDATE_DONE:') || line.startsWith('UPDATE_BLOCKED:')) {
+          setActiveTab('updates')
+        }
         return
       }
       setLogs(l => [...l, line.replace(/^LOG:\s*/, '')])
@@ -1062,6 +1136,12 @@ function UpdatesTab({ container, updateStatus: initialStatus }) {
   const isUpdating     = status?.update_in_progress
   const isPinned       = status?.pinned
   const updateDisabled = stackRole === 'db'
+
+  const updateBtnTitle = updateDisabled  ? 'Cannot update the database container here — use Settings → About'
+    : isPinned                           ? 'Image is pinned — click Unpin to enable updates'
+    : isUpdating                         ? 'Update already in progress'
+    : streaming                          ? 'Another operation is in progress'
+    : ''
 
   const scanVulns  = status?.new_image_vulns || []
   const scanCrit   = (scanVulns).filter(v => v.severity === 'critical').length
@@ -1256,9 +1336,11 @@ function UpdatesTab({ container, updateStatus: initialStatus }) {
 
           {hasUpdate && !isBlocked && (
             <button onClick={() => setConfirm('update')} disabled={streaming || isUpdating || isPinned || updateDisabled}
+              title={updateBtnTitle || undefined}
               className="flex items-center gap-1.5 text-xs px-3 py-1.5 rounded-lg font-medium"
               style={{ background: 'rgba(56,189,248,0.12)', color: '#38bdf8', border: '1px solid rgba(56,189,248,0.3)',
-                       opacity: updateDisabled ? 0.4 : 1 }}>
+                       opacity: (streaming || isUpdating || isPinned || updateDisabled) ? 0.4 : 1,
+                       cursor:  (streaming || isUpdating || isPinned || updateDisabled) ? 'not-allowed' : undefined }}>
               <ArrowUpCircle size={12} />
               Update
             </button>
@@ -1266,9 +1348,11 @@ function UpdatesTab({ container, updateStatus: initialStatus }) {
 
           {hasUpdate && !isBlocked && (
             <button onClick={() => setConfirm('scanupdate')} disabled={streaming || isUpdating || isPinned || updateDisabled}
+              title={updateBtnTitle || undefined}
               className="flex items-center gap-1.5 text-xs px-3 py-1.5 rounded-lg font-medium"
               style={{ background: 'rgba(56,189,248,0.12)', color: '#38bdf8', border: '1px solid rgba(56,189,248,0.3)',
-                       opacity: updateDisabled ? 0.4 : 1 }}>
+                       opacity: (streaming || isUpdating || isPinned || updateDisabled) ? 0.4 : 1,
+                       cursor:  (streaming || isUpdating || isPinned || updateDisabled) ? 'not-allowed' : undefined }}>
               <Shield size={12} />
               Scan &amp; Update
             </button>
@@ -1276,9 +1360,11 @@ function UpdatesTab({ container, updateStatus: initialStatus }) {
 
           {isBlocked && (
             <button onClick={() => setConfirm('force')} disabled={streaming || isUpdating || isPinned || updateDisabled}
+              title={updateBtnTitle || undefined}
               className="flex items-center gap-1.5 text-xs px-3 py-1.5 rounded-lg font-medium"
               style={{ background: 'rgba(249,115,22,0.12)', color: '#f97316', border: '1px solid rgba(249,115,22,0.3)',
-                       opacity: updateDisabled ? 0.4 : 1 }}>
+                       opacity: (streaming || isUpdating || isPinned || updateDisabled) ? 0.4 : 1,
+                       cursor:  (streaming || isUpdating || isPinned || updateDisabled) ? 'not-allowed' : undefined }}>
               <AlertTriangle size={12} />
               Force Update
             </button>

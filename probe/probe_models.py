@@ -94,9 +94,6 @@ _offline_lock = threading.Lock()
 _scan_lock = threading.Lock()
 _scanning:  set[str] = set()
 
-_host_ips_cache: tuple = (0.0, set())
-_host_ips_lock  = threading.Lock()
-
 
 def _get_mac_lock(mac: str) -> threading.Lock:
     with _upsert_locks_lock:

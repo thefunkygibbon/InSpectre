@@ -53,12 +53,7 @@ RUN if curl -s https://packagecloud.io/install/repositories/ookla/speedtest-cli/
 WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
-COPY main.py .
-COPY _version.py .
-COPY vuln_scanner.py .
-COPY traffic_monitor.py .
-COPY dhcp_classify.py .
-COPY presence_guard.py .
+COPY *.py .
 COPY mac-vendors-export.csv .
 
 ARG MAXMIND_LICENSE_KEY=""

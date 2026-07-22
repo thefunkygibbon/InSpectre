@@ -271,6 +271,7 @@ def _migrate(db: Session):
         "CREATE INDEX IF NOT EXISTS ix_devices_person_id ON devices(person_id)",
         "ALTER TABLE persons ADD COLUMN IF NOT EXISTS presence_state VARCHAR(10) DEFAULT 'unknown'",
         "UPDATE settings SET value='60' WHERE key='person_away_confirm_seconds' AND value='180'",
+        "ALTER TABLE devices ADD COLUMN IF NOT EXISTS presence_last_seen_at TIMESTAMPTZ",
     ]
     for sql in migrations:
         try:
@@ -403,6 +404,12 @@ DEFAULT_SETTINGS = {
     "auto_update_enabled":   ("false",  "Enable scheduled automatic container updates (appliance builds only)."),
     "auto_update_hour":      ("3",      "Hour of day (0-23) to run scheduled auto-updates."),
     "auto_update_days":      ("[]",     "JSON array of weekday integers to run auto-updates (0=Sun…6=Sat). Empty array = every day."),
+    "new_device_threshold_enabled": ("false", "Automatically mark devices as acknowledged (no longer 'new') after a set period."),
+    "new_device_threshold_value":   ("7",     "Number of time units before a device is no longer considered new."),
+    "new_device_threshold_unit":    ("day",   "Time unit for new-device threshold. Options: day, week, month, year."),
+    "stale_device_auto_delete_enabled": ("false", "Automatically delete devices that have not been seen for a set period. Group primary devices and important devices are never deleted."),
+    "stale_device_auto_delete_value":   ("90",    "Number of time units before a stale device is auto-deleted."),
+    "stale_device_auto_delete_unit":    ("day",   "Time unit for stale-device deletion threshold. Options: day, week, month, year."),
 }
 
 

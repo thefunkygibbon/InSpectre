@@ -338,7 +338,9 @@ async def _notification_loop():
             for pid, pstate in person_rows:
                 if pstate == "home":
                     state._person_home_state[pid] = True
-                elif pstate == "away":
+                else:
+                    # 'away' or 'unknown' both seed as False so the first real online
+                    # event correctly fires the "arrived home" notification path
                     state._person_home_state[pid] = False
         except Exception:
             pass

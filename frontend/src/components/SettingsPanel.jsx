@@ -196,6 +196,16 @@ const SETTING_META = {
     description: 'Re-scan all online devices during the configured nightly scan window. Disable to prevent automatic overnight port scan storms.' },
   enable_unscanned_retry: { label: 'Retry Unscanned Devices Each Cycle', type: 'toggle', tab: 'scanner',
     description: 'On each sweep cycle, trigger a port scan for any device that has never been scanned. Disable if new devices are causing too many simultaneous scans.' },
+
+  // Device Lifecycle
+  new_device_threshold_enabled: { label: 'Auto-expire "New" Status', type: 'toggle', tab: 'scanner',
+    description: 'Automatically mark devices as acknowledged (no longer highlighted as new) after they have been known for the configured period.' },
+  new_device_threshold_value:   { tab: 'scanner' },
+  new_device_threshold_unit:    { tab: 'scanner' },
+  stale_device_auto_delete_enabled: { label: 'Auto-delete Stale Devices', type: 'toggle', tab: 'scanner',
+    description: 'Automatically remove devices that have not been seen for the configured period. Important devices and group primary devices are protected — only stale grouped sub-interfaces and ungrouped devices are deleted.' },
+  stale_device_auto_delete_value:   { tab: 'scanner' },
+  stale_device_auto_delete_unit:    { tab: 'scanner' },
 }
 
 // Docker keys handled as custom cards
@@ -750,6 +760,107 @@ export function SettingsPanel({ onClose, onSettingChange }) {
                               {selectedPlugin.last_error && <span> Error: {selectedPlugin.last_error}</span>}
                             </p>
                           )}
+                        </div>
+                      )}
+                    </div>
+                  )
+                })()}
+              </CollapsibleSection>
+
+              {/* Device Lifecycle */}
+              <CollapsibleSection label="Device Lifecycle" Icon={RefreshCw} defaultOpen={false}>
+                {/* New device threshold — rendered inline so it shows even before backend restart seeds the setting */}
+                {(() => {
+                  const newEnabled = (val('new_device_threshold_enabled') || 'false') === 'true'
+                  return (
+                    <div className="card p-4 space-y-2">
+                      <div className="flex items-center justify-between">
+                        <label className="text-sm font-medium" style={{ color: 'var(--color-text)' }}>
+                          Auto-expire "New" Status
+                        </label>
+                        <button type="button" role="switch" aria-checked={newEnabled}
+                          onClick={() => handleChange('new_device_threshold_enabled', newEnabled ? 'false' : 'true')}
+                          className="relative inline-flex h-6 w-11 items-center rounded-full transition-colors duration-200 focus:outline-none"
+                          style={{ background: newEnabled ? 'var(--color-brand)' : 'var(--color-border)', flexShrink: 0 }}>
+                          <span className="inline-block h-4 w-4 rounded-full bg-white shadow transition-transform duration-200"
+                            style={{ transform: newEnabled ? 'translateX(22px)' : 'translateX(4px)' }} />
+                        </button>
+                      </div>
+                      <p className="text-xs" style={{ color: 'var(--color-text-faint)' }}>
+                        Automatically mark devices as acknowledged (no longer highlighted as new) after they have been known for the configured period.
+                      </p>
+                      {newEnabled && (
+                        <div className="space-y-1 pt-1">
+                          <label className="text-xs" style={{ color: 'var(--color-text-muted)' }}>Mark as acknowledged after</label>
+                          <div className="flex gap-2">
+                            <input type="number" min="1" max="999"
+                              value={val('new_device_threshold_value') || '7'}
+                              onChange={e => handleChange('new_device_threshold_value', e.target.value)}
+                              className="w-24 rounded-lg px-3 py-2 text-sm"
+                              style={{ background: 'var(--color-surface-offset)', border: '1px solid var(--color-border)', color: 'var(--color-text)' }}
+                            />
+                            <select
+                              value={val('new_device_threshold_unit') || 'day'}
+                              onChange={e => handleChange('new_device_threshold_unit', e.target.value)}
+                              className="flex-1 rounded-lg px-3 py-2 text-sm"
+                              style={{ background: 'var(--color-surface-offset)', border: '1px solid var(--color-border)', color: 'var(--color-text)' }}
+                            >
+                              <option value="day">Days</option>
+                              <option value="week">Weeks</option>
+                              <option value="month">Months</option>
+                              <option value="year">Years</option>
+                            </select>
+                          </div>
+                        </div>
+                      )}
+                    </div>
+                  )
+                })()}
+
+                {/* Stale device auto-delete — same inline pattern */}
+                {(() => {
+                  const staleEnabled = (val('stale_device_auto_delete_enabled') || 'false') === 'true'
+                  return (
+                    <div className="card p-4 space-y-2">
+                      <div className="flex items-center justify-between">
+                        <label className="text-sm font-medium" style={{ color: 'var(--color-text)' }}>
+                          Auto-delete Stale Devices
+                        </label>
+                        <button type="button" role="switch" aria-checked={staleEnabled}
+                          onClick={() => handleChange('stale_device_auto_delete_enabled', staleEnabled ? 'false' : 'true')}
+                          className="relative inline-flex h-6 w-11 items-center rounded-full transition-colors duration-200 focus:outline-none"
+                          style={{ background: staleEnabled ? 'var(--color-brand)' : 'var(--color-border)', flexShrink: 0 }}>
+                          <span className="inline-block h-4 w-4 rounded-full bg-white shadow transition-transform duration-200"
+                            style={{ transform: staleEnabled ? 'translateX(22px)' : 'translateX(4px)' }} />
+                        </button>
+                      </div>
+                      <p className="text-xs" style={{ color: 'var(--color-text-faint)' }}>
+                        Automatically remove devices that have not been seen for the configured period.
+                        Important devices and group primary devices are protected — only stale grouped
+                        sub-interfaces (e.g. a phone's old randomised MAC) and ungrouped devices are eligible.
+                      </p>
+                      {staleEnabled && (
+                        <div className="space-y-1 pt-1">
+                          <label className="text-xs" style={{ color: 'var(--color-text-muted)' }}>Auto-delete after not seen for</label>
+                          <div className="flex gap-2">
+                            <input type="number" min="1" max="999"
+                              value={val('stale_device_auto_delete_value') || '90'}
+                              onChange={e => handleChange('stale_device_auto_delete_value', e.target.value)}
+                              className="w-24 rounded-lg px-3 py-2 text-sm"
+                              style={{ background: 'var(--color-surface-offset)', border: '1px solid var(--color-border)', color: 'var(--color-text)' }}
+                            />
+                            <select
+                              value={val('stale_device_auto_delete_unit') || 'day'}
+                              onChange={e => handleChange('stale_device_auto_delete_unit', e.target.value)}
+                              className="flex-1 rounded-lg px-3 py-2 text-sm"
+                              style={{ background: 'var(--color-surface-offset)', border: '1px solid var(--color-border)', color: 'var(--color-text)' }}
+                            >
+                              <option value="day">Days</option>
+                              <option value="week">Weeks</option>
+                              <option value="month">Months</option>
+                              <option value="year">Years</option>
+                            </select>
+                          </div>
                         </div>
                       )}
                     </div>
