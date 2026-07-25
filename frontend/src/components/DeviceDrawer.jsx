@@ -729,8 +729,8 @@ export function DeviceDrawer({ device, onClose, onRename, onResolveName, onRefre
           </div>
         </div>
 
-        {/* Tab bar */}
-        <div className="flex border-b border-border px-4 gap-0 overflow-x-auto scrollbar-none" style={{ background: 'var(--color-surface)' }}>
+        {/* Tab bar — 5-col grid on mobile, single scrolling row on sm+ */}
+        <div className="grid grid-cols-5 sm:flex border-b border-border sm:overflow-x-auto sm:scrollbar-none" style={{ background: 'var(--color-surface)' }}>
           {TABS.map(tab => {
             const isVuln   = tab.id === 'vulns'
             const isActive = activeTab === tab.id
@@ -738,7 +738,7 @@ export function DeviceDrawer({ device, onClose, onRename, onResolveName, onRefre
               <button
                 key={tab.id}
                 onClick={() => setActiveTab(tab.id)}
-                className="px-3 py-3 text-xs font-medium border-b-2 transition-colors flex items-center gap-1.5 whitespace-nowrap shrink-0"
+                className="px-1 py-2.5 sm:px-3 sm:py-3 text-xs font-medium border-b-2 transition-colors flex items-center justify-center gap-1 sm:whitespace-nowrap sm:shrink-0"
                 style={isActive
                   ? { borderColor: 'var(--color-brand)', color: 'var(--color-brand)' }
                   : { borderColor: 'transparent', color: 'var(--color-text-muted)' }}
@@ -753,7 +753,7 @@ export function DeviceDrawer({ device, onClose, onRename, onResolveName, onRefre
         </div>
 
         {/* Body */}
-        <div className="flex-1 overflow-y-auto px-6 py-5 space-y-6">
+        <div className="flex-1 overflow-y-auto px-6 py-5 pb-16 space-y-6">
 
           {activeTab === 'overview' && (
             <>

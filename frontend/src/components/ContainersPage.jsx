@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback, useMemo, useRef } from 'react'
-import { Box, RefreshCw, Search, AlertCircle, Play, Square, Loader2, LayoutGrid, List, ArrowUpDown, ShieldAlert, Network, GitBranch, X, Sparkles, ChevronDown, ChevronRight, Settings2, ArrowUpCircle, Download } from 'lucide-react'
+import { Box, RefreshCw, Search, AlertCircle, Play, Square, Loader2, LayoutGrid, List, ArrowUpDown, ShieldAlert, Network, GitBranch, X, Sparkles, ChevronDown, ChevronRight, Settings2, ArrowUpCircle, Download, SlidersHorizontal } from 'lucide-react'
 import { api } from '../api'
 import { ContainerCard } from './ContainerCard'
 import { ContainerDrawer } from './ContainerDrawer'
@@ -397,6 +397,7 @@ export function ContainersPage({ openContainer, skin }) {
   const [hostFilter,    setHostFilter]    = useState('all')
   const [sort,          setSort]          = useState('name-asc')
   const [layout,        setLayout]        = useState('grid')
+  const [showFilters,   setShowFilters]   = useState(false)
   const [refreshing,    setRefreshing]    = useState(false)
   const [surfaceNewFirst,    setSurfaceNewFirst]    = useState(() => localStorage.getItem('inspectre_containers_surface_new') !== 'false')
   const [acknowledgedContainers, setAcknowledgedContainers] = useState(loadAcknowledgedContainers)
@@ -668,166 +669,238 @@ export function ContainersPage({ openContainer, skin }) {
       )}
 
       {/* Toolbar */}
-      {!disabled && !loading && (
-        <section className="flex flex-wrap gap-2 items-center">
-          <div className="relative" style={{ minWidth: '160px', flex: '1 1 160px', maxWidth: '340px' }}>
-            <Search size={15} className="absolute left-3 top-1/2 -translate-y-1/2 pointer-events-none"
-              style={{ color: 'var(--color-text-muted)' }} />
-            <input className="input pl-9 w-full" placeholder="Search containers…"
-              value={search} onChange={e => setSearch(e.target.value)} />
-            {search && (
-              <button onClick={() => setSearch('')}
-                className="absolute right-2 top-1/2 -translate-y-1/2 rounded p-0.5 transition-colors hover:opacity-70"
-                style={{ color: 'var(--color-text-muted)' }} aria-label="Clear search">
-                <X size={13} />
-              </button>
-            )}
-          </div>
+      {!disabled && !loading && (() => {
+        const activeFilterCount =
+          (filter !== 'all' ? 1 : 0) +
+          Object.keys(smartFilters).length +
+          (hostFilter !== 'all' ? 1 : 0)
+        const filtersActive = activeFilterCount > 0
 
-          <div className="flex items-center gap-1 flex-wrap">
-            {STATUS_FILTERS.map(f => (
-              <button key={f.value}
-                onClick={() => setFilter(f.value)}
-                className="px-3 py-1.5 rounded-xl text-xs font-medium border transition-colors"
-                style={filter === f.value
-                  ? { background: 'var(--color-brand)', color: 'white', borderColor: 'transparent' }
-                  : { background: 'var(--color-surface-offset)', color: 'var(--color-text-muted)', borderColor: 'var(--color-border)' }}>
-                {f.label}
-              </button>
-            ))}
-          </div>
+        return (
+          <section className="space-y-2">
+            {/* ── Top row: always visible on all screen sizes ── */}
+            <div className="flex items-center gap-2">
+              {/* Search */}
+              <div className="relative" style={{ minWidth: 0, flex: '1 1 120px' }}>
+                <Search size={14} className="absolute left-2.5 top-1/2 -translate-y-1/2 pointer-events-none"
+                  style={{ color: 'var(--color-text-muted)' }} />
+                <input className="input pl-8 w-full" placeholder="Search…"
+                  value={search} onChange={e => setSearch(e.target.value)} />
+                {search && (
+                  <button onClick={() => setSearch('')}
+                    className="absolute right-2 top-1/2 -translate-y-1/2 rounded p-0.5 hover:opacity-70"
+                    style={{ color: 'var(--color-text-muted)' }} aria-label="Clear search">
+                    <X size={12} />
+                  </button>
+                )}
+              </div>
 
-          {/* Smart filters — click to cycle: off → include (green) → exclude (red) → off */}
-          <div className="flex items-center gap-1 flex-wrap">
-            {[
-              { key: 'vulnerable',  label: 'Vulnerable',     icon: ShieldAlert },
-              { key: 'has_update',  label: 'Has Update',     icon: ArrowUpCircle },
-              { key: 'host_net',    label: 'Host Network',   icon: Network },
-              { key: 'bridge_net',  label: 'Bridge Network', icon: GitBranch },
-            ].map(({ key, label, icon: Icon }) => {
-              const state = smartFilters[key] || null
-              const style = state === 'include'
-                ? { background: 'rgba(34,197,94,0.18)',  color: '#22c55e', borderColor: 'rgba(34,197,94,0.45)' }
-                : state === 'exclude'
-                  ? { background: 'rgba(239,68,68,0.15)', color: '#ef4444', borderColor: 'rgba(239,68,68,0.4)' }
-                  : { background: 'var(--color-surface-offset)', color: 'var(--color-text-muted)', borderColor: 'var(--color-border)' }
-              return (
-                <button key={key}
-                  onClick={() => setSmartFilters(prev => {
-                    const cur = prev[key]
-                    if (!cur)              return { ...prev, [key]: 'include' }
-                    if (cur === 'include') return { ...prev, [key]: 'exclude' }
-                    const next = { ...prev }; delete next[key]; return next
-                  })}
-                  title={state ? `${label}: ${state} — click to cycle` : `${label}: off — click to include`}
-                  className="flex items-center gap-1 px-3 py-1.5 rounded-xl text-xs font-medium border transition-colors"
-                  style={style}>
-                  <Icon size={11} />
-                  {label}{state && <span className="ml-0.5 opacity-70 text-[10px]">{state === 'include' ? '✓' : '✕'}</span>}
-                </button>
-              )
-            })}
-            {Object.keys(smartFilters).length > 0 && (
-              <button onClick={() => setSmartFilters({})}
-                className="px-2 py-1.5 rounded-xl text-xs border transition-colors"
-                style={{ color: 'var(--color-text-faint)', borderColor: 'var(--color-border)', background: 'transparent' }}>
-                Clear
-              </button>
-            )}
-          </div>
-
-          {hostOptions.length > 1 && (
-            <div className="flex items-center gap-1 flex-wrap">
-              <span className="text-[10px] font-semibold uppercase tracking-wider mr-1" style={{ color: 'var(--color-text-faint)' }}>Host:</span>
+              {/* Filters toggle button */}
               <button
-                onClick={() => setHostFilter('all')}
-                className="px-3 py-1.5 rounded-xl text-xs font-medium border transition-colors"
-                style={hostFilter === 'all'
+                onClick={() => setShowFilters(v => !v)}
+                className="flex items-center gap-1.5 px-3 py-2 rounded-xl text-xs font-medium border transition-colors shrink-0 relative"
+                style={showFilters || filtersActive
                   ? { background: 'var(--color-brand)', color: 'white', borderColor: 'transparent' }
                   : { background: 'var(--color-surface-offset)', color: 'var(--color-text-muted)', borderColor: 'var(--color-border)' }}>
-                All
+                <SlidersHorizontal size={13} />
+                <span>Filters</span>
+                {filtersActive && !showFilters && (
+                  <span className="ml-0.5 px-1.5 py-0.5 rounded-full text-[10px] font-bold"
+                    style={{ background: 'rgba(255,255,255,0.25)', color: 'white' }}>
+                    {activeFilterCount}
+                  </span>
+                )}
               </button>
-              {hostOptions.map(h => (
-                <button key={h.id}
-                  onClick={() => setHostFilter(h.id)}
-                  className="px-3 py-1.5 rounded-xl text-xs font-medium border transition-colors"
-                  style={hostFilter === h.id
-                    ? { background: 'var(--color-brand)', color: 'white', borderColor: 'transparent' }
-                    : { background: 'var(--color-surface-offset)', color: 'var(--color-text-muted)', borderColor: 'var(--color-border)' }}>
-                  {h.name}
-                </button>
-              ))}
-            </div>
-          )}
 
-          <div className="ml-auto flex items-center gap-1">
-            {/* Surface new first toggle */}
-            <button
-              onClick={toggleSurfaceNewFirst}
-              title={surfaceNewFirst ? 'New containers surfaced to top (click to disable)' : 'New containers not surfaced (click to enable)'}
-              className="flex items-center gap-1 px-2.5 py-1.5 rounded-xl text-xs font-medium border transition-colors"
-              style={surfaceNewFirst
-                ? { background: 'rgba(16,185,129,0.12)', color: '#10b981', borderColor: 'rgba(16,185,129,0.35)' }
-                : { background: 'var(--color-surface-offset)', color: 'var(--color-text-faint)', borderColor: 'var(--color-border)' }}
-            >
-              <Sparkles size={11} />
-              <span>New first</span>
-            </button>
-            {/* Sort */}
-            <div className="flex items-center gap-1 mr-1">
-              <ArrowUpDown size={13} style={{ color: 'var(--color-text-faint)' }} />
-              <select className="input text-xs py-1" value={sort} onChange={e => setSort(e.target.value)}>
-                {SORT_OPTIONS.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
-              </select>
+              {/* Right-side controls */}
+              <div className="ml-auto flex items-center gap-1 shrink-0">
+                {/* New first — label hidden on small screens */}
+                <button
+                  onClick={toggleSurfaceNewFirst}
+                  title={surfaceNewFirst ? 'New containers surfaced to top (click to disable)' : 'Surface new containers first'}
+                  className="flex items-center gap-1 px-2 py-1.5 rounded-xl text-xs font-medium border transition-colors"
+                  style={surfaceNewFirst
+                    ? { background: 'rgba(16,185,129,0.12)', color: '#10b981', borderColor: 'rgba(16,185,129,0.35)' }
+                    : { background: 'var(--color-surface-offset)', color: 'var(--color-text-faint)', borderColor: 'var(--color-border)' }}>
+                  <Sparkles size={11} />
+                  <span className="hidden sm:inline">New first</span>
+                </button>
+
+                {/* Sort — label hidden on small screens */}
+                <div className="hidden sm:flex items-center gap-1">
+                  <ArrowUpDown size={13} style={{ color: 'var(--color-text-faint)' }} />
+                  <select className="input text-xs py-1" value={sort} onChange={e => setSort(e.target.value)}>
+                    {SORT_OPTIONS.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
+                  </select>
+                </div>
+
+                {/* Layout toggle */}
+                <button onClick={() => setLayout('grid')} className="btn-ghost p-1.5"
+                  title="Grid view" aria-label="Grid view"
+                  style={{ color: layout === 'grid' ? 'var(--color-brand)' : undefined }}>
+                  <LayoutGrid size={14} />
+                </button>
+                <button onClick={() => setLayout('list')} className="btn-ghost p-1.5"
+                  title="List view" aria-label="List view"
+                  style={{ color: layout === 'list' ? 'var(--color-brand)' : undefined }}>
+                  <List size={14} />
+                </button>
+
+                {/* Check all */}
+                <button
+                  onClick={checkAllUpdates}
+                  disabled={checkAllRunning}
+                  title="Check all containers for image updates"
+                  className="flex items-center gap-1.5 px-2 py-1.5 rounded-xl text-xs font-medium border transition-colors"
+                  style={{ background: 'var(--color-surface-offset)', color: 'var(--color-text-muted)', borderColor: 'var(--color-border)' }}>
+                  <RefreshCw size={11} className={checkAllRunning ? 'animate-spin' : ''} />
+                  <span className="hidden sm:inline">{checkAllRunning ? 'Checking…' : 'Check all'}</span>
+                </button>
+
+                {/* Update all */}
+                {pendingUpdateCount > 0 && (
+                  <button
+                    onClick={updateAllPending}
+                    disabled={updatingAll}
+                    title={`Update all ${pendingUpdateCount} container${pendingUpdateCount !== 1 ? 's' : ''} with available updates`}
+                    className="flex items-center gap-1 px-2 py-1.5 rounded-xl text-xs font-medium border transition-colors"
+                    style={{ background: 'rgba(59,130,246,0.15)', color: '#3b82f6', borderColor: 'rgba(59,130,246,0.4)' }}>
+                    <Download size={11} className={updatingAll ? 'animate-pulse' : ''} />
+                    <span className="hidden sm:inline">Update all</span>
+                    <span className="px-1.5 py-0.5 rounded-full text-[10px] font-bold"
+                      style={{ background: '#3b82f6', color: 'white' }}>
+                      {pendingUpdateCount}
+                    </span>
+                  </button>
+                )}
+
+                {/* Refresh */}
+                <button onClick={() => load(true)} disabled={refreshing}
+                  className="btn-ghost p-1.5" title="Refresh" aria-label="Refresh containers">
+                  <RefreshCw size={14} className={refreshing ? 'animate-spin' : ''} />
+                </button>
+              </div>
             </div>
-            {/* Layout toggle */}
-            <button onClick={() => setLayout('grid')} className="btn-ghost p-2"
-              title="Grid view" aria-label="Grid view"
-              style={{ color: layout === 'grid' ? 'var(--color-brand)' : undefined }}>
-              <LayoutGrid size={15} />
-            </button>
-            <button onClick={() => setLayout('list')} className="btn-ghost p-2"
-              title="List view" aria-label="List view"
-              style={{ color: layout === 'list' ? 'var(--color-brand)' : undefined }}>
-              <List size={15} />
-            </button>
-            <button
-              onClick={checkAllUpdates}
-              disabled={checkAllRunning}
-              title="Check all containers for image updates"
-              className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-xl text-xs font-medium border transition-colors"
-              style={{ background: 'var(--color-surface-offset)', color: 'var(--color-text-muted)', borderColor: 'var(--color-border)' }}>
-              <RefreshCw size={11} className={checkAllRunning ? 'animate-spin' : ''} />
-              {checkAllRunning ? 'Checking…' : 'Check all'}
-            </button>
+
+            {/* Check-all progress bar — shown below the toolbar so it doesn't crowd the row */}
             {checkAllRunning && (
-              <div className="max-w-[240px] truncate text-[11px]" style={{ color: 'var(--color-text-faint)' }}>
-                Checking {checkAllStatus?.completed || 0}/{checkAllStatus?.total || '…'}
-                {checkAllStatus?.current_container ? `: ${checkAllStatus.current_container}` : ''}
+              <div className="flex items-center gap-2 text-[11px] px-1" style={{ color: 'var(--color-text-faint)' }}>
+                <RefreshCw size={11} className="animate-spin shrink-0" style={{ color: 'var(--color-brand)' }} />
+                <span className="truncate">
+                  Checking {checkAllStatus?.completed || 0}/{checkAllStatus?.total || '…'}
+                  {checkAllStatus?.current_container ? ` — ${checkAllStatus.current_container}` : ''}
+                </span>
               </div>
             )}
-            {pendingUpdateCount > 0 && (
-              <button
-                onClick={updateAllPending}
-                disabled={updatingAll}
-                title={`Update all ${pendingUpdateCount} container${pendingUpdateCount !== 1 ? 's' : ''} with available updates`}
-                className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-xl text-xs font-medium border transition-colors"
-                style={{ background: 'rgba(59,130,246,0.15)', color: '#3b82f6', borderColor: 'rgba(59,130,246,0.4)' }}>
-                <Download size={11} className={updatingAll ? 'animate-pulse' : ''} />
-                Update all
-                <span className="ml-0.5 px-1.5 py-0.5 rounded-full text-[10px] font-bold"
-                  style={{ background: '#3b82f6', color: 'white' }}>
-                  {pendingUpdateCount}
-                </span>
-              </button>
+
+            {/* ── Filter panel: shown when Filters button is toggled ── */}
+            {showFilters && (
+              <div className="rounded-xl border p-3 space-y-3"
+                style={{ background: 'var(--color-surface-offset)', borderColor: 'var(--color-border)' }}>
+
+                {/* Status */}
+                <div className="space-y-1.5">
+                  <span className="text-[10px] font-semibold uppercase tracking-wider" style={{ color: 'var(--color-text-faint)' }}>Status</span>
+                  <div className="flex items-center gap-1.5 flex-wrap">
+                    {STATUS_FILTERS.map(f => (
+                      <button key={f.value}
+                        onClick={() => setFilter(f.value)}
+                        className="px-3 py-1.5 rounded-xl text-xs font-medium border transition-colors"
+                        style={filter === f.value
+                          ? { background: 'var(--color-brand)', color: 'white', borderColor: 'transparent' }
+                          : { background: 'var(--color-surface)', color: 'var(--color-text-muted)', borderColor: 'var(--color-border)' }}>
+                        {f.label}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+
+                {/* Smart filters */}
+                <div className="space-y-1.5">
+                  <span className="text-[10px] font-semibold uppercase tracking-wider" style={{ color: 'var(--color-text-faint)' }}>Smart Filters</span>
+                  <div className="flex items-center gap-1.5 flex-wrap">
+                    {[
+                      { key: 'vulnerable',  label: 'Vulnerable',     icon: ShieldAlert },
+                      { key: 'has_update',  label: 'Has Update',     icon: ArrowUpCircle },
+                      { key: 'host_net',    label: 'Host Network',   icon: Network },
+                      { key: 'bridge_net',  label: 'Bridge Network', icon: GitBranch },
+                    ].map(({ key, label, icon: Icon }) => {
+                      const state = smartFilters[key] || null
+                      const style = state === 'include'
+                        ? { background: 'rgba(34,197,94,0.18)',  color: '#22c55e', borderColor: 'rgba(34,197,94,0.45)' }
+                        : state === 'exclude'
+                          ? { background: 'rgba(239,68,68,0.15)', color: '#ef4444', borderColor: 'rgba(239,68,68,0.4)' }
+                          : { background: 'var(--color-surface)', color: 'var(--color-text-muted)', borderColor: 'var(--color-border)' }
+                      return (
+                        <button key={key}
+                          onClick={() => setSmartFilters(prev => {
+                            const cur = prev[key]
+                            if (!cur)              return { ...prev, [key]: 'include' }
+                            if (cur === 'include') return { ...prev, [key]: 'exclude' }
+                            const next = { ...prev }; delete next[key]; return next
+                          })}
+                          title={state ? `${label}: ${state} — click to cycle` : `${label}: off — click to include`}
+                          className="flex items-center gap-1 px-3 py-1.5 rounded-xl text-xs font-medium border transition-colors"
+                          style={style}>
+                          <Icon size={11} />
+                          {label}
+                          {state && <span className="ml-0.5 opacity-70 text-[10px]">{state === 'include' ? '✓' : '✕'}</span>}
+                        </button>
+                      )
+                    })}
+                  </div>
+                </div>
+
+                {/* Host filter — only when multiple hosts */}
+                {hostOptions.length > 1 && (
+                  <div className="space-y-1.5">
+                    <span className="text-[10px] font-semibold uppercase tracking-wider" style={{ color: 'var(--color-text-faint)' }}>Host</span>
+                    <div className="flex items-center gap-1.5 flex-wrap">
+                      <button onClick={() => setHostFilter('all')}
+                        className="px-3 py-1.5 rounded-xl text-xs font-medium border transition-colors"
+                        style={hostFilter === 'all'
+                          ? { background: 'var(--color-brand)', color: 'white', borderColor: 'transparent' }
+                          : { background: 'var(--color-surface)', color: 'var(--color-text-muted)', borderColor: 'var(--color-border)' }}>
+                        All
+                      </button>
+                      {hostOptions.map(h => (
+                        <button key={h.id} onClick={() => setHostFilter(h.id)}
+                          className="px-3 py-1.5 rounded-xl text-xs font-medium border transition-colors"
+                          style={hostFilter === h.id
+                            ? { background: 'var(--color-brand)', color: 'white', borderColor: 'transparent' }
+                            : { background: 'var(--color-surface)', color: 'var(--color-text-muted)', borderColor: 'var(--color-border)' }}>
+                          {h.name}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                )}
+
+                {/* Sort (visible on mobile; hidden on sm+ where it's in the top row) */}
+                <div className="sm:hidden space-y-1.5">
+                  <span className="text-[10px] font-semibold uppercase tracking-wider" style={{ color: 'var(--color-text-faint)' }}>Sort</span>
+                  <div className="flex items-center gap-1.5">
+                    <ArrowUpDown size={13} style={{ color: 'var(--color-text-faint)' }} />
+                    <select className="input text-xs py-1 flex-1" value={sort} onChange={e => setSort(e.target.value)}>
+                      {SORT_OPTIONS.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
+                    </select>
+                  </div>
+                </div>
+
+                {/* Clear all */}
+                {filtersActive && (
+                  <button
+                    onClick={() => { setFilter('all'); setSmartFilters({}); setHostFilter('all') }}
+                    className="text-xs px-3 py-1.5 rounded-xl border transition-colors"
+                    style={{ color: 'var(--color-text-faint)', borderColor: 'var(--color-border)', background: 'transparent' }}>
+                    Clear all filters
+                  </button>
+                )}
+              </div>
             )}
-            <button onClick={() => load(true)} disabled={refreshing}
-              className="btn-ghost p-2" title="Refresh" aria-label="Refresh containers">
-              <RefreshCw size={15} className={refreshing ? 'animate-spin' : ''} />
-            </button>
-          </div>
-        </section>
-      )}
+          </section>
+        )
+      })()}
 
       {/* Content */}
       {loading ? (

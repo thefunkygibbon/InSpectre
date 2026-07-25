@@ -5,6 +5,7 @@ import {
   Settings2, Clock, ExternalLink, Eye, EyeOff, Loader2, FileText, Download, FileDown,
   Copy, Check, GitMerge, Info, Trash2, RotateCw, AlertTriangle,
   RefreshCw, ArrowUpCircle, Shield, Pin, PinOff, Database,
+  Pencil, Save, Upload,
 } from 'lucide-react'
 import { api } from '../api'
 import { exportContainerVulnPDF } from '../utils/vulnPdfExport'
@@ -490,13 +491,74 @@ function VulnTab({ container, trivyScan, updateTrivyScan }) {
 }
 
 // ---------------------------------------------------------------------------
+// YAML viewer modal
+// ---------------------------------------------------------------------------
+function YamlViewModal({ title, yaml, onClose }) {
+  const [copied, setCopied] = useState(false)
+
+  function handleCopy() {
+    navigator.clipboard.writeText(yaml).then(() => {
+      setCopied(true)
+      setTimeout(() => setCopied(false), 2000)
+    })
+  }
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center p-4"
+      style={{ background: 'rgba(0,0,0,0.6)' }}
+      onClick={e => { if (e.target === e.currentTarget) onClose() }}>
+      <div className="rounded-xl shadow-2xl flex flex-col w-full max-w-2xl"
+        style={{ background: 'var(--color-surface)', border: '1px solid var(--color-border)', maxHeight: '85vh' }}>
+        <div className="flex items-center justify-between px-4 py-3 border-b shrink-0"
+          style={{ borderColor: 'var(--color-border)' }}>
+          <span className="text-sm font-semibold" style={{ color: 'var(--color-text)' }}>{title}</span>
+          <div className="flex items-center gap-2">
+            <button onClick={handleCopy}
+              className="flex items-center gap-1 text-xs px-2.5 py-1 rounded-lg border transition-colors"
+              style={{ borderColor: 'var(--color-border)', color: 'var(--color-text-muted)' }}>
+              {copied ? <Check size={11} /> : <Copy size={11} />}
+              {copied ? 'Copied!' : 'Copy'}
+            </button>
+            <button onClick={onClose} className="btn-ghost p-1">
+              <X size={14} />
+            </button>
+          </div>
+        </div>
+        <pre className="flex-1 overflow-auto p-4 text-[11px] font-mono leading-relaxed"
+          style={{ color: 'var(--color-text)', whiteSpace: 'pre' }}>
+          {yaml}
+        </pre>
+      </div>
+    </div>
+  )
+}
+
+// ---------------------------------------------------------------------------
 // Compose tab
 // ---------------------------------------------------------------------------
 function ComposeTab({ containerId, containerName, labels, resolveCurrentContainerId }) {
-  const [data,     setData]     = useState(null)
-  const [loading,  setLoading]  = useState(false)
-  const [error,    setError]    = useState(null)
-  const [copied,   setCopied]   = useState(false)
+  const [data,          setData]          = useState(null)
+  const [loading,       setLoading]       = useState(false)
+  const [error,         setError]         = useState(null)
+  const [copied,        setCopied]        = useState(false)
+
+  // Edit + deploy state
+  const [editMode,      setEditMode]      = useState(false)
+  const [editYaml,      setEditYaml]      = useState('')
+  const [deployLogs,    setDeployLogs]    = useState([])
+  const [deploying,     setDeploying]     = useState(false)
+  const deployAbortRef = useRef(null)
+
+  // Backup state
+  const [backups,       setBackups]       = useState(null)
+  const [showBackups,   setShowBackups]   = useState(false)
+  const [confirmRestore, setConfirmRestore] = useState(null)
+  const [restoring,     setRestoring]     = useState(false)
+  const [restoreLogs,   setRestoreLogs]   = useState([])
+  const restoreAbortRef = useRef(null)
+
+  // YAML viewer modal
+  const [viewYaml,      setViewYaml]      = useState(null) // { title, yaml }
 
   useEffect(() => {
     let cancelled = false
@@ -526,22 +588,110 @@ function ComposeTab({ containerId, containerName, labels, resolveCurrentContaine
   }, [containerId])
 
   function handleCopy() {
-    if (!data?.yaml) return
-    navigator.clipboard.writeText(data.yaml).then(() => {
+    const yaml = editMode ? editYaml : data?.yaml
+    if (!yaml) return
+    navigator.clipboard.writeText(yaml).then(() => {
       setCopied(true)
       setTimeout(() => setCopied(false), 2000)
     })
   }
 
   function handleDownload() {
-    if (!data?.yaml) return
-    const blob = new Blob([data.yaml], { type: 'text/yaml' })
+    const yaml = editMode ? editYaml : data?.yaml
+    if (!yaml) return
+    const blob = new Blob([yaml], { type: 'text/yaml' })
     const url  = URL.createObjectURL(blob)
     const a    = document.createElement('a')
     a.href     = url
     a.download = `${containerName || 'container'}-compose.yml`
     a.click()
     URL.revokeObjectURL(url)
+  }
+
+  function handleEdit() {
+    setEditYaml(data?.yaml || '')
+    setEditMode(true)
+    setDeployLogs([])
+  }
+
+  function handleCancelEdit() {
+    setEditMode(false)
+    setDeployLogs([])
+    if (deployAbortRef.current) deployAbortRef.current.abort()
+  }
+
+  function handleDeploy() {
+    if (deploying) return
+    setDeployLogs([])
+    setDeploying(true)
+    const ctrl = new AbortController()
+    deployAbortRef.current = ctrl
+    api.dockerDeployCompose(containerId, editYaml, line => {
+      if (line.startsWith('DEPLOY_ERROR:')) {
+        setDeployLogs(l => [...l, '❌ ' + line.slice(13)])
+        setDeploying(false)
+      } else if (line === 'DEPLOY_DONE') {
+        setDeployLogs(l => [...l, '✅ Deployed successfully.'])
+        setDeploying(false)
+        setEditMode(false)
+      } else {
+        setDeployLogs(l => [...l, line.replace(/^LOG:\s*/, '')])
+      }
+    }, ctrl.signal).catch(e => {
+      setDeployLogs(l => [...l, `❌ ${e.message || 'Deploy failed'}`])
+      setDeploying(false)
+    })
+  }
+
+  async function loadBackups() {
+    try {
+      const b = await api.dockerListBackups(containerId)
+      setBackups(b)
+    } catch (_) {}
+  }
+
+  async function manualBackup() {
+    try {
+      await api.dockerBackupContainer(containerId)
+      loadBackups()
+    } catch (_) {}
+  }
+
+  function downloadBackupCompose(backupId, name) {
+    api.dockerGetBackupCompose(backupId).then(res => {
+      const blob = new Blob([res.compose_yaml], { type: 'text/yaml' })
+      const url  = URL.createObjectURL(blob)
+      const a    = document.createElement('a'); a.href = url
+      a.download = `${name}_backup_${backupId}.yaml`
+      a.click(); URL.revokeObjectURL(url)
+    }).catch(() => {})
+  }
+
+  function viewBackupCompose(backupId, name) {
+    api.dockerGetBackupCompose(backupId).then(res => {
+      setViewYaml({ title: `Backup #${backupId} — ${name}`, yaml: res.compose_yaml })
+    }).catch(() => {})
+  }
+
+  function startRestoreStream(backupId) {
+    if (restoring) return
+    setConfirmRestore(null)
+    setRestoreLogs([])
+    setRestoring(true)
+    const ctrl = new AbortController()
+    restoreAbortRef.current = ctrl
+    api.dockerRecreateFromBackup(backupId, line => {
+      if (line.startsWith('RECREATE_ERROR:')) {
+        setRestoreLogs(l => [...l, '❌ ' + line.slice(15)])
+        setRestoring(false)
+      } else if (line === 'RECREATE_DONE') {
+        setRestoreLogs(l => [...l, '✅ Container restored successfully.'])
+        setRestoring(false)
+        loadBackups()
+      } else {
+        setRestoreLogs(l => [...l, line.replace(/^LOG:\s*/, '')])
+      }
+    }, ctrl.signal).catch(() => setRestoring(false))
   }
 
   if (loading) return (
@@ -560,6 +710,10 @@ function ComposeTab({ containerId, containerName, labels, resolveCurrentContaine
 
   return (
     <div className="space-y-3">
+      {viewYaml && (
+        <YamlViewModal title={viewYaml.title} yaml={viewYaml.yaml} onClose={() => setViewYaml(null)} />
+      )}
+
       {/* Origin notice */}
       {data.compose_managed ? (
         <div className="flex items-start gap-2 rounded-lg px-3 py-2.5 text-xs"
@@ -584,6 +738,13 @@ function ComposeTab({ containerId, containerName, labels, resolveCurrentContaine
           docker-compose.yml
         </span>
         <div className="flex items-center gap-2">
+          {!editMode && (
+            <button onClick={handleEdit}
+              className="flex items-center gap-1 text-xs px-2.5 py-1 rounded-lg border transition-colors"
+              style={{ borderColor: 'var(--color-border)', color: 'var(--color-text-muted)' }}>
+              <Pencil size={11} /> Edit
+            </button>
+          )}
           <button onClick={handleCopy}
             className="flex items-center gap-1 text-xs px-2.5 py-1 rounded-lg border transition-colors"
             style={{ borderColor: 'var(--color-border)', color: 'var(--color-text-muted)' }}>
@@ -598,11 +759,123 @@ function ComposeTab({ containerId, containerName, labels, resolveCurrentContaine
         </div>
       </div>
 
-      {/* YAML block */}
-      <pre className="rounded-lg p-4 text-[11px] font-mono overflow-x-auto leading-relaxed"
-        style={{ background: 'var(--color-surface-offset)', color: 'var(--color-text)', border: '1px solid var(--color-border)', whiteSpace: 'pre', maxHeight: '60vh', overflowY: 'auto' }}>
-        {data.yaml}
-      </pre>
+      {/* YAML block or editor */}
+      {editMode ? (
+        <div className="space-y-2">
+          <textarea
+            value={editYaml}
+            onChange={e => setEditYaml(e.target.value)}
+            spellCheck={false}
+            className="w-full rounded-lg p-4 text-[11px] font-mono leading-relaxed resize-none focus:outline-none"
+            style={{
+              background: 'var(--color-surface-offset)', color: 'var(--color-text)',
+              border: '1px solid var(--color-brand)', minHeight: '40vh', maxHeight: '60vh',
+            }}
+          />
+          <div className="flex items-center justify-between gap-2">
+            <button onClick={handleCancelEdit} disabled={deploying}
+              className="btn-ghost text-xs px-3 py-1.5 flex items-center gap-1">
+              <X size={11} /> Cancel
+            </button>
+            <button onClick={handleDeploy} disabled={deploying || !editYaml.trim()}
+              className="flex items-center gap-1.5 text-xs px-3 py-1.5 rounded-lg font-semibold transition-colors"
+              style={{ background: 'var(--color-brand)', color: '#fff', opacity: deploying ? 0.6 : 1 }}>
+              {deploying ? <Loader2 size={11} className="animate-spin" /> : <Upload size={11} />}
+              {deploying ? 'Deploying…' : 'Save & Deploy'}
+            </button>
+          </div>
+          {deployLogs.length > 0 && (
+            <div className="rounded-lg p-3 space-y-0.5 text-[11px] font-mono"
+              style={{ background: 'var(--color-surface-offset)', border: '1px solid var(--color-border)', maxHeight: '20vh', overflowY: 'auto' }}>
+              {deployLogs.map((l, i) => <div key={i} style={{ color: 'var(--color-text-muted)' }}>{l}</div>)}
+            </div>
+          )}
+        </div>
+      ) : (
+        <pre className="rounded-lg p-4 text-[11px] font-mono overflow-x-auto leading-relaxed"
+          style={{ background: 'var(--color-surface-offset)', color: 'var(--color-text)', border: '1px solid var(--color-border)', whiteSpace: 'pre', maxHeight: '60vh', overflowY: 'auto' }}>
+          {data.yaml}
+        </pre>
+      )}
+
+      {/* Backup history */}
+      <div className="card p-4 space-y-3">
+        <div className="flex items-center justify-between">
+          <button
+            className="flex items-center gap-1.5 text-sm font-semibold"
+            style={{ color: 'var(--color-text)' }}
+            onClick={() => { setShowBackups(v => !v); if (!backups) loadBackups() }}>
+            <Database size={14} style={{ color: 'var(--color-brand)' }} />
+            Backup History
+            {showBackups ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
+          </button>
+          <button onClick={manualBackup}
+            className="btn-ghost flex items-center gap-1 text-[11px]"
+            title="Save a manual backup of the current compose config">
+            <Save size={11} /> Backup Now
+          </button>
+        </div>
+        {showBackups && (
+          <div className="space-y-1.5">
+            {backups === null && <p className="text-xs" style={{ color: 'var(--color-text-faint)' }}>Loading…</p>}
+            {backups?.length === 0 && <p className="text-xs" style={{ color: 'var(--color-text-faint)' }}>No backups yet.</p>}
+            {backups?.map(b => (
+              <div key={b.id} className="flex items-center justify-between gap-2 text-xs py-1.5 border-b"
+                style={{ borderColor: 'var(--color-border)' }}>
+                <div className="min-w-0">
+                  <span className="font-mono text-[11px]" style={{ color: 'var(--color-text-muted)' }}>
+                    {b.backed_up_at ? new Date(b.backed_up_at).toLocaleString() : '—'}
+                  </span>
+                  <span className="ml-2 text-[10px] rounded px-1.5 py-0.5"
+                    style={{ background: 'rgba(107,114,128,0.1)', color: 'var(--color-text-muted)' }}>
+                    {b.reason}
+                  </span>
+                </div>
+                <div className="flex items-center gap-1 shrink-0">
+                  {b.has_compose && (<>
+                    <button onClick={() => viewBackupCompose(b.id, b.container_name)}
+                      className="btn-ghost flex items-center gap-1 text-[11px]"
+                      title="View compose YAML in browser">
+                      <Eye size={10} /> View
+                    </button>
+                    <button onClick={() => downloadBackupCompose(b.id, b.container_name)}
+                      className="btn-ghost flex items-center gap-1 text-[11px]"
+                      title="Download compose YAML">
+                      <Download size={10} /> YAML
+                    </button>
+                  </>)}
+                  {confirmRestore === b.id ? (
+                    <span className="flex items-center gap-1">
+                      <span className="text-[10px]" style={{ color: 'var(--color-text-muted)' }}>Restore?</span>
+                      <button onClick={() => startRestoreStream(b.id)}
+                        className="text-[10px] px-1.5 py-0.5 rounded font-semibold"
+                        style={{ background: 'rgba(239,68,68,0.15)', color: '#ef4444' }}>
+                        Yes
+                      </button>
+                      <button onClick={() => setConfirmRestore(null)}
+                        className="btn-ghost text-[10px] px-1">
+                        No
+                      </button>
+                    </span>
+                  ) : (
+                    <button onClick={() => setConfirmRestore(b.id)} disabled={restoring}
+                      className="btn-ghost flex items-center gap-1 text-[11px]"
+                      title="Restore container from this backup">
+                      <RotateCcw size={10} /> Restore
+                    </button>
+                  )}
+                </div>
+              </div>
+            ))}
+            {restoreLogs.length > 0 && (
+              <div className="rounded-lg p-3 space-y-0.5 text-[11px] font-mono mt-2"
+                style={{ background: 'var(--color-surface-offset)', border: '1px solid var(--color-border)', maxHeight: '16vh', overflowY: 'auto' }}>
+                {restoreLogs.map((l, i) => <div key={i} style={{ color: 'var(--color-text-muted)' }}>{l}</div>)}
+              </div>
+            )}
+          </div>
+        )}
+      </div>
     </div>
   )
 }
@@ -906,6 +1179,7 @@ function UpdatesTab({ container, updateStatus: initialStatus }) {
   const [showBackups,       setShowBackups]       = useState(false)
   const [confirmRecreate,   setConfirmRecreate]   = useState(null)  // null | backup id
   const [recreatingBackup,  setRecreatingBackup] = useState(false)
+  const [viewYaml,          setViewYaml]          = useState(null)  // { title, yaml }
 
   const stackRole = INSPECTRE_STACK[container.name] || null
   const [confirm,          setConfirm]          = useState(null)   // null | 'update' | 'force'
@@ -1098,6 +1372,13 @@ function UpdatesTab({ container, updateStatus: initialStatus }) {
     } catch (_) {}
   }
 
+  async function viewBackupCompose(backupId, name) {
+    try {
+      const res = await api.dockerGetBackupCompose(backupId)
+      setViewYaml({ title: `Backup #${backupId} — ${name}`, yaml: res.compose_yaml })
+    } catch (_) {}
+  }
+
   function startRecreateStream(backupId) {
     if (streaming || recreatingBackup) return
     setConfirmRecreate(null)
@@ -1128,7 +1409,11 @@ function UpdatesTab({ container, updateStatus: initialStatus }) {
     }
 
     api.dockerRecreateFromBackup(backupId, onLine, ctrl.signal)
-      .catch(() => { setStreaming(false); setRecreatingBackup(false) })
+      .catch(e => {
+        setLogs(l => [...l, `❌ Restore failed: ${e.message || 'Unknown error'}`])
+        setStreaming(false)
+        setRecreatingBackup(false)
+      })
   }
 
   const hasUpdate      = status?.has_update
@@ -1175,6 +1460,9 @@ function UpdatesTab({ container, updateStatus: initialStatus }) {
 
   return (
     <div className="space-y-4">
+      {viewYaml && (
+        <YamlViewModal title={viewYaml.title} yaml={viewYaml.yaml} onClose={() => setViewYaml(null)} />
+      )}
 
       {/* ── InSpectre stack warning ── */}
       {stackRole && <InspectreStackNotice role={stackRole} name={container.name} />}
@@ -1523,14 +1811,18 @@ function UpdatesTab({ container, updateStatus: initialStatus }) {
                   </span>
                 </div>
                 <div className="flex items-center gap-1 shrink-0">
-                  {b.has_compose && (
+                  {b.has_compose && (<>
+                    <button onClick={() => viewBackupCompose(b.id, b.container_name)}
+                      className="btn-ghost flex items-center gap-1 text-[11px]"
+                      title="View compose YAML in browser">
+                      <Eye size={10} /> View
+                    </button>
                     <button onClick={() => downloadBackupCompose(b.id, b.container_name)}
                       className="btn-ghost flex items-center gap-1 text-[11px]"
                       title="Download compose YAML for this backup">
-                      <Download size={10} />
-                      YAML
+                      <Download size={10} /> YAML
                     </button>
-                  )}
+                  </>)}
                   {confirmRecreate === b.id ? (
                     <span className="flex items-center gap-1">
                       <span className="text-[10px]" style={{ color: 'var(--color-text-muted)' }}>Recreate?</span>
@@ -1668,12 +1960,12 @@ export function ContainerDrawer({ container: initialContainer, trivyScan, update
           </div>
         </div>
 
-        {/* Tab bar */}
-        <div className="flex border-b border-border px-4 gap-0 overflow-x-auto scrollbar-none"
+        {/* Tab bar — wraps to 3-per-row grid on mobile, single scrolling row on sm+ */}
+        <div className="grid grid-cols-3 sm:flex border-b border-border sm:overflow-x-auto sm:scrollbar-none"
           style={{ background: 'var(--color-surface)' }}>
           {visibleTabs.map(tab => (
             <button key={tab.id} onClick={() => setActiveTab(tab.id)}
-              className="px-3 py-3 text-xs font-medium border-b-2 transition-colors whitespace-nowrap shrink-0"
+              className="px-2 py-2.5 sm:px-3 sm:py-3 text-xs font-medium border-b-2 transition-colors text-center sm:whitespace-nowrap sm:shrink-0"
               style={activeTab === tab.id
                 ? { borderColor: 'var(--color-brand)', color: 'var(--color-brand)' }
                 : { borderColor: 'transparent', color: 'var(--color-text-muted)' }}>
@@ -1686,7 +1978,7 @@ export function ContainerDrawer({ container: initialContainer, trivyScan, update
         </div>
 
         {/* Body */}
-        <div className="flex-1 overflow-y-auto px-6 py-5 space-y-6">
+        <div className="flex-1 overflow-y-auto px-6 py-5 pb-16 space-y-6">
 
           {/* ── Overview tab ── */}
           {activeTab === 'overview' && (
