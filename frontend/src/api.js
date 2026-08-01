@@ -397,6 +397,7 @@ export const api = {
   dockerListBackups:        (id)                     => request('GET',  `/docker/containers/${id}/backups`),
   dockerGetBackupCompose:   (bid)                    => request('GET',  `/docker/backups/${bid}/compose`),
   dockerRecreateFromBackup: (bid, onLine, signal)    => streamSSEPost(`/docker/backups/${bid}/recreate`, {}, onLine, signal),
+  dockerDeployCompose:      (id, yaml, onLine, signal) => streamSSEPost(`/docker/containers/${id}/deploy-compose`, { yaml }, onLine, signal),
   dockerPinContainer:       (id, pinned)             => request('POST', `/docker/containers/${id}/pin`, { pinned }),
   dockerCheckAllUpdates:    ()                       => request('POST', '/docker/check-all-updates'),
   dockerCheckAllStatus:     ()                       => request('GET',  '/docker/check-all-status'),

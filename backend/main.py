@@ -719,8 +719,9 @@ DEFAULT_SETTINGS = {
     "docker_scan_on_new":        ("false", "Automatically run a Trivy vuln scan when a new container is created."),
     "docker_scan_on_update":     ("false", "Automatically run a Trivy vuln scan when a container is recreated with an updated image."),
     # Container update management
-    "container_auto_update":           ("disabled", "What to do when an update is detected. Options: disabled, notify, scan_then_update, auto."),
-    "container_update_block_critical": ("true",     "Block container updates if the new image contains critical-severity CVEs."),
+    "container_auto_update":           ("disabled",        "What to do when an update is detected. Options: disabled, notify, scan_then_update, auto."),
+    "container_update_vuln_policy":    ("block_on_critical", "When to block an update based on new image vulnerabilities. Options: always_update, block_on_critical, block_on_high."),
+    "container_update_block_if_worse": ("false",           "When enabled, block the update only if the new image has MORE critical CVEs than the currently running image."),
     "container_backup_enabled":        ("true",     "Automatically save a full config backup before any container update."),
     "container_update_health_timeout": ("30",       "Seconds to wait for a container health check after an update before triggering rollback."),
     "container_update_stagger_seconds":("30",       "Delay in seconds between sequential container updates when running an auto-update batch."),
@@ -736,6 +737,13 @@ DEFAULT_SETTINGS = {
     "device_returned_days":          ("7",   "Days a device must be absent before a device.returned notification fires when it rejoins."),
     # Notification — traffic
     "traffic_suspicious_countries":  ("",    "Comma-separated ISO-3166 country codes to flag (e.g. CN,RU,KP). Leave blank to disable."),
+    # Device lifecycle — auto-expire new status & auto-delete stale devices
+    "new_device_threshold_enabled":     ("false", "Automatically mark devices as acknowledged after the configured period."),
+    "new_device_threshold_value":       ("7",     "Number of time units before a device's 'new' status expires."),
+    "new_device_threshold_unit":        ("day",   "Time unit for new device threshold. Options: day, week, month, year."),
+    "stale_device_auto_delete_enabled": ("false", "Automatically delete devices not seen for the configured period. Important and group-primary devices are protected."),
+    "stale_device_auto_delete_value":   ("90",    "Number of time units before a stale device is auto-deleted."),
+    "stale_device_auto_delete_unit":    ("day",   "Time unit for stale device deletion. Options: day, week, month, year."),
     # Here Be Dragons — advanced probe pipeline controls
     "enable_arp_sweep":              ("true",  "Run active ARP broadcast sweeps to discover devices on the configured subnet."),
     "enable_passive_sniffer":        ("true",  "Run the passive ARP sniffer that listens for ARP traffic. Disable to stop all passive packet capture. Takes effect immediately."),
@@ -1297,6 +1305,7 @@ def _ha_build_url(config: dict) -> tuple[str, str]:
     return f"{scheme}://{raw_host}{port_str}/api/services/{notifier}", token
 
 
+
 async def _notify_home_assistant(config: dict, title: str, body: str) -> None:
     url, token = _ha_build_url(config)
     async with httpx.AsyncClient(verify=False, timeout=10.0) as client:
@@ -1306,6 +1315,7 @@ async def _notify_home_assistant(config: dict, title: str, body: str) -> None:
             headers={"Authorization": f"Bearer {token}"},
         )
         resp.raise_for_status()
+
 
 
 async def _notification_dispatch(event_type: str, title: str, body: str,

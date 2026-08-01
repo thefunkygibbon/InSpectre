@@ -1087,9 +1087,27 @@ async def _self_update_via_helper_stream(
         if scan_first:
             db = _SessionLocal()
             try:
-                block_on_critical = _setting(db, "container_update_block_critical", "true") == "true"
+                vuln_policy     = _setting(db, "container_update_vuln_policy", "block_on_critical")
+                block_if_worse  = _setting(db, "container_update_block_if_worse", "false") == "true"
             finally:
                 db.close()
+
+            # If block_if_worse: scan current image first so we can compare counts
+            current_critical_count = 0
+            if block_if_worse and not force:
+                yield emit("LOG: [3/3] Scanning current image for baseline CVE count…")
+                def _get_current_image_ref():
+                    c_client = _make_docker_client(host_url)
+                    try:
+                        return _container_image_ref(c_client.containers.get(container_id))
+                    finally:
+                        c_client.close()
+                try:
+                    cur_img = await asyncio.to_thread(_get_current_image_ref)
+                    _, current_critical_count, _ = await asyncio.to_thread(_trivy_scan_image, cur_img)
+                    yield emit(f"LOG: [3/3] Current image baseline: {current_critical_count} critical CVE(s).")
+                except Exception as _exc:
+                    yield emit(f"LOG: [3/3] Warning: could not scan current image for comparison: {_exc}")
 
             yield emit("LOG: [3/3] Running Trivy security scan on new image…")
             scan_vulns, critical_count, high_count = await asyncio.to_thread(
@@ -1108,24 +1126,34 @@ async def _self_update_via_helper_stream(
             finally:
                 db.close()
 
-            if critical_count > 0 and block_on_critical and not force:
-                reason_str = f"{critical_count} critical CVE(s) found in new image"
-                db = _SessionLocal()
-                try:
-                    _upsert_update_status(db, container_name, host_id,
-                                          update_blocked=True,
-                                          blocked_reason=reason_str,
-                                          update_in_progress=False,
-                                          last_update_status="blocked")
-                finally:
-                    db.close()
-                yield emit(f"LOG: [BLOCKED] {reason_str} — update aborted for safety.")
-                yield emit(f"UPDATE_BLOCKED:{critical_count}")
-                return
+            if not force:
+                block_reason = None
+                if vuln_policy == "block_on_critical" and critical_count > 0:
+                    block_reason = f"{critical_count} critical CVE(s) found in new image"
+                elif vuln_policy == "block_on_high" and (critical_count + high_count) > 0:
+                    block_reason = f"{critical_count} critical, {high_count} high CVE(s) found in new image"
+                if block_reason is None and block_if_worse and critical_count > current_critical_count:
+                    block_reason = (
+                        f"New image has more critical CVEs ({critical_count}) "
+                        f"than current ({current_critical_count})"
+                    )
+                if block_reason:
+                    db = _SessionLocal()
+                    try:
+                        _upsert_update_status(db, container_name, host_id,
+                                              update_blocked=True,
+                                              blocked_reason=block_reason,
+                                              update_in_progress=False,
+                                              last_update_status="blocked")
+                    finally:
+                        db.close()
+                    yield emit(f"LOG: [BLOCKED] {block_reason} — update aborted for safety.")
+                    yield emit(f"UPDATE_BLOCKED:{critical_count}")
+                    return
 
-            if critical_count > 0 and force:
+            if (critical_count > 0 or high_count > 0) and force:
                 yield emit(
-                    f"LOG: [WARNING] {critical_count} critical CVE(s) found "
+                    f"LOG: [WARNING] {critical_count} critical, {high_count} high CVE(s) found "
                     "— proceeding anyway (force override active)."
                 )
         else:
@@ -1646,11 +1674,29 @@ async def _safe_update_stream(
             if scan_first:
                 db = _SessionLocal()
                 try:
-                    block_on_critical = _setting(db, "container_update_block_critical", "true") == "true"
+                    vuln_policy    = _setting(db, "container_update_vuln_policy", "block_on_critical")
+                    block_if_worse = _setting(db, "container_update_block_if_worse", "false") == "true"
                 finally:
                     db.close()
 
-                yield emit(f"LOG: [3/7] Running Trivy security scan on new image…")
+                # If block_if_worse: scan current image first so we can compare
+                current_critical_count = 0
+                if block_if_worse and not force:
+                    yield emit("LOG: [3/7] Scanning current image for baseline CVE count…")
+                    def _get_cur_img_ref():
+                        c_client = _make_docker_client(host_url)
+                        try:
+                            return _container_image_ref(c_client.containers.get(container_id))
+                        finally:
+                            c_client.close()
+                    try:
+                        cur_img = await asyncio.to_thread(_get_cur_img_ref)
+                        _, current_critical_count, _ = await asyncio.to_thread(_trivy_scan_image, cur_img)
+                        yield emit(f"LOG: [3/7] Current image baseline: {current_critical_count} critical CVE(s).")
+                    except Exception as _exc:
+                        yield emit(f"LOG: [3/7] Warning: could not scan current image for comparison: {_exc}")
+
+                yield emit("LOG: [3/7] Running Trivy security scan on new image…")
 
                 scan_vulns, critical_count, high_count = await asyncio.to_thread(
                     _trivy_scan_image, image_name
@@ -1668,29 +1714,39 @@ async def _safe_update_stream(
                 finally:
                     db.close()
 
-                if critical_count > 0 and block_on_critical and not force:
-                    reason_str = f"{critical_count} critical CVE(s) found in new image"
-                    db = _SessionLocal()
-                    try:
-                        _upsert_update_status(db, container_name, host_id,
-                                              update_blocked=True,
-                                              blocked_reason=reason_str,
-                                              update_in_progress=False,
-                                              last_update_status="blocked")
-                    finally:
-                        db.close()
-                    yield emit(f"LOG: [BLOCKED] {reason_str} — update aborted for safety.")
-                    yield emit(f"UPDATE_BLOCKED:{critical_count}")
-                    _fire_notification(
-                        "container.update_blocked",
-                        "Container Update Blocked",
-                        f"{container_name}: blocked — {critical_count} critical CVE(s) in new image",
-                    )
-                    return
+                if not force:
+                    block_reason = None
+                    if vuln_policy == "block_on_critical" and critical_count > 0:
+                        block_reason = f"{critical_count} critical CVE(s) found in new image"
+                    elif vuln_policy == "block_on_high" and (critical_count + high_count) > 0:
+                        block_reason = f"{critical_count} critical, {high_count} high CVE(s) found in new image"
+                    if block_reason is None and block_if_worse and critical_count > current_critical_count:
+                        block_reason = (
+                            f"New image has more critical CVEs ({critical_count}) "
+                            f"than current ({current_critical_count})"
+                        )
+                    if block_reason:
+                        db = _SessionLocal()
+                        try:
+                            _upsert_update_status(db, container_name, host_id,
+                                                  update_blocked=True,
+                                                  blocked_reason=block_reason,
+                                                  update_in_progress=False,
+                                                  last_update_status="blocked")
+                        finally:
+                            db.close()
+                        yield emit(f"LOG: [BLOCKED] {block_reason} — update aborted for safety.")
+                        yield emit(f"UPDATE_BLOCKED:{critical_count}")
+                        _fire_notification(
+                            "container.update_blocked",
+                            "Container Update Blocked",
+                            f"{container_name}: blocked — {block_reason}",
+                        )
+                        return
 
-                if critical_count > 0 and force:
+                if (critical_count > 0 or high_count > 0) and force:
                     yield emit(
-                        f"LOG: [WARNING] {critical_count} critical CVE(s) found "
+                        f"LOG: [WARNING] {critical_count} critical, {high_count} high CVE(s) found "
                         f"— proceeding anyway (force override active)."
                     )
             else:
@@ -2637,6 +2693,571 @@ async def get_backup_compose(backup_id: int, request: Request):
         return {"container_name": row[0], "compose_yaml": row[1]}
     finally:
         db.close()
+
+
+async def _deploy_compose_stream(compose_yaml: str, host_url: str):
+    """
+    Async generator: parse a compose YAML and deploy all services via the Docker SDK.
+    Yields SSE-formatted 'data: LOG: …' lines plus a final 'data: DEPLOY_DONE' or
+    'data: DEPLOY_ERROR:…' line.  No subprocess / docker CLI required.
+
+    Every await and every parsing step is guarded so that any exception becomes a
+    DEPLOY_ERROR line rather than crashing the async generator mid-stream (which
+    would give the browser an opaque "Error in input stream" message).
+    """
+    import yaml as _yaml
+    import shlex as _shlex
+    import traceback as _tb
+
+    def emit(msg: str) -> str:
+        return f"data: {msg}\n\n"
+
+    # ── Parse YAML ────────────────────────────────────────────────────────────
+    try:
+        doc = _yaml.safe_load(compose_yaml)
+    except Exception as e:
+        yield emit(f"DEPLOY_ERROR:Invalid YAML: {e}")
+        return
+
+    if not isinstance(doc, dict):
+        yield emit("DEPLOY_ERROR:YAML did not parse to a mapping — check the file structure")
+        return
+
+    services    = doc.get("services") or {}
+    top_networks = doc.get("networks") or {}
+
+    if not services:
+        yield emit("DEPLOY_ERROR:No services found in compose YAML")
+        return
+
+    yield emit(f"LOG: Found {len(services)} service(s): {', '.join(services.keys())}")
+
+    # ── Per-service deployment ────────────────────────────────────────────────
+    for svc_name, svc_cfg in services.items():
+        try:
+            svc_cfg = svc_cfg or {}
+            image = svc_cfg.get("image")
+            if not image:
+                yield emit(f"LOG: [{svc_name}] No image specified — skipping")
+                continue
+
+            container_name = svc_cfg.get("container_name") or svc_name
+            yield emit(f"LOG: [{svc_name}] Deploying '{container_name}' ({image})")
+
+            # ── Pull image ────────────────────────────────────────────────────
+            yield emit(f"LOG: [{svc_name}] Pulling {image}…")
+            try:
+                def _pull(img=image):
+                    c = _make_docker_client(host_url)
+                    try:
+                        c.images.pull(img)
+                    finally:
+                        c.close()
+                await asyncio.to_thread(_pull)
+                yield emit(f"LOG: [{svc_name}] ✓ Pull complete")
+            except Exception as pe:
+                yield emit(f"LOG: [{svc_name}] Warning: pull failed ({pe}) — using cached image if available")
+
+            # ── Stop & remove existing container ──────────────────────────────
+            yield emit(f"LOG: [{svc_name}] Stopping '{container_name}' (if running)…")
+            try:
+                def _stop_remove(cname=container_name):
+                    c = _make_docker_client(host_url)
+                    try:
+                        try:
+                            existing = c.containers.get(cname)
+                            if existing.status not in ("exited", "created"):
+                                existing.stop(timeout=15)
+                            existing.remove(force=True)
+                        except docker_sdk.errors.NotFound:
+                            pass  # nothing to remove
+                    finally:
+                        c.close()
+                await asyncio.to_thread(_stop_remove)
+                yield emit(f"LOG: [{svc_name}] ✓ Old container removed")
+            except Exception as se:
+                yield emit(f"LOG: [{svc_name}] Warning: could not remove old container ({se}) — continuing")
+
+            # ── Parse ports ───────────────────────────────────────────────────
+            port_bindings: dict = {}
+            exposed_ports: list = []
+            for p in (svc_cfg.get("ports") or []):
+                try:
+                    p = str(p)
+                    parts = p.rsplit(":", 1)
+                    if len(parts) == 2:
+                        host_part, ctr_part = parts
+                        host_sub = host_part.rsplit(":", 1)
+                        host_ip   = host_sub[0] if len(host_sub) == 2 else ""
+                        host_port = host_sub[1] if len(host_sub) == 2 else host_sub[0]
+                        proto = "tcp"
+                        if "/" in ctr_part:
+                            ctr_port_num, proto = ctr_part.split("/", 1)
+                        else:
+                            ctr_port_num = ctr_part
+                        key = f"{ctr_port_num}/{proto}"
+                        binding: dict = {"HostPort": str(host_port)}
+                        if host_ip:
+                            binding["HostIp"] = host_ip
+                        port_bindings.setdefault(key, []).append(binding)
+                        exposed_ports.append(key)
+                    else:
+                        ctr_part = parts[0]
+                        proto = "tcp"
+                        if "/" in ctr_part:
+                            ctr_port_num, proto = ctr_part.split("/", 1)
+                        else:
+                            ctr_port_num = ctr_part
+                        exposed_ports.append(f"{ctr_port_num}/{proto}")
+                except Exception:
+                    yield emit(f"LOG: [{svc_name}] Warning: could not parse port entry '{p}' — skipping")
+
+            # ── Parse volumes ─────────────────────────────────────────────────
+            binds: dict = {}
+            for v in (svc_cfg.get("volumes") or []):
+                try:
+                    if isinstance(v, dict):
+                        src  = v.get("source", "")
+                        dst  = v.get("target", "")
+                        mode = "ro" if v.get("read_only") else "rw"
+                        if src and dst:
+                            binds[src] = {"bind": dst, "mode": mode}
+                    else:
+                        parts = str(v).split(":")
+                        if len(parts) >= 2:
+                            binds[parts[0]] = {"bind": parts[1], "mode": parts[2] if len(parts) > 2 else "rw"}
+                except Exception:
+                    yield emit(f"LOG: [{svc_name}] Warning: could not parse volume entry — skipping")
+
+            # ── Environment ───────────────────────────────────────────────────
+            env_raw = svc_cfg.get("environment")
+            if isinstance(env_raw, dict):
+                env_list = [f"{k}={val}" for k, val in env_raw.items()]
+            elif isinstance(env_raw, list):
+                env_list = [str(e) for e in env_raw]
+            else:
+                env_list = None
+
+            # ── Labels ────────────────────────────────────────────────────────
+            labels_raw = svc_cfg.get("labels") or {}
+            if isinstance(labels_raw, list):
+                labels = {ll.split("=", 1)[0]: (ll.split("=", 1)[1] if "=" in ll else "") for ll in labels_raw}
+            else:
+                labels = dict(labels_raw)
+
+            # ── Restart policy ────────────────────────────────────────────────
+            restart_raw = str(svc_cfg.get("restart", "no"))
+            if ":" in restart_raw:
+                rp_name, rp_ret = restart_raw.split(":", 1)
+                rp = {"Name": rp_name, "MaximumRetryCount": int(rp_ret)}
+            else:
+                rp = {"Name": restart_raw, "MaximumRetryCount": 0}
+
+            # ── Networks ──────────────────────────────────────────────────────
+            network_mode_raw = svc_cfg.get("network_mode")
+            svc_nets_raw = svc_cfg.get("networks") or []
+            if isinstance(svc_nets_raw, dict):
+                svc_nets_raw = list(svc_nets_raw.keys())
+            svc_nets = []
+            for sn in svc_nets_raw:
+                top_cfg = top_networks.get(sn) or {}
+                svc_nets.append(top_cfg.get("name") or sn)
+
+            if network_mode_raw:
+                net_mode = network_mode_raw
+                post_connect_nets: list = []
+            elif svc_nets:
+                net_mode = svc_nets[0]
+                post_connect_nets = svc_nets[1:]
+            else:
+                net_mode = "bridge"
+                post_connect_nets = []
+
+            _net_lo = (net_mode or "").lower()
+            if _net_lo in ("host", "none") or _net_lo.startswith("container:"):
+                port_bindings_arg = None
+                exposed_ports_arg: list = []
+            else:
+                port_bindings_arg = port_bindings or None
+                exposed_ports_arg = exposed_ports
+
+            hostname = svc_cfg.get("hostname") or (
+                None if _net_lo in ("host", "none") or _net_lo.startswith("container:") else container_name
+            )
+
+            # ── Misc host-config fields ───────────────────────────────────────
+            tmpfs_raw = svc_cfg.get("tmpfs")
+            if isinstance(tmpfs_raw, str):
+                tmpfs: dict | None = {tmpfs_raw: ""}
+            elif isinstance(tmpfs_raw, list):
+                tmpfs = {t: "" for t in tmpfs_raw}
+            else:
+                tmpfs = None
+
+            devices_raw = svc_cfg.get("devices") or []
+            devices = []
+            for d in devices_raw:
+                dp = str(d).split(":")
+                devices.append({
+                    "PathOnHost":        dp[0],
+                    "PathInContainer":   dp[1] if len(dp) > 1 else dp[0],
+                    "CgroupPermissions": dp[2] if len(dp) > 2 else "rwm",
+                })
+
+            extra_hosts_raw = svc_cfg.get("extra_hosts") or []
+            extra_hosts = (
+                [f"{k}:{v}" for k, v in extra_hosts_raw.items()]
+                if isinstance(extra_hosts_raw, dict) else list(extra_hosts_raw)
+            )
+
+            dns_raw = svc_cfg.get("dns") or []
+            dns = [dns_raw] if isinstance(dns_raw, str) else list(dns_raw)
+
+            sysctls_raw = svc_cfg.get("sysctls") or {}
+            sysctls = (
+                {s.split("=", 1)[0]: s.split("=", 1)[1] for s in sysctls_raw if "=" in s}
+                if isinstance(sysctls_raw, list) else dict(sysctls_raw)
+            )
+
+            cpus = svc_cfg.get("cpus")
+            nano_cpus = int(float(cpus) * 1_000_000_000) if cpus else None
+
+            command_raw = svc_cfg.get("command")
+            if isinstance(command_raw, str):
+                command = _shlex.split(command_raw)
+            else:
+                command = command_raw  # list or None
+
+            # ── Create & start ────────────────────────────────────────────────
+            yield emit(f"LOG: [{svc_name}] Creating container '{container_name}'…")
+
+            def _create_start(
+                img=image,               cname=container_name,   cmd=command,
+                env=env_list,            lbl=labels,             ports=exposed_ports_arg,
+                hname=hostname,          wdir=svc_cfg.get("working_dir"),
+                ep=svc_cfg.get("entrypoint"), usr=svc_cfg.get("user"),
+                tty=bool(svc_cfg.get("tty", False)),
+                stdin=bool(svc_cfg.get("stdin_open", False)),
+                pb=port_bindings_arg,    bnd=binds or None,      nm=net_mode,
+                priv=bool(svc_cfg.get("privileged", False)),
+                cap_add=svc_cfg.get("cap_add") or None,
+                cap_drop=svc_cfg.get("cap_drop") or None,
+                dev=devices or None,     _dns=dns or None,
+                dns_search=svc_cfg.get("dns_search") or None,
+                eh=extra_hosts or None,  sc=sysctls or None,
+                memlim=svc_cfg.get("mem_limit") or None,
+                nc=nano_cpus,            tmp=tmpfs,
+                shm=svc_cfg.get("shm_size") or None,
+                ipc=svc_cfg.get("ipc") or None,
+                pid=svc_cfg.get("pid") or None,
+                secopt=svc_cfg.get("security_opt") or None,
+                ro=bool(svc_cfg.get("read_only", False)),
+                restart=rp,              extra_nets=post_connect_nets,
+            ):
+                c = _make_docker_client(host_url)
+                try:
+                    hcfg = c.api.create_host_config(
+                        port_bindings = pb,
+                        binds         = bnd,
+                        network_mode  = nm,
+                        privileged    = priv,
+                        cap_add       = cap_add,
+                        cap_drop      = cap_drop,
+                        devices       = dev,
+                        dns           = _dns,
+                        dns_search    = dns_search,
+                        extra_hosts   = eh,
+                        sysctls       = sc,
+                        mem_limit     = memlim,
+                        nano_cpus     = nc,
+                        tmpfs         = tmp,
+                        shm_size      = shm,
+                        ipc_mode      = ipc,
+                        pid_mode      = pid,
+                        security_opt  = secopt,
+                        read_only     = ro,
+                        restart_policy= restart,
+                    )
+                    cres = c.api.create_container(
+                        image       = img,
+                        name        = cname,
+                        command     = cmd,
+                        environment = env,
+                        labels      = lbl or None,
+                        ports       = ports or None,
+                        hostname    = hname,
+                        working_dir = wdir or None,
+                        entrypoint  = ep,
+                        user        = usr or None,
+                        tty         = tty,
+                        stdin_open  = stdin,
+                        host_config = hcfg,
+                    )
+                    cobj = c.containers.get(cres["Id"])
+                    for net_name in extra_nets:
+                        try:
+                            c.networks.get(net_name).connect(cobj)
+                        except Exception as ne:
+                            print(f"[deploy-compose] Warning: could not connect to network {net_name}: {ne}", flush=True)
+                    cobj.start()
+                finally:
+                    c.close()
+
+            try:
+                await asyncio.to_thread(_create_start)
+            except Exception as ce:
+                print(f"[deploy-compose] create/start failed for {svc_name}: {_tb.format_exc()}", flush=True)
+                yield emit(f"DEPLOY_ERROR:[{svc_name}] Failed to create/start '{container_name}': {ce}")
+                return
+
+            yield emit(f"LOG: [{svc_name}] ✓ '{container_name}' is running")
+
+        except Exception as outer:
+            print(f"[deploy-compose] unexpected error for service {svc_name}: {_tb.format_exc()}", flush=True)
+            yield emit(f"DEPLOY_ERROR:[{svc_name}] Unexpected error: {outer}")
+            return
+
+    yield emit("DEPLOY_DONE")
+
+
+@router.post("/docker/backups/{backup_id}/recreate")
+async def recreate_from_backup(backup_id: int, request: Request):
+    """SSE: Restore a container from a stored backup (compose YAML preferred, config_json fallback)."""
+    _verify_token(request)
+
+    db = _SessionLocal()
+    try:
+        row = db.execute(
+            text("SELECT container_name, host_id, config_json, compose_yaml FROM container_backups WHERE id=:id"),
+            {"id": backup_id},
+        ).fetchone()
+        if not row:
+            raise HTTPException(404, "Backup not found.")
+        container_name, host_id, config_json, compose_yaml = row
+
+        hosts = _get_enabled_hosts(db)
+        docker_hosts = [h for h in hosts if h.get("type") != "proxmox"]
+        if not docker_hosts:
+            raise HTTPException(503, "No Docker hosts configured.")
+        host_meta = next((h for h in docker_hosts if h.get("id") == host_id), docker_hosts[0])
+        host_url = host_meta.get("url") or "unix:///var/run/docker.sock"
+        resolved_host_id = host_meta.get("id")
+    finally:
+        db.close()
+
+    async def _stream():
+        def emit(msg: str) -> str:
+            return f"data: {msg}\n\n"
+
+        try:
+            yield emit(f"LOG: [1/4] Preparing to restore '{container_name}' from backup {backup_id}…")
+
+            def _get_current_id():
+                client = _make_docker_client(host_url)
+                try:
+                    matches = [c for c in client.containers.list(all=True)
+                               if c.name.lstrip("/") == container_name]
+                    return matches[0].id if matches else None
+                finally:
+                    client.close()
+
+            current_id = await asyncio.to_thread(_get_current_id)
+
+            if current_id:
+                yield emit("LOG: [1/4] Backing up current container state before restore…")
+                try:
+                    pre_id = await asyncio.to_thread(
+                        _backup_container_sync, container_name, current_id,
+                        host_url, resolved_host_id, "pre_restore",
+                    )
+                    yield emit(f"LOG: [1/4] ✓ Current state backed up (ID {pre_id})")
+                except Exception as be:
+                    yield emit(f"LOG: [1/4] Warning: could not backup current state: {be}")
+            else:
+                yield emit(f"LOG: [1/4] No existing container named '{container_name}' found — creating fresh.")
+
+            has_compose = bool(compose_yaml and not compose_yaml.startswith("# compose generation failed"))
+
+            if has_compose:
+                yield emit("LOG: [2/4] Deploying from stored compose YAML via Docker SDK…")
+                failed = False
+                async for deploy_line in _deploy_compose_stream(compose_yaml, host_url):
+                    # Translate DEPLOY_DONE/DEPLOY_ERROR into RECREATE_ equivalents
+                    if deploy_line.startswith("data: DEPLOY_ERROR:"):
+                        msg = deploy_line[len("data: DEPLOY_ERROR:"):]
+                        yield emit(f"RECREATE_ERROR:{msg.strip()}")
+                        failed = True
+                        break
+                    elif deploy_line.strip() == "data: DEPLOY_DONE":
+                        break
+                    else:
+                        yield deploy_line
+                if failed:
+                    return
+
+            else:
+                if not config_json:
+                    yield emit("RECREATE_ERROR:Backup has no config data to restore from.")
+                    return
+                yield emit("LOG: [2/4] No compose YAML in backup — restoring from inspect config…")
+                attrs = config_json if isinstance(config_json, dict) else json.loads(config_json)
+
+                def _recreate_from_config():
+                    client = _make_docker_client(host_url)
+                    try:
+                        cfg  = attrs.get("Config", {})
+                        hcfg = attrs.get("HostConfig", {})
+                        net_sets = attrs.get("NetworkSettings", {})
+
+                        bak_name = None
+                        try:
+                            cur = client.containers.get(container_name)
+                            if cur.status not in ("exited", "created"):
+                                cur.stop(timeout=15)
+                            ts = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
+                            bak_name = f"{container_name}_restore_{ts}"
+                            cur.rename(bak_name)
+                        except docker_sdk.errors.NotFound:
+                            pass
+
+                        port_bindings, exposed_ports = _extract_ports_from_network_settings(
+                            hcfg.get("PortBindings") or net_sets.get("Ports")
+                        )
+                        binds = {
+                            m["Source"]: {"bind": m["Destination"], "mode": m.get("Mode", "rw")}
+                            for m in (attrs.get("Mounts") or [])
+                            if m.get("Type") == "bind" and m.get("Source") and m.get("Destination")
+                        }
+                        vol_binds = {
+                            m["Name"]: {"bind": m["Destination"], "mode": m.get("Mode", "rw")}
+                            for m in (attrs.get("Mounts") or [])
+                            if m.get("Type") == "volume" and m.get("Name") and m.get("Destination")
+                        }
+                        all_binds = {**binds, **vol_binds} or None
+                        rp_raw = hcfg.get("RestartPolicy") or {"Name": "no"}
+                        rp = {
+                            "Name": rp_raw.get("Name", "no") if isinstance(rp_raw, dict) else "no",
+                            "MaximumRetryCount": rp_raw.get("MaximumRetryCount", 0) if isinstance(rp_raw, dict) else 0,
+                        }
+                        net_mode = hcfg.get("NetworkMode", "bridge")
+                        _net_lo = (net_mode or "").lower()
+                        _hostname = (
+                            None if _net_lo in ("host", "none") or _net_lo.startswith("container:")
+                            else (cfg.get("Hostname") or container_name)
+                        )
+                        if _net_lo in ("host", "none") or _net_lo.startswith("container:"):
+                            port_bindings, exposed_ports = None, []
+
+                        try:
+                            _cres = client.api.create_container(
+                                image        = cfg.get("Image"),
+                                name         = container_name,
+                                command      = cfg.get("Cmd"),
+                                environment  = cfg.get("Env"),
+                                labels       = cfg.get("Labels"),
+                                ports        = exposed_ports or list((cfg.get("ExposedPorts") or {}).keys()) or None,
+                                hostname     = _hostname,
+                                working_dir  = cfg.get("WorkingDir") or None,
+                                entrypoint   = cfg.get("Entrypoint"),
+                                user         = cfg.get("User") or None,
+                                tty          = cfg.get("Tty", False),
+                                stdin_open   = cfg.get("OpenStdin", False),
+                                host_config  = client.api.create_host_config(
+                                    port_bindings = port_bindings or None,
+                                    binds         = all_binds,
+                                    volumes_from  = hcfg.get("VolumesFrom") or None,
+                                    network_mode  = net_mode,
+                                    privileged    = hcfg.get("Privileged", False),
+                                    cap_add       = hcfg.get("CapAdd") or None,
+                                    cap_drop      = hcfg.get("CapDrop") or None,
+                                    devices       = hcfg.get("Devices") or None,
+                                    dns           = hcfg.get("Dns") or None,
+                                    dns_search    = hcfg.get("DnsSearch") or None,
+                                    extra_hosts   = hcfg.get("ExtraHosts") or None,
+                                    sysctls       = hcfg.get("Sysctls") or None,
+                                    mem_limit     = hcfg.get("Memory") or None,
+                                    nano_cpus     = hcfg.get("NanoCpus") or None,
+                                    log_config    = hcfg.get("LogConfig") or None,
+                                    pid_mode      = hcfg.get("PidMode") or None,
+                                    userns_mode   = hcfg.get("UsernsMode") or None,
+                                    security_opt  = hcfg.get("SecurityOpt") or None,
+                                    tmpfs         = hcfg.get("Tmpfs") or None,
+                                    shm_size      = hcfg.get("ShmSize") or None,
+                                    ipc_mode      = hcfg.get("IpcMode") or None,
+                                    read_only     = hcfg.get("ReadonlyRootfs", False),
+                                    restart_policy= rp,
+                                ),
+                            )
+                            new_c = client.containers.get(_cres["Id"])
+                            new_c.start()
+                            if bak_name:
+                                try:
+                                    client.containers.get(bak_name).remove(force=True)
+                                except Exception:
+                                    pass
+                        except Exception:
+                            if bak_name:
+                                try:
+                                    b = client.containers.get(bak_name)
+                                    b.rename(container_name)
+                                    b.start()
+                                except Exception:
+                                    pass
+                            raise
+                    finally:
+                        client.close()
+
+                yield emit("LOG: [3/4] Stopping current container and recreating from config…")
+                await asyncio.to_thread(_recreate_from_config)
+
+            yield emit(f"LOG: [4/4] ✓ Container '{container_name}' restored from backup {backup_id}.")
+            yield emit("RECREATE_DONE")
+
+        except Exception as e:
+            yield emit(f"RECREATE_ERROR:{e}")
+
+    return StreamingResponse(
+        _stream(), media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+class DeployComposeBody(BaseModel):
+    yaml: str
+
+
+@router.post("/docker/containers/{container_id}/deploy-compose")
+async def deploy_compose_endpoint(container_id: str, body: DeployComposeBody, request: Request):
+    """SSE: Deploy (or redeploy) a container using a user-provided compose YAML."""
+    _verify_token(request)
+    if _parse_proxmox_id(container_id):
+        raise HTTPException(400, "Not available for Proxmox containers.")
+
+    try:
+        import yaml as _yaml
+        _yaml.safe_load(body.yaml)
+    except Exception as e:
+        raise HTTPException(422, f"Invalid YAML: {e}")
+
+    db = _SessionLocal()
+    try:
+        host_url, _, _ = _resolve_host(db, container_id)
+    finally:
+        db.close()
+
+    async def _stream():
+        try:
+            async for line in _deploy_compose_stream(body.yaml, host_url):
+                yield line
+        except Exception as e:
+            import traceback as _tb
+            print(f"[deploy-compose] unhandled stream error: {_tb.format_exc()}", flush=True)
+            yield f"data: DEPLOY_ERROR:Internal error: {e}\n\n"
+
+    return StreamingResponse(
+        _stream(), media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
 
 
 class PinBody(BaseModel):

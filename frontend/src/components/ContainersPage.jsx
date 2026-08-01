@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback, useMemo, useRef } from 'react'
-import { Box, RefreshCw, Search, AlertCircle, Play, Square, Loader2, LayoutGrid, List, ArrowUpDown, ShieldAlert, Network, GitBranch, X, Sparkles, ChevronDown, ChevronRight, Settings2, ArrowUpCircle, Download } from 'lucide-react'
+import { Box, RefreshCw, Search, AlertCircle, Play, Square, Loader2, LayoutGrid, List, ArrowUpDown, ShieldAlert, Network, GitBranch, X, Sparkles, ChevronDown, ChevronRight, Settings2, ArrowUpCircle, Download, SlidersHorizontal } from 'lucide-react'
 import { api } from '../api'
 import { ContainerCard } from './ContainerCard'
 import { ContainerDrawer } from './ContainerDrawer'
@@ -191,10 +191,13 @@ const AUTO_UPDATE_MODES = [
 function UpdateSchedulePanel() {
   const [open,        setOpen]        = useState(false)
   const [saving,      setSaving]      = useState(false)
+  const [saveError,   setSaveError]   = useState('')
   const [enabled,     setEnabled]     = useState(false)
   const [hour,        setHour]        = useState(3)
   const [days,        setDays]        = useState([])   // [] = every day
   const [autoMode,    setAutoMode]    = useState('disabled')
+  const [vulnPolicy,  setVulnPolicy]  = useState('block_on_critical')
+  const [blockWorse,  setBlockWorse]  = useState(false)
   const [loaded,      setLoaded]      = useState(false)
 
   useEffect(() => {
@@ -207,16 +210,20 @@ function UpdateSchedulePanel() {
       setHour(parseInt(get('container_check_hour', '3'), 10) || 3)
       try { setDays(JSON.parse(get('container_check_days', '[]'))) } catch { setDays([]) }
       setAutoMode(get('container_auto_update', 'disabled'))
+      setVulnPolicy(get('container_update_vuln_policy', 'block_on_critical'))
+      setBlockWorse(get('container_update_block_if_worse', 'false') === 'true')
       setLoaded(true)
     }).catch(() => {})
   }, [])
 
   async function save(key, value) {
     setSaving(true)
+    setSaveError('')
     try {
       await api.updateSetting(key, value)
-    } catch (_) {}
-    finally { setSaving(false) }
+    } catch (e) {
+      setSaveError((e?.message || String(e)).replace(/^.*?\d{3}[: ]*/, '') || 'Save failed.')
+    } finally { setSaving(false) }
   }
 
   function toggleEnabled(val) {
@@ -245,6 +252,16 @@ function UpdateSchedulePanel() {
     save('container_auto_update', val)
   }
 
+  function changeVulnPolicy(val) {
+    setVulnPolicy(val)
+    save('container_update_vuln_policy', val)
+  }
+
+  function toggleBlockWorse(val) {
+    setBlockWorse(val)
+    save('container_update_block_if_worse', val ? 'true' : 'false')
+  }
+
   if (!loaded) return null
 
   return (
@@ -268,6 +285,12 @@ function UpdateSchedulePanel() {
             Schedule automated checks for newer container image versions.
             All updates use a blue/green strategy with automatic rollback.
           </p>
+          {saveError && (
+            <p className="text-xs px-3 py-2 rounded-lg"
+              style={{ background: 'rgba(239,68,68,0.08)', border: '1px solid rgba(239,68,68,0.3)', color: '#ef4444' }}>
+              Save failed: {saveError}
+            </p>
+          )}
 
           {/* Enable toggle */}
           <label className="flex items-center justify-between gap-3 cursor-pointer">
@@ -371,6 +394,56 @@ function UpdateSchedulePanel() {
               </select>
             </div>
 
+            {/* Vuln policy — only relevant when scan_then_update is selected */}
+            {autoMode === 'scan_then_update' && (
+              <div className="space-y-3 pt-1 border-t" style={{ borderColor: 'var(--color-border)' }}>
+                <p className="text-xs pt-2" style={{ color: 'var(--color-text-faint)' }}>
+                  Trivy will scan the new image before deploying. Choose what severity level blocks the update.
+                </p>
+
+                <div className="space-y-1">
+                  <label className="text-xs" style={{ color: 'var(--color-text-muted)' }}>Vulnerability block policy</label>
+                  <select
+                    className="w-full rounded-lg px-3 py-2 text-sm"
+                    style={{ background: 'var(--color-surface-offset)', border: '1px solid var(--color-border)', color: 'var(--color-text)' }}
+                    value={vulnPolicy}
+                    disabled={saving}
+                    onChange={e => changeVulnPolicy(e.target.value)}
+                  >
+                    <option value="always_update">Always update — ignore vulnerabilities</option>
+                    <option value="block_on_critical">Block if critical CVEs present</option>
+                    <option value="block_on_high">Block if high or critical CVEs present</option>
+                  </select>
+                </div>
+
+                {vulnPolicy !== 'always_update' && (
+                  <label className="flex items-center justify-between gap-3 cursor-pointer">
+                    <div>
+                      <span className="text-sm font-medium" style={{ color: 'var(--color-text)' }}>Block only if new image is worse</span>
+                      <p className="text-xs mt-0.5" style={{ color: 'var(--color-text-faint)' }}>
+                        Only block if the new image has <em>more</em> critical CVEs than the currently running one.
+                        If the new image is equally or less vulnerable, the update proceeds.
+                      </p>
+                    </div>
+                    <button
+                      type="button"
+                      role="switch"
+                      aria-checked={blockWorse}
+                      disabled={saving}
+                      onClick={() => toggleBlockWorse(!blockWorse)}
+                      className="relative inline-flex h-6 w-11 shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors duration-200"
+                      style={{ background: blockWorse ? 'var(--color-brand)' : 'var(--color-surface-offset)' }}
+                    >
+                      <span
+                        className="inline-block h-5 w-5 rounded-full bg-white shadow transition-transform duration-200"
+                        style={{ transform: blockWorse ? 'translateX(20px)' : 'translateX(0)' }}
+                      />
+                    </button>
+                  </label>
+                )}
+              </div>
+            )}
+
             <p className="text-xs" style={{ color: 'var(--color-text-faint)' }}>
               {enabled
                 ? `Checks run daily at ${String(hour).padStart(2,'0')}:00 UTC${days.length > 0 ? ` on ${days.slice().sort((a,b)=>a-b).map(d=>['Sun','Mon','Tue','Wed','Thu','Fri','Sat'][d]).join(', ')}` : ''}.`
@@ -397,6 +470,7 @@ export function ContainersPage({ openContainer, skin }) {
   const [hostFilter,    setHostFilter]    = useState('all')
   const [sort,          setSort]          = useState('name-asc')
   const [layout,        setLayout]        = useState('grid')
+  const [showFilters,   setShowFilters]   = useState(false)
   const [refreshing,    setRefreshing]    = useState(false)
   const [surfaceNewFirst,    setSurfaceNewFirst]    = useState(() => localStorage.getItem('inspectre_containers_surface_new') !== 'false')
   const [acknowledgedContainers, setAcknowledgedContainers] = useState(loadAcknowledgedContainers)
@@ -408,6 +482,7 @@ export function ContainersPage({ openContainer, skin }) {
   const [updateStatuses, setUpdateStatuses] = useState({})
   const [checkingAll,   setCheckingAll]   = useState(false)
   const [updatingAll,   setUpdatingAll]   = useState(false)
+  const [updateAllNotice, setUpdateAllNotice] = useState(null)
   const [checkAllStatus, setCheckAllStatus] = useState(null)
 
   const checkAllRunning = checkingAll || !!checkAllStatus?.running
@@ -439,7 +514,10 @@ export function ContainersPage({ openContainer, skin }) {
     if (pendingUpdateCount === 0) return
     setUpdatingAll(true)
     try {
-      await api.dockerUpdateAll()
+      const result = await api.dockerUpdateAll()
+      if (result?.count > 0) {
+        setUpdateAllNotice({ count: result.count, containers: result.containers || [] })
+      }
       setTimeout(() => load(true), 2000)
     } catch (_) {}
     finally { setUpdatingAll(false) }
@@ -668,166 +746,255 @@ export function ContainersPage({ openContainer, skin }) {
       )}
 
       {/* Toolbar */}
-      {!disabled && !loading && (
-        <section className="flex flex-wrap gap-2 items-center">
-          <div className="relative" style={{ minWidth: '160px', flex: '1 1 160px', maxWidth: '340px' }}>
-            <Search size={15} className="absolute left-3 top-1/2 -translate-y-1/2 pointer-events-none"
-              style={{ color: 'var(--color-text-muted)' }} />
-            <input className="input pl-9 w-full" placeholder="Search containers…"
-              value={search} onChange={e => setSearch(e.target.value)} />
-            {search && (
-              <button onClick={() => setSearch('')}
-                className="absolute right-2 top-1/2 -translate-y-1/2 rounded p-0.5 transition-colors hover:opacity-70"
-                style={{ color: 'var(--color-text-muted)' }} aria-label="Clear search">
-                <X size={13} />
-              </button>
-            )}
-          </div>
+      {!disabled && !loading && (() => {
+        const activeFilterCount =
+          (filter !== 'all' ? 1 : 0) +
+          Object.keys(smartFilters).length +
+          (hostFilter !== 'all' ? 1 : 0)
+        const filtersActive = activeFilterCount > 0
 
-          <div className="flex items-center gap-1 flex-wrap">
-            {STATUS_FILTERS.map(f => (
-              <button key={f.value}
-                onClick={() => setFilter(f.value)}
-                className="px-3 py-1.5 rounded-xl text-xs font-medium border transition-colors"
-                style={filter === f.value
-                  ? { background: 'var(--color-brand)', color: 'white', borderColor: 'transparent' }
-                  : { background: 'var(--color-surface-offset)', color: 'var(--color-text-muted)', borderColor: 'var(--color-border)' }}>
-                {f.label}
-              </button>
-            ))}
-          </div>
-
-          {/* Smart filters — click to cycle: off → include (green) → exclude (red) → off */}
-          <div className="flex items-center gap-1 flex-wrap">
-            {[
-              { key: 'vulnerable',  label: 'Vulnerable',     icon: ShieldAlert },
-              { key: 'has_update',  label: 'Has Update',     icon: ArrowUpCircle },
-              { key: 'host_net',    label: 'Host Network',   icon: Network },
-              { key: 'bridge_net',  label: 'Bridge Network', icon: GitBranch },
-            ].map(({ key, label, icon: Icon }) => {
-              const state = smartFilters[key] || null
-              const style = state === 'include'
-                ? { background: 'rgba(34,197,94,0.18)',  color: '#22c55e', borderColor: 'rgba(34,197,94,0.45)' }
-                : state === 'exclude'
-                  ? { background: 'rgba(239,68,68,0.15)', color: '#ef4444', borderColor: 'rgba(239,68,68,0.4)' }
-                  : { background: 'var(--color-surface-offset)', color: 'var(--color-text-muted)', borderColor: 'var(--color-border)' }
-              return (
-                <button key={key}
-                  onClick={() => setSmartFilters(prev => {
-                    const cur = prev[key]
-                    if (!cur)              return { ...prev, [key]: 'include' }
-                    if (cur === 'include') return { ...prev, [key]: 'exclude' }
-                    const next = { ...prev }; delete next[key]; return next
-                  })}
-                  title={state ? `${label}: ${state} — click to cycle` : `${label}: off — click to include`}
-                  className="flex items-center gap-1 px-3 py-1.5 rounded-xl text-xs font-medium border transition-colors"
-                  style={style}>
-                  <Icon size={11} />
-                  {label}{state && <span className="ml-0.5 opacity-70 text-[10px]">{state === 'include' ? '✓' : '✕'}</span>}
+        return (
+          <section className="space-y-2">
+            {/* ── Search row: full-width on mobile ── */}
+            <div className="relative">
+              <Search size={14} className="absolute left-2.5 top-1/2 -translate-y-1/2 pointer-events-none"
+                style={{ color: 'var(--color-text-muted)' }} />
+              <input className="input pl-8 w-full" placeholder="Search containers…"
+                value={search} onChange={e => setSearch(e.target.value)} />
+              {search && (
+                <button onClick={() => setSearch('')}
+                  className="absolute right-2 top-1/2 -translate-y-1/2 rounded p-0.5 hover:opacity-70"
+                  style={{ color: 'var(--color-text-muted)' }} aria-label="Clear search">
+                  <X size={12} />
                 </button>
-              )
-            })}
-            {Object.keys(smartFilters).length > 0 && (
-              <button onClick={() => setSmartFilters({})}
-                className="px-2 py-1.5 rounded-xl text-xs border transition-colors"
-                style={{ color: 'var(--color-text-faint)', borderColor: 'var(--color-border)', background: 'transparent' }}>
-                Clear
-              </button>
-            )}
-          </div>
+              )}
+            </div>
 
-          {hostOptions.length > 1 && (
-            <div className="flex items-center gap-1 flex-wrap">
-              <span className="text-[10px] font-semibold uppercase tracking-wider mr-1" style={{ color: 'var(--color-text-faint)' }}>Host:</span>
+            {/* ── Controls row ── */}
+            <div className="flex items-center gap-2">
+              {/* Filters toggle button */}
               <button
-                onClick={() => setHostFilter('all')}
-                className="px-3 py-1.5 rounded-xl text-xs font-medium border transition-colors"
-                style={hostFilter === 'all'
+                onClick={() => setShowFilters(v => !v)}
+                className="flex items-center gap-1.5 px-3 py-2 rounded-xl text-xs font-medium border transition-colors shrink-0 relative"
+                style={showFilters || filtersActive
                   ? { background: 'var(--color-brand)', color: 'white', borderColor: 'transparent' }
                   : { background: 'var(--color-surface-offset)', color: 'var(--color-text-muted)', borderColor: 'var(--color-border)' }}>
-                All
+                <SlidersHorizontal size={13} />
+                <span>Filters</span>
+                {filtersActive && !showFilters && (
+                  <span className="ml-0.5 px-1.5 py-0.5 rounded-full text-[10px] font-bold"
+                    style={{ background: 'rgba(255,255,255,0.25)', color: 'white' }}>
+                    {activeFilterCount}
+                  </span>
+                )}
               </button>
-              {hostOptions.map(h => (
-                <button key={h.id}
-                  onClick={() => setHostFilter(h.id)}
-                  className="px-3 py-1.5 rounded-xl text-xs font-medium border transition-colors"
-                  style={hostFilter === h.id
-                    ? { background: 'var(--color-brand)', color: 'white', borderColor: 'transparent' }
-                    : { background: 'var(--color-surface-offset)', color: 'var(--color-text-muted)', borderColor: 'var(--color-border)' }}>
-                  {h.name}
-                </button>
-              ))}
-            </div>
-          )}
 
-          <div className="ml-auto flex items-center gap-1">
-            {/* Surface new first toggle */}
-            <button
-              onClick={toggleSurfaceNewFirst}
-              title={surfaceNewFirst ? 'New containers surfaced to top (click to disable)' : 'New containers not surfaced (click to enable)'}
-              className="flex items-center gap-1 px-2.5 py-1.5 rounded-xl text-xs font-medium border transition-colors"
-              style={surfaceNewFirst
-                ? { background: 'rgba(16,185,129,0.12)', color: '#10b981', borderColor: 'rgba(16,185,129,0.35)' }
-                : { background: 'var(--color-surface-offset)', color: 'var(--color-text-faint)', borderColor: 'var(--color-border)' }}
-            >
-              <Sparkles size={11} />
-              <span>New first</span>
-            </button>
-            {/* Sort */}
-            <div className="flex items-center gap-1 mr-1">
-              <ArrowUpDown size={13} style={{ color: 'var(--color-text-faint)' }} />
-              <select className="input text-xs py-1" value={sort} onChange={e => setSort(e.target.value)}>
-                {SORT_OPTIONS.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
-              </select>
+              {/* Right-side controls */}
+              <div className="ml-auto flex items-center gap-1 shrink-0">
+                {/* New first — label hidden on small screens */}
+                <button
+                  onClick={toggleSurfaceNewFirst}
+                  title={surfaceNewFirst ? 'New containers surfaced to top (click to disable)' : 'Surface new containers first'}
+                  className="flex items-center gap-1 px-2 py-1.5 rounded-xl text-xs font-medium border transition-colors"
+                  style={surfaceNewFirst
+                    ? { background: 'rgba(16,185,129,0.12)', color: '#10b981', borderColor: 'rgba(16,185,129,0.35)' }
+                    : { background: 'var(--color-surface-offset)', color: 'var(--color-text-faint)', borderColor: 'var(--color-border)' }}>
+                  <Sparkles size={11} />
+                  <span className="hidden sm:inline">New first</span>
+                </button>
+
+                {/* Sort — label hidden on small screens */}
+                <div className="hidden sm:flex items-center gap-1">
+                  <ArrowUpDown size={13} style={{ color: 'var(--color-text-faint)' }} />
+                  <select className="input text-xs py-1" value={sort} onChange={e => setSort(e.target.value)}>
+                    {SORT_OPTIONS.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
+                  </select>
+                </div>
+
+                {/* Layout toggle */}
+                <button onClick={() => setLayout('grid')} className="btn-ghost p-1.5"
+                  title="Grid view" aria-label="Grid view"
+                  style={{ color: layout === 'grid' ? 'var(--color-brand)' : undefined }}>
+                  <LayoutGrid size={14} />
+                </button>
+                <button onClick={() => setLayout('list')} className="btn-ghost p-1.5"
+                  title="List view" aria-label="List view"
+                  style={{ color: layout === 'list' ? 'var(--color-brand)' : undefined }}>
+                  <List size={14} />
+                </button>
+
+                {/* Check all */}
+                <button
+                  onClick={checkAllUpdates}
+                  disabled={checkAllRunning}
+                  title="Check all containers for image updates"
+                  className="flex items-center gap-1.5 px-2 py-1.5 rounded-xl text-xs font-medium border transition-colors"
+                  style={{ background: 'var(--color-surface-offset)', color: 'var(--color-text-muted)', borderColor: 'var(--color-border)' }}>
+                  <RefreshCw size={11} className={checkAllRunning ? 'animate-spin' : ''} />
+                  <span className="hidden sm:inline">{checkAllRunning ? 'Checking…' : 'Check all'}</span>
+                </button>
+
+                {/* Update all */}
+                {pendingUpdateCount > 0 && (
+                  <button
+                    onClick={updateAllPending}
+                    disabled={updatingAll}
+                    title={`Update all ${pendingUpdateCount} container${pendingUpdateCount !== 1 ? 's' : ''} with available updates`}
+                    className="flex items-center gap-1 px-2 py-1.5 rounded-xl text-xs font-medium border transition-colors"
+                    style={{ background: 'rgba(59,130,246,0.15)', color: '#3b82f6', borderColor: 'rgba(59,130,246,0.4)' }}>
+                    <Download size={11} className={updatingAll ? 'animate-spin' : ''} />
+                    <span className="hidden sm:inline">{updatingAll ? 'Queuing…' : 'Update all'}</span>
+                    {!updatingAll && (
+                      <span className="px-1.5 py-0.5 rounded-full text-[10px] font-bold"
+                        style={{ background: '#3b82f6', color: 'white' }}>
+                        {pendingUpdateCount}
+                      </span>
+                    )}
+                  </button>
+                )}
+
+                {/* Refresh */}
+                <button onClick={() => load(true)} disabled={refreshing}
+                  className="btn-ghost p-1.5" title="Refresh" aria-label="Refresh containers">
+                  <RefreshCw size={14} className={refreshing ? 'animate-spin' : ''} />
+                </button>
+              </div>
             </div>
-            {/* Layout toggle */}
-            <button onClick={() => setLayout('grid')} className="btn-ghost p-2"
-              title="Grid view" aria-label="Grid view"
-              style={{ color: layout === 'grid' ? 'var(--color-brand)' : undefined }}>
-              <LayoutGrid size={15} />
-            </button>
-            <button onClick={() => setLayout('list')} className="btn-ghost p-2"
-              title="List view" aria-label="List view"
-              style={{ color: layout === 'list' ? 'var(--color-brand)' : undefined }}>
-              <List size={15} />
-            </button>
-            <button
-              onClick={checkAllUpdates}
-              disabled={checkAllRunning}
-              title="Check all containers for image updates"
-              className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-xl text-xs font-medium border transition-colors"
-              style={{ background: 'var(--color-surface-offset)', color: 'var(--color-text-muted)', borderColor: 'var(--color-border)' }}>
-              <RefreshCw size={11} className={checkAllRunning ? 'animate-spin' : ''} />
-              {checkAllRunning ? 'Checking…' : 'Check all'}
-            </button>
+
+            {/* Check-all progress bar — shown below the toolbar so it doesn't crowd the row */}
             {checkAllRunning && (
-              <div className="max-w-[240px] truncate text-[11px]" style={{ color: 'var(--color-text-faint)' }}>
-                Checking {checkAllStatus?.completed || 0}/{checkAllStatus?.total || '…'}
-                {checkAllStatus?.current_container ? `: ${checkAllStatus.current_container}` : ''}
+              <div className="flex items-center gap-2 text-[11px] px-1" style={{ color: 'var(--color-text-faint)' }}>
+                <RefreshCw size={11} className="animate-spin shrink-0" style={{ color: 'var(--color-brand)' }} />
+                <span className="truncate">
+                  Checking {checkAllStatus?.completed || 0}/{checkAllStatus?.total || '…'}
+                  {checkAllStatus?.current_container ? ` — ${checkAllStatus.current_container}` : ''}
+                </span>
               </div>
             )}
-            {pendingUpdateCount > 0 && (
-              <button
-                onClick={updateAllPending}
-                disabled={updatingAll}
-                title={`Update all ${pendingUpdateCount} container${pendingUpdateCount !== 1 ? 's' : ''} with available updates`}
-                className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-xl text-xs font-medium border transition-colors"
-                style={{ background: 'rgba(59,130,246,0.15)', color: '#3b82f6', borderColor: 'rgba(59,130,246,0.4)' }}>
-                <Download size={11} className={updatingAll ? 'animate-pulse' : ''} />
-                Update all
-                <span className="ml-0.5 px-1.5 py-0.5 rounded-full text-[10px] font-bold"
-                  style={{ background: '#3b82f6', color: 'white' }}>
-                  {pendingUpdateCount}
+
+            {/* Update-all notice — persists while background updates are running */}
+            {updateAllNotice && (
+              <div className="flex items-center gap-2 text-[11px] px-1">
+                <Download size={11} className="animate-pulse shrink-0" style={{ color: '#3b82f6' }} />
+                <span className="truncate" style={{ color: 'var(--color-text-faint)' }}>
+                  Updating {updateAllNotice.count} container{updateAllNotice.count !== 1 ? 's' : ''} in the background
+                  {updateAllNotice.containers.length > 0 ? ` — ${updateAllNotice.containers.join(', ')}` : ''}
                 </span>
-              </button>
+                <button onClick={() => setUpdateAllNotice(null)} className="ml-auto shrink-0 p-0.5 rounded hover:opacity-70 transition-opacity"
+                  style={{ color: 'var(--color-text-faint)' }} title="Dismiss">
+                  <X size={11} />
+                </button>
+              </div>
             )}
-            <button onClick={() => load(true)} disabled={refreshing}
-              className="btn-ghost p-2" title="Refresh" aria-label="Refresh containers">
-              <RefreshCw size={15} className={refreshing ? 'animate-spin' : ''} />
-            </button>
-          </div>
-        </section>
-      )}
+
+            {/* ── Filter panel: shown when Filters button is toggled ── */}
+            {showFilters && (
+              <div className="rounded-xl border p-3 space-y-3"
+                style={{ background: 'var(--color-surface-offset)', borderColor: 'var(--color-border)' }}>
+
+                {/* Status */}
+                <div className="space-y-1.5">
+                  <span className="text-[10px] font-semibold uppercase tracking-wider" style={{ color: 'var(--color-text-faint)' }}>Status</span>
+                  <div className="flex items-center gap-1.5 flex-wrap">
+                    {STATUS_FILTERS.map(f => (
+                      <button key={f.value}
+                        onClick={() => setFilter(f.value)}
+                        className="px-3 py-1.5 rounded-xl text-xs font-medium border transition-colors"
+                        style={filter === f.value
+                          ? { background: 'var(--color-brand)', color: 'white', borderColor: 'transparent' }
+                          : { background: 'var(--color-surface)', color: 'var(--color-text-muted)', borderColor: 'var(--color-border)' }}>
+                        {f.label}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+
+                {/* Smart filters */}
+                <div className="space-y-1.5">
+                  <span className="text-[10px] font-semibold uppercase tracking-wider" style={{ color: 'var(--color-text-faint)' }}>Smart Filters</span>
+                  <div className="flex items-center gap-1.5 flex-wrap">
+                    {[
+                      { key: 'vulnerable',  label: 'Vulnerable',     icon: ShieldAlert },
+                      { key: 'has_update',  label: 'Has Update',     icon: ArrowUpCircle },
+                      { key: 'host_net',    label: 'Host Network',   icon: Network },
+                      { key: 'bridge_net',  label: 'Bridge Network', icon: GitBranch },
+                    ].map(({ key, label, icon: Icon }) => {
+                      const state = smartFilters[key] || null
+                      const style = state === 'include'
+                        ? { background: 'rgba(34,197,94,0.18)',  color: '#22c55e', borderColor: 'rgba(34,197,94,0.45)' }
+                        : state === 'exclude'
+                          ? { background: 'rgba(239,68,68,0.15)', color: '#ef4444', borderColor: 'rgba(239,68,68,0.4)' }
+                          : { background: 'var(--color-surface)', color: 'var(--color-text-muted)', borderColor: 'var(--color-border)' }
+                      return (
+                        <button key={key}
+                          onClick={() => setSmartFilters(prev => {
+                            const cur = prev[key]
+                            if (!cur)              return { ...prev, [key]: 'include' }
+                            if (cur === 'include') return { ...prev, [key]: 'exclude' }
+                            const next = { ...prev }; delete next[key]; return next
+                          })}
+                          title={state ? `${label}: ${state} — click to cycle` : `${label}: off — click to include`}
+                          className="flex items-center gap-1 px-3 py-1.5 rounded-xl text-xs font-medium border transition-colors"
+                          style={style}>
+                          <Icon size={11} />
+                          {label}
+                          {state && <span className="ml-0.5 opacity-70 text-[10px]">{state === 'include' ? '✓' : '✕'}</span>}
+                        </button>
+                      )
+                    })}
+                  </div>
+                </div>
+
+                {/* Host filter — only when multiple hosts */}
+                {hostOptions.length > 1 && (
+                  <div className="space-y-1.5">
+                    <span className="text-[10px] font-semibold uppercase tracking-wider" style={{ color: 'var(--color-text-faint)' }}>Host</span>
+                    <div className="flex items-center gap-1.5 flex-wrap">
+                      <button onClick={() => setHostFilter('all')}
+                        className="px-3 py-1.5 rounded-xl text-xs font-medium border transition-colors"
+                        style={hostFilter === 'all'
+                          ? { background: 'var(--color-brand)', color: 'white', borderColor: 'transparent' }
+                          : { background: 'var(--color-surface)', color: 'var(--color-text-muted)', borderColor: 'var(--color-border)' }}>
+                        All
+                      </button>
+                      {hostOptions.map(h => (
+                        <button key={h.id} onClick={() => setHostFilter(h.id)}
+                          className="px-3 py-1.5 rounded-xl text-xs font-medium border transition-colors"
+                          style={hostFilter === h.id
+                            ? { background: 'var(--color-brand)', color: 'white', borderColor: 'transparent' }
+                            : { background: 'var(--color-surface)', color: 'var(--color-text-muted)', borderColor: 'var(--color-border)' }}>
+                          {h.name}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                )}
+
+                {/* Sort (visible on mobile; hidden on sm+ where it's in the top row) */}
+                <div className="sm:hidden space-y-1.5">
+                  <span className="text-[10px] font-semibold uppercase tracking-wider" style={{ color: 'var(--color-text-faint)' }}>Sort</span>
+                  <div className="flex items-center gap-1.5">
+                    <ArrowUpDown size={13} style={{ color: 'var(--color-text-faint)' }} />
+                    <select className="input text-xs py-1 flex-1" value={sort} onChange={e => setSort(e.target.value)}>
+                      {SORT_OPTIONS.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
+                    </select>
+                  </div>
+                </div>
+
+                {/* Clear all */}
+                {filtersActive && (
+                  <button
+                    onClick={() => { setFilter('all'); setSmartFilters({}); setHostFilter('all') }}
+                    className="text-xs px-3 py-1.5 rounded-xl border transition-colors"
+                    style={{ color: 'var(--color-text-faint)', borderColor: 'var(--color-border)', background: 'transparent' }}>
+                    Clear all filters
+                  </button>
+                )}
+              </div>
+            )}
+          </section>
+        )
+      })()}
 
       {/* Content */}
       {loading ? (
