@@ -91,6 +91,11 @@ _confirmed_offline_lock = threading.Lock()
 _offline_at:   dict[str, datetime] = {}
 _offline_lock = threading.Lock()
 
+# Deferred offline events: device went offline but the event write is held for
+# FLAP_SUPPRESS_SECONDS so that brief dropouts produce no timeline noise.
+_pending_offline_events: dict[str, tuple] = {}  # mac -> (timestamp, detail_dict)
+_pending_offline_lock = threading.Lock()
+
 _scan_lock = threading.Lock()
 _scanning:  set[str] = set()
 

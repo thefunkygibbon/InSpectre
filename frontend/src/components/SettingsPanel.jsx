@@ -109,13 +109,21 @@ const SETTING_META = {
     description: 'How often to check Docker registries for newer image versions. Uses only registry manifest calls — no image pulls.' },
   container_auto_update: { label: 'Auto-Update Mode', type: 'select', tab: 'docker',
     options: [
-      { value: 'disabled',        label: 'Disabled — notify only' },
-      { value: 'scan_then_update', label: 'Scan then update (block on critical CVEs)' },
-      { value: 'auto',            label: 'Auto-update (no scan gate)' },
+      { value: 'disabled',         label: 'Disabled — check only, no action' },
+      { value: 'notify',           label: 'Notify only — alert when update found' },
+      { value: 'scan_then_update', label: 'Scan then update — Trivy scan, then update if policy allows' },
+      { value: 'auto',             label: 'Auto — update immediately (no scan gate)' },
     ],
     description: 'What to do when an update is detected. Scan-then-update runs Trivy on the new image before deploying.' },
-  container_update_block_critical: { label: 'Block Updates with Critical CVEs', type: 'toggle', tab: 'docker',
-    description: 'Prevent container updates if the new image contains critical-severity CVEs. The update can still be forced manually from the drawer.' },
+  container_update_vuln_policy: { label: 'Vulnerability Block Policy', type: 'select', tab: 'docker',
+    options: [
+      { value: 'always_update',    label: 'Always update — ignore vulnerabilities' },
+      { value: 'block_on_critical', label: 'Block if critical CVEs present' },
+      { value: 'block_on_high',    label: 'Block if high or critical CVEs present' },
+    ],
+    description: 'When Scan-then-update mode is active, controls which vulnerability severity triggers a block. The update can still be forced manually from the container drawer.' },
+  container_update_block_if_worse: { label: 'Block Only if New Image is Worse', type: 'toggle', tab: 'docker',
+    description: 'When enabled, blocks the update only if the new image has MORE critical CVEs than the currently running image — an image that is equally or less vulnerable will proceed. Works alongside the policy above.' },
   container_backup_enabled: { label: 'Auto-Backup Before Update', type: 'toggle', tab: 'docker',
     description: 'Always capture a full config backup (docker inspect JSON + compose YAML) before any container update.' },
   container_update_health_timeout: { label: 'Health Check Timeout (seconds)', type: 'text', tab: 'docker',
@@ -254,6 +262,7 @@ export function SettingsPanel({ onClose, onSettingChange }) {
   const [blockPlugins,      setBlockPlugins]      = useState([])
   const [blockPluginError,  setBlockPluginError]  = useState('')
 
+  const [saveError,         setSaveError]         = useState('')
   const [trivyDbStatus,     setTrivyDbStatus]     = useState(null)
   const [trivyUpdating,     setTrivyUpdating]     = useState(false)
   const [trivyLines,        setTrivyLines]        = useState([])
@@ -363,6 +372,7 @@ export function SettingsPanel({ onClose, onSettingChange }) {
 
   async function handleSave() {
     setSaving(true)
+    setSaveError('')
     setBlockPluginError('')
     try {
       await Promise.all(
@@ -372,6 +382,8 @@ export function SettingsPanel({ onClose, onSettingChange }) {
       const msg = e?.message || String(e)
       if (msg.includes('block_plugin') || dirty.block_plugin_id !== undefined) {
         setBlockPluginError(msg.replace(/^.*\d+\s*/, ''))
+      } else {
+        setSaveError(msg.replace(/^.*?\d{3}[: ]*/, '') || 'Failed to save — check backend logs.')
       }
       setSaving(false)
       return
@@ -1082,7 +1094,8 @@ export function SettingsPanel({ onClose, onSettingChange }) {
                   Update schedule and auto-update mode are configured in the <strong>Containers</strong> page.
                 </p>
                 {settingsByKeys([
-                  'container_update_block_critical',
+                  'container_update_vuln_policy',
+                  'container_update_block_if_worse',
                   'container_backup_enabled',
                   'container_update_health_timeout',
                   'container_update_stagger_seconds',
@@ -1587,15 +1600,23 @@ export function SettingsPanel({ onClose, onSettingChange }) {
 
         {/* Footer */}
         {showFooter && (
-          <div className="px-6 py-4 flex gap-3" style={{ borderTop: '1px solid var(--color-border)' }}>
-            <button onClick={handleSave} disabled={!hasDirty || saving}
-              className={`btn-primary flex-1 flex items-center justify-center gap-2 ${!hasDirty || saving ? 'opacity-40 cursor-not-allowed' : ''}`}>
-              <Save size={14} />
-              {saving ? 'Saving…' : saved ? 'Saved ✓' : 'Save Changes'}
-            </button>
-            <button onClick={handleReset} className="btn-ghost flex items-center gap-2">
-              <RotateCcw size={14} /> Reset
-            </button>
+          <div className="px-6 py-4 space-y-2" style={{ borderTop: '1px solid var(--color-border)' }}>
+            {saveError && (
+              <p className="text-xs px-3 py-2 rounded-lg"
+                style={{ background: 'rgba(239,68,68,0.08)', border: '1px solid rgba(239,68,68,0.3)', color: '#ef4444' }}>
+                Save failed: {saveError}
+              </p>
+            )}
+            <div className="flex gap-3">
+              <button onClick={handleSave} disabled={!hasDirty || saving}
+                className={`btn-primary flex-1 flex items-center justify-center gap-2 ${!hasDirty || saving ? 'opacity-40 cursor-not-allowed' : ''}`}>
+                <Save size={14} />
+                {saving ? 'Saving…' : saved ? 'Saved ✓' : 'Save Changes'}
+              </button>
+              <button onClick={handleReset} className="btn-ghost flex items-center gap-2">
+                <RotateCcw size={14} /> Reset
+              </button>
+            </div>
           </div>
         )}
       </aside>

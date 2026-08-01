@@ -12,6 +12,7 @@ from probe_models import (
     _sniffer_seen_this_interval, _sniffer_seen_lock,
     _confirmed_offline_macs, _confirmed_offline_lock,
     _offline_at, _offline_lock,
+    _pending_offline_events, _pending_offline_lock,
     _get_mac_lock,
     _store_pending_dhcp, _pop_pending_dhcp,
     _remember_name_source,
@@ -338,9 +339,13 @@ def upsert_seen_device(mac: str, ip: str, source: str) -> bool:
                     with _confirmed_offline_lock:
                         _confirmed_offline_macs.discard(mac)
                     with _offline_lock:
-                        offline_ts = _offline_at.pop(mac, None)
-                    flap = offline_ts is not None and (now - offline_ts).total_seconds() < _cfg.FLAP_SUPPRESS_SECONDS
-                    if not flap and not getattr(existing, "suppress_presence_events", False):
+                        _offline_at.pop(mac, None)
+                    # If the offline event was still pending (not yet written), this was a
+                    # brief flap — cancel the pending event and suppress the online event too,
+                    # so neither appears in the timeline.
+                    with _pending_offline_lock:
+                        cancelled = _pending_offline_events.pop(mac, None)
+                    if cancelled is None and not getattr(existing, "suppress_presence_events", False):
                         _write_event(mac, "online", {"ip": ip, "source": source})
                 if ip_changed:
                     if is_secondary_sighting:
@@ -520,6 +525,21 @@ def update_presence_from_sweep(session, active_macs: set) -> None:
         for m in stale_macs:
             _offline_at.pop(m, None)
 
+    # Fire deferred offline events for devices that have been continuously offline
+    # for at least FLAP_SUPPRESS_SECONDS — brief dropouts shorter than this window
+    # are silently cancelled when the device returns (no timeline noise).
+    with _pending_offline_lock:
+        to_fire = [
+            (m, d) for m, (ts, d) in _pending_offline_events.items()
+            if (now - ts).total_seconds() >= _cfg.FLAP_SUPPRESS_SECONDS
+        ]
+        for m, _ in to_fire:
+            del _pending_offline_events[m]
+    for _mac, _detail in to_fire:
+        with _confirmed_offline_lock:
+            _confirmed_offline_macs.add(_mac)
+        _write_event(_mac, "offline", _detail)
+
     for dev in session.query(Device).all():
         dev_ip = (getattr(dev, "primary_ip", None) or dev.ip_address or "")
 
@@ -554,12 +574,17 @@ def update_presence_from_sweep(session, active_macs: set) -> None:
         with _offline_lock:
             _offline_at[dev.mac_address] = now
 
+        # Defer the offline event write — if the device returns before
+        # FLAP_SUPPRESS_SECONDS elapses, the pending entry is cancelled in
+        # upsert_seen_device and neither offline nor online event is written.
         with _confirmed_offline_lock:
-            already_offline = dev.mac_address in _confirmed_offline_macs
-            _confirmed_offline_macs.add(dev.mac_address)
-        if not already_offline:
-            _write_event(dev.mac_address, "offline", {
-                "ip": dev_ip,
-                "source": "sweep",
-                "elapsed_s": int((now - presence_ts).total_seconds()) if presence_ts else None,
-            })
+            already_confirmed = dev.mac_address in _confirmed_offline_macs
+        with _pending_offline_lock:
+            already_pending = dev.mac_address in _pending_offline_events
+        if not already_confirmed and not already_pending:
+            with _pending_offline_lock:
+                _pending_offline_events[dev.mac_address] = (now, {
+                    "ip": dev_ip,
+                    "source": "sweep",
+                    "elapsed_s": int((now - presence_ts).total_seconds()) if presence_ts else None,
+                })

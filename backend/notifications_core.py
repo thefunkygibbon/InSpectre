@@ -223,6 +223,7 @@ def _ha_build_url(config: dict) -> tuple[str, str]:
     return f"{scheme}://{raw_host}{port_str}/api/services/{notifier}", token
 
 
+
 async def _notify_home_assistant(config: dict, title: str, body: str) -> None:
     url, token = _ha_build_url(config)
     async with httpx.AsyncClient(verify=False, timeout=10.0) as client:
@@ -232,6 +233,7 @@ async def _notify_home_assistant(config: dict, title: str, body: str) -> None:
             headers={"Authorization": f"Bearer {token}"},
         )
         resp.raise_for_status()
+
 
 
 async def _notification_dispatch(event_type: str, title: str, body: str,

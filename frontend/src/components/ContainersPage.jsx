@@ -191,10 +191,13 @@ const AUTO_UPDATE_MODES = [
 function UpdateSchedulePanel() {
   const [open,        setOpen]        = useState(false)
   const [saving,      setSaving]      = useState(false)
+  const [saveError,   setSaveError]   = useState('')
   const [enabled,     setEnabled]     = useState(false)
   const [hour,        setHour]        = useState(3)
   const [days,        setDays]        = useState([])   // [] = every day
   const [autoMode,    setAutoMode]    = useState('disabled')
+  const [vulnPolicy,  setVulnPolicy]  = useState('block_on_critical')
+  const [blockWorse,  setBlockWorse]  = useState(false)
   const [loaded,      setLoaded]      = useState(false)
 
   useEffect(() => {
@@ -207,16 +210,20 @@ function UpdateSchedulePanel() {
       setHour(parseInt(get('container_check_hour', '3'), 10) || 3)
       try { setDays(JSON.parse(get('container_check_days', '[]'))) } catch { setDays([]) }
       setAutoMode(get('container_auto_update', 'disabled'))
+      setVulnPolicy(get('container_update_vuln_policy', 'block_on_critical'))
+      setBlockWorse(get('container_update_block_if_worse', 'false') === 'true')
       setLoaded(true)
     }).catch(() => {})
   }, [])
 
   async function save(key, value) {
     setSaving(true)
+    setSaveError('')
     try {
       await api.updateSetting(key, value)
-    } catch (_) {}
-    finally { setSaving(false) }
+    } catch (e) {
+      setSaveError((e?.message || String(e)).replace(/^.*?\d{3}[: ]*/, '') || 'Save failed.')
+    } finally { setSaving(false) }
   }
 
   function toggleEnabled(val) {
@@ -245,6 +252,16 @@ function UpdateSchedulePanel() {
     save('container_auto_update', val)
   }
 
+  function changeVulnPolicy(val) {
+    setVulnPolicy(val)
+    save('container_update_vuln_policy', val)
+  }
+
+  function toggleBlockWorse(val) {
+    setBlockWorse(val)
+    save('container_update_block_if_worse', val ? 'true' : 'false')
+  }
+
   if (!loaded) return null
 
   return (
@@ -268,6 +285,12 @@ function UpdateSchedulePanel() {
             Schedule automated checks for newer container image versions.
             All updates use a blue/green strategy with automatic rollback.
           </p>
+          {saveError && (
+            <p className="text-xs px-3 py-2 rounded-lg"
+              style={{ background: 'rgba(239,68,68,0.08)', border: '1px solid rgba(239,68,68,0.3)', color: '#ef4444' }}>
+              Save failed: {saveError}
+            </p>
+          )}
 
           {/* Enable toggle */}
           <label className="flex items-center justify-between gap-3 cursor-pointer">
@@ -371,6 +394,56 @@ function UpdateSchedulePanel() {
               </select>
             </div>
 
+            {/* Vuln policy — only relevant when scan_then_update is selected */}
+            {autoMode === 'scan_then_update' && (
+              <div className="space-y-3 pt-1 border-t" style={{ borderColor: 'var(--color-border)' }}>
+                <p className="text-xs pt-2" style={{ color: 'var(--color-text-faint)' }}>
+                  Trivy will scan the new image before deploying. Choose what severity level blocks the update.
+                </p>
+
+                <div className="space-y-1">
+                  <label className="text-xs" style={{ color: 'var(--color-text-muted)' }}>Vulnerability block policy</label>
+                  <select
+                    className="w-full rounded-lg px-3 py-2 text-sm"
+                    style={{ background: 'var(--color-surface-offset)', border: '1px solid var(--color-border)', color: 'var(--color-text)' }}
+                    value={vulnPolicy}
+                    disabled={saving}
+                    onChange={e => changeVulnPolicy(e.target.value)}
+                  >
+                    <option value="always_update">Always update — ignore vulnerabilities</option>
+                    <option value="block_on_critical">Block if critical CVEs present</option>
+                    <option value="block_on_high">Block if high or critical CVEs present</option>
+                  </select>
+                </div>
+
+                {vulnPolicy !== 'always_update' && (
+                  <label className="flex items-center justify-between gap-3 cursor-pointer">
+                    <div>
+                      <span className="text-sm font-medium" style={{ color: 'var(--color-text)' }}>Block only if new image is worse</span>
+                      <p className="text-xs mt-0.5" style={{ color: 'var(--color-text-faint)' }}>
+                        Only block if the new image has <em>more</em> critical CVEs than the currently running one.
+                        If the new image is equally or less vulnerable, the update proceeds.
+                      </p>
+                    </div>
+                    <button
+                      type="button"
+                      role="switch"
+                      aria-checked={blockWorse}
+                      disabled={saving}
+                      onClick={() => toggleBlockWorse(!blockWorse)}
+                      className="relative inline-flex h-6 w-11 shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors duration-200"
+                      style={{ background: blockWorse ? 'var(--color-brand)' : 'var(--color-surface-offset)' }}
+                    >
+                      <span
+                        className="inline-block h-5 w-5 rounded-full bg-white shadow transition-transform duration-200"
+                        style={{ transform: blockWorse ? 'translateX(20px)' : 'translateX(0)' }}
+                      />
+                    </button>
+                  </label>
+                )}
+              </div>
+            )}
+
             <p className="text-xs" style={{ color: 'var(--color-text-faint)' }}>
               {enabled
                 ? `Checks run daily at ${String(hour).padStart(2,'0')}:00 UTC${days.length > 0 ? ` on ${days.slice().sort((a,b)=>a-b).map(d=>['Sun','Mon','Tue','Wed','Thu','Fri','Sat'][d]).join(', ')}` : ''}.`
@@ -409,6 +482,7 @@ export function ContainersPage({ openContainer, skin }) {
   const [updateStatuses, setUpdateStatuses] = useState({})
   const [checkingAll,   setCheckingAll]   = useState(false)
   const [updatingAll,   setUpdatingAll]   = useState(false)
+  const [updateAllNotice, setUpdateAllNotice] = useState(null)
   const [checkAllStatus, setCheckAllStatus] = useState(null)
 
   const checkAllRunning = checkingAll || !!checkAllStatus?.running
@@ -440,7 +514,10 @@ export function ContainersPage({ openContainer, skin }) {
     if (pendingUpdateCount === 0) return
     setUpdatingAll(true)
     try {
-      await api.dockerUpdateAll()
+      const result = await api.dockerUpdateAll()
+      if (result?.count > 0) {
+        setUpdateAllNotice({ count: result.count, containers: result.containers || [] })
+      }
       setTimeout(() => load(true), 2000)
     } catch (_) {}
     finally { setUpdatingAll(false) }
@@ -678,23 +755,23 @@ export function ContainersPage({ openContainer, skin }) {
 
         return (
           <section className="space-y-2">
-            {/* ── Top row: always visible on all screen sizes ── */}
-            <div className="flex items-center gap-2">
-              {/* Search */}
-              <div className="relative" style={{ minWidth: 0, flex: '1 1 120px' }}>
-                <Search size={14} className="absolute left-2.5 top-1/2 -translate-y-1/2 pointer-events-none"
-                  style={{ color: 'var(--color-text-muted)' }} />
-                <input className="input pl-8 w-full" placeholder="Search…"
-                  value={search} onChange={e => setSearch(e.target.value)} />
-                {search && (
-                  <button onClick={() => setSearch('')}
-                    className="absolute right-2 top-1/2 -translate-y-1/2 rounded p-0.5 hover:opacity-70"
-                    style={{ color: 'var(--color-text-muted)' }} aria-label="Clear search">
-                    <X size={12} />
-                  </button>
-                )}
-              </div>
+            {/* ── Search row: full-width on mobile ── */}
+            <div className="relative">
+              <Search size={14} className="absolute left-2.5 top-1/2 -translate-y-1/2 pointer-events-none"
+                style={{ color: 'var(--color-text-muted)' }} />
+              <input className="input pl-8 w-full" placeholder="Search containers…"
+                value={search} onChange={e => setSearch(e.target.value)} />
+              {search && (
+                <button onClick={() => setSearch('')}
+                  className="absolute right-2 top-1/2 -translate-y-1/2 rounded p-0.5 hover:opacity-70"
+                  style={{ color: 'var(--color-text-muted)' }} aria-label="Clear search">
+                  <X size={12} />
+                </button>
+              )}
+            </div>
 
+            {/* ── Controls row ── */}
+            <div className="flex items-center gap-2">
               {/* Filters toggle button */}
               <button
                 onClick={() => setShowFilters(v => !v)}
@@ -765,12 +842,14 @@ export function ContainersPage({ openContainer, skin }) {
                     title={`Update all ${pendingUpdateCount} container${pendingUpdateCount !== 1 ? 's' : ''} with available updates`}
                     className="flex items-center gap-1 px-2 py-1.5 rounded-xl text-xs font-medium border transition-colors"
                     style={{ background: 'rgba(59,130,246,0.15)', color: '#3b82f6', borderColor: 'rgba(59,130,246,0.4)' }}>
-                    <Download size={11} className={updatingAll ? 'animate-pulse' : ''} />
-                    <span className="hidden sm:inline">Update all</span>
-                    <span className="px-1.5 py-0.5 rounded-full text-[10px] font-bold"
-                      style={{ background: '#3b82f6', color: 'white' }}>
-                      {pendingUpdateCount}
-                    </span>
+                    <Download size={11} className={updatingAll ? 'animate-spin' : ''} />
+                    <span className="hidden sm:inline">{updatingAll ? 'Queuing…' : 'Update all'}</span>
+                    {!updatingAll && (
+                      <span className="px-1.5 py-0.5 rounded-full text-[10px] font-bold"
+                        style={{ background: '#3b82f6', color: 'white' }}>
+                        {pendingUpdateCount}
+                      </span>
+                    )}
                   </button>
                 )}
 
@@ -790,6 +869,21 @@ export function ContainersPage({ openContainer, skin }) {
                   Checking {checkAllStatus?.completed || 0}/{checkAllStatus?.total || '…'}
                   {checkAllStatus?.current_container ? ` — ${checkAllStatus.current_container}` : ''}
                 </span>
+              </div>
+            )}
+
+            {/* Update-all notice — persists while background updates are running */}
+            {updateAllNotice && (
+              <div className="flex items-center gap-2 text-[11px] px-1">
+                <Download size={11} className="animate-pulse shrink-0" style={{ color: '#3b82f6' }} />
+                <span className="truncate" style={{ color: 'var(--color-text-faint)' }}>
+                  Updating {updateAllNotice.count} container{updateAllNotice.count !== 1 ? 's' : ''} in the background
+                  {updateAllNotice.containers.length > 0 ? ` — ${updateAllNotice.containers.join(', ')}` : ''}
+                </span>
+                <button onClick={() => setUpdateAllNotice(null)} className="ml-auto shrink-0 p-0.5 rounded hover:opacity-70 transition-opacity"
+                  style={{ color: 'var(--color-text-faint)' }} title="Dismiss">
+                  <X size={11} />
+                </button>
               </div>
             )}
 

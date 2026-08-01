@@ -1087,9 +1087,27 @@ async def _self_update_via_helper_stream(
         if scan_first:
             db = _SessionLocal()
             try:
-                block_on_critical = _setting(db, "container_update_block_critical", "true") == "true"
+                vuln_policy     = _setting(db, "container_update_vuln_policy", "block_on_critical")
+                block_if_worse  = _setting(db, "container_update_block_if_worse", "false") == "true"
             finally:
                 db.close()
+
+            # If block_if_worse: scan current image first so we can compare counts
+            current_critical_count = 0
+            if block_if_worse and not force:
+                yield emit("LOG: [3/3] Scanning current image for baseline CVE count…")
+                def _get_current_image_ref():
+                    c_client = _make_docker_client(host_url)
+                    try:
+                        return _container_image_ref(c_client.containers.get(container_id))
+                    finally:
+                        c_client.close()
+                try:
+                    cur_img = await asyncio.to_thread(_get_current_image_ref)
+                    _, current_critical_count, _ = await asyncio.to_thread(_trivy_scan_image, cur_img)
+                    yield emit(f"LOG: [3/3] Current image baseline: {current_critical_count} critical CVE(s).")
+                except Exception as _exc:
+                    yield emit(f"LOG: [3/3] Warning: could not scan current image for comparison: {_exc}")
 
             yield emit("LOG: [3/3] Running Trivy security scan on new image…")
             scan_vulns, critical_count, high_count = await asyncio.to_thread(
@@ -1108,24 +1126,34 @@ async def _self_update_via_helper_stream(
             finally:
                 db.close()
 
-            if critical_count > 0 and block_on_critical and not force:
-                reason_str = f"{critical_count} critical CVE(s) found in new image"
-                db = _SessionLocal()
-                try:
-                    _upsert_update_status(db, container_name, host_id,
-                                          update_blocked=True,
-                                          blocked_reason=reason_str,
-                                          update_in_progress=False,
-                                          last_update_status="blocked")
-                finally:
-                    db.close()
-                yield emit(f"LOG: [BLOCKED] {reason_str} — update aborted for safety.")
-                yield emit(f"UPDATE_BLOCKED:{critical_count}")
-                return
+            if not force:
+                block_reason = None
+                if vuln_policy == "block_on_critical" and critical_count > 0:
+                    block_reason = f"{critical_count} critical CVE(s) found in new image"
+                elif vuln_policy == "block_on_high" and (critical_count + high_count) > 0:
+                    block_reason = f"{critical_count} critical, {high_count} high CVE(s) found in new image"
+                if block_reason is None and block_if_worse and critical_count > current_critical_count:
+                    block_reason = (
+                        f"New image has more critical CVEs ({critical_count}) "
+                        f"than current ({current_critical_count})"
+                    )
+                if block_reason:
+                    db = _SessionLocal()
+                    try:
+                        _upsert_update_status(db, container_name, host_id,
+                                              update_blocked=True,
+                                              blocked_reason=block_reason,
+                                              update_in_progress=False,
+                                              last_update_status="blocked")
+                    finally:
+                        db.close()
+                    yield emit(f"LOG: [BLOCKED] {block_reason} — update aborted for safety.")
+                    yield emit(f"UPDATE_BLOCKED:{critical_count}")
+                    return
 
-            if critical_count > 0 and force:
+            if (critical_count > 0 or high_count > 0) and force:
                 yield emit(
-                    f"LOG: [WARNING] {critical_count} critical CVE(s) found "
+                    f"LOG: [WARNING] {critical_count} critical, {high_count} high CVE(s) found "
                     "— proceeding anyway (force override active)."
                 )
         else:
@@ -1646,11 +1674,29 @@ async def _safe_update_stream(
             if scan_first:
                 db = _SessionLocal()
                 try:
-                    block_on_critical = _setting(db, "container_update_block_critical", "true") == "true"
+                    vuln_policy    = _setting(db, "container_update_vuln_policy", "block_on_critical")
+                    block_if_worse = _setting(db, "container_update_block_if_worse", "false") == "true"
                 finally:
                     db.close()
 
-                yield emit(f"LOG: [3/7] Running Trivy security scan on new image…")
+                # If block_if_worse: scan current image first so we can compare
+                current_critical_count = 0
+                if block_if_worse and not force:
+                    yield emit("LOG: [3/7] Scanning current image for baseline CVE count…")
+                    def _get_cur_img_ref():
+                        c_client = _make_docker_client(host_url)
+                        try:
+                            return _container_image_ref(c_client.containers.get(container_id))
+                        finally:
+                            c_client.close()
+                    try:
+                        cur_img = await asyncio.to_thread(_get_cur_img_ref)
+                        _, current_critical_count, _ = await asyncio.to_thread(_trivy_scan_image, cur_img)
+                        yield emit(f"LOG: [3/7] Current image baseline: {current_critical_count} critical CVE(s).")
+                    except Exception as _exc:
+                        yield emit(f"LOG: [3/7] Warning: could not scan current image for comparison: {_exc}")
+
+                yield emit("LOG: [3/7] Running Trivy security scan on new image…")
 
                 scan_vulns, critical_count, high_count = await asyncio.to_thread(
                     _trivy_scan_image, image_name
@@ -1668,29 +1714,39 @@ async def _safe_update_stream(
                 finally:
                     db.close()
 
-                if critical_count > 0 and block_on_critical and not force:
-                    reason_str = f"{critical_count} critical CVE(s) found in new image"
-                    db = _SessionLocal()
-                    try:
-                        _upsert_update_status(db, container_name, host_id,
-                                              update_blocked=True,
-                                              blocked_reason=reason_str,
-                                              update_in_progress=False,
-                                              last_update_status="blocked")
-                    finally:
-                        db.close()
-                    yield emit(f"LOG: [BLOCKED] {reason_str} — update aborted for safety.")
-                    yield emit(f"UPDATE_BLOCKED:{critical_count}")
-                    _fire_notification(
-                        "container.update_blocked",
-                        "Container Update Blocked",
-                        f"{container_name}: blocked — {critical_count} critical CVE(s) in new image",
-                    )
-                    return
+                if not force:
+                    block_reason = None
+                    if vuln_policy == "block_on_critical" and critical_count > 0:
+                        block_reason = f"{critical_count} critical CVE(s) found in new image"
+                    elif vuln_policy == "block_on_high" and (critical_count + high_count) > 0:
+                        block_reason = f"{critical_count} critical, {high_count} high CVE(s) found in new image"
+                    if block_reason is None and block_if_worse and critical_count > current_critical_count:
+                        block_reason = (
+                            f"New image has more critical CVEs ({critical_count}) "
+                            f"than current ({current_critical_count})"
+                        )
+                    if block_reason:
+                        db = _SessionLocal()
+                        try:
+                            _upsert_update_status(db, container_name, host_id,
+                                                  update_blocked=True,
+                                                  blocked_reason=block_reason,
+                                                  update_in_progress=False,
+                                                  last_update_status="blocked")
+                        finally:
+                            db.close()
+                        yield emit(f"LOG: [BLOCKED] {block_reason} — update aborted for safety.")
+                        yield emit(f"UPDATE_BLOCKED:{critical_count}")
+                        _fire_notification(
+                            "container.update_blocked",
+                            "Container Update Blocked",
+                            f"{container_name}: blocked — {block_reason}",
+                        )
+                        return
 
-                if critical_count > 0 and force:
+                if (critical_count > 0 or high_count > 0) and force:
                     yield emit(
-                        f"LOG: [WARNING] {critical_count} critical CVE(s) found "
+                        f"LOG: [WARNING] {critical_count} critical, {high_count} high CVE(s) found "
                         f"— proceeding anyway (force override active)."
                     )
             else:
