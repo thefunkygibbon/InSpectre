@@ -807,10 +807,18 @@ def _check_update_sync(image_name: str, host_url: str, running_image_id: str | N
             current_digest = None
 
         # If the running container's image ID differs from the locally-cached image ID,
-        # a new image was pulled but the container was never restarted.
+        # a new image was pulled but the container was never restarted. Report the
+        # *actual running* image's digest as current_digest (not the newly-pulled one),
+        # so the UI doesn't confusingly show identical "Running" and "Registry" digests.
         if running_image_id and local_image_id and running_image_id != local_image_id:
+            running_current_digest = current_digest
+            try:
+                running_img = client.images.get(running_image_id)
+                running_current_digest = _local_manifest_digest(running_img, image_name) or current_digest
+            except Exception:
+                pass
             return {
-                "current_digest": current_digest,
+                "current_digest": running_current_digest,
                 "latest_digest":  current_digest,
                 "has_update":     True,
                 "local_image_id": local_image_id,
@@ -2202,6 +2210,11 @@ def _check_all_containers_for_host(
     for c in containers:
         cname      = c.name.lstrip("/")
         image_name = _container_image_ref(c)
+        # c.image.id is the config digest of the image the container is actually
+        # running — used to detect "new image pulled but container not yet
+        # restarted" the same way the manual check-update endpoint does.
+        running_img = getattr(c, "image", None)
+        running_image_id = running_img.id if running_img else None
         if progress_cb:
             try:
                 progress_cb("start", cname, host_url, host_id, total)
@@ -2249,16 +2262,19 @@ def _check_all_containers_for_host(
                 finally:
                     db.close()
 
-                result = _check_update_sync(image_for_check, host_url)
+                result = _check_update_sync(image_for_check, host_url, running_image_id)
 
                 db = _SessionLocal()
                 try:
                     kw = dict(
-                        image          = image_for_check,
-                        current_digest = result.get("current_digest"),
-                        latest_digest  = result.get("latest_digest"),
-                        has_update     = result.get("has_update", False),
-                        checked_at     = datetime.now(timezone.utc),
+                        image             = image_for_check,
+                        current_digest    = result.get("current_digest"),
+                        latest_digest     = result.get("latest_digest"),
+                        has_update        = result.get("has_update", False),
+                        checked_at        = datetime.now(timezone.utc),
+                        running_image_id  = running_image_id,
+                        last_update_status = "update_available" if result.get("has_update", False) else "checked",
+                        last_update_error  = result.get("error"),
                     )
                     if not result.get("has_update"):
                         kw["update_blocked"] = False
