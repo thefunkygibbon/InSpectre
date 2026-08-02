@@ -21,6 +21,8 @@ import container_updates as _cu
 import httpx
 import yaml as _yaml
 from config import PROBE_URL
+from trivy_utils import run_trivy_image_scan_sync
+from plugins.security_audit import audit_docker_container, audit_proxmox_guest
 
 router = APIRouter()
 
@@ -858,6 +860,85 @@ def _parse_trivy_json(data: dict) -> list:
     return vulns
 
 
+def _scan_matches_current_image(stored_image: str | None, stored_image_id: str | None,
+                                current_image: str, current_image_id: str | None) -> bool:
+    if stored_image_id and current_image_id:
+        return stored_image_id == current_image_id
+    return bool(stored_image and stored_image == current_image)
+
+
+def _scan_candidate(image: str | None, image_id: str | None, vulns, scanned_at, source: str) -> dict | None:
+    if scanned_at is None:
+        return None
+    payload = vulns if isinstance(vulns, list) else json.loads(vulns or "[]")
+    scanned_iso = scanned_at.isoformat() if hasattr(scanned_at, "isoformat") else str(scanned_at)
+    return {
+        "image": image,
+        "image_id": image_id,
+        "vulns": payload,
+        "scanned_at": scanned_iso,
+        "source": source,
+    }
+
+
+def _latest_current_image_scan(db: Session, container_name: str, host_id: int | None,
+                               current_image: str, current_image_id: str | None) -> dict:
+    scanning = bool(_container_vuln_scans.get(container_name, {}).get("scanning"))
+    stale = None
+    candidates: list[dict] = []
+
+    row = db.execute(
+        text("SELECT image, image_id, vulns, scanned_at FROM container_vuln_results WHERE name = :name"),
+        {"name": container_name},
+    ).fetchone()
+    if row:
+        row_image_id = getattr(row, "image_id", None)
+        if _scan_matches_current_image(row.image, row_image_id, current_image, current_image_id):
+            cand = _scan_candidate(row.image, row_image_id, row.vulns, row.scanned_at, "manual_or_scheduled")
+            if cand:
+                candidates.append(cand)
+        else:
+            stale = {
+                "image": row.image,
+                "image_id": row_image_id,
+                "scanned_at": row.scanned_at.isoformat() if row.scanned_at else None,
+            }
+
+    update_row = _cu._get_update_status_row(db, container_name, host_id)
+    if update_row and update_row.get("new_image_scanned_at") and update_row.get("new_image_vulns") is not None:
+        update_image = update_row.get("image") or current_image
+        update_image_id = update_row.get("running_image_id")
+        if (
+            update_row.get("last_update_status") == "success"
+            and _scan_matches_current_image(update_image, update_image_id, current_image, current_image_id)
+        ):
+            cand = _scan_candidate(
+                update_image,
+                update_image_id,
+                update_row.get("new_image_vulns"),
+                update_row.get("new_image_scanned_at"),
+                "update_time_scan",
+            )
+            if cand:
+                candidates.append(cand)
+
+    def _scan_sort_key(item: dict) -> datetime:
+        return datetime.fromisoformat(item["scanned_at"].replace("Z", "+00:00"))
+
+    best = max(candidates, key=_scan_sort_key) if candidates else None
+    if not best:
+        return {
+            "scanning": scanning,
+            "image": current_image,
+            "image_id": current_image_id,
+            "vulns": None,
+            "scanned_at": None,
+            "source": None,
+            "stale": stale,
+        }
+    return {**best, "scanning": scanning, "stale": stale}
+
+
 # ---------------------------------------------------------------------------
 # Compose file generation
 # ---------------------------------------------------------------------------
@@ -1141,12 +1222,13 @@ async def stream_docker_trivy_scan(container_id: str, db: Session = Depends(get_
             c = client.containers.get(container_id)
             image = (c.attrs.get("Config") or {}).get("Image", "")
             name  = c.name.lstrip("/")
-            return image, name
+            image_id = getattr(c.image, "id", None)
+            return image, name, image_id
         finally:
             client.close()
 
     try:
-        image, container_name = await asyncio.to_thread(_get_container_info)
+        image, container_name, image_id = await asyncio.to_thread(_get_container_info)
     except HTTPException:
         raise
     except Exception as e:
@@ -1159,40 +1241,29 @@ async def stream_docker_trivy_scan(container_id: str, db: Session = Depends(get_
     loop = asyncio.get_event_loop()
 
     def _run():
-        if not shutil.which("trivy"):
-            loop.call_soon_threadsafe(line_queue.put_nowait,
-                "LOG: [ERROR] Trivy is not installed in this container.")
-            loop.call_soon_threadsafe(line_queue.put_nowait, "TRIVY_DONE")
-            loop.call_soon_threadsafe(line_queue.put_nowait, None)
-            return
+        _container_vuln_scans[container_name] = {"scanning": True, "image": image}
         try:
-            proc = subprocess.Popen(
-                ["trivy", "image", "--format", "json", "--no-progress", "--scanners", "vuln", image],
-                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
-            )
-            stdout_data = proc.stdout.read()
-            proc.wait()
+            result = run_trivy_image_scan_sync(image)
+            if not result.get("ok"):
+                _container_vuln_scans[container_name]["error"] = result.get("error")
+                loop.call_soon_threadsafe(line_queue.put_nowait, f"LOG: [ERROR] {result.get('error')}")
+                return
 
-            scanned_at = datetime.now(timezone.utc).isoformat()
-            if proc.returncode == 0 and stdout_data.strip():
-                try:
-                    vulns = _parse_trivy_json(json.loads(stdout_data))
-                except Exception as parse_err:
-                    vulns = []
-                    loop.call_soon_threadsafe(line_queue.put_nowait,
-                        f"LOG: [ERROR] Could not parse Trivy output: {parse_err}")
-            else:
-                vulns = []
-                if proc.returncode != 0:
-                    loop.call_soon_threadsafe(line_queue.put_nowait,
-                        f"LOG: [ERROR] Trivy exited with code {proc.returncode}")
-
-            _save_trivy_result(container_name, image, vulns, scanned_at)
-            result_payload = json.dumps({"vulns": vulns, "image": image, "scanned_at": scanned_at})
+            vulns = result.get("vulns") or []
+            scanned_at = result["scanned_at"]
+            _save_trivy_result(container_name, image, vulns, scanned_at, image_id=image_id)
+            result_payload = json.dumps({
+                "vulns": vulns,
+                "image": image,
+                "image_id": image_id,
+                "scanned_at": scanned_at,
+            })
             loop.call_soon_threadsafe(line_queue.put_nowait, f"TRIVY_RESULT:{result_payload}")
         except Exception as exc:
             loop.call_soon_threadsafe(line_queue.put_nowait, f"LOG: [ERROR] {exc}")
         finally:
+            if container_name in _container_vuln_scans:
+                _container_vuln_scans[container_name]["scanning"] = False
             loop.call_soon_threadsafe(line_queue.put_nowait, "TRIVY_DONE")
             loop.call_soon_threadsafe(line_queue.put_nowait, None)
 
@@ -1297,6 +1368,45 @@ async def nuclei_template_update_stream(_user: str = Depends(get_current_user)):
                              headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
 
+@router.get("/docker/containers/{container_id}/security-state")
+async def docker_container_security_state(container_id: str, db: Session = Depends(get_db)):
+    if container_id.startswith("px-"):
+        parsed = _parse_proxmox_id(container_id)
+        if not parsed:
+            raise HTTPException(400, "Invalid Proxmox container identifier.")
+        host_id, node, vmid = parsed
+        host = _get_host_row(db, host_id)
+        audit = await asyncio.to_thread(audit_proxmox_guest, host, node, vmid, "lxc", _proxmox_request)
+        return {"image_scan": None, "audit": audit}
+
+    if not _docker_enabled(db):
+        raise HTTPException(503, "No container hosts configured.")
+
+    host_url, host_meta, host_id = _cu._resolve_host(db, container_id)
+
+    def _get_container_info():
+        client = _make_docker_client(host_url)
+        try:
+            c = client.containers.get(container_id)
+            return c.name.lstrip("/"), _cu._container_image_ref(c), getattr(c.image, "id", None)
+        finally:
+            client.close()
+
+    try:
+        container_name, current_image, current_image_id = await asyncio.to_thread(_get_container_info)
+    except Exception as exc:
+        raise HTTPException(404, str(exc))
+
+    image_scan = _latest_current_image_scan(db, container_name, host_id, current_image, current_image_id)
+    audit = await asyncio.to_thread(
+        audit_docker_container,
+        host_url,
+        container_id,
+        host_meta.get("name"),
+    )
+    return {"image_scan": image_scan, "audit": audit}
+
+
 @router.get("/docker/auto-scan/{name}")
 async def docker_auto_scan_result(name: str, db: Session = Depends(get_db)):
     """Return the stored Trivy scan result for a container name."""
@@ -1306,7 +1416,7 @@ async def docker_auto_scan_result(name: str, db: Session = Depends(get_db)):
         return {"scanning": True, "vulns": [], "image": mem.get("image", ""), "scanned_at": None}
     # Read persisted result from DB
     row = db.execute(
-        text("SELECT image, vulns, scanned_at FROM container_vuln_results WHERE name = :name"),
+        text("SELECT image, image_id, vulns, scanned_at FROM container_vuln_results WHERE name = :name"),
         {"name": name},
     ).fetchone()
     if row is None:
@@ -1315,6 +1425,7 @@ async def docker_auto_scan_result(name: str, db: Session = Depends(get_db)):
     return {
         "scanning": False,
         "image": row.image,
+        "image_id": getattr(row, "image_id", None),
         "vulns": vulns,
         "scanned_at": row.scanned_at.isoformat() if row.scanned_at else None,
     }
@@ -1322,18 +1433,46 @@ async def docker_auto_scan_result(name: str, db: Session = Depends(get_db)):
 
 @router.get("/docker/vuln-summary")
 async def docker_vuln_summary(db: Session = Depends(get_db)):
-    """Return aggregated Trivy scan results for all containers (in-memory)."""
+    """Return aggregated Trivy scan results for all current Docker containers."""
     if not _docker_enabled(db):
         raise HTTPException(503, "Docker monitoring is disabled.")
 
-    rows = db.execute(
-        text("SELECT name, image, vulns, scanned_at FROM container_vuln_results ORDER BY scanned_at DESC")
-    ).fetchall()
+    hosts = [h for h in _get_enabled_hosts(db) if h["type"] != "proxmox"]
+    if not hosts:
+        raise HTTPException(503, "No Docker hosts configured.")
+
+    def _list_current():
+        current = []
+        for host in hosts:
+            client = _make_docker_client(host["url"] or "unix:///var/run/docker.sock")
+            try:
+                for c in client.containers.list(all=True):
+                    current.append({
+                        "name": c.name.lstrip("/"),
+                        "host_id": host["id"],
+                        "image": _cu._container_image_ref(c),
+                        "image_id": getattr(c.image, "id", None),
+                    })
+            finally:
+                client.close()
+        return current
+
+    try:
+        containers = await asyncio.to_thread(_list_current)
+    except Exception as exc:
+        raise HTTPException(503, str(exc))
+
     result = []
-    for row in rows:
-        vulns = row.vulns if isinstance(row.vulns, list) else json.loads(row.vulns or "[]")
-        scanning = _container_vuln_scans.get(row.name, {}).get("scanning", False)
-        scanned_at = row.scanned_at.isoformat() if row.scanned_at else None
+    for container in containers:
+        current = _latest_current_image_scan(
+            db,
+            container["name"],
+            container["host_id"],
+            container["image"],
+            container["image_id"],
+        )
+        vulns = current.get("vulns") or []
+        scanned_at = current.get("scanned_at")
         counts = {"critical": 0, "high": 0, "medium": 0, "low": 0}
         for v in vulns:
             sev = v.get("severity", "").lower()
@@ -1346,13 +1485,16 @@ async def docker_vuln_summary(db: Session = Depends(get_db)):
         elif scanned_at:                  severity = "clean"
         else:                             severity = None
         result.append({
-            "name":       row.name,
-            "image":      row.image,
-            "scanning":   scanning,
+            "name":       container["name"],
+            "image":      container["image"],
+            "image_id":   container["image_id"],
+            "scanning":   current.get("scanning", False),
             "severity":   severity,
             "counts":     counts,
             "vulns":      vulns,
             "scanned_at": scanned_at,
+            "source":     current.get("source"),
+            "stale":      current.get("stale"),
         })
     return result
 
@@ -1367,7 +1509,12 @@ async def docker_scan_all(db: Session = Depends(get_db)):
     def _get_containers():
         client = _make_docker_client(host)
         try:
-            return [(c.name.lstrip("/"), (c.image.tags[0] if c.image.tags else c.image.id))
+            return [
+                (
+                    c.name.lstrip("/"),
+                    _cu._container_image_ref(c),
+                    getattr(c.image, "id", None),
+                )
                     for c in client.containers.list()]
         finally:
             client.close()
@@ -1380,12 +1527,12 @@ async def docker_scan_all(db: Session = Depends(get_db)):
     # Run scans sequentially in a single thread — parallel Trivy processes compete
     # for the shared vulnerability DB and fail silently, returning empty results.
     def _run_all():
-        for name, image in containers:
-            _run_trivy_for_container(name, image)
+        for name, image, image_id in containers:
+            _run_trivy_for_container(name, image, image_id=image_id)
 
     threading.Thread(target=_run_all, daemon=True).start()
 
-    return {"started": len(containers), "containers": [n for n, _ in containers]}
+    return {"started": len(containers), "containers": [n for n, _, _ in containers]}
 
 
 @router.get("/docker/timeline")

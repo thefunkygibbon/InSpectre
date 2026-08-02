@@ -382,6 +382,7 @@ export const api = {
   dockerSetNetwork:        (id, network)   => request('POST', `/docker/containers/${id}/network`, { network }),
   dockerSetRestartPolicy: (id, name, maximum_retry_count = 0) => request('POST', `/docker/containers/${id}/restart-policy`, { name, maximum_retry_count }),
   dockerAutoScanResult:   (name)      => request('GET',  `/docker/auto-scan/${encodeURIComponent(name)}`),
+  dockerSecurityState:    (id)        => request('GET',  `/docker/containers/${id}/security-state`),
   dockerVulnSummary:      ()          => request('GET',  '/docker/vuln-summary'),
   dockerScanAll:          ()          => request('POST', '/docker/scan-all'),
   getContainerTimeline:   (days)      => request('GET',  `/docker/timeline?days=${days}`),

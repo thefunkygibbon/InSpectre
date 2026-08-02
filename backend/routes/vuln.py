@@ -19,6 +19,71 @@ _nuclei_subs:  dict[str, list[asyncio.Queue]] = {}  # mac → subscriber queues
 _nuclei_lines: dict[str, list[str]] = {}            # mac → buffered output lines
 
 
+def _severity_rank(severity: str | None) -> int:
+    return {"critical": 0, "high": 1, "medium": 2, "low": 3, "info": 4, "clean": 5}.get(severity or "", 9)
+
+
+def _grouped_vuln_view(db: Session) -> list[dict]:
+    device_rows = db.execute(text("""
+        SELECT mac_address, custom_name, hostname, ip_address, vuln_severity, vuln_last_scanned,
+               group_id, group_primary
+        FROM devices
+    """)).fetchall()
+    report_rows = db.execute(text("""
+        SELECT DISTINCT ON (mac_address)
+               id, mac_address, severity, vuln_count, scanned_at, findings
+        FROM vuln_reports
+        ORDER BY mac_address, scanned_at DESC, id DESC
+    """)).fetchall()
+    latest_report_by_mac = {row.mac_address: row for row in report_rows}
+
+    grouped: dict[str, list] = defaultdict(list)
+    for row in device_rows:
+        group_key = str(row.group_id) if row.group_id else row.mac_address
+        grouped[group_key].append(row)
+
+    result = []
+    for members in grouped.values():
+        display = next((m for m in members if bool(m.group_primary)), None) or members[0]
+        report_member = display if latest_report_by_mac.get(display.mac_address) else None
+        if report_member is None:
+            report_member = next(
+                (
+                    member for member in sorted(
+                        members,
+                        key=lambda m: (
+                            latest_report_by_mac.get(m.mac_address).scanned_at if latest_report_by_mac.get(m.mac_address) else datetime.min.replace(tzinfo=timezone.utc),
+                            bool(m.group_primary),
+                        ),
+                        reverse=True,
+                    )
+                    if latest_report_by_mac.get(member.mac_address)
+                ),
+                None,
+            )
+
+        group_severity = min(
+            (_severity_rank(m.vuln_severity) for m in members if m.vuln_severity is not None),
+            default=9,
+        )
+        severity = next((s for s in ("critical", "high", "medium", "low", "info", "clean") if _severity_rank(s) == group_severity), None)
+        any_scanned_at = max(
+            (m.vuln_last_scanned for m in members if m.vuln_last_scanned is not None),
+            default=None,
+        )
+        report = latest_report_by_mac.get(report_member.mac_address) if report_member else None
+        result.append({
+            "display_mac": display.mac_address,
+            "report_mac": report_member.mac_address if report_member else display.mac_address,
+            "display_name": display.custom_name or display.hostname or display.ip_address or display.mac_address,
+            "ip_address": display.ip_address,
+            "severity": severity,
+            "vuln_last_scanned": any_scanned_at,
+            "report": report,
+        })
+    return result
+
+
 @router.get("/devices/{mac}/vuln-scan")
 async def stream_vuln_scan(mac: str, db: Session = Depends(get_db)):
     d = db.get(Device, mac.lower())
@@ -194,68 +259,52 @@ def list_all_vuln_reports(
 
 @router.get("/vulns/summary")
 def vuln_summary(db: Session = Depends(get_db)):
-    sev_rows = db.execute(text("""
-        SELECT vuln_severity, COUNT(*) AS cnt
-        FROM devices
-        WHERE vuln_severity IS NOT NULL
-        GROUP BY vuln_severity
-    """)).fetchall()
-    sev_counts = {r[0]: int(r[1]) for r in sev_rows}
+    grouped = _grouped_vuln_view(db)
 
-    top_rows = db.execute(text("""
-        SELECT DISTINCT ON (d.mac_address)
-               d.mac_address, d.custom_name, d.hostname, d.ip_address,
-               d.vuln_severity, vr.vuln_count, vr.scanned_at
-        FROM devices d
-        JOIN vuln_reports vr ON vr.mac_address = d.mac_address
-        WHERE d.vuln_severity IS NOT NULL AND d.vuln_severity NOT IN ('clean', 'info')
-        ORDER BY d.mac_address, vr.scanned_at DESC
-    """)).fetchall()
+    sev_counts: dict[str, int] = defaultdict(int)
+    for item in grouped:
+        if item["severity"] is not None:
+            sev_counts[item["severity"]] += 1
 
-    def sev_rank(s):
-        return {'critical': 0, 'high': 1, 'medium': 2, 'low': 3}.get(s or '', 9)
-
-    top_rows = sorted(top_rows, key=lambda r: sev_rank(r[4]))[:8]
+    top_rows = [
+        item for item in grouped
+        if item["severity"] not in (None, "clean", "info") and item["report"] is not None
+    ]
+    top_rows = sorted(top_rows, key=lambda item: (_severity_rank(item["severity"]), -(item["report"].vuln_count or 0)))[:8]
     top_vulnerable = [
         {
-            "mac_address":  r[0],
-            "display_name": r[1] or r[2] or r[3] or r[0],
-            "ip_address":   r[3],
-            "severity":     r[4],
-            "vuln_count":   r[5],
-            "scanned_at":   r[6].isoformat() if r[6] else None,
+            "mac_address":  item["report_mac"],
+            "display_name": item["display_name"],
+            "ip_address":   item["ip_address"],
+            "severity":     item["severity"],
+            "vuln_count":   item["report"].vuln_count,
+            "scanned_at":   item["report"].scanned_at.isoformat() if item["report"].scanned_at else None,
         }
-        for r in top_rows
+        for item in top_rows
     ]
 
-    recent_rows = db.execute(text("""
-        SELECT d.mac_address,
-               COALESCE(d.custom_name, d.hostname, d.ip_address, d.mac_address) AS display_name,
-               d.ip_address, vr.severity, vr.vuln_count, vr.scanned_at
-        FROM vuln_reports vr
-        JOIN devices d ON d.mac_address = vr.mac_address
-        ORDER BY vr.scanned_at DESC
-        LIMIT 20
-    """)).fetchall()
+    recent_rows = sorted(
+        [item for item in grouped if item["report"] is not None],
+        key=lambda item: item["report"].scanned_at or datetime.min.replace(tzinfo=timezone.utc),
+        reverse=True,
+    )[:20]
     recent_scans = [
         {
-            "mac_address":  r[0],
-            "display_name": r[1],
-            "ip_address":   r[2],
-            "severity":     r[3],
-            "vuln_count":   r[4],
-            "scanned_at":   r[5].isoformat() if r[5] else None,
+            "mac_address":  item["report_mac"],
+            "display_name": item["display_name"],
+            "ip_address":   item["ip_address"],
+            "severity":     item["report"].severity,
+            "vuln_count":   item["report"].vuln_count,
+            "scanned_at":   item["report"].scanned_at.isoformat() if item["report"].scanned_at else None,
         }
-        for r in recent_rows
+        for item in recent_rows
     ]
 
-    total_scanned = db.execute(text(
-        "SELECT COUNT(*) FROM devices WHERE vuln_last_scanned IS NOT NULL"
-    )).scalar() or 0
-    total_devices = db.execute(text("SELECT COUNT(*) FROM devices")).scalar() or 0
+    total_scanned = sum(1 for item in grouped if item["vuln_last_scanned"] is not None)
+    total_devices = len(grouped)
 
     return {
-        "severity_counts": sev_counts,
+        "severity_counts": dict(sev_counts),
         "total_scanned":   int(total_scanned),
         "total_devices":   int(total_devices),
         "top_vulnerable":  top_vulnerable,
@@ -293,31 +342,22 @@ def get_vuln_trend(days: int = Query(default=30, le=90), db: Session = Depends(g
 @router.get("/vulns/top-devices")
 def get_top_vulnerable_devices(limit: int = Query(default=10, le=50), db: Session = Depends(get_db)):
     try:
-        rows = db.execute(text("""
-            SELECT DISTINCT ON (d.mac_address)
-                d.mac_address,
-                COALESCE(d.custom_name, d.hostname, d.ip_address) AS name,
-                d.ip_address,
-                d.vuln_severity,
-                vr.vuln_count,
-                vr.scanned_at,
-                vr.findings
-            FROM devices d
-            JOIN vuln_reports vr ON vr.mac_address = d.mac_address
-            WHERE d.vuln_severity IN ('critical', 'high', 'medium')
-            ORDER BY d.mac_address, vr.scanned_at DESC
-        """)).fetchall()
-        def sev_rank(s):
-            return {'critical': 1, 'high': 2, 'medium': 3}.get(s or '', 9)
-        rows_sorted = sorted(rows, key=lambda r: sev_rank(r[3]))[:limit]
+        rows = [
+            item for item in _grouped_vuln_view(db)
+            if item["severity"] in ("critical", "high", "medium") and item["report"] is not None
+        ]
+        rows_sorted = sorted(
+            rows,
+            key=lambda item: (_severity_rank(item["severity"]), -(item["report"].vuln_count or 0)),
+        )[:limit]
         return [
             {
-                "mac": r[0], "name": r[1], "ip": r[2],
-                "severity": r[3], "vuln_count": r[4],
-                "scanned_at": r[5].isoformat() if r[5] else None,
-                "top_findings": (r[6] or [])[:3],
+                "mac": item["report_mac"], "name": item["display_name"], "ip": item["ip_address"],
+                "severity": item["severity"], "vuln_count": item["report"].vuln_count,
+                "scanned_at": item["report"].scanned_at.isoformat() if item["report"].scanned_at else None,
+                "top_findings": (item["report"].findings or [])[:3],
             }
-            for r in rows_sorted
+            for item in rows_sorted
         ]
     except Exception as e:
         raise HTTPException(500, str(e))

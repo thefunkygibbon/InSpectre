@@ -35,6 +35,7 @@ from fastapi.responses import StreamingResponse
 from jose import JWTError, jwt
 from pydantic import BaseModel
 from sqlalchemy import text
+from trivy_utils import run_trivy_image_scan_sync
 
 # ── Auth ───────────────────────────────────────────────────────────────────────
 # Replicated from main.py to avoid circular imports — only needs env vars.
@@ -947,51 +948,13 @@ def _trivy_scan_image(image_name: str) -> tuple[list, int, int]:
     Returns (vulns_list, critical_count, high_count).
     vulns_list follows the same shape as VulnTab in the frontend.
     """
-    if not shutil.which("trivy"):
-        return [], 0, 0
-    try:
-        result = subprocess.run(
-            [
-                "trivy", "image",
-                "--quiet", "--no-progress",
-                "--format", "json",
-                image_name,
-            ],
-            capture_output=True,
-            text=True,
-            timeout=300,
-        )
-        if result.returncode != 0:
-            print(f"[trivy-image-scan] exited {result.returncode}: {result.stderr[:200]}", flush=True)
-            return [], 0, 0
-
-        data  = json.loads(result.stdout)
-        vulns = []
-        for res in (data.get("Results") or []):
-            for v in (res.get("Vulnerabilities") or []):
-                score = None
-                cvss  = v.get("CVSS") or {}
-                for source in ("nvd", "redhat", "ghsa"):
-                    if cvss.get(source, {}).get("V3Score"):
-                        score = cvss[source]["V3Score"]
-                        break
-                vulns.append({
-                    "id":          v.get("VulnerabilityID", ""),
-                    "severity":    v.get("Severity", "UNKNOWN").lower(),
-                    "pkg":         v.get("PkgName", ""),
-                    "installed":   v.get("InstalledVersion", ""),
-                    "fixed":       v.get("FixedVersion", ""),
-                    "title":       v.get("Title", ""),
-                    "description": (v.get("Description") or "")[:400],
-                    "score":       score,
-                    "url": f"https://nvd.nist.gov/vuln/detail/{v.get('VulnerabilityID', '')}",
-                })
-        critical = sum(1 for v in vulns if v["severity"] == "critical")
-        high     = sum(1 for v in vulns if v["severity"] == "high")
-        return vulns, critical, high
-    except Exception as e:
-        print(f"[trivy-image-scan] {e}", flush=True)
-        return [], 0, 0
+    result = run_trivy_image_scan_sync(image_name)
+    if not result.get("ok"):
+        raise RuntimeError(result.get("error") or f"Trivy scan failed for {image_name}")
+    vulns = result.get("vulns") or []
+    critical = sum(1 for v in vulns if v["severity"] == "critical")
+    high = sum(1 for v in vulns if v["severity"] == "high")
+    return vulns, critical, high
 
 
 # ── Notification helper ────────────────────────────────────────────────────────
@@ -1110,9 +1073,22 @@ async def _self_update_via_helper_stream(
                     yield emit(f"LOG: [3/3] Warning: could not scan current image for comparison: {_exc}")
 
             yield emit("LOG: [3/3] Running Trivy security scan on new image…")
-            scan_vulns, critical_count, high_count = await asyncio.to_thread(
-                _trivy_scan_image, image_name
-            )
+            try:
+                scan_vulns, critical_count, high_count = await asyncio.to_thread(
+                    _trivy_scan_image, image_name
+                )
+            except Exception as scan_err:
+                yield emit(f"LOG: [ERROR] Trivy scan failed: {scan_err}")
+                yield emit("UPDATE_ERROR:Security scan failed — update aborted before deployment.")
+                db = _SessionLocal()
+                try:
+                    _upsert_update_status(db, container_name, host_id,
+                                          update_in_progress=False,
+                                          last_update_status="failed",
+                                          last_update_error=f"Trivy scan failed: {scan_err}")
+                finally:
+                    db.close()
+                return
             yield emit(
                 f"LOG: [3/3] ✓ Scan complete — "
                 f"{critical_count} critical, {high_count} high, {len(scan_vulns)} total CVEs."
@@ -1697,10 +1673,22 @@ async def _safe_update_stream(
                         yield emit(f"LOG: [3/7] Warning: could not scan current image for comparison: {_exc}")
 
                 yield emit("LOG: [3/7] Running Trivy security scan on new image…")
-
-                scan_vulns, critical_count, high_count = await asyncio.to_thread(
-                    _trivy_scan_image, image_name
-                )
+                try:
+                    scan_vulns, critical_count, high_count = await asyncio.to_thread(
+                        _trivy_scan_image, image_name
+                    )
+                except Exception as scan_err:
+                    yield emit(f"LOG: [ERROR] Trivy scan failed: {scan_err}")
+                    yield emit("UPDATE_ERROR:Security scan failed — update aborted before deployment.")
+                    db = _SessionLocal()
+                    try:
+                        _upsert_update_status(db, container_name, host_id,
+                                              update_in_progress=False,
+                                              last_update_status="failed",
+                                              last_update_error=f"Trivy scan failed: {scan_err}")
+                    finally:
+                        db.close()
+                    return
                 yield emit(
                     f"LOG: [3/7] ✓ Scan complete — "
                     f"{critical_count} critical, {high_count} high, {len(scan_vulns)} total CVEs."
@@ -1958,12 +1946,16 @@ async def _safe_update_stream(
                 yield emit("LOG: [7/7] Image updated successfully. Container left in stopped state.")
                 new_container.reload()
                 new_digest = new_container.image.id
+                if scan_first:
+                    from background_loops import _save_trivy_result
+                    _save_trivy_result(container_name, image_name, scan_vulns, datetime.now(timezone.utc).isoformat(), image_id=new_digest)
                 db = _SessionLocal()
                 try:
                     _upsert_update_status(db, container_name, host_id,
                                           image               = image_name,
                                           current_digest      = new_digest,
                                           latest_digest       = new_digest,
+                                          running_image_id    = new_digest,
                                           has_update          = False,
                                           update_blocked      = False,
                                           blocked_reason      = None,
@@ -2084,6 +2076,9 @@ async def _safe_update_stream(
 
                 new_container.reload()
                 new_digest = new_container.image.id
+                if scan_first:
+                    from background_loops import _save_trivy_result
+                    _save_trivy_result(container_name, image_name, scan_vulns, datetime.now(timezone.utc).isoformat(), image_id=new_digest)
 
                 db = _SessionLocal()
                 try:
@@ -2091,6 +2086,7 @@ async def _safe_update_stream(
                                           image               = image_name,
                                           current_digest      = new_digest,
                                           latest_digest       = new_digest,
+                                          running_image_id    = new_digest,
                                           has_update          = False,
                                           update_blocked      = False,
                                           blocked_reason      = None,
@@ -2552,7 +2548,12 @@ async def scan_new_image_endpoint(container_id: str, request: Request):
             yield "data: SCAN_DONE:error\n\n"
             return
 
-        vulns, critical, high = await asyncio.to_thread(_trivy_scan_image, image_name)
+        try:
+            vulns, critical, high = await asyncio.to_thread(_trivy_scan_image, image_name)
+        except Exception as scan_err:
+            yield f"data: LOG: Trivy scan failed: {scan_err}\n\n"
+            yield "data: SCAN_DONE:error\n\n"
+            return
         db2 = _SessionLocal()
         try:
             _upsert_update_status(db2, container_name, host_id,

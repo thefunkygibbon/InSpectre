@@ -190,9 +190,11 @@ def _migrate(db: Session):
         """CREATE TABLE IF NOT EXISTS container_vuln_results (
             name       TEXT NOT NULL PRIMARY KEY,
             image      TEXT NOT NULL,
+            image_id   TEXT,
             vulns      JSONB NOT NULL DEFAULT '[]',
             scanned_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
         )""",
+        "ALTER TABLE container_vuln_results ADD COLUMN IF NOT EXISTS image_id TEXT",
         "ALTER TABLE ip_history ADD COLUMN IF NOT EXISTS seen_while_online BOOLEAN",
         "ALTER TABLE devices ADD COLUMN IF NOT EXISTS primary_ip        VARCHAR",
         "ALTER TABLE devices ADD COLUMN IF NOT EXISTS primary_ip_locked BOOLEAN NOT NULL DEFAULT FALSE",
