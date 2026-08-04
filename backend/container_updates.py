@@ -2253,12 +2253,8 @@ def _check_all_containers_for_host(
                 db = _SessionLocal()
                 try:
                     image_for_check = _resolve_registry_image_ref(db, cname, host_id, image_name)
-                    prev = db.execute(
-                        text("""SELECT has_update FROM container_update_status
-                                WHERE container_name=:n AND COALESCE(host_id,-1)=COALESCE(:h,-1)"""),
-                        {"n": cname, "h": host_id},
-                    ).fetchone()
-                    had_update = bool(prev and prev[0])
+                    prev = _get_update_status_row(db, cname, host_id)
+                    had_update = bool(prev and prev.get("has_update"))
                 finally:
                     db.close()
 
@@ -2289,6 +2285,38 @@ def _check_all_containers_for_host(
                         "Container Update Available",
                         f"New image version available for {cname} ({image_for_check})",
                     )
+
+                # Scheduled auto-update modes should actually perform the update.
+                # - notify: only alert
+                # - disabled: check only
+                # - scan_then_update: scan first, then update if the scan/policy allows
+                # - auto: update immediately, skipping the vulnerability scan gate
+                if result.get("has_update") and auto_update in ("auto", "scan_then_update"):
+                    if prev and (
+                        prev.get("pinned")
+                        or prev.get("update_blocked")
+                        or prev.get("update_in_progress")
+                    ):
+                        continue
+
+                    scan_first = auto_update == "scan_then_update"
+
+                    async def _consume_update():
+                        async for _ in _safe_update_stream(
+                            c.id, host_url, host_id,
+                            force=False, scan_first=scan_first,
+                        ):
+                            pass
+
+                    try:
+                        print(
+                            f"[update-check] auto-update starting for {cname} "
+                            f"(mode={auto_update}, scan_first={scan_first})",
+                            flush=True,
+                        )
+                        asyncio.run(_consume_update())
+                    except Exception as exc:
+                        print(f"[update-check] auto-update failed for {cname}: {exc}", flush=True)
 
             except Exception as exc:
                 print(f"[update-check] {cname}: {exc}", flush=True)
@@ -3140,11 +3168,24 @@ async def recreate_from_backup(backup_id: int, request: Request):
                         port_bindings, exposed_ports = _extract_ports_from_network_settings(
                             hcfg.get("PortBindings") or net_sets.get("Ports")
                         )
-                        binds = {
-                            m["Source"]: {"bind": m["Destination"], "mode": m.get("Mode", "rw")}
-                            for m in (attrs.get("Mounts") or [])
-                            if m.get("Type") == "bind" and m.get("Source") and m.get("Destination")
-                        }
+                        binds = {}
+                        for bind_spec in (hcfg.get("Binds") or []):
+                            parts = str(bind_spec).split(":")
+                            if len(parts) < 2:
+                                continue
+                            src = ":".join(parts[:-2]) if len(parts) > 2 else parts[0]
+                            dst = parts[-2]
+                            mode = parts[-1] if len(parts) > 2 else "rw"
+                            if src and dst:
+                                binds[src] = {"bind": dst, "mode": mode or "rw"}
+                        if not binds:
+                            for m in (attrs.get("Mounts") or []):
+                                if m.get("Type") == "bind":
+                                    src  = m.get("Source", "")
+                                    dst  = m.get("Destination", "")
+                                    mode = m.get("Mode", "rw")
+                                    if src and dst:
+                                        binds[src] = {"bind": dst, "mode": mode}
                         vol_binds = {
                             m["Name"]: {"bind": m["Destination"], "mode": m.get("Mode", "rw")}
                             for m in (attrs.get("Mounts") or [])

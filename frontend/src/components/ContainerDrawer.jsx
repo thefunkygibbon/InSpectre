@@ -666,32 +666,45 @@ function ComposeTab({ containerId, containerName, labels, resolveCurrentContaine
   // YAML viewer modal
   const [viewYaml,      setViewYaml]      = useState(null) // { title, yaml }
 
+  // Load compose on mount or when containerId changes
   useEffect(() => {
-    let cancelled = false
+    let isMounted = true
     ;(async () => {
       setLoading(true)
       try {
         const res = await api.dockerCompose(containerId)
-        if (!cancelled) { setData(res); setError(null) }
-      } catch (e) {
-        const msg = String(e?.message || '')
-        if (msg.includes('404') && resolveCurrentContainerId) {
-          try {
-            const resolved = await resolveCurrentContainerId()
-            if (resolved) {
-              const res2 = await api.dockerCompose(resolved)
-              if (!cancelled) { setData(res2); setError(null) }
-              return
-            }
-          } catch (_) {}
+        if (isMounted) {
+          setData(res)
+          setError(null)
         }
-        if (!cancelled) setError(e.message || 'Failed to generate compose file')
+      } catch (e) {
+        if (isMounted) {
+          const msg = String(e?.message || '')
+          if (msg.includes('404') && resolveCurrentContainerId) {
+            try {
+              const resolved = await resolveCurrentContainerId()
+              if (resolved && isMounted) {
+                const res2 = await api.dockerCompose(resolved)
+                setData(res2)
+                setError(null)
+              }
+            } catch (_) {
+              if (isMounted) {
+                setError(e.message || 'Failed to generate compose file')
+              }
+            }
+          } else {
+            setError(e.message || 'Failed to generate compose file')
+          }
+        }
       } finally {
-        if (!cancelled) setLoading(false)
+        if (isMounted) setLoading(false)
       }
     })()
-    return () => { cancelled = true }
-  }, [containerId])
+    return () => {
+      isMounted = false
+    }
+  }, [containerId, resolveCurrentContainerId])
 
   function handleCopy() {
     const yaml = editMode ? editYaml : data?.yaml

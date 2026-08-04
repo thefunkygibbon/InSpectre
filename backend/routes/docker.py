@@ -1017,26 +1017,55 @@ def _generate_compose_yaml(c) -> tuple[str, dict]:
     volumes  = []
     tmpfs    = []
     top_vols = {}
+    seen_volume_entries: set[str] = set()
+
+    def _add_volume_entry(entry: str):
+        if entry and entry not in seen_volume_entries:
+            seen_volume_entries.add(entry)
+            volumes.append(entry)
+
+    def _parse_bind_spec(spec: str) -> tuple[str, str, str] | None:
+        parts = str(spec).split(":")
+        if len(parts) < 2:
+            return None
+        src = ":".join(parts[:-2]) if len(parts) > 2 else parts[0]
+        dst = parts[-2]
+        mode = parts[-1] if len(parts) > 2 else ""
+        return src, dst, mode
+
+    for bind_spec in (hcfg.get("Binds") or []):
+        parsed = _parse_bind_spec(bind_spec)
+        if not parsed:
+            continue
+        src, dst, mode = parsed
+        if not src or not dst:
+            continue
+        entry = f"{src}:{dst}"
+        if mode and mode not in ("", "rw", "z"):
+            entry += f":{mode}"
+        _add_volume_entry(entry)
+
     for m in (attrs.get("Mounts") or []):
         mtype = m.get("Type", "bind")
         src   = m.get("Source", "") or ""
         dst   = m.get("Destination", "") or ""
         mode  = m.get("Mode", "") or ""
         if mtype == "tmpfs":
-            tmpfs.append(dst)
+            if dst and dst not in tmpfs:
+                tmpfs.append(dst)
         elif mtype == "volume":
             vol_name = m.get("Name") or src
             v = f"{vol_name}:{dst}"
             if mode and mode not in ("", "rw"):
                 v += f":{mode}"
-            volumes.append(v)
+            _add_volume_entry(v)
             if vol_name:
                 top_vols[vol_name] = None  # mark for top-level volumes block
         else:  # bind
             v = f"{src}:{dst}"
             if mode and mode not in ("", "rw", "z"):
                 v += f":{mode}"
-            volumes.append(v)
+            _add_volume_entry(v)
     if volumes:
         svc["volumes"] = volumes
     if tmpfs:
