@@ -81,7 +81,32 @@ def _grouped_vuln_view(db: Session) -> list[dict]:
             "vuln_last_scanned": any_scanned_at,
             "report": report,
         })
-    return result
+    
+    # Secondary deduplication: Group by display_name for devices that appear to be the same
+    # (e.g., ungrouped MAC addresses with the same hostname/custom_name)
+    seen_names: dict[str, dict] = {}
+    deduped_result = []
+    for item in result:
+        key = item["display_name"].lower() if item["display_name"] else item["display_mac"]
+        
+        if key in seen_names:
+            # Merge with existing entry: keep the one with the latest scan
+            existing = seen_names[key]
+            if item.get("report") and existing.get("report"):
+                if item["report"].scanned_at > existing["report"].scanned_at:
+                    deduped_result.remove(existing)
+                    deduped_result.append(item)
+                    seen_names[key] = item
+            elif item.get("report") and not existing.get("report"):
+                deduped_result.remove(existing)
+                deduped_result.append(item)
+                seen_names[key] = item
+            # else: keep existing as it either has a report or was added first
+        else:
+            seen_names[key] = item
+            deduped_result.append(item)
+    
+    return deduped_result
 
 
 @router.get("/devices/{mac}/vuln-scan")
