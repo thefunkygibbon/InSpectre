@@ -680,7 +680,8 @@ function ComposeTab({ containerId, containerName, labels, resolveCurrentContaine
       } catch (e) {
         if (isMounted) {
           const msg = String(e?.message || '')
-          if (msg.includes('404') && resolveCurrentContainerId) {
+          // 404 can happen if container has stale ID; try to resolve current ID only as fallback
+          if (msg.includes('404') && resolveCurrentContainerId && typeof resolveCurrentContainerId === 'function') {
             try {
               const resolved = await resolveCurrentContainerId()
               if (resolved && isMounted) {
@@ -704,7 +705,7 @@ function ComposeTab({ containerId, containerName, labels, resolveCurrentContaine
     return () => {
       isMounted = false
     }
-  }, [containerId, resolveCurrentContainerId])
+  }, [containerId])
 
   function handleCopy() {
     const yaml = editMode ? editYaml : data?.yaml
