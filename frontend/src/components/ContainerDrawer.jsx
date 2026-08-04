@@ -665,47 +665,45 @@ function ComposeTab({ containerId, containerName, labels, resolveCurrentContaine
 
   // YAML viewer modal
   const [viewYaml,      setViewYaml]      = useState(null) // { title, yaml }
+  const resolveRef = useRef(resolveCurrentContainerId)
 
-  // Load compose on mount or when containerId changes
   useEffect(() => {
-    let isMounted = true
-    ;(async () => {
-      setLoading(true)
-      try {
-        const res = await api.dockerCompose(containerId)
-        if (isMounted) {
-          setData(res)
-          setError(null)
-        }
-      } catch (e) {
-        if (isMounted) {
-          const msg = String(e?.message || '')
-          // 404 can happen if container has stale ID; try to resolve current ID only as fallback
-          if (msg.includes('404') && resolveCurrentContainerId && typeof resolveCurrentContainerId === 'function') {
-            try {
-              const resolved = await resolveCurrentContainerId()
-              if (resolved && isMounted) {
-                const res2 = await api.dockerCompose(resolved)
-                setData(res2)
-                setError(null)
-              }
-            } catch (_) {
-              if (isMounted) {
-                setError(e.message || 'Failed to generate compose file')
-              }
-            }
-          } else {
-            setError(e.message || 'Failed to generate compose file')
+    resolveRef.current = resolveCurrentContainerId
+  }, [resolveCurrentContainerId])
+
+  const loadCompose = useCallback(async () => {
+    setLoading(true)
+    try {
+      const res = await api.dockerCompose(containerId)
+      setData(res)
+      setError(null)
+    } catch (e) {
+      const msg = String(e?.message || '')
+      // 404 can happen if the container was recreated with a new ID; fall back
+      // to resolving the current live container exactly once.
+      if (msg.includes('404') && resolveRef.current && typeof resolveRef.current === 'function') {
+        try {
+          const resolved = await resolveRef.current()
+          if (resolved) {
+            const res2 = await api.dockerCompose(resolved)
+            setData(res2)
+            setError(null)
+            return
           }
+        } catch (_) {
+          // Let the original error surface below.
         }
-      } finally {
-        if (isMounted) setLoading(false)
       }
-    })()
-    return () => {
-      isMounted = false
+      setError(e.message || 'Failed to generate compose file')
+    } finally {
+      setLoading(false)
     }
   }, [containerId])
+
+  // Load compose on mount or when containerId changes.
+  useEffect(() => {
+    loadCompose().catch(() => {})
+  }, [loadCompose])
 
   function handleCopy() {
     const yaml = editMode ? editYaml : data?.yaml
@@ -753,7 +751,7 @@ function ComposeTab({ containerId, containerName, labels, resolveCurrentContaine
       } else if (line === 'DEPLOY_DONE') {
         setDeployLogs(l => [...l, '✅ Deployed successfully.'])
         setDeploying(false)
-        setEditMode(false)
+        loadCompose().catch(() => {})
       } else {
         setDeployLogs(l => [...l, line.replace(/^LOG:\s*/, '')])
       }
