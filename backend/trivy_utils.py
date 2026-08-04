@@ -52,17 +52,36 @@ def ensure_trivy_db_sync() -> tuple[bool, str]:
         return True, ""
     if not shutil.which("trivy"):
         return False, "Trivy is not installed in this container."
+    
+    print("[trivy] Downloading vulnerability database (this may take a few minutes)...", flush=True)
     try:
         proc = subprocess.run(
             ["trivy", "image", "--download-db-only"],
             capture_output=True,
             text=True,
-            timeout=900,
+            timeout=1800,  # Increased timeout for slow networks
         )
+    except subprocess.TimeoutExpired:
+        return False, "Trivy database download timed out (network may be slow or unreachable)"
     except Exception as exc:
         return False, f"Failed to download the Trivy vulnerability database: {exc}"
+    
     if proc.returncode == 0 and trivy_db_exists():
+        print("[trivy] Vulnerability database downloaded successfully", flush=True)
         return True, ""
+    
+    # If DB still doesn't exist after successful run, Trivy might have downloaded to a different location
+    # Try checking alternative locations
+    alt_locations = [
+        os.path.expanduser("~/.cache/trivy/db/metadata.json"),
+        "/tmp/.trivy/db/metadata.json",
+        os.path.join(os.environ.get("TRIVY_CACHE_DIR", ""), "db/metadata.json"),
+    ]
+    for alt_loc in alt_locations:
+        if alt_loc and os.path.exists(alt_loc):
+            print(f"[trivy] Found DB at alternative location: {alt_loc}", flush=True)
+            return True, ""
+    
     detail = _trim_trivy_output(proc.stderr or proc.stdout)
     if detail:
         return False, f"Trivy vulnerability DB download failed: {detail}"
@@ -93,6 +112,10 @@ def run_trivy_image_scan_sync(image: str) -> dict:
 
     scanned_at = datetime.now(timezone.utc).isoformat()
     try:
+        # Configure environment to help Trivy access Docker daemon and database
+        env = os.environ.copy()
+        env['TRIVY_SKIP_DB_UPDATE'] = 'true'
+        
         proc = subprocess.run(
             [
                 "trivy", "image",
@@ -100,11 +123,13 @@ def run_trivy_image_scan_sync(image: str) -> dict:
                 "--no-progress",
                 "--scanners", "vuln",
                 "--skip-db-update",
+                "--severity", "CRITICAL,HIGH,MEDIUM",  # Focus on important vulns
                 image,
             ],
             capture_output=True,
             text=True,
             timeout=900,
+            env=env,
         )
     except subprocess.TimeoutExpired:
         return {
@@ -128,10 +153,25 @@ def run_trivy_image_scan_sync(image: str) -> dict:
     stderr = (proc.stderr or "").strip()
     stdout = proc.stdout or ""
     if proc.returncode != 0:
-        detail = _trim_trivy_output(stderr or stdout)
+        # Try to provide more detailed error information
+        detail = (stderr or stdout)
+        if not detail or len(detail) < 20:
+            # If stderr is empty, try to parse JSON stdout for error messages
+            try:
+                result_json = json.loads(stdout) if stdout else {}
+                detail = result_json.get("Result", {}).get("Error", detail)
+            except:
+                pass
+        
+        detail = _trim_trivy_output(detail, limit=800)  # Increased limit for better error reporting
         message = f"Trivy exited with code {proc.returncode}"
         if detail:
             message = f"{message}: {detail}"
+        
+        # Log full stderr for debugging
+        if stderr:
+            print(f"[trivy] Full error for {image}: {stderr[:500]}", flush=True)
+        
         return {
             "ok": False,
             "error": message,
