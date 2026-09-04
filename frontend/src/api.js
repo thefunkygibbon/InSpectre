@@ -34,6 +34,14 @@ async function request(method, path, body) {
     } catch (_) {
       try { detail = await res.text() } catch (_) { detail = '' }
     }
+    if (detail && typeof detail !== 'string') {
+      detail = Array.isArray(detail)
+        ? detail.map(item => {
+            const location = item?.loc ? `${item.loc.join('.')}: ` : ''
+            return `${location}${item?.msg || JSON.stringify(item)}`
+          }).join('; ')
+        : JSON.stringify(detail)
+    }
     throw new Error(detail
       ? `${method} ${path} \u2192 ${res.status}: ${detail}`
       : `${method} ${path} \u2192 ${res.status}`)
@@ -367,6 +375,7 @@ export const api = {
   // Docker container monitoring
   dockerStats:            ()              => request('GET',  '/docker/stats'),
   dockerContainers:       ()              => request('GET',  '/docker/containers'),
+  dockerCreate:           (body)         => request('POST', '/docker/containers', body),
   dockerContainer:        (id)            => request('GET',  `/docker/containers/${id}`),
   dockerStart:            (id)            => request('POST', `/docker/containers/${id}/start`),
   dockerStop:             (id)            => request('POST', `/docker/containers/${id}/stop`),

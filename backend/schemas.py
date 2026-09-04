@@ -132,6 +132,35 @@ class ContainerHostUpdate(BaseModel):
     local_ip:   Optional[str]  = None
 
 
+class DockerContainerCreate(BaseModel):
+    host_id:       Optional[int] = None
+    name:          Optional[str] = None
+    image:         Optional[str] = None
+    command:       Optional[str | List[str]] = None
+    entrypoint:    Optional[str | List[str]] = None
+    environment:   Optional[dict | List[str]] = None
+    ports:         Optional[dict | List[str]] = None
+    volumes:       Optional[dict | List[str]] = None
+    networks:      Optional[List[str]] = None
+    network:       Optional[str] = None
+    restart_policy: str = "no"
+    privileged:    bool = False
+    working_dir:   Optional[str] = None
+    hostname:      Optional[str] = None
+    compose_yaml:  Optional[str] = None
+    compose_service: Optional[str] = None
+    proxmox_node: Optional[str] = None
+    vmid:          Optional[int] = None
+    ostemplate:    Optional[str] = None
+    storage:       Optional[str] = None
+    disk_gb:       int = 8
+    cores:         int = 1
+    memory_mb:     int = 512
+    swap_mb:       int = 512
+    ip_address:    Optional[str] = None
+    gateway:       Optional[str] = None
+
+
 class GroupAddRequest(BaseModel):
     primary_mac: str
 
@@ -169,7 +198,7 @@ class ChannelCreate(BaseModel):
 class ProfileCreate(BaseModel):
     name:       str
     enabled:    bool      = True
-    events:     List[str] = []
+    events:     dict      = {}
     channel_ids: List[int] = []
 
 
@@ -179,18 +208,23 @@ class WolPayload(BaseModel):
 
 
 class PersonCreate(BaseModel):
-    name:     str
-    notes:    Optional[str]      = None
+    name:         str
+    primary_mac:  Optional[str]  = None
+    photo:       Optional[str]  = None
+    notes:        Optional[str]  = None
     mac_addresses: List[str]     = []
 
 
 class PersonUpdate(BaseModel):
-    name:  Optional[str] = None
-    notes: Optional[str] = None
+    name:        Optional[str] = None
+    primary_mac: Optional[str] = None
+    photo:       Optional[str]  = None
+    notes:       Optional[str]  = None
 
 
 class PersonDeviceAdd(BaseModel):
     mac_address: str
+    set_primary: bool = False
 
 
 class PersonBlockRequest(BaseModel):

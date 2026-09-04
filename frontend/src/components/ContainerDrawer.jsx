@@ -2165,7 +2165,14 @@ export function ContainerDrawer({ container: initialContainer, trivyScan, update
                 <Collapsible title={`Networks (${container.networks.length})`} icon={Network} defaultOpen={false}>
                   {container.networks.map((n, i) => (
                     <div key={i} className="py-1.5 border-b border-border last:border-0">
-                      <span className="text-xs font-mono" style={{ color: 'var(--color-text)' }}>{n}</span>
+                      <div className="flex items-center justify-between gap-3">
+                        <span className="text-xs font-mono" style={{ color: 'var(--color-text)' }}>{n}</span>
+                        {!isProxmox && (
+                          <span className="text-xs font-mono text-brand">
+                            {container.network_ips?.[n] || 'no IP'}
+                          </span>
+                        )}
+                      </div>
                     </div>
                   ))}
                 </Collapsible>

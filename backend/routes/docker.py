@@ -9,7 +9,7 @@ from datetime import datetime, timezone, timedelta
 from database import get_db, SessionLocal
 from auth_utils import get_current_user
 from models import Setting
-from schemas import ContainerHostCreate, ContainerHostUpdate
+from schemas import ContainerHostCreate, ContainerHostUpdate, DockerContainerCreate
 from probe_client import _probe_client
 from background_loops import (
     _trivy_db_status, _run_trivy_db_download, _trivy_db_update_lock,
@@ -342,6 +342,11 @@ def _fmt_container(c) -> dict:
         },
         "ports":          ports,
         "networks":       list((net.get("Networks") or {}).keys()),
+        "network_ips":    {
+            name: details.get("IPAddress", "")
+            for name, details in (net.get("Networks") or {}).items()
+            if details.get("IPAddress")
+        },
         "mounts":         mounts,
         "env":            config.get("Env") or [],
         "created":        attrs.get("Created",""),
@@ -361,6 +366,159 @@ def _add_docker_host_meta(container: dict, host: dict, host_url: str) -> dict:
     container["host_url"] = host_url
     container["host_local_ip"] = host.get("local_ip")  # Store local_ip for port links
     return container
+
+
+def _compose_value_list(value, key: str) -> list:
+    """Normalize common Compose list/dict forms for the Docker SDK."""
+    if value is None:
+        return []
+    if isinstance(value, dict):
+        return [f"{k}:{v}" for k, v in value.items()]
+    if isinstance(value, list):
+        return value
+    raise ValueError(f"Compose '{key}' must be a list or mapping.")
+
+
+def _parse_create_spec(body: DockerContainerCreate) -> dict:
+    spec = body.model_dump(exclude_none=True)
+    compose_service = None
+    if body.compose_yaml:
+        document = _yaml.safe_load(body.compose_yaml)
+        if not isinstance(document, dict) or not isinstance(document.get("services"), dict):
+            raise ValueError("Compose YAML must contain a services mapping.")
+        services = document["services"]
+        compose_service = body.compose_service or (next(iter(services), None))
+        if not compose_service or compose_service not in services:
+            raise ValueError("Select a valid service from the Compose YAML.")
+        service = services[compose_service]
+        if not isinstance(service, dict):
+            raise ValueError("The selected Compose service must be a mapping.")
+        explicit = {k: v for k, v in spec.items()
+                    if k in body.model_fields_set
+                    and k not in {"compose_yaml", "compose_service", "host_id"}}
+        spec = {**service, **explicit}
+        spec.setdefault("name", compose_service)
+        spec["environment"] = spec.get("environment", spec.get("env"))
+        spec["volumes"] = _compose_value_list(spec.get("volumes"), "volumes")
+        spec["ports"] = _compose_value_list(spec.get("ports"), "ports")
+        networks = spec.get("networks")
+        spec["networks"] = list(networks.keys()) if isinstance(networks, dict) else (networks or [])
+    spec.pop("compose_yaml", None)
+    spec.pop("compose_service", None)
+    if not spec.get("image"):
+        raise ValueError("An image is required.")
+    if not spec.get("name"):
+        raise ValueError("A container name is required.")
+    return spec
+
+
+def _create_docker_container(body: DockerContainerCreate, host: dict) -> dict:
+    spec = _parse_create_spec(body)
+    client = _make_docker_client(host["url"] or "unix:///var/run/docker.sock")
+    try:
+        env = spec.get("environment", spec.get("env"))
+        if isinstance(env, list):
+            env = {item.split("=", 1)[0]: item.split("=", 1)[1] for item in env if "=" in item}
+        ports = {}
+        for port in spec.get("ports") or []:
+            if isinstance(port, int):
+                ports[f"{port}/tcp"] = port
+                continue
+            value = str(port)
+            parts = value.split(":")
+            container_port = parts[-1]
+            if "/" not in container_port:
+                container_port = f"{container_port}/tcp"
+            ports[container_port] = int(parts[-2]) if len(parts) > 1 else None
+        volumes = {}
+        for volume in spec.get("volumes") or []:
+            value = str(volume)
+            parts = value.split(":")
+            if len(parts) < 2:
+                raise ValueError(f"Invalid volume mapping: {value}")
+            volumes[parts[0]] = {"bind": parts[1], "mode": parts[2] if len(parts) > 2 else "rw"}
+        networks = spec.get("networks") or []
+        network = spec.get("network") or (networks[0] if networks else None)
+        restart = spec.get("restart_policy", spec.get("restart", "no"))
+        restart_policy = {"Name": restart} if isinstance(restart, str) and restart != "no" else None
+        command = spec.get("command")
+        entrypoint = spec.get("entrypoint")
+        container = client.containers.run(
+            image=spec["image"],
+            name=spec["name"],
+            command=command,
+            entrypoint=entrypoint,
+            environment=env,
+            ports=ports or None,
+            volumes=volumes or None,
+            network=network,
+            restart_policy=restart_policy,
+            privileged=bool(spec.get("privileged", False)),
+            working_dir=spec.get("working_dir"),
+            hostname=spec.get("hostname"),
+            detach=True,
+        )
+        for additional_network in networks[1:]:
+            client.networks.get(additional_network).connect(container)
+        container.reload()
+        return _add_docker_host_meta(_fmt_container(container), host,
+                                     host["url"] or "unix:///var/run/docker.sock")
+    finally:
+        client.close()
+
+
+def _create_proxmox_container(body: DockerContainerCreate, host: dict) -> dict:
+    if body.compose_yaml:
+        raise ValueError("Compose YAML deployment is only supported for Docker hosts.")
+    node = body.proxmox_node or host.get("node") or "pve"
+    if not body.vmid or not body.ostemplate or not body.name:
+        raise ValueError("Proxmox deployments require a VMID, hostname, and OS template.")
+    params = {
+        "vmid": body.vmid, "hostname": body.name, "ostemplate": body.ostemplate,
+        "cores": body.cores, "memory": body.memory_mb, "swap": body.swap_mb,
+        "rootfs": f"{body.storage or 'local-lvm'}:{body.disk_gb}",
+        "start": 1,
+    }
+    if body.ip_address:
+        params["net0"] = f"name=eth0,bridge=vmbr0,ip={body.ip_address}" + (
+            f",gw={body.gateway}" if body.gateway else "")
+    result = _proxmox_request(host, "POST", f"/api2/json/nodes/{node}/lxc", data=params)
+    task = result.get("data")
+    # Return the same normalized shape as the list endpoint after the task is queued.
+    return _fmt_proxmox_container(
+        {"vmid": body.vmid, "hostname": body.name, "name": body.name,
+         "status": "running", "ostemplate": body.ostemplate},
+        body.vmid, node, host, "lxc"
+    ) | {"task": task}
+
+
+@router.post("/docker/containers", status_code=201)
+async def create_docker_container(body: DockerContainerCreate, db: Session = Depends(get_db)):
+    all_hosts = _get_enabled_hosts(db)
+    hosts = [h for h in all_hosts if h["type"] != "proxmox"]
+    if body.host_id is not None:
+        selected = next((h for h in all_hosts if h["id"] == body.host_id), None)
+        if selected and selected["type"] == "proxmox":
+            try:
+                return await asyncio.to_thread(_create_proxmox_container, body, selected)
+            except Exception as e:
+                raise HTTPException(400, str(e))
+        hosts = [h for h in hosts if h["id"] == body.host_id]
+    elif not hosts and all_hosts:
+        selected = all_hosts[0]
+        if selected["type"] == "proxmox":
+            try:
+                return await asyncio.to_thread(_create_proxmox_container, body, selected)
+            except Exception as e:
+                raise HTTPException(400, str(e))
+    if not hosts:
+        raise HTTPException(503, "No enabled Docker host is available.")
+    try:
+        return await asyncio.to_thread(_create_docker_container, body, hosts[0])
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(400, str(e))
 
 
 @router.get("/docker/stats")
