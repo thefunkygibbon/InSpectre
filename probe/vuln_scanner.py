@@ -178,6 +178,12 @@ _NOISE_RE = re.compile(
 # Helpers
 # ---------------------------------------------------------------------------
 
+def _parse_template_selection(raw_templates: str) -> set[str]:
+    tokens = {t.strip().lower() for t in (raw_templates or DEFAULT_TEMPLATES).split(",") if t.strip()}
+    if not tokens or "all" in tokens:
+        return {"cve", "exposure", "misconfig", "default-login", "network"}
+    return tokens
+
 def _bump_severity(current: str, candidate: str) -> str:
     if _SEV_RANK.get(candidate, 0) > _SEV_RANK.get(current, 0):
         return candidate
@@ -301,6 +307,7 @@ def _build_scan_jobs(
     open_ports: list[int],
     svc_map: dict[int, dict],
     templates_root: str,
+    template_selection: set[str],
 ) -> list[dict]:
     """
     Partition open ports into jobs.  Each job has:
@@ -340,9 +347,16 @@ def _build_scan_jobs(
     # ── Web job (HTTP + HTTPS share the same template directories) ───────────
     web_targets = web_http + web_https
     if web_targets:
-        dirs = _existing_dirs([
-            os.path.join(templates_root, d) for d in _HTTP_SUBDIRS
-        ])
+        http_subdirs = []
+        if "misconfig" in template_selection:
+            http_subdirs.append("http/misconfiguration")
+        if "default-login" in template_selection:
+            http_subdirs.append("http/default-logins")
+        if "exposure" in template_selection:
+            http_subdirs.extend(["http/exposed-panels", "http/exposures", "http/vulnerabilities"])
+        if "cve" in template_selection and "http/vulnerabilities" not in http_subdirs:
+            http_subdirs.append("http/vulnerabilities")
+        dirs = _existing_dirs([os.path.join(templates_root, d) for d in http_subdirs])
         if web_https:
             ssl_dir = os.path.join(templates_root, "ssl")
             if os.path.isdir(ssl_dir):
@@ -356,7 +370,7 @@ def _build_scan_jobs(
 
         # ── Product-specific CVE jobs (only for identified products) ──────────
         cves_dir = os.path.join(templates_root, "http/cves")
-        if os.path.isdir(cves_dir):
+        if "cve" in template_selection and os.path.isdir(cves_dir):
             product_tags: set[str] = set()
             for port in open_ports:
                 if _classify_port(port, svc_map) in ("http", "https"):
@@ -370,11 +384,22 @@ def _build_scan_jobs(
                     "template_args": ["-t", cves_dir, "-tags", tag],
                     "label":         f"http-cves/{tag} — {len(web_targets)} endpoint(s)",
                 })
+            if not product_tags:
+                jobs.append({
+                    "targets":       web_targets,
+                    "template_args": ["-t", cves_dir],
+                    "label":         f"http-cves/generic — {len(web_targets)} endpoint(s)",
+                })
 
     # ── Per-service network jobs (one per nuclei tag so -tags filters correctly)
-    net_dirs = _existing_dirs([
-        os.path.join(templates_root, d) for d in _NETWORK_SUBDIRS
-    ])
+    network_subdirs = []
+    if "cve" in template_selection or "network" in template_selection:
+        network_subdirs.append("network/cves")
+    if "default-login" in template_selection:
+        network_subdirs.append("network/default-logins")
+    if "exposure" in template_selection or "network" in template_selection:
+        network_subdirs.append("network/exposed-service")
+    net_dirs = _existing_dirs([os.path.join(templates_root, d) for d in network_subdirs])
     for tag, targets in net_by_tag.items():
         if net_dirs:
             jobs.append({
@@ -499,6 +524,7 @@ async def run_vuln_scan(
     Phase 4  — run one nuclei invocation per job, streaming progress live.
     Phase 5  — merge findings across all jobs and emit RESULT:<json>.
     """
+    template_selection = _parse_template_selection(templates)
     templates_root = os.path.expanduser("~/nuclei-templates")
     if not os.path.isdir(templates_root):
         yield "[WARN] Nuclei templates not found — run 'nuclei -update-templates' in the container"
@@ -534,10 +560,19 @@ async def run_vuln_scan(
 
     # ── Phase 3: Scan plan ───────────────────────────────────────────────────
     if open_ports:
-        jobs = _build_scan_jobs(ip, open_ports, svc_map, templates_root)
+        jobs = _build_scan_jobs(ip, open_ports, svc_map, templates_root, template_selection)
     else:
         # No open ports — fall back to default HTTP/HTTPS probe
-        dirs = _existing_dirs([os.path.join(templates_root, d) for d in _HTTP_SUBDIRS])
+        http_subdirs = []
+        if "misconfig" in template_selection:
+            http_subdirs.append("http/misconfiguration")
+        if "default-login" in template_selection:
+            http_subdirs.append("http/default-logins")
+        if "exposure" in template_selection:
+            http_subdirs.extend(["http/exposed-panels", "http/exposures", "http/vulnerabilities"])
+        if "cve" in template_selection and "http/vulnerabilities" not in http_subdirs:
+            http_subdirs.append("http/vulnerabilities")
+        dirs = _existing_dirs([os.path.join(templates_root, d) for d in http_subdirs])
         ssl_dir = os.path.join(templates_root, "ssl")
         if os.path.isdir(ssl_dir):
             dirs.append(ssl_dir)

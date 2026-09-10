@@ -35,6 +35,7 @@ from fastapi.responses import StreamingResponse
 from jose import JWTError, jwt
 from pydantic import BaseModel
 from sqlalchemy import text
+from trivy_utils import run_trivy_image_scan_sync
 
 # ── Auth ───────────────────────────────────────────────────────────────────────
 # Replicated from main.py to avoid circular imports — only needs env vars.
@@ -806,10 +807,18 @@ def _check_update_sync(image_name: str, host_url: str, running_image_id: str | N
             current_digest = None
 
         # If the running container's image ID differs from the locally-cached image ID,
-        # a new image was pulled but the container was never restarted.
+        # a new image was pulled but the container was never restarted. Report the
+        # *actual running* image's digest as current_digest (not the newly-pulled one),
+        # so the UI doesn't confusingly show identical "Running" and "Registry" digests.
         if running_image_id and local_image_id and running_image_id != local_image_id:
+            running_current_digest = current_digest
+            try:
+                running_img = client.images.get(running_image_id)
+                running_current_digest = _local_manifest_digest(running_img, image_name) or current_digest
+            except Exception:
+                pass
             return {
-                "current_digest": current_digest,
+                "current_digest": running_current_digest,
                 "latest_digest":  current_digest,
                 "has_update":     True,
                 "local_image_id": local_image_id,
@@ -947,51 +956,13 @@ def _trivy_scan_image(image_name: str) -> tuple[list, int, int]:
     Returns (vulns_list, critical_count, high_count).
     vulns_list follows the same shape as VulnTab in the frontend.
     """
-    if not shutil.which("trivy"):
-        return [], 0, 0
-    try:
-        result = subprocess.run(
-            [
-                "trivy", "image",
-                "--quiet", "--no-progress",
-                "--format", "json",
-                image_name,
-            ],
-            capture_output=True,
-            text=True,
-            timeout=300,
-        )
-        if result.returncode != 0:
-            print(f"[trivy-image-scan] exited {result.returncode}: {result.stderr[:200]}", flush=True)
-            return [], 0, 0
-
-        data  = json.loads(result.stdout)
-        vulns = []
-        for res in (data.get("Results") or []):
-            for v in (res.get("Vulnerabilities") or []):
-                score = None
-                cvss  = v.get("CVSS") or {}
-                for source in ("nvd", "redhat", "ghsa"):
-                    if cvss.get(source, {}).get("V3Score"):
-                        score = cvss[source]["V3Score"]
-                        break
-                vulns.append({
-                    "id":          v.get("VulnerabilityID", ""),
-                    "severity":    v.get("Severity", "UNKNOWN").lower(),
-                    "pkg":         v.get("PkgName", ""),
-                    "installed":   v.get("InstalledVersion", ""),
-                    "fixed":       v.get("FixedVersion", ""),
-                    "title":       v.get("Title", ""),
-                    "description": (v.get("Description") or "")[:400],
-                    "score":       score,
-                    "url": f"https://nvd.nist.gov/vuln/detail/{v.get('VulnerabilityID', '')}",
-                })
-        critical = sum(1 for v in vulns if v["severity"] == "critical")
-        high     = sum(1 for v in vulns if v["severity"] == "high")
-        return vulns, critical, high
-    except Exception as e:
-        print(f"[trivy-image-scan] {e}", flush=True)
-        return [], 0, 0
+    result = run_trivy_image_scan_sync(image_name)
+    if not result.get("ok"):
+        raise RuntimeError(result.get("error") or f"Trivy scan failed for {image_name}")
+    vulns = result.get("vulns") or []
+    critical = sum(1 for v in vulns if v["severity"] == "critical")
+    high = sum(1 for v in vulns if v["severity"] == "high")
+    return vulns, critical, high
 
 
 # ── Notification helper ────────────────────────────────────────────────────────
@@ -1110,9 +1081,22 @@ async def _self_update_via_helper_stream(
                     yield emit(f"LOG: [3/3] Warning: could not scan current image for comparison: {_exc}")
 
             yield emit("LOG: [3/3] Running Trivy security scan on new image…")
-            scan_vulns, critical_count, high_count = await asyncio.to_thread(
-                _trivy_scan_image, image_name
-            )
+            try:
+                scan_vulns, critical_count, high_count = await asyncio.to_thread(
+                    _trivy_scan_image, image_name
+                )
+            except Exception as scan_err:
+                yield emit(f"LOG: [ERROR] Trivy scan failed: {scan_err}")
+                yield emit("UPDATE_ERROR:Security scan failed — update aborted before deployment.")
+                db = _SessionLocal()
+                try:
+                    _upsert_update_status(db, container_name, host_id,
+                                          update_in_progress=False,
+                                          last_update_status="failed",
+                                          last_update_error=f"Trivy scan failed: {scan_err}")
+                finally:
+                    db.close()
+                return
             yield emit(
                 f"LOG: [3/3] ✓ Scan complete — "
                 f"{critical_count} critical, {high_count} high, {len(scan_vulns)} total CVEs."
@@ -1697,10 +1681,22 @@ async def _safe_update_stream(
                         yield emit(f"LOG: [3/7] Warning: could not scan current image for comparison: {_exc}")
 
                 yield emit("LOG: [3/7] Running Trivy security scan on new image…")
-
-                scan_vulns, critical_count, high_count = await asyncio.to_thread(
-                    _trivy_scan_image, image_name
-                )
+                try:
+                    scan_vulns, critical_count, high_count = await asyncio.to_thread(
+                        _trivy_scan_image, image_name
+                    )
+                except Exception as scan_err:
+                    yield emit(f"LOG: [ERROR] Trivy scan failed: {scan_err}")
+                    yield emit("UPDATE_ERROR:Security scan failed — update aborted before deployment.")
+                    db = _SessionLocal()
+                    try:
+                        _upsert_update_status(db, container_name, host_id,
+                                              update_in_progress=False,
+                                              last_update_status="failed",
+                                              last_update_error=f"Trivy scan failed: {scan_err}")
+                    finally:
+                        db.close()
+                    return
                 yield emit(
                     f"LOG: [3/7] ✓ Scan complete — "
                     f"{critical_count} critical, {high_count} high, {len(scan_vulns)} total CVEs."
@@ -1958,12 +1954,16 @@ async def _safe_update_stream(
                 yield emit("LOG: [7/7] Image updated successfully. Container left in stopped state.")
                 new_container.reload()
                 new_digest = new_container.image.id
+                if scan_first:
+                    from background_loops import _save_trivy_result
+                    _save_trivy_result(container_name, image_name, scan_vulns, datetime.now(timezone.utc).isoformat(), image_id=new_digest)
                 db = _SessionLocal()
                 try:
                     _upsert_update_status(db, container_name, host_id,
                                           image               = image_name,
                                           current_digest      = new_digest,
                                           latest_digest       = new_digest,
+                                          running_image_id    = new_digest,
                                           has_update          = False,
                                           update_blocked      = False,
                                           blocked_reason      = None,
@@ -2084,6 +2084,9 @@ async def _safe_update_stream(
 
                 new_container.reload()
                 new_digest = new_container.image.id
+                if scan_first:
+                    from background_loops import _save_trivy_result
+                    _save_trivy_result(container_name, image_name, scan_vulns, datetime.now(timezone.utc).isoformat(), image_id=new_digest)
 
                 db = _SessionLocal()
                 try:
@@ -2091,6 +2094,7 @@ async def _safe_update_stream(
                                           image               = image_name,
                                           current_digest      = new_digest,
                                           latest_digest       = new_digest,
+                                          running_image_id    = new_digest,
                                           has_update          = False,
                                           update_blocked      = False,
                                           blocked_reason      = None,
@@ -2206,6 +2210,11 @@ def _check_all_containers_for_host(
     for c in containers:
         cname      = c.name.lstrip("/")
         image_name = _container_image_ref(c)
+        # c.image.id is the config digest of the image the container is actually
+        # running — used to detect "new image pulled but container not yet
+        # restarted" the same way the manual check-update endpoint does.
+        running_img = getattr(c, "image", None)
+        running_image_id = running_img.id if running_img else None
         if progress_cb:
             try:
                 progress_cb("start", cname, host_url, host_id, total)
@@ -2244,25 +2253,24 @@ def _check_all_containers_for_host(
                 db = _SessionLocal()
                 try:
                     image_for_check = _resolve_registry_image_ref(db, cname, host_id, image_name)
-                    prev = db.execute(
-                        text("""SELECT has_update FROM container_update_status
-                                WHERE container_name=:n AND COALESCE(host_id,-1)=COALESCE(:h,-1)"""),
-                        {"n": cname, "h": host_id},
-                    ).fetchone()
-                    had_update = bool(prev and prev[0])
+                    prev = _get_update_status_row(db, cname, host_id)
+                    had_update = bool(prev and prev.get("has_update"))
                 finally:
                     db.close()
 
-                result = _check_update_sync(image_for_check, host_url)
+                result = _check_update_sync(image_for_check, host_url, running_image_id)
 
                 db = _SessionLocal()
                 try:
                     kw = dict(
-                        image          = image_for_check,
-                        current_digest = result.get("current_digest"),
-                        latest_digest  = result.get("latest_digest"),
-                        has_update     = result.get("has_update", False),
-                        checked_at     = datetime.now(timezone.utc),
+                        image             = image_for_check,
+                        current_digest    = result.get("current_digest"),
+                        latest_digest     = result.get("latest_digest"),
+                        has_update        = result.get("has_update", False),
+                        checked_at        = datetime.now(timezone.utc),
+                        running_image_id  = running_image_id,
+                        last_update_status = "update_available" if result.get("has_update", False) else "checked",
+                        last_update_error  = result.get("error"),
                     )
                     if not result.get("has_update"):
                         kw["update_blocked"] = False
@@ -2277,6 +2285,38 @@ def _check_all_containers_for_host(
                         "Container Update Available",
                         f"New image version available for {cname} ({image_for_check})",
                     )
+
+                # Scheduled auto-update modes should actually perform the update.
+                # - notify: only alert
+                # - disabled: check only
+                # - scan_then_update: scan first, then update if the scan/policy allows
+                # - auto: update immediately, skipping the vulnerability scan gate
+                if result.get("has_update") and auto_update in ("auto", "scan_then_update"):
+                    if prev and (
+                        prev.get("pinned")
+                        or prev.get("update_blocked")
+                        or prev.get("update_in_progress")
+                    ):
+                        continue
+
+                    scan_first = auto_update == "scan_then_update"
+
+                    async def _consume_update():
+                        async for _ in _safe_update_stream(
+                            c.id, host_url, host_id,
+                            force=False, scan_first=scan_first,
+                        ):
+                            pass
+
+                    try:
+                        print(
+                            f"[update-check] auto-update starting for {cname} "
+                            f"(mode={auto_update}, scan_first={scan_first})",
+                            flush=True,
+                        )
+                        asyncio.run(_consume_update())
+                    except Exception as exc:
+                        print(f"[update-check] auto-update failed for {cname}: {exc}", flush=True)
 
             except Exception as exc:
                 print(f"[update-check] {cname}: {exc}", flush=True)
@@ -2552,7 +2592,12 @@ async def scan_new_image_endpoint(container_id: str, request: Request):
             yield "data: SCAN_DONE:error\n\n"
             return
 
-        vulns, critical, high = await asyncio.to_thread(_trivy_scan_image, image_name)
+        try:
+            vulns, critical, high = await asyncio.to_thread(_trivy_scan_image, image_name)
+        except Exception as scan_err:
+            yield f"data: LOG: Trivy scan failed: {scan_err}\n\n"
+            yield "data: SCAN_DONE:error\n\n"
+            return
         db2 = _SessionLocal()
         try:
             _upsert_update_status(db2, container_name, host_id,
@@ -3123,11 +3168,24 @@ async def recreate_from_backup(backup_id: int, request: Request):
                         port_bindings, exposed_ports = _extract_ports_from_network_settings(
                             hcfg.get("PortBindings") or net_sets.get("Ports")
                         )
-                        binds = {
-                            m["Source"]: {"bind": m["Destination"], "mode": m.get("Mode", "rw")}
-                            for m in (attrs.get("Mounts") or [])
-                            if m.get("Type") == "bind" and m.get("Source") and m.get("Destination")
-                        }
+                        binds = {}
+                        for bind_spec in (hcfg.get("Binds") or []):
+                            parts = str(bind_spec).split(":")
+                            if len(parts) < 2:
+                                continue
+                            src = ":".join(parts[:-2]) if len(parts) > 2 else parts[0]
+                            dst = parts[-2]
+                            mode = parts[-1] if len(parts) > 2 else "rw"
+                            if src and dst:
+                                binds[src] = {"bind": dst, "mode": mode or "rw"}
+                        if not binds:
+                            for m in (attrs.get("Mounts") or []):
+                                if m.get("Type") == "bind":
+                                    src  = m.get("Source", "")
+                                    dst  = m.get("Destination", "")
+                                    mode = m.get("Mode", "rw")
+                                    if src and dst:
+                                        binds[src] = {"bind": dst, "mode": mode}
                         vol_binds = {
                             m["Name"]: {"bind": m["Destination"], "mode": m.get("Mode", "rw")}
                             for m in (attrs.get("Mounts") or [])

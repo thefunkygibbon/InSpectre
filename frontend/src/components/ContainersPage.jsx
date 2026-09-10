@@ -1,8 +1,9 @@
 import { useState, useEffect, useCallback, useMemo, useRef } from 'react'
-import { Box, RefreshCw, Search, AlertCircle, Play, Square, Loader2, LayoutGrid, List, ArrowUpDown, ShieldAlert, Network, GitBranch, X, Sparkles, ChevronDown, ChevronRight, Settings2, ArrowUpCircle, Download, SlidersHorizontal } from 'lucide-react'
+import { Box, RefreshCw, Search, AlertCircle, Play, Square, Loader2, LayoutGrid, List, ArrowUpDown, ShieldAlert, Network, GitBranch, X, Sparkles, ChevronDown, ChevronRight, Settings2, ArrowUpCircle, Download, SlidersHorizontal, Plus } from 'lucide-react'
 import { api } from '../api'
 import { ContainerCard } from './ContainerCard'
 import { ContainerDrawer } from './ContainerDrawer'
+import { NewContainerDrawer } from './NewContainerDrawer'
 import { StatCard } from './StatCard'
 
 const STOPPED_STATES = ['exited', 'created', 'dead']
@@ -464,6 +465,8 @@ export function ContainersPage({ openContainer, skin }) {
   const [error,         setError]         = useState(null)
   const [disabled,      setDisabled]      = useState(false)
   const [selected,      setSelected]      = useState(null)
+  const [showNewContainer, setShowNewContainer] = useState(false)
+  const [containerHosts, setContainerHosts] = useState([])
   const [search,        setSearch]        = useState('')
   const [filter,        setFilter]        = useState('all')
   const [smartFilters,  setSmartFilters]  = useState({})
@@ -588,6 +591,7 @@ export function ContainersPage({ openContainer, skin }) {
   }, [])
 
   useEffect(() => { load() }, [load])
+  useEffect(() => { api.listContainerHosts().then(setContainerHosts).catch(() => {}) }, [])
 
   useEffect(() => {
     const id = setInterval(() => load(true), 15000)
@@ -791,6 +795,11 @@ export function ContainersPage({ openContainer, skin }) {
 
               {/* Right-side controls */}
               <div className="ml-auto flex items-center gap-1 shrink-0">
+                 <button onClick={() => setShowNewContainer(true)}
+                   className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-xl text-xs font-medium border"
+                   style={{ background: 'var(--color-brand)', color: 'white', borderColor: 'transparent' }}>
+                   <Plus size={12} /> <span className="hidden sm:inline">New container</span>
+                 </button>
                 {/* New first — label hidden on small screens */}
                 <button
                   onClick={toggleSurfaceNewFirst}
@@ -1057,6 +1066,13 @@ export function ContainersPage({ openContainer, skin }) {
           onClose={() => setSelected(null)}
           onContainerUpdate={handleContainerUpdate}
           updateStatus={updateStatuses[selected.name]}
+        />
+      )}
+      {showNewContainer && (
+        <NewContainerDrawer
+          hosts={containerHosts}
+          onClose={() => setShowNewContainer(false)}
+          onCreated={() => { setShowNewContainer(false); load(true) }}
         />
       )}
     </div>

@@ -45,11 +45,29 @@ def _upsert_dhcp_info(
         hostname_updated = False
 
         if hostname:
+            prior_dhcp_hostname = device.dhcp_hostname
             if device.dhcp_hostname != hostname:
                 device.dhcp_hostname = hostname
                 changed = True
+
+            # Naming priority: manual name > non-generic DNS/mDNS name > DHCP-reported
+            # hostname > other discovery methods > generic DNS name as a last resort.
+            # DHCP hostnames are frequently auto-generated/generic (e.g. "android-1a2b3c")
+            # and must never clobber a meaningful name already resolved from a
+            # higher-priority source (rDNS, mDNS, a plugin, etc). Only let DHCP claim
+            # the display hostname when there's nothing better in place yet, or when
+            # the current name was itself only ever a DHCP-sourced/generic value.
             current_hn = device.hostname or ""
-            should_replace = not device.custom_name and hostname != current_hn
+            should_replace = (
+                not device.custom_name
+                and hostname != current_hn
+                and (
+                    not current_hn
+                    or _is_generic_hostname(current_hn)
+                    or _cfg._is_ip_derived_hostname(current_hn)
+                    or current_hn == prior_dhcp_hostname
+                )
+            )
             if should_replace:
                 conflict = session.query(Device).filter(
                     Device.hostname == hostname,
@@ -60,7 +78,7 @@ def _upsert_dhcp_info(
                     changed = True
                     hostname_updated = True
                     if current_hn:
-                        print(f"[dhcp] {mac}: hostname {current_hn!r} → {hostname!r} (DHCP overrides rDNS)", flush=True)
+                        print(f"[dhcp] {mac}: hostname {current_hn!r} → {hostname!r} (DHCP name applied — no stronger name available)", flush=True)
 
         if vendor_class and device.dhcp_vendor_class != vendor_class:
             device.dhcp_vendor_class = vendor_class
@@ -470,18 +488,22 @@ def refresh_missing_vendors() -> None:
 
 
 def refresh_missing_hostnames() -> None:
-    """Resolve hostnames for online devices that have none and whose cooldown has elapsed."""
+    """Resolve hostnames for online devices that have none, plus a periodic re-check for
+    devices whose current display hostname only ever came from DHCP (self-reported and
+    often generic) — giving a real rDNS/mDNS name a chance to reclaim priority once it
+    becomes resolvable, per the naming priority: manual > DNS (non-generic) > DHCP > other."""
     if not _cfg.ENABLE_HOSTNAME_RESOLUTION:
         return
     now = datetime.now(timezone.utc)
     session = Session()
     try:
-        unnamed = session.query(Device).filter(
+        candidates = session.query(Device).filter(
             Device.is_online == True,
-            Device.hostname  == None,
+            Device.custom_name == None,
+            (Device.hostname == None) | (Device.hostname == Device.dhcp_hostname),
         ).all()
         updated = 0
-        for dev in unnamed:
+        for dev in candidates:
             scan_ip = dev.primary_ip or dev.ip_address
             if not _cfg._is_valid_ip(scan_ip):
                 continue
@@ -495,11 +517,15 @@ def refresh_missing_hostnames() -> None:
             name = resolve_hostname(scan_ip)
             dev.hostname_last_attempted = now
             if name:
-                if _remember_name_source(dev, "rdns_hostname", name):
-                    pass
-                dev.hostname = name
-                updated += 1
-                print(f"[hostname] Resolved: {scan_ip} -> {name}", flush=True)
+                _remember_name_source(dev, "rdns_hostname", name)
+                current_hn = dev.hostname or ""
+                # Only promote the freshly-resolved DNS name if it's meaningfully
+                # better than what's there — i.e. non-generic and different from the
+                # (possibly DHCP-sourced) current value.
+                if name != current_hn and not _is_generic_hostname(name):
+                    dev.hostname = name
+                    updated += 1
+                    print(f"[hostname] Resolved: {scan_ip} -> {name}", flush=True)
         if updated or True:
             session.commit()
             if updated:

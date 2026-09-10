@@ -58,7 +58,7 @@ const TABS = [
   { id: 'overview', label: 'Overview'  },
   { id: 'compose',  label: 'Compose'   },
   { id: 'logs',     label: 'Logs'      },
-  { id: 'vuln',     label: 'Vuln Scan' },
+  { id: 'vuln',     label: 'Security'  },
   { id: 'updates',  label: 'Updates'   },
   { id: 'admin',    label: 'Admin'     },
 ]
@@ -236,6 +236,7 @@ const SEV_CFG = {
   high:     { label: 'High',     color: '#f97316', bg: 'rgba(249,115,22,0.12)', border: 'rgba(249,115,22,0.3)' },
   medium:   { label: 'Medium',   color: '#f59e0b', bg: 'rgba(245,158,11,0.12)', border: 'rgba(245,158,11,0.3)' },
   low:      { label: 'Low',      color: '#3b82f6', bg: 'rgba(59,130,246,0.12)', border: 'rgba(59,130,246,0.3)' },
+  info:     { label: 'Info',     color: '#22c55e', bg: 'rgba(34,197,94,0.12)',  border: 'rgba(34,197,94,0.3)'  },
   unknown:  { label: 'Unknown',  color: '#8b5cf6', bg: 'rgba(139,92,246,0.12)', border: 'rgba(139,92,246,0.3)' },
 }
 const SEV_ORDER = ['critical', 'high', 'medium', 'low', 'unknown']
@@ -322,45 +323,96 @@ function VulnGroup({ severity, vulns, defaultOpen }) {
   )
 }
 
-// ---------------------------------------------------------------------------
-// Vuln scan tab (Trivy) — state is lifted to ContainersPage
-// ---------------------------------------------------------------------------
-function VulnTab({ container, trivyScan, updateTrivyScan }) {
-  const abortRef        = useRef(null)
-  const [loadingHistory, setLoadingHistory] = useState(false)
+function SecurityAuditFindingCard({ finding }) {
+  const cfg = SEV_CFG[finding.severity] || SEV_CFG.unknown
+  return (
+    <div className="rounded-lg border p-3 space-y-2" style={{ borderColor: cfg.border, background: cfg.bg }}>
+      <div className="flex items-start justify-between gap-3">
+        <div>
+          <span className="text-[10px] font-bold px-1.5 py-0.5 rounded"
+            style={{ background: 'rgba(0,0,0,0.2)', color: cfg.color }}>
+            {cfg.label.toUpperCase()}
+          </span>
+          <p className="mt-2 text-xs leading-snug" style={{ color: 'var(--color-text)' }}>{finding.description}</p>
+        </div>
+        <span className="text-[10px] font-mono shrink-0" style={{ color: 'var(--color-text-faint)' }}>
+          {finding.id}
+        </span>
+      </div>
+      <p className="text-[11px] leading-snug" style={{ color: 'var(--color-text-muted)' }}>
+        <strong>Advice:</strong> {finding.advice}
+      </p>
+    </div>
+  )
+}
 
-  const logs      = trivyScan.logs || []
-  const vulns     = trivyScan.vulns     // null = never scanned, [] = clean, [...] = found
-  const scanning  = trivyScan.scanning
+// ---------------------------------------------------------------------------
+// Security tab (Trivy + runtime audit) — Trivy state is lifted to ContainersPage
+// ---------------------------------------------------------------------------
+function SecurityTab({ container, trivyScan, updateTrivyScan }) {
+  const abortRef = useRef(null)
+  const [loadingSecurity, setLoadingSecurity] = useState(false)
+  const [audit, setAudit] = useState(null)
+  const isProxmox = container.host_type === 'proxmox'
+
+  const logs = trivyScan.logs || []
+  const vulns = trivyScan.vulns
+  const scanning = trivyScan.scanning
   const scannedAt = trivyScan.scannedAt
+  const scanSource = trivyScan.source || null
+  const stale = trivyScan.stale || null
 
-  // On first open, load stored result from backend
-  useEffect(() => {
-    if (vulns !== null || scanning) return
-    setLoadingHistory(true)
-    api.dockerAutoScanResult(container.name).then(data => {
-      if (data && Array.isArray(data.vulns)) {
-        updateTrivyScan({ vulns: data.vulns, scannedAt: data.scanned_at || null })
+  const loadSecurityState = useCallback((force = false) => {
+    if (loadingSecurity && !force) return
+    setLoadingSecurity(true)
+    api.dockerSecurityState(container.id).then(data => {
+      const imageScan = data?.image_scan
+      if (imageScan) {
+        updateTrivyScan(cur => ({
+          ...cur,
+          vulns: Array.isArray(imageScan.vulns) ? imageScan.vulns : null,
+          scannedAt: imageScan.scanned_at || null,
+          source: imageScan.source || null,
+          stale: imageScan.stale || null,
+        }))
       }
-    }).catch(() => {}).finally(() => setLoadingHistory(false))
-  }, []) // eslint-disable-line react-hooks/exhaustive-deps
+      setAudit(data?.audit || null)
+    }).catch(err => {
+      setAudit({ findings: [], error: err.message || 'Failed to load security state.' })
+    }).finally(() => setLoadingSecurity(false))
+  }, [container.id, loadingSecurity, updateTrivyScan])
+
+  useEffect(() => {
+    if (scanning) return
+    loadSecurityState(true)
+  }, [container.id]) // eslint-disable-line react-hooks/exhaustive-deps
 
   function startScan() {
+    if (isProxmox) return
     if (abortRef.current) abortRef.current.abort()
     const ctrl = new AbortController()
     abortRef.current = ctrl
-    updateTrivyScan({ logs: [], vulns: null, scanning: true, scannedAt: null })
+    updateTrivyScan({ logs: [], vulns: null, scanning: true, scannedAt: null, source: null, stale: null })
     api.dockerTrivyScan(container.id, (line) => {
       if (line.startsWith('TRIVY_RESULT:')) {
         try {
           const payload = JSON.parse(line.slice('TRIVY_RESULT:'.length))
-          updateTrivyScan(cur => ({ ...cur, vulns: payload.vulns || [], scannedAt: payload.scanned_at || null }))
-        } catch (_) { /* ignore parse errors */ }
+          updateTrivyScan(cur => ({
+            ...cur,
+            vulns: payload.vulns || [],
+            scannedAt: payload.scanned_at || null,
+            source: 'manual_scan',
+            stale: null,
+          }))
+        } catch (_) {}
       } else if (line !== 'TRIVY_DONE') {
         const msg = line.startsWith('LOG: ') ? line.slice(5) : line
         updateTrivyScan(cur => ({ ...cur, logs: [...(cur.logs || []).slice(-199), msg] }))
       }
-    }, ctrl.signal).catch(() => {}).finally(() => updateTrivyScan(cur => ({ ...cur, scanning: false })))
+    }, ctrl.signal).catch(() => {}).finally(() => {
+      updateTrivyScan(cur => ({ ...cur, scanning: false }))
+      loadSecurityState(true)
+    })
   }
 
   function stopScan() {
@@ -376,44 +428,58 @@ function VulnTab({ container, trivyScan, updateTrivyScan }) {
     grouped[s].push(v)
   }
   const hasVulns = vulns !== null && vulns.length > 0
+  const auditFindings = (audit?.findings || []).slice().sort((a, b) => {
+    const order = { critical: 0, high: 1, medium: 2, info: 3 }
+    return (order[a.severity] ?? 9) - (order[b.severity] ?? 9)
+  })
 
   return (
     <div className="space-y-4">
-      {/* Image info + scan timestamp */}
       <div className="rounded-lg px-4 py-3 text-xs space-y-1"
         style={{ background: 'var(--color-surface-offset)', border: '1px solid var(--color-border)' }}>
         <p className="font-medium" style={{ color: 'var(--color-text)' }}>
-          Image: <span className="font-mono">{container.image}</span>
+          {isProxmox ? 'Guest' : 'Image'}: <span className="font-mono">{container.image}</span>
         </p>
-        {scannedAt && !scanning && (
-          <p style={{ color: 'var(--color-text-faint)' }}>Last scanned: {new Date(scannedAt).toLocaleString()}</p>
+        {!isProxmox && scannedAt && !scanning && (
+          <p style={{ color: 'var(--color-text-faint)' }}>
+            Last image scan: {new Date(scannedAt).toLocaleString()}
+            {scanSource ? ` · ${scanSource.replaceAll('_', ' ')}` : ''}
+          </p>
         )}
-        {!scannedAt && !scanning && vulns === null && (
-          <p style={{ color: 'var(--color-text-faint)' }}>Scans the container image for known CVEs using Trivy.</p>
+        {!isProxmox && stale?.scanned_at && vulns === null && (
+          <p style={{ color: '#f59e0b' }}>
+            Previous scan data exists for a different image ({stale.image || 'unknown image'}), so it is not shown as the current result.
+          </p>
+        )}
+        {audit?.scanned_at && (
+          <p style={{ color: 'var(--color-text-faint)' }}>
+            Last runtime audit: {new Date(audit.scanned_at).toLocaleString()}
+          </p>
         )}
       </div>
 
-      {/* Controls */}
-      <div className="flex items-center gap-2">
-        {scanning ? (
-          <button onClick={stopScan}
-            className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium border
-                       border-red-500/40 bg-red-500/10 text-red-400 hover:bg-red-500/20 transition-colors">
-            <Square size={11} className="fill-current" /> Stop Scan
-          </button>
-        ) : (
-          <button onClick={startScan}
-            className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium border
-                       border-brand/40 bg-brand/10 text-brand hover:bg-brand/20 transition-colors">
-            <ShieldAlert size={11} /> {vulns !== null ? 'Re-scan' : 'Scan Image'}
-          </button>
+      <div className="flex items-center gap-2 flex-wrap">
+        {!isProxmox && (
+          scanning ? (
+            <button onClick={stopScan}
+              className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium border
+                         border-red-500/40 bg-red-500/10 text-red-400 hover:bg-red-500/20 transition-colors">
+              <Square size={11} className="fill-current" /> Stop Scan
+            </button>
+          ) : (
+            <button onClick={startScan}
+              className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium border
+                         border-brand/40 bg-brand/10 text-brand hover:bg-brand/20 transition-colors">
+              <ShieldAlert size={11} /> {vulns !== null ? 'Re-scan Image' : 'Scan Image'}
+            </button>
+          )
         )}
-        {scanning && (
-          <span className="flex items-center gap-1 text-xs" style={{ color: 'var(--color-text-faint)' }}>
-            <Loader2 size={11} className="animate-spin" />Scanning…
-          </span>
-        )}
-        {vulns !== null && !scanning && (
+        <button onClick={() => loadSecurityState(true)} disabled={loadingSecurity || scanning}
+          className="btn-ghost flex items-center gap-1.5 text-xs">
+          <RefreshCw size={12} className={loadingSecurity ? 'animate-spin' : ''} />
+          Refresh Security
+        </button>
+        {!isProxmox && vulns !== null && !scanning && (
           <button
             onClick={() => exportContainerVulnPDF(container, vulns, scannedAt)}
             className="flex items-center gap-1 px-2 py-1.5 rounded-lg text-xs font-medium transition-colors ml-auto"
@@ -424,7 +490,6 @@ function VulnTab({ container, trivyScan, updateTrivyScan }) {
         )}
       </div>
 
-      {/* Scan errors/warnings only — INFO lines suppressed */}
       {logs.some(l => l.includes('[ERROR]') || l.includes('[WARN]')) && (
         <div className="rounded-lg p-3 font-mono text-[11px] space-y-0.5"
           style={{ background: 'var(--color-surface-offset)', border: '1px solid var(--color-border)' }}>
@@ -437,55 +502,96 @@ function VulnTab({ container, trivyScan, updateTrivyScan }) {
         </div>
       )}
 
-      {/* Loading history */}
-      {loadingHistory && (
-        <div className="flex items-center gap-2 text-xs py-4" style={{ color: 'var(--color-text-faint)' }}>
-          <Loader2 size={13} className="animate-spin" /> Loading last scan result…
+      {audit?.error && (
+        <div className="rounded-lg p-3 text-xs"
+          style={{ background: 'rgba(239,68,68,0.08)', border: '1px solid rgba(239,68,68,0.25)', color: '#ef4444' }}>
+          Runtime security audit failed: {audit.error}
         </div>
       )}
 
-      {/* Not-yet-scanned empty state */}
-      {vulns === null && !scanning && !loadingHistory && (
-        <div className="flex flex-col items-center py-10 gap-2 text-center">
-          <ShieldAlert size={24} style={{ color: 'var(--color-text-faint)' }} />
-          <p className="text-xs" style={{ color: 'var(--color-text-faint)' }}>
-            Click "Scan Image" to check for known CVEs with Trivy.
-          </p>
+      {loadingSecurity && (
+        <div className="flex items-center gap-2 text-xs py-2" style={{ color: 'var(--color-text-faint)' }}>
+          <Loader2 size={13} className="animate-spin" /> Loading security data…
         </div>
       )}
 
-      {/* Results */}
-      {vulns !== null && !scanning && (
-        <>
-          {hasVulns ? (
-            <div className="flex flex-wrap gap-2">
-              {SEV_ORDER.filter(s => grouped[s].length > 0).map(s => {
-                const cfg = SEV_CFG[s]
-                return (
-                  <span key={s} className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold"
-                    style={{ background: cfg.bg, color: cfg.color, border: `1px solid ${cfg.border}` }}>
-                    <span className="text-base font-bold tabular-nums">{grouped[s].length}</span> {cfg.label}
-                  </span>
-                )
-              })}
-            </div>
-          ) : (
-            <div className="flex items-center gap-2 px-4 py-3 rounded-lg text-xs font-medium"
-              style={{ background: 'rgba(34,197,94,0.1)', color: '#22c55e', border: '1px solid rgba(34,197,94,0.25)' }}>
-              <ShieldCheck size={14} /> No vulnerabilities found in this image
+      {!isProxmox && (
+        <div className="space-y-3">
+          <div className="flex items-center gap-2">
+            <ShieldAlert size={13} style={{ color: 'var(--color-brand)' }} />
+            <span className="text-xs font-semibold uppercase tracking-wider" style={{ color: 'var(--color-text-muted)' }}>
+              Image Vulnerability Scan
+            </span>
+          </div>
+
+          {vulns === null && !scanning && !loadingSecurity && (
+            <div className="flex flex-col items-center py-8 gap-2 text-center">
+              <ShieldAlert size={24} style={{ color: 'var(--color-text-faint)' }} />
+              <p className="text-xs" style={{ color: 'var(--color-text-faint)' }}>
+                {stale?.scanned_at
+                  ? 'No scan result is stored for the current running image yet.'
+                  : 'Click "Scan Image" to check the current running image for known CVEs with Trivy.'}
+              </p>
             </div>
           )}
 
-          {hasVulns && (
-            <div>
-              {SEV_ORDER.filter(s => grouped[s].length > 0).map(s => (
-                <VulnGroup key={s} severity={s} vulns={grouped[s]}
-                  defaultOpen={s === 'critical' || s === 'high'} />
-              ))}
-            </div>
+          {vulns !== null && !scanning && (
+            <>
+              {hasVulns ? (
+                <div className="flex flex-wrap gap-2">
+                  {SEV_ORDER.filter(s => grouped[s].length > 0).map(s => {
+                    const cfg = SEV_CFG[s]
+                    return (
+                      <span key={s} className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold"
+                        style={{ background: cfg.bg, color: cfg.color, border: `1px solid ${cfg.border}` }}>
+                        <span className="text-base font-bold tabular-nums">{grouped[s].length}</span> {cfg.label}
+                      </span>
+                    )
+                  })}
+                </div>
+              ) : (
+                <div className="flex items-center gap-2 px-4 py-3 rounded-lg text-xs font-medium"
+                  style={{ background: 'rgba(34,197,94,0.1)', color: '#22c55e', border: '1px solid rgba(34,197,94,0.25)' }}>
+                  <ShieldCheck size={14} /> No vulnerabilities found in the current running image
+                </div>
+              )}
+
+              {hasVulns && (
+                <div>
+                  {SEV_ORDER.filter(s => grouped[s].length > 0).map(s => (
+                    <VulnGroup key={s} severity={s} vulns={grouped[s]}
+                      defaultOpen={s === 'critical' || s === 'high'} />
+                  ))}
+                </div>
+              )}
+            </>
           )}
-        </>
+        </div>
       )}
+
+      <div className="space-y-3">
+        <div className="flex items-center gap-2">
+          <Shield size={13} style={{ color: 'var(--color-brand)' }} />
+          <span className="text-xs font-semibold uppercase tracking-wider" style={{ color: 'var(--color-text-muted)' }}>
+            Runtime Security Audit
+          </span>
+        </div>
+
+        {!loadingSecurity && audit && auditFindings.length === 0 && !audit.error && (
+          <div className="flex items-center gap-2 px-4 py-3 rounded-lg text-xs font-medium"
+            style={{ background: 'rgba(34,197,94,0.1)', color: '#22c55e', border: '1px solid rgba(34,197,94,0.25)' }}>
+            <ShieldCheck size={14} /> No common runtime misconfigurations were detected
+          </div>
+        )}
+
+        {auditFindings.length > 0 && (
+          <div className="space-y-2">
+            {auditFindings.map((finding, idx) => (
+              <SecurityAuditFindingCard key={`${finding.id}-${idx}`} finding={finding} />
+            ))}
+          </div>
+        )}
+      </div>
     </div>
   )
 }
@@ -559,33 +665,45 @@ function ComposeTab({ containerId, containerName, labels, resolveCurrentContaine
 
   // YAML viewer modal
   const [viewYaml,      setViewYaml]      = useState(null) // { title, yaml }
+  const resolveRef = useRef(resolveCurrentContainerId)
 
   useEffect(() => {
-    let cancelled = false
-    ;(async () => {
-      setLoading(true)
-      try {
-        const res = await api.dockerCompose(containerId)
-        if (!cancelled) { setData(res); setError(null) }
-      } catch (e) {
-        const msg = String(e?.message || '')
-        if (msg.includes('404') && resolveCurrentContainerId) {
-          try {
-            const resolved = await resolveCurrentContainerId()
-            if (resolved) {
-              const res2 = await api.dockerCompose(resolved)
-              if (!cancelled) { setData(res2); setError(null) }
-              return
-            }
-          } catch (_) {}
+    resolveRef.current = resolveCurrentContainerId
+  }, [resolveCurrentContainerId])
+
+  const loadCompose = useCallback(async () => {
+    setLoading(true)
+    try {
+      const res = await api.dockerCompose(containerId)
+      setData(res)
+      setError(null)
+    } catch (e) {
+      const msg = String(e?.message || '')
+      // 404 can happen if the container was recreated with a new ID; fall back
+      // to resolving the current live container exactly once.
+      if (msg.includes('404') && resolveRef.current && typeof resolveRef.current === 'function') {
+        try {
+          const resolved = await resolveRef.current()
+          if (resolved) {
+            const res2 = await api.dockerCompose(resolved)
+            setData(res2)
+            setError(null)
+            return
+          }
+        } catch (_) {
+          // Let the original error surface below.
         }
-        if (!cancelled) setError(e.message || 'Failed to generate compose file')
-      } finally {
-        if (!cancelled) setLoading(false)
       }
-    })()
-    return () => { cancelled = true }
+      setError(e.message || 'Failed to generate compose file')
+    } finally {
+      setLoading(false)
+    }
   }, [containerId])
+
+  // Load compose on mount or when containerId changes.
+  useEffect(() => {
+    loadCompose().catch(() => {})
+  }, [loadCompose])
 
   function handleCopy() {
     const yaml = editMode ? editYaml : data?.yaml
@@ -633,7 +751,7 @@ function ComposeTab({ containerId, containerName, labels, resolveCurrentContaine
       } else if (line === 'DEPLOY_DONE') {
         setDeployLogs(l => [...l, '✅ Deployed successfully.'])
         setDeploying(false)
-        setEditMode(false)
+        loadCompose().catch(() => {})
       } else {
         setDeployLogs(l => [...l, line.replace(/^LOG:\s*/, '')])
       }
@@ -1860,11 +1978,11 @@ export function ContainerDrawer({ container: initialContainer, trivyScan, update
   const [container,   setContainer]   = useState(initialContainer)
   const isProxmox   = container.host_type === 'proxmox'
   const visibleTabs = isProxmox
-    ? TABS.filter(t => !['logs', 'vuln', 'compose', 'updates'].includes(t.id))
+    ? TABS.filter(t => !['logs', 'compose', 'updates'].includes(t.id))
     : TABS
   const startTab    = initialTab || 'overview'
   const [activeTab,   setActiveTab]   = useState(
-    isProxmox && (startTab === 'logs' || startTab === 'vuln') ? 'overview' : startTab
+    isProxmox && startTab === 'logs' ? 'overview' : startTab
   )
   const [actioning,   setActioning]   = useState(null)
   const [actionMsg,   setActionMsg]   = useState('')
@@ -2047,7 +2165,14 @@ export function ContainerDrawer({ container: initialContainer, trivyScan, update
                 <Collapsible title={`Networks (${container.networks.length})`} icon={Network} defaultOpen={false}>
                   {container.networks.map((n, i) => (
                     <div key={i} className="py-1.5 border-b border-border last:border-0">
-                      <span className="text-xs font-mono" style={{ color: 'var(--color-text)' }}>{n}</span>
+                      <div className="flex items-center justify-between gap-3">
+                        <span className="text-xs font-mono" style={{ color: 'var(--color-text)' }}>{n}</span>
+                        {!isProxmox && (
+                          <span className="text-xs font-mono text-brand">
+                            {container.network_ips?.[n] || 'no IP'}
+                          </span>
+                        )}
+                      </div>
                     </div>
                   ))}
                 </Collapsible>
@@ -2135,9 +2260,9 @@ export function ContainerDrawer({ container: initialContainer, trivyScan, update
             />
           )}
 
-          {/* ── Vuln tab ── */}
+          {/* ── Security tab ── */}
           {activeTab === 'vuln' && (
-            <VulnTab
+            <SecurityTab
               container={container}
               trivyScan={trivyScan}
               updateTrivyScan={updateTrivyScan}

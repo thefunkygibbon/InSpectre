@@ -13,6 +13,145 @@ from config import PROBE_URL
 from database import SessionLocal
 from models import Setting, TrafficStat
 from probe_client import _probe_client
+from trivy_utils import run_trivy_image_scan_sync
+
+
+# ---------------------------------------------------------------------------
+# Device lifecycle — auto-expire "new" status & auto-delete stale devices
+# ---------------------------------------------------------------------------
+def _lifecycle_threshold_seconds(value_key: str, unit_key: str, db) -> int:
+    """Convert a value+unit setting pair into a total number of seconds."""
+    try:
+        value = int((db.get(Setting, value_key) or type('', (), {'value': '7'})()).value or 7)
+    except (ValueError, AttributeError):
+        value = 7
+    unit_row = db.get(Setting, unit_key)
+    unit = (unit_row.value or "day").strip().lower() if unit_row else "day"
+    multipliers = {"day": 86400, "week": 604800, "month": 2592000, "year": 31536000}
+    return value * multipliers.get(unit, 86400)
+
+
+async def _device_lifecycle_loop():
+    """Hourly loop that auto-acknowledges new devices and auto-deletes stale ones."""
+    await asyncio.sleep(120)  # startup grace period
+    while True:
+        try:
+            db = SessionLocal()
+            try:
+                def _flag(key):
+                    row = db.get(Setting, key)
+                    return row and row.value.strip().lower() == "true"
+
+                now = datetime.now(timezone.utc)
+
+                # ── Auto-acknowledge new devices past threshold ────────────
+                if _flag("new_device_threshold_enabled"):
+                    secs = _lifecycle_threshold_seconds(
+                        "new_device_threshold_value", "new_device_threshold_unit", db)
+                    cutoff = now - timedelta(seconds=secs)
+                    result = db.execute(
+                        text("""
+                            UPDATE devices
+                            SET is_acknowledged = true
+                            WHERE is_acknowledged = false
+                              AND first_seen < :cutoff
+                        """),
+                        {"cutoff": cutoff},
+                    )
+                    if result.rowcount:
+                        db.commit()
+                        print(f"[lifecycle] Auto-acknowledged {result.rowcount} device(s) "
+                              f"older than threshold.", flush=True)
+
+                # ── Auto-delete stale devices ──────────────────────────────
+                if _flag("stale_device_auto_delete_enabled"):
+                    secs = _lifecycle_threshold_seconds(
+                        "stale_device_auto_delete_value", "stale_device_auto_delete_unit", db)
+                    cutoff = now - timedelta(seconds=secs)
+                    # Fetch candidates: not seen since cutoff, not important, not group primary
+                    # when the group has other living members.
+                    candidates = db.execute(
+                        text("""
+                            SELECT d.mac_address, d.group_id, d.group_primary
+                            FROM devices d
+                            WHERE d.last_seen < :cutoff
+                              AND COALESCE(d.is_important, false) = false
+                              AND (
+                                -- ungrouped devices are eligible
+                                d.group_id IS NULL
+                                OR
+                                -- grouped non-primary members are eligible
+                                COALESCE(d.group_primary, false) = false
+                                OR
+                                -- primary is eligible only if ALL other group members are also stale
+                                (
+                                  COALESCE(d.group_primary, false) = true
+                                  AND NOT EXISTS (
+                                    SELECT 1 FROM devices d2
+                                    WHERE d2.group_id = d.group_id
+                                      AND d2.mac_address != d.mac_address
+                                      AND d2.last_seen >= :cutoff
+                                  )
+                                )
+                              )
+                        """),
+                        {"cutoff": cutoff},
+                    ).fetchall()
+
+                    for row in candidates:
+                        mac = row[0]
+                        gid = row[1]
+                        is_primary = row[2]
+
+                        # If deleting a primary with no surviving members, clean group refs
+                        if gid and is_primary:
+                            db.execute(
+                                text("UPDATE devices SET group_id = NULL, group_primary = false "
+                                     "WHERE group_id = :gid AND mac_address != :mac"),
+                                {"gid": str(gid), "mac": mac},
+                            )
+                        # Promote a new primary if deleting a non-primary whose group now
+                        # needs a new primary (rare edge case but safe to handle)
+                        elif gid and not is_primary:
+                            existing_primary = db.execute(
+                                text("SELECT mac_address FROM devices "
+                                     "WHERE group_id = :gid AND group_primary = true "
+                                     "AND mac_address != :mac LIMIT 1"),
+                                {"gid": str(gid), "mac": mac},
+                            ).fetchone()
+                            if not existing_primary:
+                                new_primary = db.execute(
+                                    text("SELECT mac_address FROM devices "
+                                         "WHERE group_id = :gid AND mac_address != :mac "
+                                         "AND last_seen >= :cutoff LIMIT 1"),
+                                    {"gid": str(gid), "mac": mac, "cutoff": cutoff},
+                                ).fetchone()
+                                if new_primary:
+                                    db.execute(
+                                        text("UPDATE devices SET group_primary = true "
+                                             "WHERE mac_address = :m"),
+                                        {"m": new_primary[0]},
+                                    )
+
+                        db.execute(
+                            text("DELETE FROM devices WHERE mac_address = :mac"),
+                            {"mac": mac},
+                        )
+                        print(f"[lifecycle] Auto-deleted stale device {mac} "
+                              f"(not seen since before {cutoff.date()})", flush=True)
+
+                    if candidates:
+                        db.commit()
+
+            except Exception as exc:
+                db.rollback()
+                print(f"[lifecycle] Error in device lifecycle loop: {exc}", flush=True)
+            finally:
+                db.close()
+        except Exception as outer:
+            print(f"[lifecycle] Outer error: {outer}", flush=True)
+
+        await asyncio.sleep(3600)  # run hourly
 
 
 # ---------------------------------------------------------------------------
@@ -240,18 +379,25 @@ async def _trivy_db_update_loop():
 # ---------------------------------------------------------------------------
 # Container Trivy scanning helpers
 # ---------------------------------------------------------------------------
-def _save_trivy_result(name: str, image: str, vulns: list, scanned_at: str):
+def _save_trivy_result(name: str, image: str, vulns: list, scanned_at: str, image_id: str | None = None):
     from sqlalchemy import text
     try:
         db = SessionLocal()
         db.execute(text("""
-            INSERT INTO container_vuln_results (name, image, vulns, scanned_at)
-            VALUES (:name, :image, cast(:vulns as jsonb), :scanned_at)
+            INSERT INTO container_vuln_results (name, image, image_id, vulns, scanned_at)
+            VALUES (:name, :image, :image_id, cast(:vulns as jsonb), :scanned_at)
             ON CONFLICT (name) DO UPDATE
                 SET image = EXCLUDED.image,
+                    image_id = EXCLUDED.image_id,
                     vulns = EXCLUDED.vulns,
                     scanned_at = EXCLUDED.scanned_at
-        """), {"name": name, "image": image, "vulns": json.dumps(vulns), "scanned_at": scanned_at})
+        """), {
+            "name": name,
+            "image": image,
+            "image_id": image_id,
+            "vulns": json.dumps(vulns),
+            "scanned_at": scanned_at,
+        })
         db.commit()
     except Exception as e:
         print(f"[trivy] DB save failed for {name}: {e}", flush=True)
@@ -259,30 +405,18 @@ def _save_trivy_result(name: str, image: str, vulns: list, scanned_at: str):
         db.close()
 
 
-def _run_trivy_for_container(name: str, image: str):
+def _run_trivy_for_container(name: str, image: str, image_id: str | None = None):
     from notifications_core import _notification_dispatch
     import state as _state
     _container_vuln_scans[name] = {"scanning": True, "image": image}
-    if not shutil.which("trivy"):
-        _container_vuln_scans[name]["scanning"] = False
-        return
     try:
-        proc = subprocess.Popen(
-            ["trivy", "image", "--format", "json", "--no-progress", "--scanners", "vuln", image],
-            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
-        )
-        stdout_data = proc.stdout.read()
-        proc.wait()
-        scanned_at = datetime.now(timezone.utc).isoformat()
-        if proc.returncode == 0 and stdout_data.strip():
-            try:
-                from routes.docker import _parse_trivy_json
-                vulns = _parse_trivy_json(json.loads(stdout_data))
-            except Exception:
-                vulns = []
-        else:
-            vulns = []
-        _save_trivy_result(name, image, vulns, scanned_at)
+        result = run_trivy_image_scan_sync(image)
+        if not result.get("ok"):
+            _container_vuln_scans[name]["error"] = result.get("error")
+            print(f"[trivy] {name}: {result.get('error')}", flush=True)
+            return
+        vulns = result.get("vulns") or []
+        _save_trivy_result(name, image, vulns, result["scanned_at"], image_id=image_id)
         if vulns and _state._main_loop and not _state._main_loop.is_closed():
             severities = {v.get("severity", "").upper() for v in vulns}
             if "CRITICAL" in severities:
@@ -303,6 +437,22 @@ def _run_trivy_for_container(name: str, image: str):
         print(f"[trivy] {name}: {exc}", flush=True)
     finally:
         _container_vuln_scans[name]["scanning"] = False
+
+
+def _run_trivy_for_live_container(name: str, host_url: str):
+    from container_updates import _container_image_ref
+    from routes.docker import _make_docker_client
+
+    client = _make_docker_client(host_url)
+    try:
+        container = client.containers.get(name)
+        _run_trivy_for_container(
+            container.name.lstrip("/"),
+            _container_image_ref(container),
+            image_id=getattr(container.image, "id", None),
+        )
+    finally:
+        client.close()
 
 
 def _record_container_event(name: str, status: str):
@@ -392,13 +542,13 @@ async def _docker_event_loop():
                                     )
 
                         if action == "create" and do_new:
-                            threading.Thread(target=_run_trivy_for_container,
-                                             args=(cname, image), daemon=True).start()
+                            threading.Thread(target=_run_trivy_for_live_container,
+                                             args=(cname, host), daemon=True).start()
                         elif action == "start" and do_update:
                             prev = seen_images.get(cname)
                             if prev and prev != image:
-                                threading.Thread(target=_run_trivy_for_container,
-                                                 args=(cname, image), daemon=True).start()
+                                threading.Thread(target=_run_trivy_for_live_container,
+                                                 args=(cname, host), daemon=True).start()
 
                         if action in ("create", "start"):
                             seen_images[cname] = image
