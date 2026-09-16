@@ -1,8 +1,8 @@
 # Global ARG must be declared BEFORE the first FROM line
 ARG BUILD_FROM=ghcr.io/home-assistant/amd64-base:3.19
 
-# Stage 1: Build Frontend Static Assets
-FROM node:20-alpine AS frontend-builder
+# Stage 1: Build Frontend Static Assets natively on host architecture
+FROM --platform=$BUILDPLATFORM node:20-alpine AS frontend-builder
 WORKDIR /build
 COPY frontend/package*.json ./
 RUN npm ci || npm install
