@@ -1,3 +1,6 @@
+# Global ARG must be declared BEFORE the first FROM line
+ARG BUILD_FROM=ghcr.io/home-assistant/amd64-base:3.19
+
 # Stage 1: Build Frontend Static Assets
 FROM node:20-alpine AS frontend-builder
 WORKDIR /build
@@ -7,7 +10,6 @@ COPY frontend/ ./
 RUN npm run build
 
 # Stage 2: Main Home Assistant Image
-ARG BUILD_FROM=ghcr.io/home-assistant/amd64-base:3.19
 FROM ${BUILD_FROM}
 
 # Allow global pip installs on Alpine 3.19+
