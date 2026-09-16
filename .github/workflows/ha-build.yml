@@ -4,41 +4,64 @@ on:
   push:
     branches: [ main ]
   workflow_dispatch:
-
+    
 jobs:
-  build-ha-addon:
-    name: Build Home Assistant Add-on Images
+  # AMD64 Build Job
+  build-amd64:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout Code
+        uses: actions/checkout@v4
 
-      - uses: docker/setup-qemu-action@v3
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
 
-      - uses: docker/setup-buildx-action@v3
-
-      - uses: docker/login-action@v3
+      - name: Log in to Docker Registry
+        uses: docker/login-action@v3
         with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build & push AMD64 HA Add-on
+      - name: Build and push AMD64 Add-on
         uses: docker/build-push-action@v5
         with:
           context: .
           file: ./Dockerfile.ha
           platforms: linux/amd64
-          push: true
-          tags: thefunkygibbon/inspectre-addon-amd64:latest
           build-args: |
             BUILD_FROM=ghcr.io/home-assistant/amd64-base:3.19
+          tags: ghcr.io/${{ github.repository_owner }}/inspectre-addon-amd64:latest
+          push: true
+          cache-from: type=gha,scope=amd64
+          cache-to: type=gha,mode=max,scope=amd64
 
-      - name: Build & push ARM64 HA Add-on
+  # ARM64 Build Job (Native Hardware Execution)
+  build-arm64:
+    runs-on: ubuntu-24.04-arm   # <--- THIS USES NATIVE ARM64 HARDWARE
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Docker Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push ARM64 Add-on
         uses: docker/build-push-action@v5
         with:
           context: .
           file: ./Dockerfile.ha
           platforms: linux/arm64
-          push: true
-          tags: thefunkygibbon/inspectre-addon-aarch64:latest
           build-args: |
             BUILD_FROM=ghcr.io/home-assistant/aarch64-base:3.19
+          tags: ghcr.io/${{ github.repository_owner }}/inspectre-addon-aarch64:latest
+          push: true
+          cache-from: type=gha,scope=arm64
+          cache-to: type=gha,mode=max,scope=arm64
