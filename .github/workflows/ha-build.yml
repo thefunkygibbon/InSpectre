@@ -14,6 +14,12 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      - name: Extract base version from package.json
+        id: get_version
+        run: |
+          VERSION=$(jq -r '.version' frontend/package.json)
+          echo "VERSION=${VERSION}" >> $GITHUB_ENV
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
@@ -31,7 +37,9 @@ jobs:
           platforms: linux/amd64
           build-args: |
             BUILD_FROM=ghcr.io/home-assistant/amd64-base:3.19
-          tags: thefunkygibbon/inspectre-addon-amd64:latest
+          tags: |
+            thefunkygibbon/inspectre-addon-amd64:${{ env.VERSION }}-${{ github.run_number }}
+            thefunkygibbon/inspectre-addon-amd64:latest
           push: true
           cache-from: type=gha,scope=amd64
           cache-to: type=gha,mode=max,scope=amd64
@@ -42,6 +50,12 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+
+      - name: Extract base version from package.json
+        id: get_version
+        run: |
+          VERSION=$(jq -r '.version' frontend/package.json)
+          echo "VERSION=${VERSION}" >> $GITHUB_ENV
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -60,7 +74,43 @@ jobs:
           platforms: linux/arm64
           build-args: |
             BUILD_FROM=ghcr.io/home-assistant/aarch64-base:3.19
-          tags: thefunkygibbon/inspectre-addon-aarch64:latest
+          tags: |
+            thefunkygibbon/inspectre-addon-aarch64:${{ env.VERSION }}-${{ github.run_number }}
+            thefunkygibbon/inspectre-addon-aarch64:latest
           push: true
           cache-from: type=gha,scope=arm64
           cache-to: type=gha,mode=max,scope=arm64
+
+  # NEW AUTOMATION JOB
+  update-ha-addon-repo:
+    name: Update HA Add-on Version Config
+    needs: [build-amd64, build-arm64]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout main repository to read version
+        uses: actions/checkout@v4
+
+      - name: Extract base version
+        run: |
+          VERSION=$(jq -r '.version' frontend/package.json)
+          echo "NEW_VERSION=${VERSION}-${{ github.run_number }}" >> $GITHUB_ENV
+
+      - name: Checkout inspectre-ha-addon repository
+        uses: actions/checkout@v4
+        with:
+          repository: thefunkygibbon/inspectre-ha-addon
+          token: ${{ secrets.AUTO_UPDATE_PAT }}
+          path: ha-addon-repo
+
+      - name: Update config.yaml with new version
+        run: |
+          cd ha-addon-repo
+          sed -i 's/^version: .*/version: "${{ env.NEW_VERSION }}"/' inspectre/config.yaml
+
+      - name: Commit and push changes to HA Add-on repo
+        run: |
+          cd ha-addon-repo
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add inspectre/config.yaml
+          git diff --quiet && git diff --staged --quiet || (git commit -m "Auto update add-on version to ${{ env.NEW_VERSION }}" && git push)
