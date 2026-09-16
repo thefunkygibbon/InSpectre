@@ -1,0 +1,5 @@
+#!/usr/bin/with-contenv bashio
+export DATABASE_URL="postgresql://inspectre:inspectre@127.0.0.1:5432/inspectre"
+export PROBE_API_URL="http://127.0.0.1:8666"
+cd /app/probe
+exec python3 probe.py

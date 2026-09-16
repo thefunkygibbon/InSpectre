@@ -1,0 +1,4 @@
+#!/usr/bin/with-contenv bashio
+export DATABASE_URL="postgresql://inspectre:inspectre@127.0.0.1:5432/inspectre"
+cd /app/backend
+exec python3 main.py
