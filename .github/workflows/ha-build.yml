@@ -24,5 +24,5 @@ jobs:
             --target .
             --dockerfile Dockerfile.ha
             --docker-hub thefunkygibbon
-            --amd64
-            --aarch64
+          amd64: true
+          aarch64: true
