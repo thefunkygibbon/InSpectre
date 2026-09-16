@@ -1,29 +1,29 @@
-name: Build & Push HA Add-on Image
+name: Build and Push Home Assistant Add-on Images
 
 on:
   push:
-    branches: [ main ]
+    branches:
+      - main
   workflow_dispatch:
-    
+
 jobs:
-  # AMD64 Build Job
   build-amd64:
+    name: Build AMD64 Add-on Image
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout Code
+      - name: Checkout repository
         uses: actions/checkout@v4
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Log in to Docker Registry
+      - name: Log in to Docker Hub
         uses: docker/login-action@v3
         with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      - name: Build and push AMD64 Add-on
+      - name: Build and push AMD64 Image
         uses: docker/build-push-action@v5
         with:
           context: .
@@ -31,29 +31,28 @@ jobs:
           platforms: linux/amd64
           build-args: |
             BUILD_FROM=ghcr.io/home-assistant/amd64-base:3.19
-          tags: ghcr.io/${{ github.repository_owner }}/inspectre-addon-amd64:latest
+          tags: thefunkygibbon/inspectre-addon-amd64:latest
           push: true
           cache-from: type=gha,scope=amd64
           cache-to: type=gha,mode=max,scope=amd64
 
-  # ARM64 Build Job (Native Hardware Execution)
   build-arm64:
-    runs-on: ubuntu-24.04-arm   # <--- THIS USES NATIVE ARM64 HARDWARE
+    name: Build ARM64 Add-on Image
+    runs-on: ubuntu-24.04-arm
     steps:
-      - name: Checkout Code
+      - name: Checkout repository
         uses: actions/checkout@v4
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Log in to Docker Registry
+      - name: Log in to Docker Hub
         uses: docker/login-action@v3
         with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      - name: Build and push ARM64 Add-on
+      - name: Build and push ARM64 Image
         uses: docker/build-push-action@v5
         with:
           context: .
@@ -61,7 +60,7 @@ jobs:
           platforms: linux/arm64
           build-args: |
             BUILD_FROM=ghcr.io/home-assistant/aarch64-base:3.19
-          tags: ghcr.io/${{ github.repository_owner }}/inspectre-addon-aarch64:latest
+          tags: thefunkygibbon/inspectre-addon-aarch64:latest
           push: true
           cache-from: type=gha,scope=arm64
           cache-to: type=gha,mode=max,scope=arm64
