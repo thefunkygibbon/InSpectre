@@ -879,6 +879,7 @@ async def docker_update(container_id: str, db: Session = Depends(get_db)):
                 binds=host_cfg.get("Binds") or None,
                 port_bindings=port_bindings,
                 privileged=bool(host_cfg.get("Privileged")),
+                runtime=host_cfg.get("Runtime") or None,
                 cap_add=host_cfg.get("CapAdd") or None,
                 cap_drop=host_cfg.get("CapDrop") or None,
                 extra_hosts=_parse_extra_hosts(host_cfg.get("ExtraHosts")),
@@ -1141,10 +1142,30 @@ def _generate_compose_yaml(c) -> tuple[str, dict]:
         else:
             svc["restart"] = rp_name
 
-    # ports
+    # HostConfig.PortBindings is the stable config-time source. NetworkSettings
+    # can be empty for stopped containers and may also contain duplicate
+    # exposed-port entries while a container is running.
     ports = []
     seen_port_entries: set = set()
-    for cport, bindings in (net_sets.get("Ports") or {}).items():
+    configured_ports = hcfg.get("PortBindings") or {}
+    def _port_key(raw_key):
+        raw_key = str(raw_key).strip()
+        if "/" in raw_key:
+            port, protocol = raw_key.rsplit("/", 1)
+        else:
+            port, protocol = raw_key, "tcp"
+        protocol = protocol.lower()
+        if protocol not in {"tcp", "udp", "sctp"} or not port.isdigit():
+            return None
+        return f"{port}/{protocol}"
+
+    normalized_ports = {}
+    for raw_key, bindings in configured_ports.items():
+        cport = _port_key(raw_key)
+        if cport and bindings:
+            normalized_ports.setdefault(cport, bindings)
+
+    for cport, bindings in normalized_ports.items():
         # Bug 2: skip phantom /0 protocol entries Docker creates on recreation
         if cport.endswith("/0"):
             continue
@@ -1152,22 +1173,19 @@ def _generate_compose_yaml(c) -> tuple[str, dict]:
             for b in bindings:
                 hip   = b.get("HostIp", "") or ""
                 hport = b.get("HostPort", "") or ""
+                if not hport:
+                    continue
                 # Bug 3: normalize all-interfaces addresses to empty string
                 if hip in ("0.0.0.0", "::"):
                     hip = ""
-                if hip:
-                    entry = f"{hip}:{hport}:{cport}" if hport else cport
-                else:
-                    entry = f"{hport}:{cport}" if hport else cport
+                if hport and hip:
+                    entry = f"{hip}:{hport}:{cport}"
+                elif hport:
+                    entry = f"{hport}:{cport}"
                 # Bug 1: deduplicate IPv4 and IPv6 bindings for the same port
                 if entry not in seen_port_entries:
                     seen_port_entries.add(entry)
                     ports.append(entry)
-        else:
-            # exposed but not published
-            if cport not in seen_port_entries:
-                seen_port_entries.add(cport)
-                ports.append(cport)
     if ports:
         svc["ports"] = ports
 
@@ -1228,6 +1246,29 @@ def _generate_compose_yaml(c) -> tuple[str, dict]:
         svc["volumes"] = volumes
     if tmpfs:
         svc["tmpfs"] = tmpfs
+    elif hcfg.get("Tmpfs"):
+        tmpfs_config = hcfg["Tmpfs"]
+        svc["tmpfs"] = (
+            list(tmpfs_config.keys())
+            if isinstance(tmpfs_config, dict)
+            else list(tmpfs_config)
+        )
+
+    # Keep configured bind strings when Docker omits Mounts from an inspect
+    # response (notably for stopped containers).
+    for bind_spec in (hcfg.get("Binds") or []):
+        parsed = _parse_bind_spec(bind_spec)
+        if not parsed:
+            continue
+        src, dst, mode = parsed
+        if not src or not dst:
+            continue
+        entry = f"{src}:{dst}"
+        if mode and mode not in ("", "rw", "z"):
+            entry += f":{mode}"
+        _add_volume_entry(entry)
+    if volumes:
+        svc["volumes"] = volumes
 
     # environment (skip empty, mask nothing — user can see their own config)
     env = [e for e in (cfg.get("Env") or []) if e and "=" in e]
@@ -1293,8 +1334,32 @@ def _generate_compose_yaml(c) -> tuple[str, dict]:
         svc["extra_hosts"] = extra_hosts
 
     # capabilities
-    cap_add  = hcfg.get("CapAdd")  or []
-    cap_drop = hcfg.get("CapDrop") or []
+    default_caps = {
+        "AUDIT_WRITE", "CHOWN", "DAC_OVERRIDE", "FOWNER", "FSETID",
+        "KILL", "MKNOD", "NET_BIND_SERVICE", "NET_RAW", "SETFCAP",
+        "SETGID", "SETPCAP", "SETUID", "SYS_CHROOT",
+    }
+    cap_add = [
+        cap for cap in (hcfg.get("CapAdd") or [])
+        if str(cap).upper().removeprefix("CAP_") not in default_caps
+    ]
+    # These capabilities are already outside Docker's default capability
+    # whitelist, so listing them in cap_drop does not change the container.
+    default_dropped_caps = {
+        "AUDIT_CONTROL", "BLOCK_SUSPEND", "DAC_READ_SEARCH", "IPC_LOCK",
+        "IPC_OWNER", "LEASE", "LINUX_IMMUTABLE", "MAC_ADMIN", "MAC_OVERRIDE",
+        "NET_ADMIN", "NET_BROADCAST", "SYSLOG", "SYS_BOOT", "SYS_MODULE",
+        "SYS_NICE", "SYS_PACCT", "SYS_PTRACE", "SYS_RAWIO", "SYS_RESOURCE",
+        "SYS_TIME", "SYS_TTY_CONFIG", "WAKE_ALARM",
+    }
+    cap_drop = (
+        list(hcfg.get("CapDrop") or [])
+        if hcfg.get("Privileged")
+        else [
+            cap for cap in (hcfg.get("CapDrop") or [])
+            if str(cap).upper().removeprefix("CAP_") not in default_dropped_caps
+        ]
+    )
     if cap_add:
         svc["cap_add"]  = cap_add
     if cap_drop:
@@ -1303,9 +1368,17 @@ def _generate_compose_yaml(c) -> tuple[str, dict]:
     if hcfg.get("Privileged"):
         svc["privileged"] = True
 
+    runtime = hcfg.get("Runtime") or ""
+    if runtime and runtime.lower() != "runc":
+        svc["runtime"] = runtime
+
     # devices
     devs = [
-        f"{d['PathOnHost']}:{d['PathInContainer']}"
+        ":".join(filter(None, (
+            d.get("PathOnHost"),
+            d.get("PathInContainer"),
+            d.get("CgroupPermissions", "rwm"),
+        )))
         for d in (hcfg.get("Devices") or [])
         if d.get("PathOnHost")
     ]
@@ -1316,6 +1389,9 @@ def _generate_compose_yaml(c) -> tuple[str, dict]:
     dns = [d for d in (hcfg.get("Dns") or []) if d]
     if dns:
         svc["dns"] = dns
+    dns_search = [d for d in (hcfg.get("DnsSearch") or []) if d]
+    if dns_search:
+        svc["dns_search"] = dns_search
 
     # resource limits
     mem = hcfg.get("Memory") or 0
@@ -1330,6 +1406,36 @@ def _generate_compose_yaml(c) -> tuple[str, dict]:
     nano = hcfg.get("NanoCpus") or 0
     if nano:
         svc["cpus"] = round(nano / 1e9, 4)
+
+    for host_key, compose_key in (
+        ("PidMode", "pid"), ("UsernsMode", "userns_mode"),
+    ):
+        value = hcfg.get(host_key) or ""
+        if value:
+            svc[compose_key] = value
+    security_opt = [v for v in (hcfg.get("SecurityOpt") or []) if v]
+    if security_opt:
+        svc["security_opt"] = security_opt
+    if hcfg.get("ReadonlyRootfs"):
+        svc["read_only"] = True
+    if hcfg.get("ShmSize") not in (None, 0, 64 * 1024 * 1024):
+        svc["shm_size"] = hcfg["ShmSize"]
+    if hcfg.get("Init"):
+        svc["init"] = True
+    if cfg.get("Tty"):
+        svc["tty"] = True
+    if cfg.get("OpenStdin"):
+        svc["stdin_open"] = True
+    if cfg.get("StopSignal"):
+        svc["stop_signal"] = cfg["StopSignal"]
+    if hcfg.get("StopTimeout") is not None:
+        svc["stop_grace_period"] = f"{hcfg['StopTimeout']}s"
+    if hcfg.get("OomKillDisable"):
+        svc["oom_kill_disable"] = True
+    if hcfg.get("PidsLimit"):
+        svc["pids_limit"] = hcfg["PidsLimit"]
+    if hcfg.get("Ulimits"):
+        svc["ulimits"] = hcfg["Ulimits"]
 
     # sysctls
     sysctls = hcfg.get("Sysctls") or {}

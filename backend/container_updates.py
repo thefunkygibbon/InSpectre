@@ -394,6 +394,7 @@ try:
             volumes_from  = hcfg.get("VolumesFrom") or None,
             network_mode  = primary_mode,
             privileged    = hcfg.get("Privileged", False),
+            runtime       = hcfg.get("Runtime") or None,
             cap_add       = hcfg.get("CapAdd") or None,
             cap_drop      = hcfg.get("CapDrop") or None,
             devices       = hcfg.get("Devices") or None,
@@ -1337,6 +1338,7 @@ def _recreate_container_with_net(client, dep, new_net_mode: str) -> None:
                 volumes_from  = hcfg.get("VolumesFrom") or None,
                 network_mode  = new_net_mode,
                 privileged    = hcfg.get("Privileged", False),
+                runtime       = hcfg.get("Runtime") or None,
                 cap_add       = hcfg.get("CapAdd") or None,
                 cap_drop      = hcfg.get("CapDrop") or None,
                 devices       = hcfg.get("Devices") or None,
@@ -1848,6 +1850,7 @@ async def _safe_update_stream(
                             volumes_from   = hcfg.get("VolumesFrom") or None,
                             network_mode   = _raw_net_mode,
                             privileged     = hcfg.get("Privileged", False),
+                            runtime        = hcfg.get("Runtime") or None,
                             cap_add        = hcfg.get("CapAdd") or None,
                             cap_drop       = hcfg.get("CapDrop") or None,
                             devices        = hcfg.get("Devices") or None,
@@ -2837,9 +2840,14 @@ async def _deploy_compose_stream(compose_yaml: str, host_url: str):
                         host_port = host_sub[1] if len(host_sub) == 2 else host_sub[0]
                         proto = "tcp"
                         if "/" in ctr_part:
-                            ctr_port_num, proto = ctr_part.split("/", 1)
+                            port_parts = ctr_part.rsplit("/", 1)
+                            if len(port_parts) != 2:
+                                raise ValueError("invalid container port")
+                            ctr_port_num, proto = port_parts
                         else:
                             ctr_port_num = ctr_part
+                        if proto not in {"tcp", "udp", "sctp"} or not ctr_port_num.isdigit():
+                            raise ValueError("invalid container port")
                         key = f"{ctr_port_num}/{proto}"
                         binding: dict = {"HostPort": str(host_port)}
                         if host_ip:
@@ -2850,9 +2858,14 @@ async def _deploy_compose_stream(compose_yaml: str, host_url: str):
                         ctr_part = parts[0]
                         proto = "tcp"
                         if "/" in ctr_part:
-                            ctr_port_num, proto = ctr_part.split("/", 1)
+                            port_parts = ctr_part.rsplit("/", 1)
+                            if len(port_parts) != 2:
+                                raise ValueError("invalid container port")
+                            ctr_port_num, proto = port_parts
                         else:
                             ctr_port_num = ctr_part
+                        if proto not in {"tcp", "udp", "sctp"} or not ctr_port_num.isdigit():
+                            raise ValueError("invalid container port")
                         exposed_ports.append(f"{ctr_port_num}/{proto}")
                 except Exception:
                     yield emit(f"LOG: [{svc_name}] Warning: could not parse port entry '{p}' — skipping")
@@ -2864,13 +2877,21 @@ async def _deploy_compose_stream(compose_yaml: str, host_url: str):
                     if isinstance(v, dict):
                         src  = v.get("source", "")
                         dst  = v.get("target", "")
-                        mode = "ro" if v.get("read_only") else "rw"
+                        mode = v.get("mode") or ("ro" if v.get("read_only") else "rw")
                         if src and dst:
                             binds[src] = {"bind": dst, "mode": mode}
                     else:
-                        parts = str(v).split(":")
-                        if len(parts) >= 2:
-                            binds[parts[0]] = {"bind": parts[1], "mode": parts[2] if len(parts) > 2 else "rw"}
+                        raw = str(v)
+                        parts = raw.rsplit(":", 2)
+                        if len(parts) == 2:
+                            src, dst = parts
+                            mode = "rw"
+                        elif len(parts) == 3:
+                            src, dst, mode = parts
+                        else:
+                            continue
+                        if src and dst:
+                            binds[src] = {"bind": dst, "mode": mode or "rw"}
                 except Exception:
                     yield emit(f"LOG: [{svc_name}] Warning: could not parse volume entry — skipping")
 
@@ -2932,8 +2953,10 @@ async def _deploy_compose_stream(compose_yaml: str, host_url: str):
 
             # ── Misc host-config fields ───────────────────────────────────────
             tmpfs_raw = svc_cfg.get("tmpfs")
-            if isinstance(tmpfs_raw, str):
-                tmpfs: dict | None = {tmpfs_raw: ""}
+            if isinstance(tmpfs_raw, dict):
+                tmpfs = dict(tmpfs_raw)
+            elif isinstance(tmpfs_raw, str):
+                tmpfs = {tmpfs_raw: ""}
             elif isinstance(tmpfs_raw, list):
                 tmpfs = {t: "" for t in tmpfs_raw}
             else:
@@ -2973,6 +2996,23 @@ async def _deploy_compose_stream(compose_yaml: str, host_url: str):
             else:
                 command = command_raw  # list or None
 
+            stop_grace = svc_cfg.get("stop_grace_period")
+            if stop_grace is not None:
+                raw_grace = str(stop_grace).strip().lower()
+                try:
+                    if raw_grace.endswith("ms"):
+                        stop_timeout = max(1, round(float(raw_grace[:-2]) / 1000))
+                    elif raw_grace.endswith("m"):
+                        stop_timeout = round(float(raw_grace[:-1]) * 60)
+                    elif raw_grace.endswith("h"):
+                        stop_timeout = round(float(raw_grace[:-1]) * 3600)
+                    else:
+                        stop_timeout = round(float(raw_grace.rstrip("s")))
+                except ValueError:
+                    raise ValueError(f"Invalid stop_grace_period: {stop_grace}")
+            else:
+                stop_timeout = None
+
             # ── Create & start ────────────────────────────────────────────────
             yield emit(f"LOG: [{svc_name}] Creating container '{container_name}'…")
 
@@ -2997,6 +3037,14 @@ async def _deploy_compose_stream(compose_yaml: str, host_url: str):
                 pid=svc_cfg.get("pid") or None,
                 secopt=svc_cfg.get("security_opt") or None,
                 ro=bool(svc_cfg.get("read_only", False)),
+                runtime=svc_cfg.get("runtime") or None,
+                userns=svc_cfg.get("userns_mode") or None,
+                pids=svc_cfg.get("pids_limit"),
+                oom=bool(svc_cfg.get("oom_kill_disable", False)),
+                ulimits=svc_cfg.get("ulimits") or None,
+                init=bool(svc_cfg.get("init", False)),
+                stop_signal=svc_cfg.get("stop_signal") or None,
+                stop_timeout=stop_timeout,
                 restart=rp,              extra_nets=post_connect_nets,
             ):
                 c = _make_docker_client(host_url)
@@ -3021,6 +3069,12 @@ async def _deploy_compose_stream(compose_yaml: str, host_url: str):
                         pid_mode      = pid,
                         security_opt  = secopt,
                         read_only     = ro,
+                        runtime       = runtime,
+                        userns_mode   = userns,
+                        pids_limit    = pids,
+                        oom_kill_disable = oom,
+                        ulimits       = ulimits,
+                        init           = init,
                         restart_policy= restart,
                     )
                     cres = c.api.create_container(
@@ -3037,6 +3091,8 @@ async def _deploy_compose_stream(compose_yaml: str, host_url: str):
                         tty         = tty,
                         stdin_open  = stdin,
                         host_config = hcfg,
+                        stop_signal = stop_signal,
+                        stop_timeout = stop_timeout,
                     )
                     cobj = c.containers.get(cres["Id"])
                     for net_name in extra_nets:
@@ -3226,6 +3282,7 @@ async def recreate_from_backup(backup_id: int, request: Request):
                                     volumes_from  = hcfg.get("VolumesFrom") or None,
                                     network_mode  = net_mode,
                                     privileged    = hcfg.get("Privileged", False),
+                                    runtime       = hcfg.get("Runtime") or None,
                                     cap_add       = hcfg.get("CapAdd") or None,
                                     cap_drop      = hcfg.get("CapDrop") or None,
                                     devices       = hcfg.get("Devices") or None,
