@@ -162,21 +162,25 @@ _DAY_ABBREVS = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
 
 def _schedule_active_now(days_of_week: str, start_time: str, end_time: str) -> bool:
     now_local = datetime.now()
-    current_day = _DAY_ABBREVS[now_local.weekday()]
-    allowed_days = [d.strip().lower() for d in days_of_week.split(",")]
-    if current_day not in allowed_days:
-        return False
     try:
-        sh, sm = map(int, start_time.split(":"))
-        eh, em = map(int, end_time.split(":"))
+        allowed_days = {d.strip().lower()[:3] for d in (days_of_week or "").split(",") if d.strip()}
+        sh, sm = map(int, str(start_time).strip().split(":")[:2])
+        eh, em = map(int, str(end_time).strip().split(":")[:2])
         start_mins = sh * 60 + sm
         end_mins   = eh * 60 + em
         now_mins   = now_local.hour * 60 + now_local.minute
+        current_weekday = now_local.weekday()
         if end_mins > start_mins:
+            if _DAY_ABBREVS[current_weekday] not in allowed_days:
+                return False
             return start_mins <= now_mins < end_mins
-        else:
-            return now_mins >= start_mins or now_mins < end_mins
-    except Exception:
+        if now_mins >= start_mins:
+            return _DAY_ABBREVS[current_weekday] in allowed_days
+        if now_mins < end_mins:
+            previous_day = _DAY_ABBREVS[(current_weekday - 1) % 7]
+            return previous_day in allowed_days
+        return False
+    except (AttributeError, TypeError, ValueError):
         return False
 
 

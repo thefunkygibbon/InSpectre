@@ -162,7 +162,7 @@ class DockerContainerCreate(BaseModel):
 
 
 class GroupAddRequest(BaseModel):
-    primary_mac: str
+    target_mac: str
 
 
 class ZoneAssign(BaseModel):
