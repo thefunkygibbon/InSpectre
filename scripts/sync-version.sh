@@ -9,6 +9,7 @@
 #   - probe/_version.py        (read at runtime by the probe)
 #   - frontend/src/version.js  (bundled into the SPA at build time)
 #   - frontend/package.json    ("version" field)
+#   - frontend/package-lock.json (root package version fields)
 #
 # Each component is built from its own Docker context, which is why the version
 # must be materialised into each subtree rather than read from one shared path.
@@ -26,10 +27,16 @@ fi
 
 VERSION="$(tr -d ' \t\r\n' < "$VERSION_FILE")"
 
-# Validate semver: MAJOR.MINOR.PATCH with optional -prerelease / +build metadata.
-if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?$ ]]; then
-  echo "ERROR: '$VERSION' in $VERSION_FILE is not valid semver (expected MAJOR.MINOR.PATCH)" >&2
+# Main-branch releases use MAJOR.MINOR; development versions use MAJOR.MINOR.PATCH.
+if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+(\.[0-9]+)?([-+][0-9A-Za-z.-]+)?$ ]]; then
+  echo "ERROR: '$VERSION' in $VERSION_FILE is not valid (expected MAJOR.MINOR[.PATCH])" >&2
   exit 1
+fi
+
+# npm requires a three-part semver in package.json even for short main releases.
+PACKAGE_VERSION="$VERSION"
+if [[ "$PACKAGE_VERSION" =~ ^([0-9]+\.[0-9]+)([-+].*)?$ ]]; then
+  PACKAGE_VERSION="${BASH_REMATCH[1]}.0${BASH_REMATCH[2]:-}"
 fi
 
 NOTE_HASH="# AUTO-GENERATED — do not edit. Source of truth: /VERSION. Run scripts/sync-version.sh."
@@ -55,23 +62,35 @@ EOF
 # the version tooling works on hosts that don't have Python installed.
 if command -v jq >/dev/null 2>&1; then
   tmp="$(mktemp)"
-  jq --arg v "$VERSION" '.version = $v' frontend/package.json > "$tmp"
+  jq --arg v "$PACKAGE_VERSION" '.version = $v' frontend/package.json > "$tmp"
   mv "$tmp" frontend/package.json
+  if [[ -f frontend/package-lock.json ]]; then
+    tmp="$(mktemp)"
+    jq --arg v "$PACKAGE_VERSION" '.version = $v | if .packages? then .packages[""].version = $v else . end' frontend/package-lock.json > "$tmp"
+    mv "$tmp" frontend/package-lock.json
+  fi
 elif command -v python3 >/dev/null 2>&1; then
-  python3 - "$VERSION" <<'PY'
-import json, sys
+  python3 - "$PACKAGE_VERSION" <<'PY'
+import json, os, sys
 version = sys.argv[1]
-path = "frontend/package.json"
-with open(path, encoding="utf-8") as fh:
-    data = json.load(fh)
-data["version"] = version
-with open(path, "w", encoding="utf-8") as fh:
-    json.dump(data, fh, indent=2)
-    fh.write("\n")
+for path in ("frontend/package.json", "frontend/package-lock.json"):
+    if not os.path.exists(path):
+        continue
+    with open(path, encoding="utf-8") as fh:
+        data = json.load(fh)
+    data["version"] = version
+    if "packages" in data and "" in data["packages"]:
+        data["packages"][""]["version"] = version
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(data, fh, indent=2)
+        fh.write("\n")
 PY
 else
   # Last resort: rewrite the first "version": "..." line in place.
-  sed -i -E "0,/\"version\"[[:space:]]*:[[:space:]]*\"[^\"]*\"/s//\"version\": \"$VERSION\"/" frontend/package.json
+  sed -i -E "0,/\"version\"[[:space:]]*:[[:space:]]*\"[^\"]*\"/s//\"version\": \"$PACKAGE_VERSION\"/" frontend/package.json
+  if [[ -f frontend/package-lock.json ]]; then
+    sed -i -E '/"name": "inspectre-frontend"/,/^[[:space:]]*"version":/{ /^[[:space:]]*"version":/s/"version": "[^"]*"/"version": "'"$PACKAGE_VERSION"'"/; }' frontend/package-lock.json
+  fi
 fi
 
-echo "[sync-version] version $VERSION → backend/_version.py, probe/_version.py, frontend/src/version.js, frontend/package.json"
+echo "[sync-version] version $VERSION → backend/_version.py, probe/_version.py, frontend/src/version.js; package metadata=$PACKAGE_VERSION"

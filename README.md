@@ -269,27 +269,28 @@ Contributions are welcome. Please open an issue to discuss a change before submi
 
 ### Versioning
 
-The project version lives in a single file — **`VERSION`** at the repo root — and everything else is derived from it. The backend, probe and frontend each read an auto-generated version module that is stamped from `VERSION`; never edit those generated files by hand:
+The project version lives in a single file — **`VERSION`** at the repo root — and everything else is derived from it. Development versions on `test` use `MAJOR.MINOR.PATCH`; a promoted release on `main` uses the shorter `MAJOR.MINOR` form. The backend, probe and frontend each read an auto-generated version module that is stamped from `VERSION`; never edit those generated files by hand:
 
-- `backend/_version.py`, `probe/_version.py`, `frontend/src/version.js`, and the `version` field in `frontend/package.json`
+- `backend/_version.py`, `probe/_version.py`, `frontend/src/version.js`, and the frontend package and lockfile version fields
 
 Useful commands:
 
 ```bash
 scripts/sync-version.sh            # re-stamp all components from VERSION
-scripts/bump-version.sh patch      # 1.2.0 -> 1.2.1  (default)
-scripts/bump-version.sh minor      # 1.2.0 -> 1.3.0
-scripts/bump-version.sh major      # 1.2.0 -> 2.0.0
-scripts/bump-version.sh set 2.1.0  # set an explicit version
+scripts/bump-version.sh patch      # 1.3 -> 1.3.1 (test branch default)
+scripts/bump-version.sh minor      # 1.2.56 -> 1.3.0
+scripts/bump-version.sh release    # 1.2.56 -> 1.3 (main release format)
+scripts/bump-version.sh major      # 1.2.56 -> 2.0.0
+scripts/bump-version.sh set 2.1    # set an explicit version
 ```
 
-**Automatic bumping:** a git pre-commit hook keeps the version moving forward so it never goes stale again. Enable it once per clone:
+**Branch-aware automatic bumping:** enable the git pre-commit hook once per clone:
 
 ```bash
 git config core.hooksPath .githooks
 ```
 
-With the hook active, every commit auto-increments the **patch** number and re-stamps the derived files. To cut a `minor`/`major` release instead, run `scripts/bump-version.sh minor` (or `major`) and stage `VERSION` before committing — the hook detects the manual bump and only syncs. Set `INSPECTRE_NO_VERSION_BUMP=1` to skip bumping for a single commit. `./inspectre.sh rebuild` also re-stamps from `VERSION` before building, so deployed images always carry the correct version.
+With the hook active, commits on `test` increment the **patch** number and re-stamp generated files. After a push to `main`, GitHub Actions promotes the version to the next `MAJOR.MINOR` (for example, `1.2.56` becomes `1.3`), commits that version on `main`, and synchronizes the new release base to `test`. The next development commit then starts the new patch line (for example, `1.3.1`). This requires Actions to have permission to write repository contents. The frontend package and lockfile store the equivalent three-part version (`1.3.0`) because npm requires semver, while the app and backend report the short release version (`1.3`). Set `INSPECTRE_NO_VERSION_BUMP=1` to skip the test-branch bump for a single commit. `./inspectre.sh rebuild` also re-stamps from `VERSION` before building, so deployed images always carry the correct version.
 
 ---
 

@@ -1,16 +1,21 @@
 name: Build & Push Containers
 
 on:
-  push:
-    branches: [ main ]
+  workflow_run:
+    workflows: ["Promote main version"]
+    types: [completed]
+    branches: [main]
   workflow_dispatch:
 
 jobs:
   build-amd64:
     name: Build x64 images (latest)
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: main
 
       - uses: docker/setup-buildx-action@v3
 
@@ -45,9 +50,12 @@ jobs:
 
   build-arm64:
     name: Build ARM64 images (raspi)
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: main
 
       - uses: docker/setup-qemu-action@v3
 
