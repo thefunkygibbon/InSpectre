@@ -16,6 +16,14 @@ export function NewContainerDrawer({ hosts = [], onClose, onCreated }) {
   const [volumes, setVolumes] = useState('')
   const [network, setNetwork] = useState('')
   const [restart, setRestart] = useState('no')
+  const [runAsUser, setRunAsUser] = useState('')
+  const [hostname, setHostname] = useState('')
+  const [workingDirectory, setWorkingDirectory] = useState('')
+  const [memoryLimit, setMemoryLimit] = useState('')
+  const [cpuShares, setCpuShares] = useState('')
+  const [privileged, setPrivileged] = useState(false)
+  const [readOnly, setReadOnly] = useState(false)
+  const [advancedOptions, setAdvancedOptions] = useState('')
   const [composeYaml, setComposeYaml] = useState('')
   const [composeService, setComposeService] = useState('')
   const [vmid, setVmid] = useState('')
@@ -35,6 +43,35 @@ export function NewContainerDrawer({ hosts = [], onClose, onCreated }) {
     e.preventDefault()
     setBusy(true); setError('')
     const lines = value => value.split('\n').map(v => v.trim()).filter(Boolean)
+    let parsedAdvancedOptions
+    if (selectedHost?.type !== 'proxmox' && advancedOptions.trim()) {
+      try {
+        parsedAdvancedOptions = JSON.parse(advancedOptions)
+        if (!parsedAdvancedOptions || Array.isArray(parsedAdvancedOptions) || typeof parsedAdvancedOptions !== 'object') {
+          throw new Error('Advanced options must be a JSON object.')
+        }
+      } catch (err) {
+        setError(err.message || 'Advanced options must be valid JSON.')
+        setBusy(false)
+        return
+      }
+    }
+    const configuredOptions = { ...(parsedAdvancedOptions || {}) }
+    if (runAsUser.trim()) configuredOptions.user = runAsUser.trim()
+    if (hostname.trim()) configuredOptions.hostname = hostname.trim()
+    if (workingDirectory.trim()) configuredOptions.working_dir = workingDirectory.trim()
+    if (memoryLimit.trim()) configuredOptions.mem_limit = memoryLimit.trim()
+    if (cpuShares.trim()) {
+      const value = Number(cpuShares)
+      if (!Number.isInteger(value) || value < 2) {
+        setError('CPU shares must be a whole number of at least 2.')
+        setBusy(false)
+        return
+      }
+      configuredOptions.cpu_shares = value
+    }
+    if (privileged) configuredOptions.privileged = true
+    if (readOnly) configuredOptions.read_only = true
     const body = selectedHost?.type === 'proxmox'
       ? { host_id: Number(hostId), name, vmid: Number(vmid), proxmox_node: node || undefined, ostemplate: template, storage, disk_gb: Number(disk), memory_mb: Number(memory), cores: Number(cores), ip_address: ipAddress || undefined, gateway: gateway || undefined }
       : mode === 'compose'
@@ -44,6 +81,9 @@ export function NewContainerDrawer({ hosts = [], onClose, onCreated }) {
           ports: lines(ports), environment: lines(environment), volumes: lines(volumes),
           network: network || undefined, restart_policy: restart,
         }
+    if (selectedHost?.type !== 'proxmox' && Object.keys(configuredOptions).length > 0) {
+      body.advanced_options = configuredOptions
+    }
     try {
       const created = await api.dockerCreate(body)
       onCreated(created)
@@ -116,6 +156,47 @@ export function NewContainerDrawer({ hosts = [], onClose, onCreated }) {
                   {['no', 'always', 'unless-stopped', 'on-failure'].map(v => <option key={v}>{v}</option>)}
                 </select>
               </label>
+              <details className="rounded-lg border p-3" style={{ borderColor: 'var(--color-border)' }}>
+                <summary className="cursor-pointer text-xs font-medium text-text">Advanced Docker options</summary>
+                <p className="mt-2 text-[11px] leading-relaxed text-text-faint">
+                  Configure common runtime settings or enter additional Docker create options as JSON. For example, use cap_drop, cap_add, devices, dns, labels, security_opt, sysctls, or tmpfs.
+                </p>
+                <div className="grid grid-cols-2 gap-2 mt-3">
+                  <label className="text-xs text-text-muted">User
+                    <input className={inputClass} style={inputStyle} value={runAsUser} onChange={e => setRunAsUser(e.target.value)} placeholder="1000:1000" />
+                  </label>
+                  <label className="text-xs text-text-muted">Hostname
+                    <input className={inputClass} style={inputStyle} value={hostname} onChange={e => setHostname(e.target.value)} />
+                  </label>
+                  <label className="text-xs text-text-muted">Memory limit
+                    <input className={inputClass} style={inputStyle} value={memoryLimit} onChange={e => setMemoryLimit(e.target.value)} placeholder="512m" />
+                  </label>
+                  <label className="text-xs text-text-muted">CPU shares
+                    <input type="number" min="2" step="1" className={inputClass} style={inputStyle} value={cpuShares} onChange={e => setCpuShares(e.target.value)} placeholder="1024" />
+                  </label>
+                  <label className="col-span-2 text-xs text-text-muted">Working directory
+                    <input className={inputClass} style={inputStyle} value={workingDirectory} onChange={e => setWorkingDirectory(e.target.value)} placeholder="/app" />
+                  </label>
+                </div>
+                <div className="flex gap-4 mt-3">
+                  <label className="flex items-center gap-2 text-xs text-text-muted">
+                    <input type="checkbox" checked={privileged} onChange={e => setPrivileged(e.target.checked)} />
+                    Privileged
+                  </label>
+                  <label className="flex items-center gap-2 text-xs text-text-muted">
+                    <input type="checkbox" checked={readOnly} onChange={e => setReadOnly(e.target.checked)} />
+                    Read-only root filesystem
+                  </label>
+                </div>
+                <textarea
+                  className={`${inputClass} mt-2 min-h-28 font-mono`}
+                  style={inputStyle}
+                  value={advancedOptions}
+                  onChange={e => setAdvancedOptions(e.target.value)}
+                  placeholder={'{\n  "mem_limit": "512m",\n  "cpu_shares": 512,\n  "cap_drop": ["ALL"],\n  "read_only": true\n}'}
+                  aria-label="Advanced Docker options JSON"
+                />
+              </details>
             </>
           )}
           {error && <p className="text-xs text-red-400">{error}</p>}

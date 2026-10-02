@@ -1,4 +1,4 @@
-from fastapi import APIRouter, HTTPException, Depends, Query
+from fastapi import APIRouter, HTTPException, Depends, Query, WebSocket, WebSocketDisconnect
 from fastapi.responses import StreamingResponse, Response
 from sqlalchemy import text
 from sqlalchemy.orm import Session
@@ -7,7 +7,7 @@ from collections import defaultdict
 import asyncio, json, os, shutil, threading, subprocess
 from datetime import datetime, timezone, timedelta
 from database import get_db, SessionLocal
-from auth_utils import get_current_user
+from auth_utils import get_current_user, _decode_token
 from models import Setting
 from schemas import ContainerHostCreate, ContainerHostUpdate, DockerContainerCreate
 from probe_client import _probe_client
@@ -20,7 +20,7 @@ from notifications_core import _notification_dispatch
 import container_updates as _cu
 import httpx
 import yaml as _yaml
-from config import PROBE_URL
+from config import PROBE_URL, CORS_ORIGINS
 from trivy_utils import run_trivy_image_scan_sync
 from plugins.security_audit import audit_docker_container, audit_proxmox_guest
 
@@ -405,6 +405,27 @@ def _parse_create_spec(body: DockerContainerCreate) -> dict:
         spec["networks"] = list(networks.keys()) if isinstance(networks, dict) else (networks or [])
     spec.pop("compose_yaml", None)
     spec.pop("compose_service", None)
+    advanced_options = spec.pop("advanced_options", None)
+    if advanced_options is not None:
+        if not isinstance(advanced_options, dict):
+            raise ValueError("Advanced Docker options must be a JSON object.")
+        allowed = {
+            "auto_remove", "cap_add", "cap_drop", "cpu_period", "cpu_quota",
+            "cpu_shares", "cpuset_cpus", "cpu_rt_period", "cpu_rt_runtime",
+            "device_cgroup_rules", "devices", "dns", "dns_search",
+            "dns_opt", "domainname", "extra_hosts", "group_add", "healthcheck",
+            "init", "ipc_mode", "labels", "mac_address", "mem_limit",
+            "mem_reservation", "memswap_limit", "nano_cpus", "network_mode", "pid_mode",
+            "pids_limit", "platform", "privileged", "publish_all_ports", "read_only",
+            "security_opt", "shm_size", "stop_signal", "stop_timeout", "cgroup_parent",
+            "oom_kill_disable", "oom_score_adj", "runtime",
+            "storage_opt", "sysctls", "tmpfs", "ulimits", "user", "userns_mode",
+            "volumes_from", "working_dir", "hostname", "entrypoint",
+        }
+        unknown = sorted(set(advanced_options) - allowed)
+        if unknown:
+            raise ValueError(f"Unsupported advanced Docker option(s): {', '.join(unknown)}")
+        spec.update(advanced_options)
     if not spec.get("image"):
         raise ValueError("An image is required.")
     if not spec.get("name"):
@@ -424,14 +445,37 @@ def _create_docker_container(body: DockerContainerCreate, host: dict) -> dict:
             if isinstance(port, int):
                 ports[f"{port}/tcp"] = port
                 continue
+            if isinstance(port, dict):
+                container_port = port.get("target")
+                if container_port is None:
+                    raise ValueError("Compose port mappings require a target port.")
+                protocol = port.get("protocol", "tcp")
+                host_port = port.get("published")
+                host_ip = port.get("host_ip")
+                binding = int(host_port) if host_port is not None else None
+                ports[f"{container_port}/{protocol}"] = (
+                    (host_ip, binding) if host_ip else binding
+                )
+                continue
             value = str(port)
             parts = value.split(":")
             container_port = parts[-1]
             if "/" not in container_port:
                 container_port = f"{container_port}/tcp"
-            ports[container_port] = int(parts[-2]) if len(parts) > 1 else None
+            if len(parts) > 2:
+                ports[container_port] = (parts[-3], int(parts[-2]))
+            else:
+                ports[container_port] = int(parts[-2]) if len(parts) > 1 else None
         volumes = {}
         for volume in spec.get("volumes") or []:
+            if isinstance(volume, dict):
+                source = volume.get("source")
+                target = volume.get("target")
+                if not source or not target or volume.get("type", "volume") not in {"bind", "volume"}:
+                    raise ValueError("Compose long volume syntax must specify a bind or named-volume source and target.")
+                mode = volume.get("mode") or ("ro" if volume.get("read_only") else "rw")
+                volumes[source] = {"bind": target, "mode": mode}
+                continue
             value = str(volume)
             parts = value.split(":")
             if len(parts) < 2:
@@ -441,6 +485,29 @@ def _create_docker_container(body: DockerContainerCreate, host: dict) -> dict:
         network = spec.get("network") or (networks[0] if networks else None)
         restart = spec.get("restart_policy", spec.get("restart", "no"))
         restart_policy = {"Name": restart} if isinstance(restart, str) and restart != "no" else None
+        docker_options = {
+            key: spec[key] for key in (
+                "user", "labels", "dns", "dns_search", "dns_opt", "extra_hosts",
+                "cap_add", "cap_drop", "devices", "security_opt", "sysctls",
+                "device_cgroup_rules", "tmpfs", "mem_limit", "mem_reservation",
+                "memswap_limit", "cpu_shares", "cpu_quota", "cpu_period",
+                "cpu_rt_period", "cpu_rt_runtime", "cpuset_cpus", "nano_cpus",
+                "pids_limit", "shm_size", "read_only", "auto_remove", "init",
+                "tty", "stdin_open", "publish_all_ports", "network_mode",
+                "domainname", "group_add", "healthcheck", "ipc_mode", "mac_address",
+                "pid_mode", "platform", "stop_signal", "stop_timeout", "storage_opt",
+                "ulimits", "userns_mode", "volumes_from", "cgroup_parent",
+                "oom_kill_disable", "oom_score_adj", "runtime",
+            ) if key in spec
+        }
+        if isinstance(docker_options.get("tmpfs"), list):
+            docker_options["tmpfs"] = {path: "" for path in docker_options["tmpfs"]}
+        for key in (
+            "dns", "dns_search", "dns_opt", "cap_add", "cap_drop", "devices",
+            "security_opt", "group_add", "volumes_from",
+        ):
+            if isinstance(docker_options.get(key), str):
+                docker_options[key] = [docker_options[key]]
         command = spec.get("command")
         entrypoint = spec.get("entrypoint")
         container = client.containers.run(
@@ -457,6 +524,7 @@ def _create_docker_container(body: DockerContainerCreate, host: dict) -> dict:
             working_dir=spec.get("working_dir"),
             hostname=spec.get("hostname"),
             detach=True,
+            **docker_options,
         )
         for additional_network in networks[1:]:
             client.networks.get(additional_network).connect(container)
@@ -992,6 +1060,173 @@ async def stream_docker_logs(container_id: str, tail: int = 100, db: Session = D
 
     return StreamingResponse(_gen(), media_type="text/event-stream",
                              headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+
+@router.websocket("/docker/containers/{container_id}/console")
+async def docker_container_console(
+    websocket: WebSocket,
+    container_id: str,
+    host_id: int | None = None,
+    shell: str = "/bin/sh",
+):
+    """Proxy an authenticated interactive Docker exec session over WebSocket."""
+    origin = websocket.headers.get("origin")
+    request_host = websocket.headers.get("host")
+    allowed_origins = {value.rstrip("/") for value in CORS_ORIGINS}
+    if origin and origin.rstrip("/") not in allowed_origins:
+        from urllib.parse import urlparse
+        if urlparse(origin).netloc != request_host:
+            await websocket.close(code=4403)
+            return
+
+    await websocket.accept()
+    try:
+        auth_frame = await asyncio.wait_for(websocket.receive(), timeout=10)
+        if auth_frame["type"] == "websocket.disconnect":
+            return
+        auth_message = auth_frame.get("text")
+        if not isinstance(auth_message, str):
+            await websocket.close(code=4401, reason="Authentication required")
+            return
+        auth_data = json.loads(auth_message)
+        token = auth_data.get("token") if isinstance(auth_data, dict) else None
+        username = _decode_token(token) if isinstance(token, str) else None
+        if not username:
+            await websocket.close(code=4401, reason="Authentication required")
+            return
+        auth_db = SessionLocal()
+        try:
+            user_exists = auth_db.execute(
+                text("SELECT username FROM users WHERE username = :username"),
+                {"username": username},
+            ).fetchone()
+        finally:
+            auth_db.close()
+        if not user_exists:
+            await websocket.close(code=4401, reason="User not found")
+            return
+    except WebSocketDisconnect:
+        return
+    except (asyncio.TimeoutError, json.JSONDecodeError):
+        await websocket.close(code=4401, reason="Authentication required")
+        return
+
+    if shell not in {"/bin/sh", "/bin/bash", "/bin/ash", "sh", "bash", "ash"}:
+        await websocket.send_text("Unsupported shell.")
+        await websocket.close(code=4400)
+        return
+
+    db = SessionLocal()
+    try:
+        hosts = [host for host in _get_enabled_hosts(db) if host["type"] != "proxmox"]
+        if host_id is not None:
+            host = next((item for item in hosts if item["id"] == host_id), None)
+            if host is None:
+                await websocket.send_text("Docker host not found or disabled.")
+                await websocket.close(code=4404)
+                return
+        elif hosts:
+            host = hosts[0]
+        else:
+            host = {
+                "id": None,
+                "name": "Local Docker",
+                "type": "docker",
+                "url": _get_docker_host(db),
+            }
+    finally:
+        db.close()
+
+    session = {}
+    try:
+        def _open_exec():
+            client = _make_docker_client(host["url"] or "unix:///var/run/docker.sock")
+            try:
+                container = client.containers.get(container_id)
+                container.reload()
+                if not container.attrs.get("State", {}).get("Running"):
+                    raise ValueError("The container must be running to open a console.")
+                exec_info = client.api.exec_create(
+                    container.id,
+                    cmd=[shell],
+                    stdin=True,
+                    stdout=True,
+                    stderr=True,
+                    tty=True,
+                )
+                stream = client.api.exec_start(exec_info["Id"], socket=True, tty=True)
+                return client, exec_info["Id"], stream
+            except Exception:
+                client.close()
+                raise
+
+        client, exec_id, stream = await asyncio.to_thread(_open_exec)
+        session.update(client=client, exec_id=exec_id, stream=stream)
+    except Exception as exc:
+        await websocket.send_text(f"Unable to open container console: {exc}")
+        await websocket.close(code=1011)
+        return
+
+    async def _send_output():
+        while True:
+            chunk = await asyncio.to_thread(session["stream"].read, 4096)
+            if not chunk:
+                return
+            await websocket.send_bytes(chunk)
+
+    async def _send_input():
+        while True:
+            message = await websocket.receive()
+            if message["type"] == "websocket.disconnect":
+                return
+            if message.get("bytes") is not None:
+                payload = message["bytes"]
+            else:
+                data = message.get("text", "")
+                resize_prefix = "\x00inspectre-resize:"
+                if data.startswith(resize_prefix):
+                    try:
+                        dimensions = json.loads(data[len(resize_prefix):])
+                    except json.JSONDecodeError:
+                        dimensions = {}
+                    columns = dimensions.get("cols") if isinstance(dimensions, dict) else None
+                    rows = dimensions.get("rows") if isinstance(dimensions, dict) else None
+                    if type(columns) is int and type(rows) is int:
+                        await asyncio.to_thread(
+                            session["client"].api.exec_resize,
+                            session["exec_id"],
+                            height=max(1, min(rows, 500)),
+                            width=max(1, min(columns, 500)),
+                        )
+                    continue
+                payload = data.encode("utf-8")
+            if payload:
+                await asyncio.to_thread(session["stream"]._sock.sendall, payload)
+
+    output_task = asyncio.create_task(_send_output())
+    input_task = asyncio.create_task(_send_input())
+    try:
+        done, pending = await asyncio.wait(
+            {output_task, input_task}, return_when=asyncio.FIRST_COMPLETED
+        )
+        for task in pending:
+            task.cancel()
+        session["stream"].close()
+        await asyncio.gather(*pending, return_exceptions=True)
+        for task in done:
+            error = task.exception()
+            if error and not isinstance(error, WebSocketDisconnect):
+                raise error
+    except (WebSocketDisconnect, RuntimeError, OSError):
+        pass
+    except Exception as exc:
+        try:
+            await websocket.send_text(f"\r\nConsole connection failed: {exc}\r\n")
+        except Exception:
+            pass
+    finally:
+        session["stream"].close()
+        session["client"].close()
 
 
 def _parse_trivy_json(data: dict) -> list:

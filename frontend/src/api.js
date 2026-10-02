@@ -377,6 +377,13 @@ export const api = {
   dockerContainers:       ()              => request('GET',  '/docker/containers'),
   dockerCreate:           (body)         => request('POST', '/docker/containers', body),
   dockerContainer:        (id)            => request('GET',  `/docker/containers/${id}`),
+  dockerConsoleUrl:       (id, hostId, shell) => {
+    const url = new URL(`${BASE.replace(/\/$/, '')}/docker/containers/${encodeURIComponent(id)}/console`, window.location.href)
+    url.protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
+    if (hostId != null) url.searchParams.set('host_id', hostId)
+    if (shell) url.searchParams.set('shell', shell)
+    return url.toString()
+  },
   dockerStart:            (id)            => request('POST', `/docker/containers/${id}/start`),
   dockerStop:             (id)            => request('POST', `/docker/containers/${id}/stop`),
   dockerRestart:          (id)            => request('POST', `/docker/containers/${id}/restart`),
