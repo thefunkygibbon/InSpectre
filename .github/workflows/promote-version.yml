@@ -1,0 +1,55 @@
+name: Promote main version
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  promote:
+    if: "${{ !startsWith(github.event.head_commit.message, 'chore: promote release version ') }}"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Configure Git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Promote release version
+        id: release
+        run: |
+          ./scripts/bump-version.sh release
+          echo "VERSION=$(cat VERSION)" >> "$GITHUB_OUTPUT"
+          git add VERSION backend/_version.py probe/_version.py frontend/src/version.js frontend/package.json frontend/package-lock.json
+          git commit -m "chore: promote release version $(cat VERSION)"
+          git push origin HEAD:main
+
+      - name: Sync release base to test
+        env:
+          RELEASE_VERSION: ${{ steps.release.outputs.VERSION }}
+        run: |
+          git fetch origin +refs/heads/test:refs/remotes/origin/test
+          git switch --create version-sync-test --track origin/test
+
+          release_line="$(cut -d. -f1,2 <<< "$RELEASE_VERSION")"
+          current_version="$(tr -d ' \t\r\n' < VERSION)"
+          current_line="$(cut -d. -f1,2 <<< "$current_version")"
+          latest_line="$(printf '%s\n' "$release_line" "$current_line" | sort -V | tail -n1)"
+
+          if [[ "$current_line" == "$release_line" || "$latest_line" == "$current_line" ]]; then
+            echo "test already uses $current_version; leaving its patch level intact"
+            exit 0
+          fi
+
+          printf '%s\n' "$RELEASE_VERSION" > VERSION
+          ./scripts/sync-version.sh
+          git add VERSION backend/_version.py probe/_version.py frontend/src/version.js frontend/package.json frontend/package-lock.json
+          git commit -m "chore: sync test version to $RELEASE_VERSION"
+          git push origin HEAD:test

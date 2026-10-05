@@ -94,6 +94,7 @@
     - 12.13 [Bulk Update Controls](#1213-bulk-update-controls)
     - 12.14 [Container Update Settings](#1214-container-update-settings)
     - 12.15 [Container Update Limitations](#1215-container-update-limitations)
+    - 12.16 [Creating Docker Containers](#1216-creating-docker-containers)
 13. [Home Assistant MQTT Integration](#13-home-assistant-mqtt-integration)
     - 13.1 [Overview](#131-overview)
     - 13.2 [Requirements](#132-requirements)
@@ -173,6 +174,10 @@ http://<host-ip>:3000
 If you are running InSpectre on the same machine as your browser, use `http://localhost:3000`.
 
 The UI is a single-page React application with built-in authentication. On first launch you will be taken through the **Setup Wizard** before reaching the main dashboard.
+
+On supported browsers, you can install InSpectre as a web app using the browser's install option (or the in-app install prompt when available). The service worker caches the app shell and static assets for quicker startup and a basic offline fallback; live inventory, scans, and other API-backed features still require a connection to InSpectre.
+
+Use **Settings → Admin → UI Style** to switch between the rounded **Spectre** interface and the terminal-inspired **Phantom** skin. A light/dark theme toggle is also available in the interface.
 
 ### 1.5 Authentication
 
@@ -831,6 +836,8 @@ Each finding shows:
 
 A finding does not necessarily mean the device is compromised — it means a condition exists that matches a known vulnerable pattern. Review each finding in context.
 
+Use **Export PDF** in the device drawer to download the device's vulnerability findings as a report.
+
 ### 5.5 Vulnerability Settings
 
 Global vulnerability scan settings are accessible from the **Vulnerability Report** page (the shield icon in the nav bar) via the **settings cog** (⚙) in the top-right of the header. Clicking the cog expands a settings panel inline on the page.
@@ -1428,7 +1435,7 @@ The **Containers** page is accessible from the main navigation bar (the box/cube
 
 ### 12.7 Container Drawer
 
-Click any container to open its detail drawer. The drawer has up to five tabs depending on the host type:
+Click any container to open its detail drawer. Docker containers have Overview, Compose, Logs, Console, Security, Updates, and Admin tabs. Proxmox guests show Overview, Security, and Admin; Docker-specific tabs are not available for Proxmox guests.
 
 **Overview tab** (all containers):
 - Status badge and restart policy
@@ -1439,13 +1446,28 @@ Click any container to open its detail drawer. The drawer has up to five tabs de
 
 **Logs tab** (Docker only):
 - Stream live logs from the container
-- Select how many lines to tail (50, 100, 200, 500)
+- Select how many lines to tail
 - Stop streaming with one click
 
-**Vuln Scan tab** (Docker only):
-- Scan the container image for CVEs using Trivy (see [Section 12.8](#128-container-vulnerability-scanning-trivy))
+**Compose tab** (Docker only):
+- View a Compose YAML representation generated from the live container configuration. For Compose-managed containers, the drawer also shows the Compose project and service.
+- Edit the YAML and deploy the updated configuration, with progress streamed in the drawer.
+- Create, view, download, and restore container configuration backups. A saved backup can also be used to recreate a container; Inspectre displays progress while it is recreated.
 
-**Update tab** (Docker only):
+The generated YAML represents the container's current configuration; it is not necessarily the original Compose file from the host.
+
+**Console tab** (Docker only):
+- Open an interactive shell (`/bin/sh`, `/bin/bash`, or `/bin/ash`) in a running container. The selected shell must exist in the image.
+- Console traffic is authenticated and proxied through the InSpectre backend; the browser does not connect directly to the Docker host.
+- The shell runs as the container's configured user. It does not require SSH to be installed or enabled in the container.
+- On mobile, the terminal resizes to the visible area when the on-screen keyboard opens.
+
+**Security tab**:
+- For Docker containers, scan the image for CVEs using Trivy (see [Section 12.8](#128-container-vulnerability-scanning-trivy)) and review runtime configuration audit findings.
+- Runtime checks can flag risky settings such as privileged mode, Docker socket mounts, root users, added capabilities, public port bindings, and missing resource limits or health checks.
+- Proxmox guests show runtime security audit findings but do not have Docker image scans.
+
+**Updates tab** (Docker only):
 - Check for newer image versions and update the container safely (see [Section 12.10–12.15](#1210-container-image-update-management))
 - Shows current vs latest digest, last check timestamp, update status, and streaming update log
 
@@ -1462,7 +1484,7 @@ InSpectre uses [Trivy](https://github.com/aquasecurity/trivy) to scan Docker con
 **Running a scan:**
 
 1. Open a container's drawer.
-2. Go to the **Vuln Scan** tab.
+2. Go to the **Security** tab.
 3. Click **Scan Image**.
 
 Trivy progress messages stream in real time as the scan runs. When complete, results are displayed grouped by severity.
@@ -1482,9 +1504,11 @@ Click a finding to expand it for full details.
 
 **Summary badges** show the count per severity at the top of the results when the scan is complete.
 
+Use **Export PDF** in the Security tab to download the current image scan findings as a report.
+
 **Scan history:**
 
-When InSpectre runs a Trivy auto-scan for a container image (triggered by scheduled scanning), the result is stored. The next time you open the Vuln Scan tab for that container, the last stored result is loaded automatically without needing to re-scan.
+When InSpectre runs a Trivy auto-scan for a container image (triggered by scheduled scanning), the result is stored. The next time you open the Security tab for that container, the last stored result is loaded automatically without needing to re-scan.
 
 **Rescanning:**
 
@@ -1503,7 +1527,7 @@ The **Container Vulnerabilities** section at the bottom of the dashboard shows:
 - Total CVE count across all scanned images
 - Count of clean (no findings) images
 - CVE findings grouped by severity (Critical, High, Medium, Low) — click a severity group to expand the list of affected containers and their CVE counts
-- Click a container name in the expanded list to jump directly to that container's Vuln Scan tab
+- Click a container name in the expanded list to jump directly to that container's Security tab
 
 ### 12.10 Container Image Update Management
 
@@ -1553,7 +1577,7 @@ Open the container's drawer and go to the **Update** tab (visible for Docker con
 | 6. Start | The new container is started |
 | 7. Health check | InSpectre waits (up to the configured timeout) for the container to be in a healthy/running state. If it becomes healthy, the backup is cleaned up. If it fails, the new container is removed and the backup is renamed back to the original name (automatic rollback). |
 
-All progress messages stream live to the Update tab log panel.
+All progress messages stream live to the Updates tab log panel.
 
 **Cascade restart for shared-network containers:**
 
@@ -1565,7 +1589,7 @@ If a container's update was blocked due to critical CVEs, you can override the b
 
 **Pinning a container:**
 
-Click the **Pin** toggle in the Update tab to exclude a container from all automatic update checks and auto-update runs. Pinned containers are shown with a lock badge and skipped entirely by the scheduled update loop. You can still update them manually at any time.
+Click the **Pin** toggle in the Updates tab to exclude a container from all automatic update checks and auto-update runs. Pinned containers are shown with a lock badge and skipped entirely by the scheduled update loop. You can still update them manually at any time.
 
 You can also pin via a Docker label on the container itself:
 ```
@@ -1635,7 +1659,23 @@ The correct resolution is to update such containers by re-running `docker compos
 
 **Proxmox LXC containers:**
 
-Image update management is not available for Proxmox LXC containers. The Update tab is only shown in the drawer for Docker containers.
+Image update management is not available for Proxmox LXC containers. The Updates tab is only shown in the drawer for Docker containers.
+
+### 12.16 Creating Docker Containers
+
+Click **New container** in the Containers page toolbar. Choose a Docker host as the deployment target, then select **Container settings** or **Compose YAML**.
+
+**Container settings form:**
+- Set a name and image, with an optional command.
+- Configure port mappings, environment variables, volume mounts, network, and restart policy.
+- Expand **Advanced Docker options** for user, hostname, working directory, memory limit, CPU shares, privileged mode, and read-only root filesystem.
+- Additional Docker create options can be entered as a JSON object. Supported options include capabilities, devices, DNS, labels, security options, sysctls, temporary filesystems, CPU/memory/PID limits, and other Docker Engine settings. Unsupported option names are rejected with an error rather than silently ignored.
+
+**Compose YAML:**
+
+Paste a Compose document containing a `services` mapping. Optionally specify which service to deploy; if omitted, Inspectre uses the first service. This creates the selected service as a container through the Docker API—it does not run `docker compose up` for the entire project. Supply required values such as image, volumes, networks, and environment directly in the service definition.
+
+**Proxmox:** When a Proxmox host is selected, the drawer instead offers the LXC creation fields (hostname, VMID, node, OS template, storage, disk, memory, cores, and optional network settings). Compose deployment and the interactive console are Docker-only.
 
 ---
 
@@ -1800,9 +1840,9 @@ InSpectre publishes `online` to `inspectre/system/status` on connect and configu
 - Trivy downloads its vulnerability database on first use and on each update interval. If the database was not yet downloaded when the scan ran, results will be empty. Wait a few minutes and re-scan.
 - Check the backend container logs for Trivy database update messages: `docker compose logs backend`
 
-**Logs tab or Vuln Scan tab is missing for a container**
+**Logs, Compose, Console, or Updates tab is missing for a container**
 
-- These tabs are only available for Docker containers. Proxmox LXC containers show only the Overview and Admin tabs.
+- These tabs are only available for Docker containers. Proxmox guests show only the Overview, Security, and Admin tabs.
 
 **Home Assistant MQTT shows "Disconnected"**
 
@@ -1919,6 +1959,12 @@ plugin code to write or run. You describe the HTTP / file / SNMP calls and how
 to map their responses, and the InSpectre plugin engine performs them on a
 schedule or in response to events. This keeps shared plugins safe — a manifest
 can only make the calls it declares, using the credentials you enter.
+
+Plugins can also expose actions for external webhook calls, so an outside
+service can trigger a declared plugin action in InSpectre. A webhook secret can
+be configured to verify the request signature. See the [Plugin Developer
+Guide](plugin.md#16-webhook-triggered-actions) for the endpoint and signature
+details.
 
 The plugin engine is managed from **Settings → Plugins**.
 

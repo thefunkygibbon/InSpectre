@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef, useCallback } from 'react'
+import { Component, useState, useEffect, useRef, useCallback, lazy, Suspense } from 'react'
 import {
   X, Box, Play, Square, RotateCcw, ChevronDown, ChevronRight,
   Network, HardDrive, Tag, Terminal, ShieldAlert, ShieldCheck,
@@ -9,6 +9,31 @@ import {
 } from 'lucide-react'
 import { api } from '../api'
 import { exportContainerVulnPDF } from '../utils/vulnPdfExport'
+
+const ContainerConsole = lazy(() => import('./ContainerConsole'))
+
+class ConsoleErrorBoundary extends Component {
+  state = { errorMessage: null }
+
+  static getDerivedStateFromError(error) {
+    return { errorMessage: error?.message || 'Unknown rendering error.' }
+  }
+
+  componentDidCatch(error) {
+    console.error('Container console failed to render:', error)
+  }
+
+  render() {
+    if (this.state.errorMessage) {
+      return (
+        <div className="text-sm text-red-400">
+          The container console could not be displayed: {this.state.errorMessage}
+        </div>
+      )
+    }
+    return this.props.children
+  }
+}
 
 const STATUS_CONFIG = {
   running:    { color: '#22c55e', bg: 'rgba(34,197,94,0.12)',   border: 'rgba(34,197,94,0.3)',   label: 'Running'    },
@@ -58,6 +83,7 @@ const TABS = [
   { id: 'overview', label: 'Overview'  },
   { id: 'compose',  label: 'Compose'   },
   { id: 'logs',     label: 'Logs'      },
+  { id: 'console',  label: 'Console'   },
   { id: 'vuln',     label: 'Security'  },
   { id: 'updates',  label: 'Updates'   },
   { id: 'admin',    label: 'Admin'     },
@@ -1978,7 +2004,7 @@ export function ContainerDrawer({ container: initialContainer, trivyScan, update
   const [container,   setContainer]   = useState(initialContainer)
   const isProxmox   = container.host_type === 'proxmox'
   const visibleTabs = isProxmox
-    ? TABS.filter(t => !['logs', 'compose', 'updates'].includes(t.id))
+    ? TABS.filter(t => !['logs', 'console', 'compose', 'updates'].includes(t.id))
     : TABS
   const startTab    = initialTab || 'overview'
   const [activeTab,   setActiveTab]   = useState(
@@ -2078,12 +2104,12 @@ export function ContainerDrawer({ container: initialContainer, trivyScan, update
           </div>
         </div>
 
-        {/* Tab bar — wraps to 3-per-row grid on mobile, single scrolling row on sm+ */}
-        <div className="grid grid-cols-3 sm:flex border-b border-border sm:overflow-x-auto sm:scrollbar-none"
+        {/* Keep the full tab set visible in a compact grid. */}
+        <div className={`grid ${visibleTabs.length > 5 ? 'grid-cols-4 sm:grid-cols-7' : 'grid-cols-4'} border-b border-border`}
           style={{ background: 'var(--color-surface)' }}>
           {visibleTabs.map(tab => (
             <button key={tab.id} onClick={() => setActiveTab(tab.id)}
-              className="px-2 py-2.5 sm:px-3 sm:py-3 text-xs font-medium border-b-2 transition-colors text-center sm:whitespace-nowrap sm:shrink-0"
+              className="min-w-0 px-1 py-2 sm:px-1.5 sm:py-2.5 text-[11px] sm:text-xs font-medium border-b-2 transition-colors text-center whitespace-nowrap"
               style={activeTab === tab.id
                 ? { borderColor: 'var(--color-brand)', color: 'var(--color-brand)' }
                 : { borderColor: 'transparent', color: 'var(--color-text-muted)' }}>
@@ -2258,6 +2284,14 @@ export function ContainerDrawer({ container: initialContainer, trivyScan, update
               isRunning={isRunning}
               resolveCurrentContainerId={resolveCurrentContainerId}
             />
+          )}
+
+          {activeTab === 'console' && (
+            <ConsoleErrorBoundary key={container.id}>
+              <Suspense fallback={<div className="text-xs text-text-faint">Loading terminal…</div>}>
+                <ContainerConsole container={container} />
+              </Suspense>
+            </ConsoleErrorBoundary>
           )}
 
           {/* ── Security tab ── */}

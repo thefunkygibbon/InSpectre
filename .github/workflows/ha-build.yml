@@ -1,18 +1,22 @@
 name: Build and Push Home Assistant Add-on Images
 
 on:
-  push:
-    branches:
-      - main
+  workflow_run:
+    workflows: ["Promote main version"]
+    types: [completed]
+    branches: [main]
   workflow_dispatch:
 
 jobs:
   build-amd64:
     name: Build AMD64 Add-on Image
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          ref: main
 
       - name: Extract base version from package.json
         id: get_version
@@ -46,10 +50,13 @@ jobs:
 
   build-arm64:
     name: Build ARM64 Add-on Image
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
     runs-on: ubuntu-24.04-arm
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          ref: main
 
       - name: Extract base version from package.json
         id: get_version
@@ -89,6 +96,8 @@ jobs:
     steps:
       - name: Checkout main repository to read version
         uses: actions/checkout@v4
+        with:
+          ref: main
 
       - name: Extract base version
         run: |

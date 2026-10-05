@@ -212,10 +212,14 @@ def _try_auto_group_by_hostname(mac: str, hostname: str) -> bool:
         row = sess.execute(
             text("""
                 SELECT mac_address, group_id, group_manual FROM devices
-                WHERE hostname IS NOT NULL AND hostname != ''
-                  AND LOWER(SPLIT_PART(hostname, '.', 1)) = :base
-                  AND mac_address != :mac
-                  AND COALESCE(auto_group_optout, false) = false
+                    WHERE (
+                            (hostname IS NOT NULL AND hostname != ''
+                             AND LOWER(SPLIT_PART(hostname, '.', 1)) = :base)
+                         OR (dhcp_hostname IS NOT NULL AND dhcp_hostname != ''
+                             AND LOWER(SPLIT_PART(dhcp_hostname, '.', 1)) = :base)
+                      )
+                      AND mac_address != :mac
+                      AND COALESCE(auto_group_optout, false) = false
                 ORDER BY is_online DESC
                 LIMIT 1
             """),

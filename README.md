@@ -25,6 +25,8 @@ Check the [Wiki](https://github.com/thefunkygibbon/InSpectre/wiki) for full admi
 - **Network Events** — global online/offline event log across all devices with source attribution (ARP sweep, passive sniffer, or plugin)
 - **Per-device uptime bar** — 7-day presence history visible at a glance in every device drawer
 - **IP history** — every IP address a device has ever held, with timestamps
+- **Installable web app** — install InSpectre from supported browsers; its app shell can fall back to cached assets, while live device data still requires a connection
+- **Appearance options** — switch between the Spectre interface and the Phantom terminal-style skin, with light/dark theme support
 
 ### Device Management
 - **Custom metadata** — set a friendly name, device type, vendor override, location/room, tags, and zone per device
@@ -49,6 +51,7 @@ Check the [Wiki](https://github.com/thefunkygibbon/InSpectre/wiki) for full admi
 - **Port scanning** — nmap-based TCP port sweep with OS detection and service fingerprinting. Scans always target a device's pinned **primary IP** — whether triggered on first discovery, on reconnect after a long offline period, or manually from the drawer — so multi-homed and grouped hosts are scanned consistently on the same address.
 - **Baseline tracking** — detects port drift and raises alerts when a device's open ports change
 - **Vulnerability scanning** — Nuclei-based CVE scanning with per-service template routing; findings shown by severity (critical, high, medium, low)
+- **PDF vulnerability reports** — export device scan findings as a shareable report from the device drawer
 - **Scheduled scans** — configurable nightly scan window with per-device auto-scan triggers
 - **Security dashboard** — network-wide vulnerability overview grouped by severity; includes container image vulnerabilities alongside device findings; scan settings accessible inline via the settings cog
 
@@ -56,7 +59,11 @@ Check the [Wiki](https://github.com/thefunkygibbon/InSpectre/wiki) for full admi
 - **Multi-host support** — connect to multiple Docker hosts (local socket or remote TCP) and Proxmox VE nodes simultaneously
 - **Container management** — view all running and stopped containers, start/stop/restart with one click
 - **Log streaming** — live container log tailing directly from the UI
-- **Image vulnerability scanning** — Trivy-based CVE scanner checks container images for known vulnerabilities; findings grouped by severity with expandable CVE cards showing CVSS scores, affected packages, and NVD links
+- **Container deployment** — create a container from a Compose service or configure common Docker settings in the form, with an advanced JSON editor for resource limits, capabilities, devices, DNS, labels, and other Docker create options
+- **Proxied container console** — open an authenticated interactive shell for a running Docker container from its drawer; the terminal connection is proxied through Inspectre rather than connecting the browser directly to the Docker host
+- **Compose configuration editor** — inspect a Compose YAML generated from a live container, edit it, and deploy the updated configuration from the drawer
+- **Container security audits** — review runtime configuration findings such as privileged mode, Docker socket mounts, root users, public port bindings, and missing resource limits
+- **Image vulnerability scanning** — Trivy-based CVE scanner checks container images for known vulnerabilities; findings grouped by severity with expandable CVE cards showing CVSS scores, affected packages, and NVD links, with PDF export
 - **Proxmox VE integration** — monitor LXC containers from Proxmox VE nodes via REST API (API token auth)
 - **Host filter** — filter the container list by configured host; each container card shows which host it came from
 - **Auto-scan results** — last Trivy scan result for each image is stored and shown immediately when you open the drawer
@@ -66,6 +73,7 @@ Check the [Wiki](https://github.com/thefunkygibbon/InSpectre/wiki) for full admi
 - **Smart filter: Has Update** — filter the container list to show only containers with a newer image available
 - **Update-aware admin tab** — per-container admin panel shows current vs latest image digest, update/rollback controls, pin toggle (exclude from auto-updates), network mode management, and restart policy configuration
 - **Config backups** — before every update a full backup of `docker inspect` JSON and a reconstructed compose YAML is saved; view and restore from the container drawer
+- **Backup restore and recreation** — create manual configuration backups, inspect or download their Compose YAML, and recreate a container from a saved configuration
 
 ### Device Blocking
 - **Per-device blocking** — cut any device off from the internet with one click using ARP MITM
@@ -85,7 +93,7 @@ Check the [Wiki](https://github.com/thefunkygibbon/InSpectre/wiki) for full admi
 - **Email Tools** — MX/SPF/DMARC/DKIM Checker, SMTP Banner Grab, BIMI Lookup, DNSBL Check
 
 ### Extensibility
-- **Plugin system** — integrate external services (DNS servers, firewalls, controllers, DHCP sources) for device discovery, enrichment, presence, and blocking. Plugins are simple declarative JSON/YAML manifests (no code) uploaded via Settings → Plugins. Built-in plugins ship for AdGuard Home, Pi-hole, TP-Link Omada, Home Assistant, OPNsense, and pfSense. See the [Plugin Developer Guide](plugin.md) and [`examples/plugins/`](examples/plugins/) to write your own.
+- **Plugin system** — integrate external services (DNS servers, firewalls, controllers, DHCP sources) for device discovery, enrichment, presence, and blocking. Plugins are simple declarative JSON/YAML manifests (no code) uploaded via Settings → Plugins; they can poll on a schedule, respond to InSpectre events, or expose webhook-triggered actions. Built-in plugins ship for AdGuard Home, Pi-hole, TP-Link Omada, Home Assistant, OPNsense, and pfSense. See the [Plugin Developer Guide](plugin.md) and [`examples/plugins/`](examples/plugins/) to write your own.
 
 ### Alerts & Notifications
 - **Toast + browser notifications** — instant in-app and OS-level alerts
@@ -261,27 +269,28 @@ Contributions are welcome. Please open an issue to discuss a change before submi
 
 ### Versioning
 
-The project version lives in a single file — **`VERSION`** at the repo root — and everything else is derived from it. The backend, probe and frontend each read an auto-generated version module that is stamped from `VERSION`; never edit those generated files by hand:
+The project version lives in a single file — **`VERSION`** at the repo root — and everything else is derived from it. Development versions on `test` use `MAJOR.MINOR.PATCH`; a promoted release on `main` uses the shorter `MAJOR.MINOR` form. The backend, probe and frontend each read an auto-generated version module that is stamped from `VERSION`; never edit those generated files by hand:
 
-- `backend/_version.py`, `probe/_version.py`, `frontend/src/version.js`, and the `version` field in `frontend/package.json`
+- `backend/_version.py`, `probe/_version.py`, `frontend/src/version.js`, and the frontend package and lockfile version fields
 
 Useful commands:
 
 ```bash
 scripts/sync-version.sh            # re-stamp all components from VERSION
-scripts/bump-version.sh patch      # 1.2.0 -> 1.2.1  (default)
-scripts/bump-version.sh minor      # 1.2.0 -> 1.3.0
-scripts/bump-version.sh major      # 1.2.0 -> 2.0.0
-scripts/bump-version.sh set 2.1.0  # set an explicit version
+scripts/bump-version.sh patch      # 1.3 -> 1.3.1 (test branch default)
+scripts/bump-version.sh minor      # 1.2.56 -> 1.3.0
+scripts/bump-version.sh release    # 1.2.56 -> 1.3 (main release format)
+scripts/bump-version.sh major      # 1.2.56 -> 2.0.0
+scripts/bump-version.sh set 2.1    # set an explicit version
 ```
 
-**Automatic bumping:** a git pre-commit hook keeps the version moving forward so it never goes stale again. Enable it once per clone:
+**Branch-aware automatic bumping:** enable the git pre-commit hook once per clone:
 
 ```bash
 git config core.hooksPath .githooks
 ```
 
-With the hook active, every commit auto-increments the **patch** number and re-stamps the derived files. To cut a `minor`/`major` release instead, run `scripts/bump-version.sh minor` (or `major`) and stage `VERSION` before committing — the hook detects the manual bump and only syncs. Set `INSPECTRE_NO_VERSION_BUMP=1` to skip bumping for a single commit. `./inspectre.sh rebuild` also re-stamps from `VERSION` before building, so deployed images always carry the correct version.
+With the hook active, commits on `test` increment the **patch** number and re-stamp generated files. After a push to `main`, GitHub Actions promotes the version to the next `MAJOR.MINOR` (for example, `1.2.56` becomes `1.3`), commits that version on `main`, and synchronizes the new release base to `test`. The next development commit then starts the new patch line (for example, `1.3.1`). This requires Actions to have permission to write repository contents. The frontend package and lockfile store the equivalent three-part version (`1.3.0`) because npm requires semver, while the app and backend report the short release version (`1.3`). Set `INSPECTRE_NO_VERSION_BUMP=1` to skip the test-branch bump for a single commit. `./inspectre.sh rebuild` also re-stamps from `VERSION` before building, so deployed images always carry the correct version.
 
 ---
 
