@@ -9,7 +9,7 @@ permissions:
 
 jobs:
   promote:
-    if: ${{ !startsWith(github.event.head_commit.message, 'chore: promote release version ') }}
+    if: "${{ !startsWith(github.event.head_commit.message, 'chore: promote release version ') }}"
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
