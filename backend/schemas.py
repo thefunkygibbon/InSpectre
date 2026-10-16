@@ -231,6 +231,7 @@ class ProfileCreate(BaseModel):
 class WolPayload(BaseModel):
     mac: str
     ip:  Optional[str] = None
+    broadcast: str = "255.255.255.255"
 
 
 class PersonCreate(BaseModel):

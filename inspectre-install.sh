@@ -49,7 +49,14 @@ else
     echo "        sudo usermod -aG docker \$USER   (then log out and back in)"
     MISSING=1
   else
-    ok "Docker daemon is running"
+    DOCKER_SERVER_VERSION="$(docker info --format '{{.ServerVersion}}' 2>/dev/null || true)"
+    if [[ "$DOCKER_SERVER_VERSION" =~ ^([0-9]+)\. ]] &&
+       (( BASH_REMATCH[1] >= 24 )); then
+      ok "Docker Engine ${DOCKER_SERVER_VERSION} is running"
+    else
+      warn "Docker Engine 24+ is required (detected: ${DOCKER_SERVER_VERSION:-unknown})."
+      MISSING=1
+    fi
   fi
 fi
 
@@ -123,9 +130,10 @@ case "$PLATFORM_CHOICE" in
   *) die "Invalid selection '${PLATFORM_CHOICE}'. Choose 1 (x64) or 2 (raspberry)." ;;
 esac
 
-if { [ "$INSPECTRE_TAG" = "latest" ] && [ "$DETECTED" = "pi" ]; } || \
+if [ -z "$DETECTED" ] || \
+   { [ "$INSPECTRE_TAG" = "latest" ] && [ "$DETECTED" = "pi" ]; } || \
    { [ "$INSPECTRE_TAG" = "raspi"  ] && [ "$DETECTED" = "x64" ]; }; then
-  warn "You selected images for a different architecture than this host ($HOST_ARCH)."
+  warn "The selected image architecture may not match this host ($HOST_ARCH)."
   warn "The containers will fail to start unless this is intentional (e.g. emulation)."
   read -rp "  Continue anyway? [y/N]: " ARCH_CONFIRM </dev/tty
   [[ "$ARCH_CONFIRM" =~ ^[Yy]$ ]] || die "Aborted by user."
@@ -219,7 +227,9 @@ fi
 
 # ── Start the stack ──────────────────────────────────────────
 header "Starting InSpectre"
-echo "  Pulling images and starting containers (this may take a minute)..."
+echo "  Pulling images (this may take a minute)..."
+docker compose -f docker-compose.deploy.yml pull
+echo "  Starting containers..."
 docker compose -f docker-compose.deploy.yml up -d
 
 echo ""
