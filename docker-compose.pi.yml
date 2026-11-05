@@ -68,6 +68,10 @@ services:
       - "com.centurylinklabs.watchtower.enable=true"
     network_mode: "host"
     privileged: true
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
     environment:
       - DATABASE_URL=postgresql://${POSTGRES_USER:-inspectre}:${POSTGRES_PASSWORD:-inspectre}@localhost:5432/${POSTGRES_DB:-inspectre}
       - SCAN_INTERVAL=${SCAN_INTERVAL:-60}

@@ -8,6 +8,7 @@ import {
   Pencil, Save, Upload,
 } from 'lucide-react'
 import { api } from '../api'
+import { JobLog, formatJobLine } from './JobLog'
 import { exportContainerVulnPDF } from '../utils/vulnPdfExport'
 
 const ContainerConsole = lazy(() => import('./ContainerConsole'))
@@ -688,6 +689,9 @@ function ComposeTab({ containerId, containerName, labels, resolveCurrentContaine
   const [restoring,     setRestoring]     = useState(false)
   const [restoreLogs,   setRestoreLogs]   = useState([])
   const restoreAbortRef = useRef(null)
+  const showBackupsRef  = useRef(false)
+  const loadBackupsRef  = useRef(null)
+  showBackupsRef.current = showBackups
 
   // YAML viewer modal
   const [viewYaml,      setViewYaml]      = useState(null) // { title, yaml }
@@ -760,32 +764,57 @@ function ComposeTab({ containerId, containerName, labels, resolveCurrentContaine
 
   function handleCancelEdit() {
     setEditMode(false)
-    setDeployLogs([])
-    if (deployAbortRef.current) deployAbortRef.current.abort()
+    if (!deploying) setDeployLogs([])
   }
 
-  function handleDeploy() {
-    if (deploying) return
-    setDeployLogs([])
+  const followDeploy = useCallback((start) => {
     setDeploying(true)
     const ctrl = new AbortController()
     deployAbortRef.current = ctrl
-    api.dockerDeployCompose(containerId, editYaml, line => {
+    start(line => {
+      setDeployLogs(l => [...l, formatJobLine(line)])
       if (line.startsWith('DEPLOY_ERROR:')) {
-        setDeployLogs(l => [...l, '❌ ' + line.slice(13)])
         setDeploying(false)
+        if (showBackupsRef.current) loadBackupsRef.current?.()
       } else if (line === 'DEPLOY_DONE') {
-        setDeployLogs(l => [...l, '✅ Deployed successfully.'])
         setDeploying(false)
+        setEditMode(false)
         loadCompose().catch(() => {})
-      } else {
-        setDeployLogs(l => [...l, line.replace(/^LOG:\s*/, '')])
+        if (showBackupsRef.current) loadBackupsRef.current?.()
       }
     }, ctrl.signal).catch(e => {
+      if (ctrl.signal.aborted) return
       setDeployLogs(l => [...l, `❌ ${e.message || 'Deploy failed'}`])
       setDeploying(false)
     })
+  }, [loadCompose])
+
+  function handleDeploy() {
+    if (deploying) return
+    setDeployLogs(['Submitting — the current container config is backed up automatically before any change…'])
+    followDeploy((onLine, signal) => api.dockerDeployCompose(containerId, editYaml, onLine, signal))
   }
+
+  // Re-attach to a deploy/restore that is still running server-side (e.g. after
+  // the drawer was closed or the page reloaded mid-operation).
+  useEffect(() => {
+    if (!containerName) return
+    let cancelled = false
+    api.dockerJobs().then(jobs => {
+      if (cancelled) return
+      const job = (jobs || []).find(j => j.container_name === containerName && !j.finished_at
+        && (j.kind === 'deploy' || j.kind === 'recreate'))
+      if (!job) return
+      setDeployLogs([`Re-attached to running ${job.kind} job ${job.id}…`])
+      followDeploy((onLine, signal) => api.dockerAttachJob(job.id, onLine, signal))
+    }).catch(() => {})
+    return () => { cancelled = true }
+  }, [containerName, followDeploy])
+
+  useEffect(() => () => {
+    deployAbortRef.current?.abort()
+    restoreAbortRef.current?.abort()
+  }, [])
 
   async function loadBackups() {
     try {
@@ -793,6 +822,7 @@ function ComposeTab({ containerId, containerName, labels, resolveCurrentContaine
       setBackups(b)
     } catch (_) {}
   }
+  loadBackupsRef.current = loadBackups
 
   async function manualBackup() {
     try {
@@ -825,17 +855,20 @@ function ComposeTab({ containerId, containerName, labels, resolveCurrentContaine
     const ctrl = new AbortController()
     restoreAbortRef.current = ctrl
     api.dockerRecreateFromBackup(backupId, line => {
+      setRestoreLogs(l => [...l, formatJobLine(line)])
       if (line.startsWith('RECREATE_ERROR:')) {
-        setRestoreLogs(l => [...l, '❌ ' + line.slice(15)])
-        setRestoring(false)
-      } else if (line === 'RECREATE_DONE') {
-        setRestoreLogs(l => [...l, '✅ Container restored successfully.'])
         setRestoring(false)
         loadBackups()
-      } else {
-        setRestoreLogs(l => [...l, line.replace(/^LOG:\s*/, '')])
+      } else if (line === 'RECREATE_DONE') {
+        setRestoring(false)
+        loadBackups()
+        loadCompose().catch(() => {})
       }
-    }, ctrl.signal).catch(() => setRestoring(false))
+    }, ctrl.signal).catch(e => {
+      if (ctrl.signal.aborted) return
+      setRestoreLogs(l => [...l, `❌ ${e.message || 'Restore failed'}`])
+      setRestoring(false)
+    })
   }
 
   if (loading) return (
@@ -928,12 +961,10 @@ function ComposeTab({ containerId, containerName, labels, resolveCurrentContaine
               {deploying ? 'Deploying…' : 'Save & Deploy'}
             </button>
           </div>
-          {deployLogs.length > 0 && (
-            <div className="rounded-lg p-3 space-y-0.5 text-[11px] font-mono"
-              style={{ background: 'var(--color-surface-offset)', border: '1px solid var(--color-border)', maxHeight: '20vh', overflowY: 'auto' }}>
-              {deployLogs.map((l, i) => <div key={i} style={{ color: 'var(--color-text-muted)' }}>{l}</div>)}
-            </div>
-          )}
+          <p className="text-[10px]" style={{ color: 'var(--color-text-faint)' }}>
+            A backup of the current container is saved first. The old container is only removed once the
+            new one is confirmed running — otherwise it is restored automatically.
+          </p>
         </div>
       ) : (
         <pre className="rounded-lg p-4 text-[11px] font-mono overflow-x-auto leading-relaxed"
@@ -941,6 +972,8 @@ function ComposeTab({ containerId, containerName, labels, resolveCurrentContaine
           {data.yaml}
         </pre>
       )}
+
+      <JobLog lines={deployLogs} running={deploying} />
 
       {/* Backup history */}
       <div className="card p-4 space-y-3">
@@ -1012,10 +1045,7 @@ function ComposeTab({ containerId, containerName, labels, resolveCurrentContaine
               </div>
             ))}
             {restoreLogs.length > 0 && (
-              <div className="rounded-lg p-3 space-y-0.5 text-[11px] font-mono mt-2"
-                style={{ background: 'var(--color-surface-offset)', border: '1px solid var(--color-border)', maxHeight: '16vh', overflowY: 'auto' }}>
-                {restoreLogs.map((l, i) => <div key={i} style={{ color: 'var(--color-text-muted)' }}>{l}</div>)}
-              </div>
+              <div className="mt-2"><JobLog lines={restoreLogs} running={restoring} maxHeight="30vh" /></div>
             )}
           </div>
         )}
@@ -1431,7 +1461,7 @@ function UpdatesTab({ container, updateStatus: initialStatus }) {
     }
   }
 
-  function startStream(mode, force = false, scanFirst = true) {
+  function startStream(mode, force = false, scanFirst = true, attachJobId = null) {
     if (streaming) return
     setLogs([])
     setScanResult(null)
@@ -1459,23 +1489,41 @@ function UpdatesTab({ container, updateStatus: initialStatus }) {
         return
       }
       if (line.startsWith('UPDATE_DONE:') || line.startsWith('UPDATE_BLOCKED:') || line.startsWith('SCAN_DONE:')) {
+        if (line.startsWith('UPDATE_')) setLogs(l => [...l, formatJobLine(line)])
         setStreaming(false)
         refreshStatus()
-        if (line.startsWith('UPDATE_DONE:') || line.startsWith('UPDATE_BLOCKED:')) {
-          setActiveTab('updates')
-        }
         return
       }
-      setLogs(l => [...l, line.replace(/^LOG:\s*/, '')])
+      setLogs(l => [...l, formatJobLine(line)])
     }
 
     if (mode === 'scan') {
       api.dockerScanNewImage(container.id, onLine, ctrl.signal).catch(() => setStreaming(false))
     } else {
-      api.dockerSafeUpdate(container.id, { force, scan_first: scanFirst }, onLine, ctrl.signal)
-        .catch(() => setStreaming(false))
+      const onErr = e => {
+        if (!ctrl.signal.aborted) setLogs(l => [...l, `❌ ${e.message || 'Update stream failed'}`])
+        setStreaming(false)
+      }
+      if (attachJobId) {
+        api.dockerAttachJob(attachJobId, onLine, ctrl.signal).then(() => setStreaming(false), onErr)
+      } else {
+        api.dockerSafeUpdate(container.id, { force, scan_first: scanFirst }, onLine, ctrl.signal)
+          .then(() => setStreaming(false), onErr)
+      }
     }
   }
+
+  useEffect(() => {
+    let cancelled = false
+    api.dockerJobs().then(jobs => {
+      if (cancelled) return
+      const job = (jobs || []).find(j => j.container_name === container.name && !j.finished_at
+        && (j.kind === 'update' || j.kind === 'recreate'))
+      if (job) startStream('update', false, true, job.id)
+    }).catch(() => {})
+    return () => { cancelled = true; abortRef.current?.abort() }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [container.name])
 
   function stopStream() {
     abortRef.current?.abort()
@@ -1549,12 +1597,12 @@ function UpdatesTab({ container, updateStatus: initialStatus }) {
         loadBackups()
         return
       }
-      setLogs(l => [...l, line.replace(/^LOG:\s*/, '')])
+      setLogs(l => [...l, formatJobLine(line)])
     }
 
     api.dockerRecreateFromBackup(backupId, onLine, ctrl.signal)
       .catch(e => {
-        setLogs(l => [...l, `❌ Restore failed: ${e.message || 'Unknown error'}`])
+        if (!ctrl.signal.aborted) setLogs(l => [...l, `❌ Restore failed: ${e.message || 'Unknown error'}`])
         setStreaming(false)
         setRecreatingBackup(false)
       })
@@ -1811,9 +1859,10 @@ function UpdatesTab({ container, updateStatus: initialStatus }) {
           {streaming && (
             <button onClick={stopStream}
               className="btn-ghost flex items-center gap-1.5 text-xs"
-              style={{ color: '#ef4444' }}>
+              style={{ color: '#ef4444' }}
+              title={streamMode === 'scan' ? 'Stop the scan' : 'Stop watching — the operation keeps running on the server'}>
               <Square size={12} />
-              Stop
+              {streamMode === 'scan' ? 'Stop' : 'Detach'}
             </button>
           )}
         </div>
@@ -1908,7 +1957,7 @@ function UpdatesTab({ container, updateStatus: initialStatus }) {
             {streamMode === 'scan' ? 'Scan Log' : streamMode === 'recreate' ? 'Recreate Log' : 'Update Log'}
             {streaming && <Loader2 size={10} className="animate-spin ml-1" />}
           </span>
-          <div className="rounded-lg p-3 font-mono text-[11px] space-y-0.5 max-h-56 overflow-y-auto"
+          <div className="rounded-lg p-3 font-mono text-[11px] space-y-0.5 max-h-96 overflow-y-auto whitespace-pre-wrap break-words"
             style={{ background: 'var(--color-surface-offset)', border: '1px solid var(--color-border)' }}>
             {logs.map((l, i) => (
               <div key={i} style={{

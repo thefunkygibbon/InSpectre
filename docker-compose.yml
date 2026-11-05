@@ -49,6 +49,10 @@ services:
     container_name: inspectre-probe
     network_mode: "host"
     privileged: true
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
     restart: always
     environment:
       DATABASE_URL: postgresql://admin:2bffaeae7a209b178854078631c5b136@localhost:5432/inspectre

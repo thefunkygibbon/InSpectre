@@ -19,19 +19,24 @@ Wired into main.py via:
 """
 
 import asyncio
+import io
 import json
 import os
+import re
 import shutil
 import socket
 import subprocess
 import threading
 import time
+import traceback
+import uuid
+import zipfile
 from datetime import datetime, timezone
 from typing import Optional
 
 import docker as docker_sdk
 from fastapi import APIRouter, HTTPException, Request
-from fastapi.responses import StreamingResponse
+from fastapi.responses import Response, StreamingResponse
 from jose import JWTError, jwt
 from pydantic import BaseModel
 from sqlalchemy import text
@@ -133,6 +138,137 @@ _check_all_status = {
 }
 
 router = APIRouter()
+
+
+# ── Background jobs ────────────────────────────────────────────────────────────
+# Container update / deploy / restore operations run as detached asyncio tasks so
+# a dropped browser connection or proxy timeout can never abort them half-way.
+# Clients (re)attach to the buffered log via /docker/jobs/{id}/stream?from=N.
+
+_JOBS: dict[str, dict] = {}
+_JOBS_KEEP = 50
+_JOB_HEARTBEAT_SECONDS = 10
+_JOB_ERROR_PREFIX = {"deploy": "DEPLOY_ERROR", "recreate": "RECREATE_ERROR", "update": "UPDATE_ERROR"}
+_JOB_FAIL_MARKERS = ("DEPLOY_ERROR:", "RECREATE_ERROR:", "UPDATE_ERROR:", "UPDATE_BLOCKED:",
+                     "UPDATE_DONE:rolled_back", "UPDATE_DONE:rollback_failed")
+_JOB_OK_MARKERS = ("DEPLOY_DONE", "RECREATE_DONE", "UPDATE_DONE:", "SELF_UPDATE_STARTED")
+
+
+def _job_public(job: dict, with_lines: bool = False) -> dict:
+    out = {k: job[k] for k in ("id", "kind", "container_name", "status",
+                                "started_at", "finished_at", "last_line")}
+    out["line_count"] = len(job["lines"])
+    if with_lines:
+        out["lines"] = [ln[len("data: "):].rstrip("\n") for ln in job["lines"]]
+    return out
+
+
+def _running_job_for(container_name: str) -> dict | None:
+    return next((j for j in _JOBS.values()
+                 if j["finished_at"] is None and j["container_name"] == container_name), None)
+
+
+def _start_job(kind: str, container_name: str, agen) -> dict:
+    if _running_job_for(container_name):
+        raise HTTPException(409, f"Another operation is already running for '{container_name}'.")
+    job = {
+        "id": uuid.uuid4().hex[:12], "kind": kind, "container_name": container_name,
+        "status": "running", "result": None, "started_at": _utc_now_iso(),
+        "finished_at": None, "last_line": None, "lines": [],
+        "cond": asyncio.Condition(), "t0": time.monotonic(),
+    }
+    finished = sorted((j for j in _JOBS.values() if j["finished_at"]), key=lambda j: j["started_at"])
+    for old in finished[:max(0, len(finished) - _JOBS_KEEP + 1)]:
+        _JOBS.pop(old["id"], None)
+    _JOBS[job["id"]] = job
+    job["task"] = asyncio.create_task(_run_job(job, agen))
+    return job
+
+
+async def _run_job(job: dict, agen) -> None:
+    log_path = None
+    try:
+        log_dir = os.path.join(BACKUP_DIR, "_job_logs")
+        os.makedirs(log_dir, exist_ok=True)
+        safe_name = re.sub(r"[^A-Za-z0-9_.-]", "_", job["container_name"])
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+        log_path = os.path.join(log_dir, f"{stamp}_{job['kind']}_{safe_name}_{job['id']}.log")
+    except Exception:
+        pass
+
+    async def _append(msg: str) -> None:
+        if msg.startswith("LOG:"):
+            msg = f"LOG: [+{time.monotonic() - job['t0']:.1f}s] {msg[4:].strip()}"
+        job["lines"].append(f"data: {msg}\n\n")
+        job["last_line"] = msg
+        if msg.startswith(_JOB_FAIL_MARKERS):
+            job["result"] = "failed"
+        elif msg.startswith(_JOB_OK_MARKERS) and job["result"] is None:
+            job["result"] = "success"
+        print(f"[job {job['id']} {job['kind']} {job['container_name']}] {msg}", flush=True)
+        if log_path:
+            try:
+                with open(log_path, "a") as f:
+                    f.write(f"{_utc_now_iso()} {msg}\n")
+            except Exception:
+                pass
+        async with job["cond"]:
+            job["cond"].notify_all()
+
+    try:
+        async for chunk in agen:
+            for raw in str(chunk).splitlines():
+                raw = raw.strip()
+                if raw.startswith("data:") and raw[5:].strip():
+                    await _append(raw[5:].strip())
+    except Exception as e:
+        print(f"[job {job['id']}] crashed: {traceback.format_exc()}", flush=True)
+        await _append(f"{_JOB_ERROR_PREFIX.get(job['kind'], 'JOB_ERROR')}:Internal error: {e}")
+    finally:
+        job["status"] = job["result"] or "finished"
+        job["finished_at"] = _utc_now_iso()
+        async with job["cond"]:
+            job["cond"].notify_all()
+
+
+async def _job_sse(job: dict, start: int = 0):
+    yield f"data: JOB_ID:{job['id']}\n\n"
+    idx = max(0, start)
+    cond = job["cond"]
+    while True:
+        while idx < len(job["lines"]):
+            yield job["lines"][idx]
+            idx += 1
+        if job["finished_at"]:
+            yield f"data: JOB_END:{job['status']}\n\n"
+            return
+        async with cond:
+            try:
+                await asyncio.wait_for(
+                    cond.wait_for(lambda: idx < len(job["lines"]) or job["finished_at"]),
+                    _JOB_HEARTBEAT_SECONDS,
+                )
+            except asyncio.TimeoutError:
+                pass
+        if idx >= len(job["lines"]) and not job["finished_at"]:
+            yield "data: JOB_HB\n\n"
+
+
+def _job_response(job: dict, start: int = 0) -> StreamingResponse:
+    return StreamingResponse(
+        _job_sse(job, start), media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+def _lookup_container_name(host_url: str, container_id: str) -> str:
+    client = _make_docker_client(host_url)
+    try:
+        return client.containers.get(container_id).name.lstrip("/")
+    except Exception:
+        return container_id[:12]
+    finally:
+        client.close()
 
 
 def _resolve_net_mode_parent(client, container, raw_net_mode: str) -> str:
@@ -2646,17 +2782,12 @@ async def safe_update_endpoint(container_id: str, body: SafeUpdateBody, request:
     finally:
         db.close()
 
-    async def _stream():
-        async for line in _safe_update_stream(
-            container_id, host_url, host_id,
-            force=body.force, scan_first=body.scan_first,
-        ):
-            yield line
-
-    return StreamingResponse(
-        _stream(), media_type="text/event-stream",
-        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
-    )
+    container_name = await asyncio.to_thread(_lookup_container_name, host_url, container_id)
+    job = _start_job("update", container_name, _safe_update_stream(
+        container_id, host_url, host_id,
+        force=body.force, scan_first=body.scan_first,
+    ))
+    return _job_response(job)
 
 
 @router.post("/docker/containers/{container_id}/backup")
@@ -2743,7 +2874,203 @@ async def get_backup_compose(backup_id: int, request: Request):
         db.close()
 
 
-async def _deploy_compose_stream(compose_yaml: str, host_url: str):
+@router.get("/docker/backups")
+async def list_all_backups(request: Request, container: Optional[str] = None, limit: int = 1000):
+    """List backups for every container, including ones that no longer exist."""
+    _verify_token(request)
+    limit = max(1, min(limit, 5000))
+    db = _SessionLocal()
+    try:
+        rows = db.execute(text(f"""
+            SELECT id, container_name, host_id, image, backed_up_at, reason,
+                   (compose_yaml IS NOT NULL AND compose_yaml != ''
+                    AND compose_yaml NOT LIKE '# compose generation failed%') AS has_compose
+            FROM container_backups
+            {"WHERE container_name = :n" if container else ""}
+            ORDER BY backed_up_at DESC, id DESC
+            LIMIT :lim
+        """), {"n": container, "lim": limit}).fetchall()
+        docker_hosts = [h for h in _get_enabled_hosts(db) if h.get("type") != "proxmox"]
+    finally:
+        db.close()
+
+    def _live_names():
+        names: set[str] = set()
+        for h in docker_hosts:
+            client = _make_docker_client(h.get("url") or "unix:///var/run/docker.sock")
+            try:
+                names.update(c.name.lstrip("/") for c in client.containers.list(all=True))
+            finally:
+                client.close()
+        return names
+
+    try:
+        live = await asyncio.to_thread(_live_names)
+    except Exception:
+        live = None
+
+    return {
+        "backups": [
+            {
+                "id":             r[0],
+                "container_name": r[1],
+                "host_id":        r[2],
+                "image":          r[3],
+                "backed_up_at":   r[4].isoformat() if r[4] else None,
+                "reason":         r[5],
+                "has_compose":    bool(r[6]),
+                "container_exists": (r[1] in live) if live is not None else None,
+            }
+            for r in rows
+        ],
+    }
+
+
+@router.delete("/docker/backups/{backup_id}")
+async def delete_backup(backup_id: int, request: Request):
+    _verify_token(request)
+    db = _SessionLocal()
+    try:
+        res = db.execute(text("DELETE FROM container_backups WHERE id=:id"), {"id": backup_id})
+        db.commit()
+        if not res.rowcount:
+            raise HTTPException(404, "Backup not found.")
+        return {"deleted": backup_id}
+    finally:
+        db.close()
+
+
+@router.get("/docker/backups/export.zip")
+async def export_backups_zip(request: Request, latest_only: bool = False):
+    """Download stored compose backups as a zip (one folder per container)."""
+    _verify_token(request)
+    db = _SessionLocal()
+    try:
+        rows = db.execute(text("""
+            SELECT id, container_name, backed_up_at, reason, compose_yaml
+            FROM container_backups
+            WHERE compose_yaml IS NOT NULL AND compose_yaml != ''
+              AND compose_yaml NOT LIKE '# compose generation failed%'
+            ORDER BY container_name, backed_up_at DESC, id DESC
+        """)).fetchall()
+    finally:
+        db.close()
+
+    def _safe(s: str) -> str:
+        return re.sub(r"[^A-Za-z0-9_.-]", "_", s or "unknown")
+
+    buf = io.BytesIO()
+    seen: set[str] = set()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        for bid, name, ts, reason, yaml_text in rows:
+            if latest_only and name in seen:
+                continue
+            seen.add(name)
+            if latest_only:
+                path = f"{_safe(name)}/docker-compose.yml"
+            else:
+                stamp = ts.strftime("%Y%m%d_%H%M%S") if ts else "unknown"
+                path = f"{_safe(name)}/{stamp}_{_safe(reason)}_{bid}.yml"
+            zf.writestr(path, yaml_text)
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    return Response(
+        buf.getvalue(), media_type="application/zip",
+        headers={"Content-Disposition": f'attachment; filename="inspectre-compose-backups-{stamp}.zip"'},
+    )
+
+
+@router.get("/docker/jobs")
+async def list_jobs(request: Request):
+    _verify_token(request)
+    jobs = sorted(_JOBS.values(), key=lambda j: j["started_at"], reverse=True)
+    return [_job_public(j) for j in jobs]
+
+
+@router.get("/docker/jobs/{job_id}")
+async def get_job(job_id: str, request: Request):
+    _verify_token(request)
+    job = _JOBS.get(job_id)
+    if not job:
+        raise HTTPException(404, "Job not found.")
+    return _job_public(job, with_lines=True)
+
+
+@router.get("/docker/jobs/{job_id}/stream")
+async def stream_job(job_id: str, request: Request, start: int = 0):
+    """SSE: replay a job's log from line `start` and follow it until it finishes."""
+    _verify_token(request)
+    job = _JOBS.get(job_id)
+    if not job:
+        raise HTTPException(404, "Job not found.")
+    return _job_response(job, start)
+
+
+async def _stream_image_pull(host_url: str, image: str):
+    """Async generator of human-readable pull progress lines; raises if the pull fails."""
+    loop = asyncio.get_running_loop()
+    q: asyncio.Queue = asyncio.Queue()
+    errors: list = []
+
+    def _pull():
+        try:
+            api = docker_sdk.APIClient(base_url=host_url, timeout=300)
+        except Exception as e:
+            errors.append(e)
+            loop.call_soon_threadsafe(q.put_nowait, None)
+            return
+        try:
+            for evt in api.pull(image, stream=True, decode=True):
+                loop.call_soon_threadsafe(q.put_nowait, evt)
+        except Exception as e:
+            errors.append(e)
+        finally:
+            try:
+                api.close()
+            except Exception:
+                pass
+            loop.call_soon_threadsafe(q.put_nowait, None)
+
+    task = asyncio.create_task(asyncio.to_thread(_pull))
+    done_layers: set[str] = set()
+    dl_pct: dict[str, int] = {}
+    t0 = time.monotonic()
+    while True:
+        try:
+            evt = await asyncio.wait_for(q.get(), timeout=15)
+        except asyncio.TimeoutError:
+            yield (f"…still pulling ({int(time.monotonic() - t0)}s elapsed, "
+                   f"{len(done_layers)} layer(s) complete)")
+            continue
+        if evt is None:
+            break
+        if evt.get("error"):
+            errors.append(RuntimeError(evt["error"]))
+            continue
+        status = evt.get("status", "")
+        layer  = evt.get("id", "")
+        detail = evt.get("progressDetail") or {}
+        if status in ("Pull complete", "Already exists"):
+            if layer and layer not in done_layers:
+                done_layers.add(layer)
+                yield f"[{layer[:12]}] {status}"
+        elif status == "Downloading" and layer and detail.get("total"):
+            milestone = int(detail.get("current", 0) / detail["total"] * 100) // 25 * 25
+            if dl_pct.get(layer) != milestone:
+                dl_pct[layer] = milestone
+                yield f"[{layer[:12]}] downloading {milestone}% of {detail['total'] / 1048576:.1f} MB"
+        elif status.startswith(("Digest:", "Status:")):
+            yield status
+    await task
+    if errors:
+        raise errors[0]
+
+
+async def _deploy_compose_stream(
+    compose_yaml: str,
+    host_url: str,
+    host_id: Optional[int] = None,
+    backup_reason: Optional[str] = None,
+):
     """
     Async generator: parse a compose YAML and deploy all services via the Docker SDK.
     Yields SSE-formatted 'data: LOG: …' lines plus a final 'data: DEPLOY_DONE' or
@@ -2782,6 +3109,42 @@ async def _deploy_compose_stream(compose_yaml: str, host_url: str):
 
     # ── Per-service deployment ────────────────────────────────────────────────
     for svc_name, svc_cfg in services.items():
+        prev_name: Optional[str] = None
+        was_running = False
+        created_ids: list = []
+        container_name = svc_name
+
+        def _rollback():
+            """Remove the half-created container and put the previous one back."""
+            c = _make_docker_client(host_url)
+            try:
+                for cid in created_ids:
+                    try:
+                        c.containers.get(cid).remove(force=True)
+                    except docker_sdk.errors.NotFound:
+                        pass
+                if not prev_name:
+                    return "no previous container to restore"
+                old = c.containers.get(prev_name)
+                old.rename(container_name)
+                if was_running:
+                    old.start()
+                    return f"'{container_name}' restored and running again"
+                return f"'{container_name}' restored (left stopped, as it was before)"
+            finally:
+                c.close()
+
+        async def _rollback_lines():
+            yield emit(f"LOG: [{svc_name}] [ROLLBACK] Restoring the previous container…")
+            try:
+                msg = await asyncio.to_thread(_rollback)
+                yield emit(f"LOG: [{svc_name}] [ROLLBACK] ✓ {msg}")
+            except Exception as rbe:
+                yield emit(
+                    f"LOG: [{svc_name}] [ROLLBACK FAILED] {rbe} — the previous container is still on "
+                    f"the host as '{prev_name}', and its config backup is in Settings → Docker → Container Backups"
+                )
+
         try:
             svc_cfg = svc_cfg or {}
             image = svc_cfg.get("image")
@@ -2792,39 +3155,76 @@ async def _deploy_compose_stream(compose_yaml: str, host_url: str):
             container_name = svc_cfg.get("container_name") or svc_name
             yield emit(f"LOG: [{svc_name}] Deploying '{container_name}' ({image})")
 
+            # ── Locate existing container ─────────────────────────────────────
+            def _find_existing(cname=container_name):
+                c = _make_docker_client(host_url)
+                try:
+                    try:
+                        ex = c.containers.get(cname)
+                    except docker_sdk.errors.NotFound:
+                        return None
+                    return {"id": ex.id, "status": ex.status, "image": _container_image_ref(ex)}
+                finally:
+                    c.close()
+
+            existing = await asyncio.to_thread(_find_existing)
+            if existing:
+                yield emit(
+                    f"LOG: [{svc_name}] Found existing '{container_name}' "
+                    f"(id {existing['id'][:12]}, status {existing['status']}, image {existing['image']})"
+                )
+                role = _stack_role(container_name, existing["id"])
+                if role in ("self", "db"):
+                    what = "backend" if role == "self" else "database"
+                    yield emit(
+                        f"DEPLOY_ERROR:[{svc_name}] '{container_name}' is the InSpectre {what} container — "
+                        "redeploying it from here would kill this operation half-way. Nothing was changed. "
+                        "Use Settings → About → Update InSpectre or docker compose on the host instead."
+                    )
+                    return
+            else:
+                yield emit(f"LOG: [{svc_name}] No existing container named '{container_name}' — a new one will be created")
+
+            # ── Backup (abort if it fails — never touch an unbacked container) ──
+            if existing and backup_reason:
+                yield emit(f"LOG: [{svc_name}] Backing up current configuration of '{container_name}'…")
+                try:
+                    bid = await asyncio.to_thread(
+                        _backup_container_sync, container_name, existing["id"],
+                        host_url, host_id, backup_reason,
+                    )
+                except Exception as be:
+                    yield emit(f"DEPLOY_ERROR:[{svc_name}] Backup failed ({be}) — aborting, nothing was changed.")
+                    return
+                yield emit(
+                    f"LOG: [{svc_name}] ✓ Backup #{bid} saved — restorable from "
+                    "Settings → Docker → Container Backups even if the container disappears"
+                )
+
             # ── Pull image ────────────────────────────────────────────────────
             yield emit(f"LOG: [{svc_name}] Pulling {image}…")
             try:
-                def _pull(img=image):
-                    c = _make_docker_client(host_url)
-                    try:
-                        c.images.pull(img)
-                    finally:
-                        c.close()
-                await asyncio.to_thread(_pull)
+                async for msg in _stream_image_pull(host_url, image):
+                    yield emit(f"LOG: [{svc_name}]   {msg}")
                 yield emit(f"LOG: [{svc_name}] ✓ Pull complete")
             except Exception as pe:
-                yield emit(f"LOG: [{svc_name}] Warning: pull failed ({pe}) — using cached image if available")
-
-            # ── Stop & remove existing container ──────────────────────────────
-            yield emit(f"LOG: [{svc_name}] Stopping '{container_name}' (if running)…")
-            try:
-                def _stop_remove(cname=container_name):
+                def _has_local(img=image):
                     c = _make_docker_client(host_url)
                     try:
-                        try:
-                            existing = c.containers.get(cname)
-                            if existing.status not in ("exited", "created"):
-                                existing.stop(timeout=15)
-                            existing.remove(force=True)
-                        except docker_sdk.errors.NotFound:
-                            pass  # nothing to remove
+                        c.images.get(img)
+                        return True
+                    except docker_sdk.errors.ImageNotFound:
+                        return False
                     finally:
                         c.close()
-                await asyncio.to_thread(_stop_remove)
-                yield emit(f"LOG: [{svc_name}] ✓ Old container removed")
-            except Exception as se:
-                yield emit(f"LOG: [{svc_name}] Warning: could not remove old container ({se}) — continuing")
+                if await asyncio.to_thread(_has_local):
+                    yield emit(f"LOG: [{svc_name}] Warning: pull failed ({pe}) — using locally cached image")
+                else:
+                    yield emit(
+                        f"DEPLOY_ERROR:[{svc_name}] Pull failed ({pe}) and the image is not available "
+                        "locally — aborting, nothing was changed."
+                    )
+                    return
 
             # ── Parse ports ───────────────────────────────────────────────────
             port_bindings: dict = {}
@@ -3013,8 +3413,65 @@ async def _deploy_compose_stream(compose_yaml: str, host_url: str):
             else:
                 stop_timeout = None
 
+            summary = [
+                f"network={net_mode}",
+                f"ports={len(port_bindings_arg or {})}",
+                f"volumes={len(binds)}",
+                f"env={len(env_list or [])}",
+                f"restart={rp['Name']}",
+            ]
+            for key in ("ipc", "pid", "privileged", "runtime", "user"):
+                if svc_cfg.get(key):
+                    summary.append(f"{key}={svc_cfg[key]}")
+            if devices:
+                summary.append(f"devices={len(devices)}")
+            if post_connect_nets:
+                summary.append(f"extra_networks={','.join(post_connect_nets)}")
+            yield emit(f"LOG: [{svc_name}] Parsed config: {', '.join(summary)}")
+
+            # ── Stop & set aside the old container (kept until the new one is confirmed) ──
+            if existing:
+                was_running = existing["status"] in ("running", "restarting", "paused")
+                new_prev = f"{container_name}_inspectre_prev_{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}"
+                grace = stop_timeout or 15
+                if was_running:
+                    yield emit(f"LOG: [{svc_name}] Stopping '{container_name}' (up to {grace}s)…")
+
+                def _stop_rename(cid=existing["id"], newname=new_prev, running=was_running, t=grace):
+                    c = _make_docker_client(host_url)
+                    try:
+                        ex = c.containers.get(cid)
+                        if running:
+                            ex.stop(timeout=t)
+                        ex.rename(newname)
+                    finally:
+                        c.close()
+
+                try:
+                    await asyncio.to_thread(_stop_rename)
+                except Exception as se:
+                    if was_running:
+                        def _restart(cid=existing["id"]):
+                            c = _make_docker_client(host_url)
+                            try:
+                                c.containers.get(cid).start()
+                            finally:
+                                c.close()
+                        try:
+                            await asyncio.to_thread(_restart)
+                        except Exception:
+                            pass
+                    yield emit(f"DEPLOY_ERROR:[{svc_name}] Could not stop/set aside '{container_name}': {se}")
+                    return
+                prev_name = new_prev
+                yield emit(
+                    f"LOG: [{svc_name}] ✓ Old container stopped and kept as '{prev_name}' "
+                    "until the new one is confirmed running"
+                )
+
             # ── Create & start ────────────────────────────────────────────────
             yield emit(f"LOG: [{svc_name}] Creating container '{container_name}'…")
+            net_warnings: list = []
 
             def _create_start(
                 img=image,               cname=container_name,   cmd=command,
@@ -3094,12 +3551,13 @@ async def _deploy_compose_stream(compose_yaml: str, host_url: str):
                         stop_signal = stop_signal,
                         stop_timeout = stop_timeout,
                     )
+                    created_ids.append(cres["Id"])
                     cobj = c.containers.get(cres["Id"])
                     for net_name in extra_nets:
                         try:
                             c.networks.get(net_name).connect(cobj)
                         except Exception as ne:
-                            print(f"[deploy-compose] Warning: could not connect to network {net_name}: {ne}", flush=True)
+                            net_warnings.append(f"could not connect to network {net_name}: {ne}")
                     cobj.start()
                 finally:
                     c.close()
@@ -3108,13 +3566,92 @@ async def _deploy_compose_stream(compose_yaml: str, host_url: str):
                 await asyncio.to_thread(_create_start)
             except Exception as ce:
                 print(f"[deploy-compose] create/start failed for {svc_name}: {_tb.format_exc()}", flush=True)
+                yield emit(f"LOG: [{svc_name}] ✗ Create/start failed: {ce}")
+                if prev_name:
+                    async for ln in _rollback_lines():
+                        yield ln
                 yield emit(f"DEPLOY_ERROR:[{svc_name}] Failed to create/start '{container_name}': {ce}")
                 return
+            for w in net_warnings:
+                yield emit(f"LOG: [{svc_name}] Warning: {w}")
+            yield emit(f"LOG: [{svc_name}] ✓ Started new container {created_ids[-1][:12]} — verifying it stays up…")
+
+            # ── Verify the new container doesn't immediately die ───────────────────
+            def _probe_state(cid=created_ids[-1]):
+                c = _make_docker_client(host_url)
+                try:
+                    x = c.containers.get(cid)
+                    return x.attrs.get("State") or {}, x.attrs.get("RestartCount") or 0
+                finally:
+                    c.close()
+
+            failure: Optional[str] = None
+            checks = 5
+            for i in range(checks):
+                await asyncio.sleep(2)
+                state, restarts = await asyncio.to_thread(_probe_state)
+                st = state.get("Status", "?")
+                health = (state.get("Health") or {}).get("Status")
+                yield emit(
+                    f"LOG: [{svc_name}]   check {i + 1}/{checks}: status={st}"
+                    + (f", health={health}" if health else "")
+                    + (f", restarts={restarts}" if restarts else "")
+                )
+                if st in ("exited", "dead"):
+                    if state.get("ExitCode") == 0 and not was_running:
+                        break
+                    failure = f"exited with code {state.get('ExitCode')}" + (
+                        f" ({state['Error']})" if state.get("Error") else "")
+                    break
+                if st == "restarting" or restarts:
+                    failure = f"is crash-looping (restart count {restarts})"
+                    break
+
+            if failure:
+                def _tail_logs(cid=created_ids[-1]):
+                    c = _make_docker_client(host_url)
+                    try:
+                        return c.containers.get(cid).logs(tail=25).decode("utf-8", errors="replace")
+                    finally:
+                        c.close()
+                yield emit(f"LOG: [{svc_name}] ✗ New container {failure}. Last log lines:")
+                try:
+                    for ln in (await asyncio.to_thread(_tail_logs)).splitlines()[-25:]:
+                        if ln.strip():
+                            yield emit(f"LOG: [{svc_name}]   | {ln.rstrip()}")
+                except Exception as le:
+                    yield emit(f"LOG: [{svc_name}]   (could not read logs: {le})")
+                if prev_name:
+                    async for ln in _rollback_lines():
+                        yield ln
+                    yield emit(f"DEPLOY_ERROR:[{svc_name}] New '{container_name}' {failure} — previous container restored.")
+                else:
+                    yield emit(f"DEPLOY_ERROR:[{svc_name}] New '{container_name}' {failure}. Container left in place for inspection.")
+                return
+
+            # ── Commit: drop the old container ─────────────────────────────────────────
+            if prev_name:
+                def _remove_prev(name=prev_name):
+                    c = _make_docker_client(host_url)
+                    try:
+                        c.containers.get(name).remove(force=True)
+                    finally:
+                        c.close()
+                try:
+                    await asyncio.to_thread(_remove_prev)
+                    yield emit(f"LOG: [{svc_name}] ✓ Removed previous container '{prev_name}'")
+                except Exception as re_err:
+                    yield emit(f"LOG: [{svc_name}] Warning: could not remove '{prev_name}' ({re_err}) — remove it manually")
+                prev_name = None
 
             yield emit(f"LOG: [{svc_name}] ✓ '{container_name}' is running")
 
         except Exception as outer:
             print(f"[deploy-compose] unexpected error for service {svc_name}: {_tb.format_exc()}", flush=True)
+            yield emit(f"LOG: [{svc_name}] ✗ Unexpected error: {outer}")
+            if prev_name:
+                async for ln in _rollback_lines():
+                    yield ln
             yield emit(f"DEPLOY_ERROR:[{svc_name}] Unexpected error: {outer}")
             return
 
@@ -3182,7 +3719,7 @@ async def recreate_from_backup(backup_id: int, request: Request):
             if has_compose:
                 yield emit("LOG: [2/4] Deploying from stored compose YAML via Docker SDK…")
                 failed = False
-                async for deploy_line in _deploy_compose_stream(compose_yaml, host_url):
+                async for deploy_line in _deploy_compose_stream(compose_yaml, host_url, resolved_host_id):
                     # Translate DEPLOY_DONE/DEPLOY_ERROR into RECREATE_ equivalents
                     if deploy_line.startswith("data: DEPLOY_ERROR:"):
                         msg = deploy_line[len("data: DEPLOY_ERROR:"):]
@@ -3331,10 +3868,7 @@ async def recreate_from_backup(backup_id: int, request: Request):
         except Exception as e:
             yield emit(f"RECREATE_ERROR:{e}")
 
-    return StreamingResponse(
-        _stream(), media_type="text/event-stream",
-        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
-    )
+    return _job_response(_start_job("recreate", container_name, _stream()))
 
 
 class DeployComposeBody(BaseModel):
@@ -3356,23 +3890,15 @@ async def deploy_compose_endpoint(container_id: str, body: DeployComposeBody, re
 
     db = _SessionLocal()
     try:
-        host_url, _, _ = _resolve_host(db, container_id)
+        host_url, _, host_id = _resolve_host(db, container_id)
     finally:
         db.close()
 
-    async def _stream():
-        try:
-            async for line in _deploy_compose_stream(body.yaml, host_url):
-                yield line
-        except Exception as e:
-            import traceback as _tb
-            print(f"[deploy-compose] unhandled stream error: {_tb.format_exc()}", flush=True)
-            yield f"data: DEPLOY_ERROR:Internal error: {e}\n\n"
-
-    return StreamingResponse(
-        _stream(), media_type="text/event-stream",
-        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
-    )
+    container_name = await asyncio.to_thread(_lookup_container_name, host_url, container_id)
+    job = _start_job("deploy", container_name, _deploy_compose_stream(
+        body.yaml, host_url, host_id, backup_reason="pre_compose_edit",
+    ))
+    return _job_response(job)
 
 
 class PinBody(BaseModel):

@@ -1,7 +1,7 @@
 FROM python:3.12-slim
 
 # Expose target architecture for multi-arch binary downloads
-ARG TARGETARCH=amd64
+ARG TARGETARCH
 
 # Network tools
 RUN apt-get update && apt-get install -y --no-install-recommends \

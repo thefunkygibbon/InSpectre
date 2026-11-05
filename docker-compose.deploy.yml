@@ -76,6 +76,10 @@ services:
     container_name: inspectre-probe
     network_mode: "host"
     privileged: true
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
     restart: always
     environment:
       # ⚠️  Keep this in sync with db.POSTGRES_PASSWORD above.

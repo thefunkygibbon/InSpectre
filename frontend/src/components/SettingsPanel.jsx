@@ -11,6 +11,7 @@ import { useTheme } from '../hooks/useTheme'
 import { NotificationsTab } from './NotificationsTab'
 import { PluginsTab } from './PluginsTab'
 import { StreamOutput } from './StreamOutput'
+import { ContainerBackupsManager, ContainerJobsPanel } from './ContainerBackupsManager'
 
 // ── Setting definitions ────────────────────────────────────────────────────────
 const SETTING_META = {
@@ -1115,6 +1116,14 @@ export function SettingsPanel({ onClose, onSettingChange }) {
                     Check All Containers Now
                   </button>
                 </div>
+              </CollapsibleSection>
+
+              <CollapsibleSection label="Container Backups" Icon={Database} defaultOpen={false}>
+                <ContainerBackupsManager />
+              </CollapsibleSection>
+
+              <CollapsibleSection label="Background Jobs" Icon={RefreshCw} defaultOpen={false}>
+                <ContainerJobsPanel />
               </CollapsibleSection>
             </>
           )}

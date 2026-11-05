@@ -80,7 +80,11 @@ async function streamSSEPost(path, body, onLine, signal) {
   const res = await fetch(`${BASE}${path}`, {
     method: 'POST', headers, body: JSON.stringify(body), signal,
   })
-  if (!res.ok) throw new Error(`POST ${path} \u2192 ${res.status}`)
+  if (!res.ok) {
+    let detail = ''
+    try { detail = (await res.clone().json())?.detail || '' } catch (_) {}
+    throw new Error(`POST ${path} \u2192 ${res.status}${detail ? `: ${detail}` : ''}`)
+  }
   const reader  = res.body.getReader()
   const decoder = new TextDecoder()
   let buf = ''
@@ -98,6 +102,67 @@ async function streamSSEPost(path, body, onLine, signal) {
       }
     }
   }
+}
+
+// Long container operations run as backend jobs. The stream starts with
+// JOB_ID:<id> and ends with JOB_END:<status>; if the connection drops before
+// JOB_END we re-attach to /docker/jobs/<id>/stream from the last line seen.
+const JOB_TERMINAL_RE = /^(DEPLOY_DONE|DEPLOY_ERROR:|RECREATE_DONE|RECREATE_ERROR:|UPDATE_DONE:|UPDATE_ERROR:|UPDATE_BLOCKED:|SELF_UPDATE_STARTED)/
+
+async function runJobStream(open, onLine, signal, knownJobId = null) {
+  const st = { jobId: knownJobId, seen: 0, ended: false }
+  let kick = () => {}
+  const handle = text => {
+    kick()
+    if (text === 'JOB_HB') return
+    if (text.startsWith('JOB_ID:')) { st.jobId = text.slice(7); return }
+    if (text.startsWith('JOB_END:')) { st.ended = true; return }
+    st.seen += 1
+    if (JOB_TERMINAL_RE.test(text)) st.ended = true
+    onLine(text)
+  }
+  let first = true
+  let attempt = 0
+  let lastSeen = 0
+  while (!st.ended && !signal?.aborted) {
+    // The server heartbeats every 10s; a silent connection is treated as dead.
+    const inner = new AbortController()
+    const onAbort = () => inner.abort()
+    signal?.addEventListener('abort', onAbort)
+    let timer = null
+    kick = () => { clearTimeout(timer); timer = setTimeout(() => inner.abort(), 35000) }
+    kick()
+    try {
+      if (first) await open(handle, inner.signal)
+      else await streamSSE(`/docker/jobs/${st.jobId}/stream?start=${st.seen}`, handle, inner.signal)
+    } catch (e) {
+      if (signal?.aborted) return
+      if (!st.jobId) throw e
+      if (/\u2192 404/.test(e.message || '')) {
+        throw new Error('The server no longer knows this job (backend restarted?). Check the container state and Settings \u2192 Docker \u2192 Container Backups.')
+      }
+    } finally {
+      clearTimeout(timer)
+      kick = () => {}
+      signal?.removeEventListener('abort', onAbort)
+    }
+    first = false
+    if (st.ended || signal?.aborted) return
+    if (!st.jobId) throw new Error('Stream ended unexpectedly')
+    if (st.seen > lastSeen) { attempt = 0; lastSeen = st.seen }
+    attempt += 1
+    if (attempt > 180) throw new Error('Gave up reconnecting \u2014 the job may still be running; see Settings \u2192 Docker \u2192 Background Jobs.')
+    onLine(`LOG: \u26a0 Connection to server lost \u2014 the operation continues in the background. Reconnecting (attempt ${attempt})\u2026`)
+    await new Promise(r => setTimeout(r, Math.min(1000 * attempt, 10000)))
+  }
+}
+
+function streamJobPost(path, body, onLine, signal) {
+  return runJobStream((handle, sig) => streamSSEPost(path, body, handle, sig), onLine, signal)
+}
+
+function attachJob(jobId, onLine, signal) {
+  return runJobStream((handle, sig) => streamSSE(`/docker/jobs/${jobId}/stream?start=0`, handle, sig), onLine, signal, jobId)
 }
 
 export const api = {
@@ -409,12 +474,23 @@ export const api = {
   dockerCheckUpdate:        (id)                     => request('POST', `/docker/containers/${id}/check-update`),
   dockerResetUpdate:        (id)                     => request('POST', `/docker/containers/${id}/reset-update`),
   dockerScanNewImage:       (id, onLine, signal)     => streamSSEPost(`/docker/containers/${id}/scan-new-image`, {}, onLine, signal),
-  dockerSafeUpdate:         (id, body, onLine, signal) => streamSSEPost(`/docker/containers/${id}/safe-update`, body, onLine, signal),
+  dockerSafeUpdate:         (id, body, onLine, signal) => streamJobPost(`/docker/containers/${id}/safe-update`, body, onLine, signal),
   dockerBackupContainer:    (id)                     => request('POST', `/docker/containers/${id}/backup`),
   dockerListBackups:        (id)                     => request('GET',  `/docker/containers/${id}/backups`),
+  dockerListAllBackups:     ()                       => request('GET',  '/docker/backups'),
+  dockerDeleteBackup:       (bid)                    => request('DELETE', `/docker/backups/${bid}`),
+  dockerExportBackups:      (latestOnly = false)     => {
+    const token = getToken()
+    return fetch(`${BASE}/docker/backups/export.zip?latest_only=${latestOnly}`, {
+      headers: token ? { Authorization: `Bearer ${token}` } : {},
+    })
+  },
   dockerGetBackupCompose:   (bid)                    => request('GET',  `/docker/backups/${bid}/compose`),
-  dockerRecreateFromBackup: (bid, onLine, signal)    => streamSSEPost(`/docker/backups/${bid}/recreate`, {}, onLine, signal),
-  dockerDeployCompose:      (id, yaml, onLine, signal) => streamSSEPost(`/docker/containers/${id}/deploy-compose`, { yaml }, onLine, signal),
+  dockerRecreateFromBackup: (bid, onLine, signal)    => streamJobPost(`/docker/backups/${bid}/recreate`, {}, onLine, signal),
+  dockerDeployCompose:      (id, yaml, onLine, signal) => streamJobPost(`/docker/containers/${id}/deploy-compose`, { yaml }, onLine, signal),
+  dockerJobs:               ()                       => request('GET',  '/docker/jobs'),
+  dockerJob:                (jobId)                  => request('GET',  `/docker/jobs/${jobId}`),
+  dockerAttachJob:          (jobId, onLine, signal)  => attachJob(jobId, onLine, signal),
   dockerPinContainer:       (id, pinned)             => request('POST', `/docker/containers/${id}/pin`, { pinned }),
   dockerCheckAllUpdates:    ()                       => request('POST', '/docker/check-all-updates'),
   dockerCheckAllStatus:     ()                       => request('GET',  '/docker/check-all-status'),

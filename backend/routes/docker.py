@@ -398,6 +398,9 @@ def _parse_create_spec(body: DockerContainerCreate) -> dict:
                     and k not in {"compose_yaml", "compose_service", "host_id"}}
         spec = {**service, **explicit}
         spec.setdefault("name", compose_service)
+        for compose_key, sdk_key in (("ipc", "ipc_mode"), ("pid", "pid_mode")):
+            if compose_key in spec:
+                spec.setdefault(sdk_key, spec.pop(compose_key))
         spec["environment"] = spec.get("environment", spec.get("env"))
         spec["volumes"] = _compose_value_list(spec.get("volumes"), "volumes")
         spec["ports"] = _compose_value_list(spec.get("ports"), "ports")
@@ -1648,6 +1651,14 @@ def _generate_compose_yaml(c) -> tuple[str, dict]:
         value = hcfg.get(host_key) or ""
         if value:
             svc[compose_key] = value
+    ipc_mode = hcfg.get("IpcMode") or ""
+    if ipc_mode and ipc_mode not in ("private", "shareable"):
+        if ipc_mode.startswith("container:"):
+            try:
+                ipc_mode = "container:" + c.client.containers.get(ipc_mode.split(":", 1)[1]).name.lstrip("/")
+            except Exception:
+                pass
+        svc["ipc"] = ipc_mode
     security_opt = [v for v in (hcfg.get("SecurityOpt") or []) if v]
     if security_opt:
         svc["security_opt"] = security_opt

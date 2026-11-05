@@ -247,7 +247,9 @@ patch_dockerfiles() {
 import sys, re
 path = sys.argv[1]
 with open(path) as f: txt = f.read()
-txt = re.sub(r'(^FROM python:3\.12-slim\n)', r'\1ARG TARGETARCH=amd64\n', txt, count=1, flags=re.MULTILINE)
+txt = re.sub(r'(?m)^ARG TARGETARCH(?:=.*)?$', 'ARG TARGETARCH', txt)
+if not re.search(r'(?m)^ARG TARGETARCH$', txt):
+    txt = re.sub(r'(^FROM python:3\.12-slim\n)', r'\1ARG TARGETARCH\n', txt, count=1, flags=re.MULTILINE)
 txt = txt.replace('nuclei_${NUCLEI_VERSION}_linux_amd64.zip', 'nuclei_${NUCLEI_VERSION}_linux_${TARGETARCH}.zip')
 txt = txt.replace('nerva-linux-amd64.tar.gz', 'nerva-linux-${TARGETARCH}.tar.gz')
 with open(path, 'w') as f: f.write(txt)
@@ -257,7 +259,9 @@ PY
 import sys, re
 path = sys.argv[1]
 with open(path) as f: txt = f.read()
-txt = re.sub(r'(^FROM python:3\.12-slim\n)', r'\1ARG TARGETARCH=amd64\n', txt, count=1, flags=re.MULTILINE)
+txt = re.sub(r'(?m)^ARG TARGETARCH(?:=.*)?$', 'ARG TARGETARCH', txt)
+if not re.search(r'(?m)^ARG TARGETARCH$', txt):
+    txt = re.sub(r'(^FROM python:3\.12-slim\n)', r'\1ARG TARGETARCH\n', txt, count=1, flags=re.MULTILINE)
 txt = txt.replace(
     '"https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz"',
     '"https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/trivy_${TRIVY_VERSION}_Linux-$([ \"$TARGETARCH\" = \"arm64\" ] && echo ARM64 || echo 64bit).tar.gz"'
@@ -1330,7 +1334,7 @@ main() {
   check_deps
   clone_repo
 
-  # FIX #13: patch Dockerfiles whenever any ARM build is needed (not just VM/Pi)
+  # Ensure cloned Dockerfiles use BuildKit's target architecture for downloads.
   ( $BUILD_VM || $BUILD_PI || $BUILD_CONTAINERS_ARM || $BUILD_PI_ONLINE ) && patch_dockerfiles
 
   build_docker_images
